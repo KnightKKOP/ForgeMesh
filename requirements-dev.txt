@@ -8,5 +8,7 @@ pytest-cov
 ruff
 pydantic>=2,<3
 jsonschema
-pyyamlfastapi
+pyyaml
+fastapi
+uvicorn
 httpx

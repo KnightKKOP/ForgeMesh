@@ -28,6 +28,7 @@ from collections.abc import Callable
 
 from pydantic import BaseModel, Field
 
+from .circuit_breaker import CircuitBreakerRegistry
 from .provider import DecisionCandidate, DecisionProvider, DecisionRequest
 
 
@@ -73,6 +74,11 @@ class DecisionRouter:
         timeout_seconds: 单个 Provider 的调用时限（秒）。
         validator: 可选候选校验器；返回 ``True`` 表示候选有效。
             可抛出异常，视为该校验失败并触发降级。
+        high_risk_threshold: 视为高风险的等级字符串（按字典序比较）。
+        circuit_breakers: 可选的多 Provider 熔断器注册表。提供时，Router
+            在调用每个 Provider 前先查询其熔断器是否放行；被熔断的 Provider
+            跳过并记入 ``attempts``。成功/失败结果同步回灌熔断器统计。
+            熔断器**不**改变降级语义，高风险保护仍由本 Router 强制。
     """
 
     def __init__(
@@ -81,11 +87,13 @@ class DecisionRouter:
         timeout_seconds: float = 5.0,
         validator: Callable[[DecisionCandidate], bool] | None = None,
         high_risk_threshold: str = "high",
+        circuit_breakers: CircuitBreakerRegistry | None = None,
     ) -> None:
         self.providers: list[DecisionProvider] = list(providers)
         self.timeout_seconds = timeout_seconds
         self.validator = validator
         self.high_risk_threshold = high_risk_threshold
+        self.circuit_breakers = circuit_breakers
 
     @staticmethod
     def _provider_id(provider: DecisionProvider) -> str:
@@ -118,8 +126,22 @@ class DecisionRouter:
                 error=f"high-risk request (risk_level={risk}) requires fallback providers",
             )
 
+        cb = self.circuit_breakers
         for provider in self.providers:
             provider_id = self._provider_id(provider)
+
+            # 熔断器：被熔断的 Provider 直接跳过并记录（不改变降级语义）
+            if cb is not None and not cb.allow_request(provider_id):
+                attempts.append(
+                    Attempt(
+                        provider=provider_id,
+                        ok=False,
+                        error="circuit breaker open",
+                        latency_ms=0.0,
+                    )
+                )
+                continue
+
             started = time.monotonic()
 
             try:
@@ -135,6 +157,8 @@ class DecisionRouter:
                         latency_ms=_elapsed_ms(started),
                     )
                 )
+                if cb is not None:
+                    cb.record_failure(provider_id)
                 continue
             except Exception as exc:  # noqa: BLE001 - 任意 Provider 故障均降级
                 attempts.append(
@@ -145,6 +169,8 @@ class DecisionRouter:
                         latency_ms=_elapsed_ms(started),
                     )
                 )
+                if cb is not None:
+                    cb.record_failure(provider_id)
                 continue
 
             candidates = list(raw) if raw else []
@@ -161,6 +187,8 @@ class DecisionRouter:
                             latency_ms=_elapsed_ms(started),
                         )
                     )
+                    if cb is not None:
+                        cb.record_failure(provider_id)
                     continue
 
             if not candidates:
@@ -172,6 +200,8 @@ class DecisionRouter:
                         latency_ms=_elapsed_ms(started),
                     )
                 )
+                if cb is not None:
+                    cb.record_failure(provider_id)
                 continue
 
             attempts.append(
@@ -182,6 +212,8 @@ class DecisionRouter:
                     latency_ms=_elapsed_ms(started),
                 )
             )
+            if cb is not None:
+                cb.record_success(provider_id)
             return DecisionResult(
                 candidates=candidates,
                 chosen=candidates[0],
@@ -208,4 +240,5 @@ __all__ = [
     "Attempt",
     "DecisionResult",
     "DecisionRouter",
+    "CircuitBreakerRegistry",
 ]

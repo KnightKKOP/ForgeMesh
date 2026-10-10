@@ -1,79 +1,33 @@
-"""ForgeMesh 命令行入口骨架（阶段 0，占位）。
+"""ForgeMesh CLI — 声明式资源管理工具。
 
-提供 ``forgemesh`` 命令与子命令骨架：
+命令::
 
-* ``forgemesh apply -f <file>``  —— 声明式下发资源（占位，返回未实现）；
-* ``forgemesh get <kind>``       —— 查询资源（占位）；
-* ``forgemesh describe <kind> <name>`` —— 查看资源详情（占位）；
-* ``forgemesh version``          —— 打印版本信息。
+  forgemesh apply -f <file.yaml>    创建/更新资源
+  forgemesh get <kind> <name>       查询资源
+  forgemesh describe <kind> <name>  查询资源详情
+  forgemesh list <kind>             列出资源
+  forgemesh delete <kind> <name>    删除资源
 
-阶段 0 不发起任何网络请求，仅校验参数并返回明确的“未实现”提示与退出码：
-``0`` 成功、``2`` 参数错误、``3`` 未实现（占位）。
+全局选项::
+
+  --tenant <id>       租户 ID（默认 ``default``）
+  --namespace <ns>    命名空间（可选）
+  --api-url <url>     API 地址（默认 ``http://localhost:8080``，P1 直连 Registry）
+
+P1 简化：CLI 直接调用 :class:`SQLiteRegistry`（内存库），不走 HTTP。
+后续阶段将切换为 HTTP 客户端模式。
+
+兼容 Python 3.9+。
 """
 
 from __future__ import annotations
 
 import argparse
-import json
+import asyncio
 import sys
 from typing import List, Optional
 
-#: CLI 版本。
-CLI_VERSION = "0.0.1"
-
-#: 退出码约定。
-EXIT_OK = 0
-EXIT_USAGE = 2
-EXIT_NOT_IMPLEMENTED = 3
-
-
-def _not_implemented(action: str, payload: Optional[dict] = None) -> int:
-    """输出统一的“未实现”提示并返回退出码。"""
-    message = {
-        "error": {
-            "code": "NOT_IMPLEMENTED",
-            "message": f"阶段 0 占位：`{action}` 尚未实现。",
-        }
-    }
-    if payload:
-        message["request"] = payload
-    print(json.dumps(message, ensure_ascii=False))
-    return EXIT_NOT_IMPLEMENTED
-
-
-def _build_parser() -> argparse.ArgumentParser:
-    """构造命令行解析器（骨架）。"""
-    parser = argparse.ArgumentParser(
-        prog="forgemesh",
-        description="ForgeMesh 命令行工具（阶段 0 骨架，占位）。",
-    )
-    parser.add_argument(
-        "--version",
-        action="version",
-        version=f"forgemesh {CLI_VERSION}",
-    )
-    subparsers = parser.add_subparsers(dest="command", metavar="<command>")
-
-    apply_parser = subparsers.add_parser("apply", help="声明式下发资源")
-    apply_parser.add_argument(
-        "-f", "--filename", required=True, help="资源 YAML/JSON 文件路径"
-    )
-    apply_parser.add_argument(
-        "--dry-run", action="store_true", help="仅校验，不提交"
-    )
-
-    get_parser = subparsers.add_parser("get", help="查询资源")
-    get_parser.add_argument("kind", help="资源类型，如 inferenceservice")
-    get_parser.add_argument("name", nargs="?", help="资源名（可选）")
-    get_parser.add_argument("-o", "--output", choices=["table", "json", "yaml"],
-                            default="table", help="输出格式")
-
-    describe_parser = subparsers.add_parser("describe", help="查看资源详情")
-    describe_parser.add_argument("kind", help="资源类型")
-    describe_parser.add_argument("name", help="资源名")
-
-    subparsers.add_parser("version", help="打印版本信息")
-    return parser
+from .commands import cmd_apply, cmd_delete, cmd_describe, cmd_get, cmd_list
 
 
 def main(argv: Optional[List[str]] = None) -> int:
@@ -83,37 +37,54 @@ def main(argv: Optional[List[str]] = None) -> int:
         argv: 参数列表；``None`` 时读取 ``sys.argv[1:]``。
 
     Returns:
-        进程退出码（参见模块级 ``EXIT_*`` 常量）。
+        进程退出码（``0`` 成功，``1`` 业务错误）。
     """
-    parser = _build_parser()
+    parser = argparse.ArgumentParser(
+        prog="forgemesh", description="ForgeMesh CLI — 声明式资源管理工具"
+    )
+    parser.add_argument("--tenant", default="default", help="租户 ID")
+    parser.add_argument("--namespace", default=None, help="命名空间")
+    parser.add_argument(
+        "--api-url", default="http://localhost:8080", help="API 地址"
+    )
+
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    # apply
+    p_apply = subparsers.add_parser("apply", help="创建/更新资源")
+    p_apply.add_argument("-f", "--file", required=True, help="YAML 文件路径")
+
+    # get
+    p_get = subparsers.add_parser("get", help="查询资源")
+    p_get.add_argument("kind", help="资源类型")
+    p_get.add_argument("name", help="资源名称")
+
+    # describe
+    p_describe = subparsers.add_parser("describe", help="查询资源详情")
+    p_describe.add_argument("kind", help="资源类型")
+    p_describe.add_argument("name", help="资源名称")
+
+    # list
+    p_list = subparsers.add_parser("list", help="列出资源")
+    p_list.add_argument("kind", help="资源类型")
+
+    # delete
+    p_delete = subparsers.add_parser("delete", help="删除资源")
+    p_delete.add_argument("kind", help="资源类型")
+    p_delete.add_argument("name", help="资源名称")
+
     args = parser.parse_args(argv)
 
-    if args.command is None:
-        parser.print_help()
-        return EXIT_OK
+    commands = {
+        "apply": cmd_apply,
+        "get": cmd_get,
+        "describe": cmd_describe,
+        "list": cmd_list,
+        "delete": cmd_delete,
+    }
 
-    if args.command == "version":
-        print(f"forgemesh {CLI_VERSION}")
-        return EXIT_OK
-
-    if args.command == "apply":
-        return _not_implemented(
-            "apply", {"file": args.filename, "dryRun": args.dry_run}
-        )
-
-    if args.command == "get":
-        return _not_implemented(
-            "get",
-            {"kind": args.kind, "name": args.name, "output": args.output},
-        )
-
-    if args.command == "describe":
-        return _not_implemented(
-            "describe", {"kind": args.kind, "name": args.name}
-        )
-
-    parser.print_help()
-    return EXIT_USAGE
+    handler = commands[args.command]
+    return asyncio.run(handler(args))
 
 
 if __name__ == "__main__":  # pragma: no cover - 直接执行入口

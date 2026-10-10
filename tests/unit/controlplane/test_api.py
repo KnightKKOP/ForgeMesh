@@ -1,0 +1,120 @@
+"""REST API 单元测试。
+
+覆盖 ``/api/v1`` 资源 CRUD 端点与租户上下文注入：
+
+* 创建 → 查询往返；
+* 重复创建返回 409；
+* 查询不存在返回 404；
+* 删除后查询返回 404；
+* 列表返回多个资源；
+* 缺失 ``X-Tenant-Id`` 头返回 400。
+
+使用 FastAPI ``TestClient``（同步驱动），不依赖 pytest-asyncio。
+"""
+
+from __future__ import annotations
+
+import pytest
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
+from forgemesh.controlplane.api import create_api_router
+from forgemesh.controlplane.api.dependencies import init_registry
+
+TENANT_HEADERS = {"X-Tenant-Id": "tenant-a"}
+
+
+@pytest.fixture()
+def client() -> TestClient:
+    """构造带 API 路由的测试客户端（全新内存库）。"""
+    init_registry(":memory:")
+    app = FastAPI()
+    app.include_router(create_api_router())
+    return TestClient(app)
+
+
+def _payload(name: str = "svc-1", namespace: str = "default") -> dict:
+    """构造推理服务创建请求体。"""
+    return {
+        "apiVersion": "forgemesh.io/v1alpha1",
+        "kind": "InferenceService",
+        "metadata": {"name": name, "namespace": namespace},
+    }
+
+
+def test_create_and_get_inference_service(client: TestClient) -> None:
+    """POST 创建 → GET 查询返回同一资源。"""
+    resp = client.post(
+        "/api/v1/inference-services", json=_payload(), headers=TENANT_HEADERS
+    )
+    assert resp.status_code == 200, resp.text
+    created = resp.json()
+    assert created["kind"] == "InferenceService"
+    assert created["metadata"]["name"] == "svc-1"
+    assert created["metadata"]["tenantId"] == "tenant-a"
+
+    resp2 = client.get(
+        "/api/v1/inference-services/svc-1",
+        headers=TENANT_HEADERS,
+        params={"namespace": "default"},
+    )
+    assert resp2.status_code == 200, resp2.text
+    assert resp2.json()["metadata"]["name"] == "svc-1"
+
+
+def test_create_conflict(client: TestClient) -> None:
+    """重复创建同名资源返回 409。"""
+    client.post("/api/v1/inference-services", json=_payload(), headers=TENANT_HEADERS)
+    resp = client.post(
+        "/api/v1/inference-services", json=_payload(), headers=TENANT_HEADERS
+    )
+    assert resp.status_code == 409, resp.text
+
+
+def test_get_not_found(client: TestClient) -> None:
+    """查询不存在的资源返回 404。"""
+    resp = client.get(
+        "/api/v1/inference-services/nope",
+        headers=TENANT_HEADERS,
+        params={"namespace": "default"},
+    )
+    assert resp.status_code == 404, resp.text
+
+
+def test_delete_inference_service(client: TestClient) -> None:
+    """DELETE 后 GET 返回 404。"""
+    client.post("/api/v1/inference-services", json=_payload(), headers=TENANT_HEADERS)
+    resp = client.delete(
+        "/api/v1/inference-services/svc-1",
+        headers=TENANT_HEADERS,
+        params={"namespace": "default"},
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["status"] == "deleted"
+
+    resp2 = client.get(
+        "/api/v1/inference-services/svc-1",
+        headers=TENANT_HEADERS,
+        params={"namespace": "default"},
+    )
+    assert resp2.status_code == 404, resp2.text
+
+
+def test_list_inference_services(client: TestClient) -> None:
+    """创建多个 → LIST 返回列表。"""
+    for i in range(3):
+        client.post(
+            "/api/v1/inference-services",
+            json=_payload(name=f"svc-{i}"),
+            headers=TENANT_HEADERS,
+        )
+    resp = client.get("/api/v1/inference-services", headers=TENANT_HEADERS)
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["count"] == 3
+    assert len(body["items"]) == 3
+
+
+def test_missing_tenant_header(client: TestClient) -> None:
+    """无 X-Tenant-Id 头返回 400。"""
+    resp = client.post("/api/v1/inference-services", json=_payload())
+    assert resp.status_code == 400, resp.text

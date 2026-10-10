@@ -39,7 +39,7 @@ func TestCorrelation_GeneratesWhenMissing(t *testing.T) {
 // TestCorrelation_PreservesInbound 验证入站已带关联 ID 时原样透传（跨服务链路连续）。
 func TestCorrelation_PreservesInbound(t *testing.T) {
 	const (
-		header = "X-Trace-ID"
+		header  = "X-Trace-ID"
 		inbound = "upstream-corr-123"
 	)
 

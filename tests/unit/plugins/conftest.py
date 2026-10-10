@@ -80,3 +80,7 @@ _load_plugin_module("workflow_reference_provider", "workflow-reference")
 _load_plugin_package("gpu_nvidia_plugin", "gpu-nvidia")
 # 预加载 runtime-vllm 插件包（含 model / deploy / verify / release 子模块）。
 _load_plugin_package("runtime_vllm_plugin", "runtime-vllm")
+# 预加载 metering-basic 插件包（含 usage / provider 子模块）。
+_load_plugin_package("metering_basic_plugin", "metering-basic")
+# 预加载 qos-basic 插件包（含 provider 子模块）。
+_load_plugin_package("qos_basic_plugin", "qos-basic")

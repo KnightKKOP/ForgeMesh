@@ -42,3 +42,56 @@ func Authz(tenantHeader string) Middleware {
 		})
 	}
 }
+
+// AuthzWithToken 返回带 Bearer Token 校验的鉴权中间件。
+//
+// 行为：
+//   - 若 validTokens 非空，则从 Authorization: Bearer <token> 头提取 token，
+//     校验是否在 validTokens 集合中；缺失或无效时返回 401。
+//   - 若 validTokens 为空，退化为仅检查租户头存在性（与 Authz 一致），
+//     便于在未启用 Token 校验的环境无缝降级。
+//   - 通过 Token 校验后，仍需校验租户头存在性，保证多租户语义不被绕过。
+//
+// 安全约束：Token 比较采用 map 查找（O(1)），不泄露有效 token 列表；
+// 生产环境应结合 JWT 签名校验使用，本实现为静态 Token 白名单占位。
+func AuthzWithToken(tenantHeader string, validTokens map[string]bool) Middleware {
+	if tenantHeader == "" {
+		tenantHeader = DefaultTenantHeader
+	}
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			// 如果配置了 token 校验，先校验 Bearer Token。
+			if len(validTokens) > 0 {
+				token := extractBearerToken(r)
+				if token == "" || !validTokens[token] {
+					http.Error(w, "401 Unauthorized: invalid or missing token", http.StatusUnauthorized)
+					return
+				}
+			}
+			// 租户头校验（现有逻辑）。
+			tenant := strings.TrimSpace(r.Header.Get(tenantHeader))
+			if tenant == "" {
+				http.Error(w, "401 Unauthorized: missing tenant identity", http.StatusUnauthorized)
+				return
+			}
+			ctx := WithTenant(r.Context(), tenant)
+			next.ServeHTTP(w, r.WithContext(ctx))
+		})
+	}
+}
+
+// extractBearerToken 从 Authorization 头提取 Bearer token。
+//
+// 仅识别 "Bearer <token>" 前缀格式（RFC 6750 §2.1），其他方案（Basic/Digest 等）
+// 返回空字符串。token 前后空白会被 TrimSpace 去除，避免填充绕过。
+func extractBearerToken(r *http.Request) string {
+	auth := r.Header.Get("Authorization")
+	if auth == "" {
+		return ""
+	}
+	const prefix = "Bearer "
+	if !strings.HasPrefix(auth, prefix) {
+		return ""
+	}
+	return strings.TrimSpace(auth[len(prefix):])
+}

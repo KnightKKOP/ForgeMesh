@@ -10,26 +10,46 @@
 
 ### 1.1 环境要求
 
-- Python **3.9+**（CI 覆盖 3.9 与 3.11）
+- Python **3.12+**（CI 覆盖 3.12）
+- **uv**（Python 包与虚拟环境管理器，替代 pip/venv，安装见 <https://docs.astral.sh/uv/>）
 - GNU Make
 - Go **1.22+**（仅开发 `gateway/` 时需要）
 - Git
 
 ### 1.2 初始化
 
+**方式一：直接 clone（有写权限的贡献者）**
+
 ```bash
 git clone git@github.com:Mekoforge/ForgeMesh.git
 cd ForgeMesh
-python3 -m venv .venv
-make install          # 安装全部子包（editable）+ 开发依赖
+uv sync               # 创建虚拟环境并安装全部子包（editable）+ 开发依赖
 make test             # 运行全部测试，确认基线通过
 ```
+
+**方式二：fork → clone（外部贡献者推荐）**
+
+```bash
+# 1. 在 GitHub 上 fork 仓库到你自己的账号下
+# 2. clone 你的 fork
+git clone git@github.com:<你的用户名>/ForgeMesh.git
+cd ForgeMesh
+# 3. 添加上游远程，以便同步最新 main
+git remote add upstream git@github.com:Mekoforge/ForgeMesh.git
+git fetch upstream
+# 4. 安装依赖
+uv sync
+make test
+```
+
+> 后续同步上游：`git fetch upstream && git checkout main && git merge upstream/main && git push origin main`
 
 ### 1.3 常用命令
 
 | 命令 | 说明 |
 | --- | --- |
-| `make install` | 创建 `.venv`，安装全部子包（editable）+ 开发依赖 |
+| `uv sync` | 创建虚拟环境，安装全部子包（editable）+ 开发依赖 |
+| `make install` | 等价于 `uv sync`（Makefile 封装） |
 | `make test` | 运行全部测试（pytest） |
 | `make test-unit` | 仅单元测试 |
 | `make test-contract` | 仅契约测试 |
@@ -42,12 +62,13 @@ make test             # 运行全部测试，确认基线通过
 ## 2. 开发流程
 
 1. **认领或提交 Issue**：说明背景、期望行为与验收标准；重大变更先讨论方向。
-2. **创建分支**：从最新 `main` 切出（见第 3 节命名规范）。
-3. **编写代码与测试**：遵循第 5 节测试要求与项目代码规范。
-4. **本地自检**：`make fmt && make lint && make test` 全绿。
-5. **提交**：遵循第 4 节提交规范，使用 `-s` 签署 DCO（见第 6 节）。
-6. **发起 PR**：填写 PR 模板，关联 Issue，逐项确认第 8 节 PR 检查项。
-7. **评审与合并**：至少 1 名维护者/模块 Owner 批准；公共接口变更需按第 7 节完成兼容性评审。
+2. **同步上游**：`git fetch upstream && git checkout main && git merge upstream/main`（fork 模式）或 `git pull origin main`（直接 clone 模式）。
+3. **创建分支**：从最新 `main` 切出（见第 3 节命名规范）。
+4. **编写代码与测试**：遵循第 5 节测试要求与项目代码规范。
+5. **本地自检**：`make fmt && make lint && make test` 全绿。
+6. **提交**：遵循第 4 节提交规范，使用 `-s` 签署 DCO（见第 6 节）。
+7. **发起 PR**：从你的 fork 向 `Mekoforge/ForgeMesh` 的 `main` 发起 PR；填写 PR 模板，关联 Issue，逐项确认第 8 节 PR 检查项。
+8. **评审与合并**：至少 1 名维护者/模块 Owner 批准；公共接口变更需按第 7 节完成兼容性评审。
 
 ---
 
@@ -110,6 +131,15 @@ Signed-off-by: Zhang San <zhangsan@example.com>
 
 > 测试布局见 `tests/unit`、`tests/contract`、`tests/integration`、`tests/e2e`、`tests/chaos`、`tests/security`。
 
+### 5.1 文档要求
+
+- **公共 API 必须有 docstring**：所有公共类、函数、方法、Protocol、数据模型须附带 docstring，说明用途、参数、返回值与异常。
+- **docstring 语言**：中文描述 + 英文标识符；类型注解使用 `Optional` / `List` / `Dict`（而非 PEP 604 `X | None`），与项目风格一致。
+- **复杂逻辑注释**：非显而易见的算法、状态机转移、策略选择等须注释说明"为什么"（why），而非"做什么"（what）。
+- **文档同步**：新增或变更公共 API 时，同步更新相关文档（README / docs / OpenAPI / CHANGELOG）。
+- **ADR 同步**：涉及架构决策的变更须同步创建或更新 ADR（见第 7 节）。
+- **示例代码**：公共 API 的 docstring 中可附 usage 示例（doctest 风格），鼓励但非强制。
+
 ---
 
 ## 6. 贡献者许可（DCO）
@@ -162,7 +192,7 @@ ADR 与上游架构基线冲突时，以 [`architecture.md`](docs/architecture/a
 
 ## 9. 代码风格
 
-- **Python**：ruff 配置见根 `pyproject.toml`（行宽 100，`py39` 目标）。统一类型注解，公共 API 使用 Pydantic 强类型模型，禁止以未校验的任意 dict 作为公共接口。
+- **Python**：ruff 配置见根 `pyproject.toml`（行宽 100，`py312` 目标）。统一类型注解，使用 `Optional[X]` / `List[X]` / `Dict[K, V]`（而非 PEP 604 `X | None`）；公共 API 使用 Pydantic 强类型模型，禁止以未校验的任意 dict 作为公共接口。
 - **Go**：`gateway/` 内遵循 `gofmt` / `go vet`；对外契约版本化。
 - **通用**：命名清晰、函数单一职责、为复杂逻辑写注释说明"为什么"，不留 TODO 占位（除非关联 Issue）。
 - 仓库文本统一使用 UTF-8，换行与缩进遵循 `.editorconfig`。

@@ -84,3 +84,7 @@ _load_plugin_package("runtime_vllm_plugin", "runtime-vllm")
 _load_plugin_package("metering_basic_plugin", "metering-basic")
 # 预加载 qos-basic 插件包（含 provider 子模块）。
 _load_plugin_package("qos_basic_plugin", "qos-basic")
+# 预加载 workflow-temporal 插件包（含 provider 子模块）。
+_load_plugin_package("workflow_temporal_plugin", "workflow-temporal")
+# 预加载 runtime-tgi 插件包（含 provider 子模块）。
+_load_plugin_package("runtime_tgi_plugin", "runtime-tgi")

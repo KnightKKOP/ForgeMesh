@@ -6,15 +6,13 @@
 
 [tool.ruff]
 line-length = 100
-target-version = "py39"
+target-version = "py312"
 extend-exclude = [".venv", "build", "dist", "gateway"]
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "UP", "B", "C4", "SIM"]
-# 团队统一：项目需兼容 Python 3.9，统一使用 typing.Optional/List/Dict，
-# 因此忽略要求改用 PEP585/PEP604（内置泛型 / X|Y）语法的 UP 规则。
-# UP006=非 PEP585 注解, UP035=弃用 typing 导入, UP037=注解引号, UP045=非 PEP604 Optional, UP007=非 PEP604 Union
-ignore = ["E501", "B008", "UP006", "UP035", "UP037", "UP045", "UP007"]
+# Python 3.12+：原生支持 PEP 585（内置泛型）与 PEP 604（X|Y），无需忽略 UP 规则。
+ignore = ["E501", "B008"]
 
 [tool.ruff.lint.per-file-ignores]
 "__init__.py" = ["F401"]

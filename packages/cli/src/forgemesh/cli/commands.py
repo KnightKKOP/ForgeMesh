@@ -12,7 +12,7 @@ from __future__ import annotations
 import json
 import sys
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any
 
 import yaml
 from forgemesh.controlplane.registry import SQLiteRegistry
@@ -25,7 +25,7 @@ def _get_registry() -> SQLiteRegistry:
     return SQLiteRegistry(":memory:")  # P1 简化：每次新建内存库
 
 
-def _build_resource(data: Dict[str, Any], tenant_id: str) -> Resource:
+def _build_resource(data: dict[str, Any], tenant_id: str) -> Resource:
     """从 YAML 解析结果构造 :class:`Resource`，注入租户上下文。
 
     ``--tenant`` 为租户权威来源，覆盖 YAML metadata 中可能存在的
@@ -46,7 +46,7 @@ async def cmd_apply(args: Any) -> int:
         return 1
 
     with file_path.open("r", encoding="utf-8") as f:
-        data: Dict[str, Any] = yaml.safe_load(f) or {}
+        data: dict[str, Any] = yaml.safe_load(f) or {}
 
     registry = _get_registry()
     resource = _build_resource(data, args.tenant)

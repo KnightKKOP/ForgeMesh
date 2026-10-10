@@ -2,13 +2,11 @@
 
 from __future__ import annotations
 
-from typing import Optional
-
 from fastapi import Header, HTTPException
 from forgemesh.controlplane.registry import SQLiteRegistry
 
 #: 全局 Registry 实例（由 ``init_registry`` 初始化）。
-_registry: Optional[SQLiteRegistry] = None
+_registry: SQLiteRegistry | None = None
 
 
 def init_registry(db_path: str = ":memory:") -> SQLiteRegistry:
@@ -33,7 +31,7 @@ def get_registry() -> SQLiteRegistry:
 
 
 async def get_tenant_id(
-    x_tenant_id: Optional[str] = Header(default=None, alias="X-Tenant-Id"),
+    x_tenant_id: str | None = Header(default=None, alias="X-Tenant-Id"),
 ) -> str:
     """从请求头 ``X-Tenant-Id`` 提取租户 ID（强制要求）。
 

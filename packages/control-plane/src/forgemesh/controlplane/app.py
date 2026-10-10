@@ -18,7 +18,7 @@
 from __future__ import annotations
 
 import json
-from typing import Any, Dict, Optional
+from typing import Any
 
 from pydantic import BaseModel
 
@@ -51,9 +51,9 @@ class HealthResponse(BaseModel):
 def error_envelope(
     code: str,
     message: str,
-    correlation_id: Optional[str] = None,
-    details: Optional[Dict[str, Any]] = None,
-) -> Dict[str, Any]:
+    correlation_id: str | None = None,
+    details: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     """构造统一错误信封。
 
     Args:
@@ -62,7 +62,7 @@ def error_envelope(
         correlation_id: 全链路关联 ID（INV-4），可为空。
         details: 附加结构化信息，可为空。
     """
-    error: Dict[str, Any] = {"code": code, "message": message}
+    error: dict[str, Any] = {"code": code, "message": message}
     if correlation_id is not None:
         error["correlationId"] = correlation_id
     if details is not None:
@@ -81,7 +81,7 @@ PLACEHOLDER_ROUTES = (
 )
 
 
-def _placeholder_payload(method: str, path: str) -> Dict[str, Any]:
+def _placeholder_payload(method: str, path: str) -> dict[str, Any]:
     """生成占位响应载荷（501）。"""
     return error_envelope(
         NOT_IMPLEMENTED_CODE,
@@ -91,7 +91,7 @@ def _placeholder_payload(method: str, path: str) -> Dict[str, Any]:
 
 if _FASTAPI_AVAILABLE:
 
-    def create_app() -> "FastAPI":
+    def create_app() -> FastAPI:
         """创建 FastAPI 应用并注册探针与占位路由。
 
         阶段 0 **不连接数据库**，所有资源/运行端点返回 501。
@@ -134,7 +134,7 @@ if _FASTAPI_AVAILABLE:
 
 else:  # pragma: no cover - 兜底路径：无 FastAPI 时使用标准库实现
 
-    def create_app() -> "FastAPI":  # type: ignore[valid-type]
+    def create_app() -> FastAPI:  # type: ignore[valid-type]
         """无 FastAPI 环境时的占位工厂（抛出明确错误）。"""
         raise RuntimeError(
             "未检测到 FastAPI。请安装可选依赖：pip install 'forgemesh-control-plane[api]'，"
@@ -150,7 +150,7 @@ else:  # pragma: no cover - 兜底路径：无 FastAPI 时使用标准库实现
 
         server_version = f"forgeMesh-control-plane/{CONTROL_PLANE_VERSION}"
 
-        def _write_json(self, status: int, payload: Dict[str, Any]) -> None:
+        def _write_json(self, status: int, payload: dict[str, Any]) -> None:
             body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
             self.send_response(status)
             self.send_header("Content-Type", "application/json; charset=utf-8")

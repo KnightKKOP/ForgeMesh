@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -32,7 +32,7 @@ class ScheduleRequest(BaseModel):
 
     tenant_id: str
     resource_kind: str
-    requirements: Dict[str, Any] = Field(default_factory=dict)
+    requirements: dict[str, Any] = Field(default_factory=dict)
 
 
 class FeasibilityResult(BaseModel):
@@ -48,7 +48,7 @@ class FeasibilityResult(BaseModel):
 
     feasible: bool
     reason: str = ""
-    candidates: List[str] = Field(default_factory=list)
+    candidates: list[str] = Field(default_factory=list)
 
 
 class AllocationRef(BaseModel):
@@ -64,7 +64,7 @@ class AllocationRef(BaseModel):
 
     allocation_id: str
     resource_id: str
-    lease_until: Optional[datetime] = None
+    lease_until: datetime | None = None
 
 
 class Scheduler(ABC):

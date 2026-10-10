@@ -30,7 +30,6 @@
 from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
-from typing import Dict, Set
 
 from forgemesh.core.errors import InvalidStateTransition
 
@@ -64,8 +63,8 @@ class StateMachine:
             name: 状态机名称，默认 ``"state-machine"``。
         """
         self.name = name
-        self.states: Set[str] = set(states)
-        self.transitions: Dict[str, Set[str]] = {
+        self.states: set[str] = set(states)
+        self.transitions: dict[str, set[str]] = {
             source: set(targets) for source, targets in transitions.items()
         }
 
@@ -110,11 +109,11 @@ class StateMachine:
 # ---------------------------------------------------------------------------
 
 #: ``InferenceService`` 的全部合法状态集合。
-INFERENCE_STATES: Set[str] = {phase.value for phase in InferencePhase}
+INFERENCE_STATES: set[str] = {phase.value for phase in InferencePhase}
 
 #: ``InferenceService`` 权威转移表。键为源状态，值为允许的目标状态集合。
 #: ``Failed`` / ``Unknown`` 为吸收态，``Terminating`` 为终态，三者均无出边。
-INFERENCE_TRANSITIONS: Dict[str, Set[str]] = {
+INFERENCE_TRANSITIONS: dict[str, set[str]] = {
     InferencePhase.PENDING.value: {
         InferencePhase.SCHEDULING.value,
         InferencePhase.FAILED.value,
@@ -173,10 +172,10 @@ INFERENCE_STATE_MACHINE = StateMachine(
 # ---------------------------------------------------------------------------
 
 #: ``Allocation`` 的全部合法状态集合。
-ALLOCATION_STATES: Set[str] = {status.value for status in AllocationStatus}
+ALLOCATION_STATES: set[str] = {status.value for status in AllocationStatus}
 
 #: ``Allocation`` 权威转移表：``Active → {Released, Expired}``，终态无出边。
-ALLOCATION_TRANSITIONS: Dict[str, Set[str]] = {
+ALLOCATION_TRANSITIONS: dict[str, set[str]] = {
     AllocationStatus.ACTIVE.value: {
         AllocationStatus.RELEASED.value,
         AllocationStatus.EXPIRED.value,

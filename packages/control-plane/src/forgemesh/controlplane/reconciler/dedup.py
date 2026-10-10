@@ -7,7 +7,6 @@
 from __future__ import annotations
 
 import hashlib
-from typing import Optional
 
 from pydantic import BaseModel, ConfigDict
 
@@ -34,9 +33,9 @@ class DedupKey(BaseModel):
 
 def compute_dedup_key(
     kind: str,
-    namespace: Optional[str],
+    namespace: str | None,
     name: str,
-    uid: Optional[str],
+    uid: str | None,
     generation: int,
     operation: str,
 ) -> DedupKey:

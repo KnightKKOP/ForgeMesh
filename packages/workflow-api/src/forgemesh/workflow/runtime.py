@@ -21,7 +21,7 @@ Temporal/Cadence 等）都必须满足同一语义，业务模型不与之耦合
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -46,10 +46,10 @@ class Step(BaseModel):
 
     id: str
     uses: str
-    needs: List[str] = Field(default_factory=list)
-    with_: Dict[str, Any] = Field(default_factory=dict, alias="with")
-    timeout: Optional[int] = Field(default=None, description="步骤级超时（秒）")
-    compensate: Optional[str] = Field(default=None, description="补偿步骤 id（回滚时执行）")
+    needs: list[str] = Field(default_factory=list)
+    with_: dict[str, Any] = Field(default_factory=dict, alias="with")
+    timeout: int | None = Field(default=None, description="步骤级超时（秒）")
+    compensate: str | None = Field(default=None, description="补偿步骤 id（回滚时执行）")
     requires_approval: bool = Field(default=False, description="是否需要人工审批")
 
 
@@ -80,9 +80,9 @@ class WorkflowDefinition(BaseModel):
     """
 
     name: str
-    timeout_seconds: Optional[int] = None
-    inputs: Dict[str, Any] = Field(default_factory=dict)
-    steps: List[Step]
+    timeout_seconds: int | None = None
+    inputs: dict[str, Any] = Field(default_factory=dict)
+    steps: list[Step]
 
 
 class RunRef(BaseModel):
@@ -109,7 +109,7 @@ class WorkflowRuntime(ABC):
     async def start(
         self,
         defn: WorkflowDefinition,
-        inputs: Dict[str, Any],
+        inputs: dict[str, Any],
         idempotency_key: str,
     ) -> RunRef:
         """启动（或幂等复用）一个运行实例。
@@ -144,7 +144,7 @@ class WorkflowRuntime(ABC):
 
     @abstractmethod
     async def signal(
-        self, run_id: str, name: str, payload: Dict[str, Any]
+        self, run_id: str, name: str, payload: dict[str, Any]
     ) -> None:
         """向运行实例投递外部信号，唤醒处于 ``WAITING`` 的步骤/审批。
 

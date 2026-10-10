@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import asyncio
 import time
-from typing import Callable, List, Optional
+from collections.abc import Callable
 
 from pydantic import BaseModel, Field
 
@@ -43,7 +43,7 @@ class Attempt(BaseModel):
 
     provider: str
     ok: bool
-    error: Optional[str] = None
+    error: str | None = None
     latency_ms: float = 0.0
 
 
@@ -58,11 +58,11 @@ class DecisionResult(BaseModel):
         error: 顶层失败原因；成功时为 ``None``。
     """
 
-    candidates: List[DecisionCandidate] = Field(default_factory=list)
-    chosen: Optional[DecisionCandidate] = None
+    candidates: list[DecisionCandidate] = Field(default_factory=list)
+    chosen: DecisionCandidate | None = None
     success: bool
-    attempts: List[Attempt] = Field(default_factory=list)
-    error: Optional[str] = None
+    attempts: list[Attempt] = Field(default_factory=list)
+    error: str | None = None
 
 
 class DecisionRouter:
@@ -77,12 +77,12 @@ class DecisionRouter:
 
     def __init__(
         self,
-        providers: List[DecisionProvider],
+        providers: list[DecisionProvider],
         timeout_seconds: float = 5.0,
-        validator: Optional[Callable[[DecisionCandidate], bool]] = None,
+        validator: Callable[[DecisionCandidate], bool] | None = None,
         high_risk_threshold: str = "high",
     ) -> None:
-        self.providers: List[DecisionProvider] = list(providers)
+        self.providers: list[DecisionProvider] = list(providers)
         self.timeout_seconds = timeout_seconds
         self.validator = validator
         self.high_risk_threshold = high_risk_threshold
@@ -105,7 +105,7 @@ class DecisionRouter:
             :class:`DecisionResult`。若无有效候选，返回 ``success=False``
             （**绝不**默认放行）。
         """
-        attempts: List[Attempt] = []
+        attempts: list[Attempt] = []
 
         # 高风险降级保护：高风险请求且无备用 Provider 时，直接返回失败
         risk = getattr(req, "risk_level", None)
@@ -126,7 +126,7 @@ class DecisionRouter:
                 raw = await asyncio.wait_for(
                     provider.decide(req), timeout=self.timeout_seconds
                 )
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 attempts.append(
                     Attempt(
                         provider=provider_id,

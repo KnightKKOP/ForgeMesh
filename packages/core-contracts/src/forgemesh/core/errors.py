@@ -16,8 +16,6 @@
 
 from __future__ import annotations
 
-from typing import Optional
-
 
 class ForgeMeshError(Exception):
     """ForgeMesh 领域异常基类。
@@ -27,10 +25,10 @@ class ForgeMeshError(Exception):
         details: 可选的附加上下文（用于审计/诊断），默认 ``None``。
     """
 
-    def __init__(self, message: str = "", details: Optional[dict] = None) -> None:
+    def __init__(self, message: str = "", details: dict | None = None) -> None:
         super().__init__(message)
         self.message = message
-        self.details: Optional[dict] = details
+        self.details: dict | None = details
 
     def __str__(self) -> str:  # pragma: no cover - 简单委托
         if self.details:

@@ -25,8 +25,8 @@ PostgreSQL 存储）在控制平面子包中提供。
 
 from __future__ import annotations
 
+import builtins
 from abc import ABC, abstractmethod
-from typing import Dict, List, Optional
 
 from .objects import Resource
 
@@ -41,7 +41,7 @@ class ResourceRegistry(ABC):
     async def get(
         self,
         kind: str,
-        namespace: Optional[str],
+        namespace: str | None,
         name: str,
         tenant_id: str,
     ) -> Resource:
@@ -62,9 +62,9 @@ class ResourceRegistry(ABC):
     async def put(
         self,
         resource: Resource,
-        expected_version: Optional[str] = None,
-        actor: Optional[str] = None,
-        correlation_id: Optional[str] = None,
+        expected_version: str | None = None,
+        actor: str | None = None,
+        correlation_id: str | None = None,
     ) -> Resource:
         """写入（Create 或 Update-CAS）资源，返回写入后的最新对象。
 
@@ -84,12 +84,12 @@ class ResourceRegistry(ABC):
         self,
         kind: str,
         tenant_id: str,
-        namespace: Optional[str] = None,
-        labels: Optional[Dict[str, str]] = None,
+        namespace: str | None = None,
+        labels: dict[str, str] | None = None,
         watch: bool = False,
-        continue_token: Optional[str] = None,
+        continue_token: str | None = None,
         limit: int = 100,
-    ) -> List[Resource]:
+    ) -> builtins.list[Resource]:
         """按 ``kind`` + 可选 ``namespace`` / ``labels`` 过滤列出资源。
 
         Args:
@@ -107,11 +107,11 @@ class ResourceRegistry(ABC):
     async def delete(
         self,
         kind: str,
-        namespace: Optional[str],
+        namespace: str | None,
         name: str,
         tenant_id: str,
-        actor: Optional[str] = None,
-        correlation_id: Optional[str] = None,
+        actor: str | None = None,
+        correlation_id: str | None = None,
     ) -> None:
         """删除资源。
 

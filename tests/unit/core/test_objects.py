@@ -10,7 +10,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import pytest
 from forgemesh.core.objects import (
@@ -57,7 +57,7 @@ def test_construct_resource_with_metadata() -> None:
 
 
 def test_construct_condition() -> None:
-    now = datetime(2026, 10, 10, tzinfo=timezone.utc)
+    now = datetime(2026, 10, 10, tzinfo=UTC)
     cond = Condition(
         type="Ready",
         status="True",

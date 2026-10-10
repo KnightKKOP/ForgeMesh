@@ -26,9 +26,10 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import builtins
 import json
 import sqlite3
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any
 
 from forgemesh.core.errors import ConflictError, NotFoundError
 from forgemesh.core.objects import Resource
@@ -79,13 +80,13 @@ class SQLiteRegistry(ResourceRegistry):
         self._conn.commit()
 
     @staticmethod
-    def _encode_token(namespace: Optional[str], name: str) -> str:
+    def _encode_token(namespace: str | None, name: str) -> str:
         """将分页游标 ``(namespace, name)`` 编码为 opaque base64 字符串。"""
         payload = json.dumps({"ns": namespace, "name": name}, ensure_ascii=False)
         return base64.urlsafe_b64encode(payload.encode("utf-8")).decode("ascii")
 
     @staticmethod
-    def _decode_token(token: str) -> Tuple[Optional[str], str]:
+    def _decode_token(token: str) -> tuple[str | None, str]:
         """解码分页游标，返回 ``(namespace, name)``。"""
         try:
             raw = base64.urlsafe_b64decode(token.encode("ascii")).decode("utf-8")
@@ -106,7 +107,7 @@ class SQLiteRegistry(ResourceRegistry):
     async def get(
         self,
         kind: str,
-        namespace: Optional[str],
+        namespace: str | None,
         name: str,
         tenant_id: str,
     ) -> Resource:
@@ -130,9 +131,9 @@ class SQLiteRegistry(ResourceRegistry):
     async def put(
         self,
         resource: Resource,
-        expected_version: Optional[str] = None,
-        actor: Optional[str] = None,
-        correlation_id: Optional[str] = None,
+        expected_version: str | None = None,
+        actor: str | None = None,
+        correlation_id: str | None = None,
     ) -> Resource:
         """写入（Create 或 Update-CAS）资源，返回写入后的最新对象。
 
@@ -226,12 +227,12 @@ class SQLiteRegistry(ResourceRegistry):
         self,
         kind: str,
         tenant_id: str,
-        namespace: Optional[str] = None,
-        labels: Optional[Dict[str, str]] = None,
+        namespace: str | None = None,
+        labels: dict[str, str] | None = None,
         watch: bool = False,
-        continue_token: Optional[str] = None,
+        continue_token: str | None = None,
         limit: int = 100,
-    ) -> List[Resource]:
+    ) -> builtins.list[Resource]:
         """按 ``kind`` + 可选 ``namespace`` / ``labels`` 过滤列出资源（分页）。
 
         ``watch=True`` 在阶段 P1 暂未实现，抛 :class:`NotImplementedError`。
@@ -239,9 +240,9 @@ class SQLiteRegistry(ResourceRegistry):
         if watch:
             raise NotImplementedError("watch stream is not implemented in phase P1")
 
-        def _list() -> List[Resource]:
+        def _list() -> list[Resource]:
             sql = "SELECT body FROM resources WHERE tenant_id=? AND kind=?"
-            params: List[Any] = [tenant_id, kind]
+            params: list[Any] = [tenant_id, kind]
             if namespace is not None:
                 sql += " AND namespace IS ?"
                 params.append(namespace)
@@ -271,11 +272,11 @@ class SQLiteRegistry(ResourceRegistry):
     async def delete(
         self,
         kind: str,
-        namespace: Optional[str],
+        namespace: str | None,
         name: str,
         tenant_id: str,
-        actor: Optional[str] = None,
-        correlation_id: Optional[str] = None,
+        actor: str | None = None,
+        correlation_id: str | None = None,
     ) -> None:
         """删除资源；不存在或跨租户时抛 :class:`NotFoundError`。"""
 

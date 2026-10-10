@@ -15,7 +15,7 @@ plan → authorize → prepare → deploy → verify → commit …），并保�
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 
 class WorkflowProvider(ABC):
@@ -34,15 +34,15 @@ class WorkflowProvider(ABC):
         *,
         definition: str,
         version: int,
-        inputs: Dict[str, Any],
+        inputs: dict[str, Any],
         tenant_id: str,
-        correlation_id: Optional[str] = None,
+        correlation_id: str | None = None,
     ) -> str:
         """启动一次工作流运行，返回 ``run_id``。"""
         raise NotImplementedError
 
     @abstractmethod
-    async def get_run(self, *, run_id: str, tenant_id: str) -> Dict[str, Any]:
+    async def get_run(self, *, run_id: str, tenant_id: str) -> dict[str, Any]:
         """查询运行状态。"""
         raise NotImplementedError
 
@@ -58,7 +58,7 @@ class WorkflowProvider(ABC):
         """取消运行，并触发已执行步骤的补偿。"""
         raise NotImplementedError
 
-    def capabilities(self) -> List[str]:
+    def capabilities(self) -> list[str]:
         """声明 Provider 能力（用于决策路由与兼容性协商）。"""
         return ["workflow.execute", "workflow.approval", "workflow.compensate"]
 
@@ -70,16 +70,16 @@ class ReferenceWorkflowProvider(WorkflowProvider):
 
     def __init__(self) -> None:
         #: 已受理但未执行的运行（仅内存，进程退出即丢失）。
-        self._accepted: Dict[str, Dict[str, Any]] = {}
+        self._accepted: dict[str, dict[str, Any]] = {}
 
     async def start_run(
         self,
         *,
         definition: str,
         version: int,
-        inputs: Dict[str, Any],
+        inputs: dict[str, Any],
         tenant_id: str,
-        correlation_id: Optional[str] = None,
+        correlation_id: str | None = None,
     ) -> str:
         run_id = f"run-placeholder-{definition}-v{version}"
         self._accepted[run_id] = {
@@ -92,7 +92,7 @@ class ReferenceWorkflowProvider(WorkflowProvider):
         }
         return run_id
 
-    async def get_run(self, *, run_id: str, tenant_id: str) -> Dict[str, Any]:
+    async def get_run(self, *, run_id: str, tenant_id: str) -> dict[str, Any]:
         record = self._accepted.get(run_id)
         if record is None:
             return {"runId": run_id, "state": "Unknown", "tenantId": tenant_id}

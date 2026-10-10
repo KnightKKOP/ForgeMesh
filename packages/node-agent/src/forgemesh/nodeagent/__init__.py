@@ -18,11 +18,10 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from enum import Enum
-from typing import List, Optional
+from enum import Enum, StrEnum
 
 
-class TaskType(str, Enum):
+class TaskType(StrEnum):
     """Agent 支持的任务类型（受控枚举，无任意命令）。"""
 
     PROBE_GPU = "PROBE_GPU"
@@ -33,7 +32,7 @@ class TaskType(str, Enum):
     RELEASE_ALLOCATION = "RELEASE_ALLOCATION"
 
 
-class TaskState(str, Enum):
+class TaskState(StrEnum):
     """任务执行结果状态（对齐 ``TaskResult.State``）。"""
 
     UNSPECIFIED = "STATE_UNSPECIFIED"
@@ -64,10 +63,10 @@ class Task:
     execution_id: str
     idempotency_key: str
     type: TaskType
-    deadline: Optional[str] = None
-    requested_permissions: List[str] = field(default_factory=list)
+    deadline: str | None = None
+    requested_permissions: list[str] = field(default_factory=list)
     input_schema_version: str = "v1"
-    correlation_id: Optional[str] = None
+    correlation_id: str | None = None
     input: bytes = b""
 
 
@@ -80,9 +79,9 @@ class TaskResult:
     state: TaskState = TaskState.UNSPECIFIED
     output: bytes = b""
     output_schema_version: str = "v1"
-    error_code: Optional[str] = None
-    error_message: Optional[str] = None
-    completed_at: Optional[str] = None
+    error_code: str | None = None
+    error_message: str | None = None
+    completed_at: str | None = None
 
 
 class NodeAgent(ABC):
@@ -93,17 +92,17 @@ class NodeAgent(ABC):
 
     @abstractmethod
     async def register(self, *, agent_id: str, agent_version: str,
-                       capabilities: List[str]) -> bool:
+                       capabilities: list[str]) -> bool:
         """注册并协商能力/兼容性。返回是否被接受。"""
         raise NotImplementedError
 
     @abstractmethod
-    async def heartbeat(self, *, running_execution_ids: List[str]) -> None:
+    async def heartbeat(self, *, running_execution_ids: list[str]) -> None:
         """上报心跳及在途执行，用于离线检测与重连恢复。"""
         raise NotImplementedError
 
     @abstractmethod
-    async def poll_task(self, *, agent_id: str) -> Optional[Task]:
+    async def poll_task(self, *, agent_id: str) -> Task | None:
         """拉取一个待执行类型化任务；无任务时返回 ``None``。"""
         raise NotImplementedError
 

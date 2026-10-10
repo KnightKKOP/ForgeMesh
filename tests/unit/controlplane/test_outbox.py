@@ -16,7 +16,6 @@
 from __future__ import annotations
 
 import asyncio
-from typing import List, Optional
 
 import pytest
 from forgemesh.controlplane.outbox import (
@@ -37,7 +36,7 @@ def _make_event(
     aggregate_type: str = "InferenceService",
     aggregate_id: str = "svc-1",
     event_type: str = "Created",
-    payload: Optional[dict] = None,
+    payload: dict | None = None,
 ) -> OutboxEvent:
     """构造一个可复用的最小 OutboxEvent。"""
     return OutboxEvent(
@@ -137,7 +136,7 @@ def test_dispatcher_dispatch_once() -> None:
     outbox.put(_make_event("evt-1"))
     outbox.put(_make_event("evt-2"))
 
-    published: List[str] = []
+    published: list[str] = []
 
     def publisher(event: OutboxEvent) -> None:
         published.append(event.event_id)
@@ -178,7 +177,7 @@ def test_dispatcher_with_async_publisher() -> None:
     outbox.put(_make_event("evt-1"))
     outbox.put(_make_event("evt-2"))
 
-    published: List[str] = []
+    published: list[str] = []
 
     async def async_publisher(event: OutboxEvent) -> None:
         await asyncio.sleep(0)  # 模拟异步操作
@@ -202,7 +201,7 @@ def test_idempotent_consumer_first_time() -> None:
     """首次消费返回 True。"""
     consumer = IdempotentConsumer()
     event = _make_event()
-    handled: List[str] = []
+    handled: list[str] = []
 
     def handler(ev: OutboxEvent) -> None:
         handled.append(ev.event_id)
@@ -217,7 +216,7 @@ def test_idempotent_consumer_duplicate() -> None:
     """重复消费返回 False。"""
     consumer = IdempotentConsumer()
     event = _make_event()
-    handled: List[str] = []
+    handled: list[str] = []
 
     def handler(ev: OutboxEvent) -> None:
         handled.append(ev.event_id)

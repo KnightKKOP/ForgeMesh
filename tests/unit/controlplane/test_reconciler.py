@@ -7,7 +7,7 @@ Scheduler 分配成功与失败、幂等性。
 from __future__ import annotations
 
 import asyncio
-from typing import Any, Dict, Optional
+from typing import Any
 
 import pytest
 from forgemesh.controlplane.reconciler import ReconciliationController, compute_dedup_key
@@ -41,7 +41,7 @@ def make_resource(
 
 def make_context(
     resource: Resource,
-    observed: Optional[Dict[str, Any]] = None,
+    observed: dict[str, Any] | None = None,
     dedup_key: str = "key-1",
     tenant_id: str = "tenant-1",
     correlation_id: str = "corr-1",

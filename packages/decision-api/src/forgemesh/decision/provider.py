@@ -9,7 +9,8 @@ JEV 只回答「有哪些候选动作」，**不**分配资源、**不**写资�
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional, Protocol, Sequence
+from collections.abc import Sequence
+from typing import Any, Protocol
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -31,9 +32,9 @@ class DecisionRequest(BaseModel):
     request_id: str
     tenant_id: str
     operation: str
-    context: Dict[str, Any] = Field(default_factory=dict)
-    risk_level: Optional[str] = Field(default=None, description="风险等级（low/medium/high），高风险触发降级保护")
-    deadline_ms: Optional[int] = Field(default=None, ge=1, description="决策时限（毫秒），超时视为失败")
+    context: dict[str, Any] = Field(default_factory=dict)
+    risk_level: str | None = Field(default=None, description="风险等级（low/medium/high），高风险触发降级保护")
+    deadline_ms: int | None = Field(default=None, ge=1, description="决策时限（毫秒），超时视为失败")
 
 
 class DecisionCandidate(BaseModel):
@@ -49,9 +50,9 @@ class DecisionCandidate(BaseModel):
 
     candidate_id: str
     action: str
-    parameters: Dict[str, Any] = Field(default_factory=dict)
-    rationale: List[str] = Field(default_factory=list)
-    confidence: Optional[float] = None
+    parameters: dict[str, Any] = Field(default_factory=dict)
+    rationale: list[str] = Field(default_factory=list)
+    confidence: float | None = None
 
 
 class DecisionProvider(Protocol):

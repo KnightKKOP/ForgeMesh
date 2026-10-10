@@ -22,8 +22,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
-from typing import Dict, List, Optional, Set
+from datetime import UTC, datetime
 
 from forgemesh.core.errors import ConflictError, InvalidStateTransition, NotFoundError
 from forgemesh.plugin.manifest import (
@@ -53,7 +52,7 @@ class PluginRecord(BaseModel):
     manifest: PluginManifest
     lifecycle_state: PluginLifecycleState = PluginLifecycleState.DISCOVERED
     health_status: str = "Unknown"
-    installed_at: Optional[str] = None
+    installed_at: str | None = None
 
 
 class PluginManager:
@@ -63,7 +62,7 @@ class PluginManager:
     """
 
     def __init__(self) -> None:
-        self._plugins: Dict[str, PluginRecord] = {}
+        self._plugins: dict[str, PluginRecord] = {}
 
     # ------------------------------------------------------------------ #
     # 注册与发现
@@ -100,8 +99,8 @@ class PluginManager:
         return self._plugins[plugin_id]
 
     def discover(
-        self, category: Optional[PluginCategory] = None
-    ) -> List[PluginManifest]:
+        self, category: PluginCategory | None = None
+    ) -> list[PluginManifest]:
         """发现已注册插件，可按类别过滤。
 
         Args:
@@ -110,7 +109,7 @@ class PluginManager:
         Returns:
             匹配插件的 Manifest 列表。
         """
-        results: List[PluginManifest] = []
+        results: list[PluginManifest] = []
         for record in self._plugins.values():
             if category is None or record.manifest.spec.category == category:
                 results.append(record.manifest)
@@ -150,14 +149,14 @@ class PluginManager:
             )
         record.lifecycle_state = target
         if target == PluginLifecycleState.INSTALLED:
-            record.installed_at = datetime.now(timezone.utc).isoformat()
+            record.installed_at = datetime.now(UTC).isoformat()
         return record
 
     # ------------------------------------------------------------------ #
     # 能力发现
     # ------------------------------------------------------------------ #
 
-    def get_capabilities(self, plugin_id: str) -> Set[str]:
+    def get_capabilities(self, plugin_id: str) -> set[str]:
         """获取插件声明的能力集合（``spec.provides``）。
 
         Raises:
@@ -194,7 +193,7 @@ class PluginManager:
     # 权限校验（最小权限原则）
     # ------------------------------------------------------------------ #
 
-    def check_permissions(self, plugin_id: str, required: Set[str]) -> bool:
+    def check_permissions(self, plugin_id: str, required: set[str]) -> bool:
         """校验插件是否拥有所需权限。
 
         按 ``required ⊆ granted`` 判定，其中 ``granted`` 取自
@@ -247,7 +246,7 @@ class PluginManager:
     # 查询辅助
     # ------------------------------------------------------------------ #
 
-    def list_installed(self) -> List[PluginRecord]:
+    def list_installed(self) -> list[PluginRecord]:
         """列出所有已安装（Installed/Enabled/Disabled）的插件记录。"""
         installed_states = {
             PluginLifecycleState.INSTALLED,

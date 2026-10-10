@@ -14,14 +14,14 @@
 
 from __future__ import annotations
 
-from enum import Enum
-from typing import List, Literal, Optional
+from enum import StrEnum
+from typing import Literal
 
 from forgemesh.core.objects import Condition, Resource
 from pydantic import BaseModel, ConfigDict, Field
 
 
-class InferencePhase(str, Enum):
+class InferencePhase(StrEnum):
     """``InferenceService`` 生命周期阶段（11 态）。
 
     取值与 ``states.INFERENCE_TRANSITIONS`` 的键一致；``str`` 混入便于与
@@ -52,7 +52,7 @@ class ModelRef(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     reference: str
-    digest: Optional[str] = None
+    digest: str | None = None
 
 
 class RuntimeRef(BaseModel):
@@ -66,7 +66,7 @@ class RuntimeRef(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     provider: str
-    version: Optional[str] = None
+    version: str | None = None
 
 
 class AcceleratorSpec(BaseModel):
@@ -140,7 +140,7 @@ class InferenceServiceStatus(BaseModel):
 
     phase: InferencePhase = InferencePhase.PENDING
     observedGeneration: int = 0
-    conditions: List[Condition] = Field(default_factory=list)
+    conditions: list[Condition] = Field(default_factory=list)
 
 
 class InferenceService(Resource):

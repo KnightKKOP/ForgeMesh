@@ -15,7 +15,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -35,9 +35,9 @@ class Node(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    agent_version: Optional[str] = None
+    agent_version: str | None = None
     health: str = DEFAULT_HEALTH
-    last_seen_at: Optional[datetime] = None
+    last_seen_at: datetime | None = None
 
 
 class Accelerator(BaseModel):
@@ -67,8 +67,8 @@ class DeviceInstance(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    parent_id: Optional[str] = None
-    profile: Optional[str] = None
+    parent_id: str | None = None
+    profile: str | None = None
     health: str = DEFAULT_HEALTH
 
 
@@ -87,9 +87,9 @@ class DeviceProfile(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     vendor: str
-    capabilities: Dict[str, Any] = Field(default_factory=dict)
-    runtimes: List[str] = Field(default_factory=list)
-    constraints: Dict[str, Any] = Field(default_factory=dict)
+    capabilities: dict[str, Any] = Field(default_factory=dict)
+    runtimes: list[str] = Field(default_factory=list)
+    constraints: dict[str, Any] = Field(default_factory=dict)
 
 
 class Topology(BaseModel):
@@ -103,8 +103,8 @@ class Topology(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    nodes: List[str] = Field(default_factory=list)
-    links: List[Dict[str, Any]] = Field(default_factory=list)
+    nodes: list[str] = Field(default_factory=list)
+    links: list[dict[str, Any]] = Field(default_factory=list)
     discovery: str = "unknown"
 
 
@@ -121,7 +121,7 @@ class HealthReport(BaseModel):
 
     status: str = DEFAULT_HEALTH
     message: str = ""
-    observed_at: Optional[datetime] = None
+    observed_at: datetime | None = None
 
 
 class RuntimeInstance(BaseModel):
@@ -137,9 +137,9 @@ class RuntimeInstance(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     runtime: str
-    version: Optional[str] = None
+    version: str | None = None
     health: str = DEFAULT_HEALTH
-    endpoint: Optional[str] = None
+    endpoint: str | None = None
 
 
 __all__ = [

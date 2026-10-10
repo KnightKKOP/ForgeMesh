@@ -21,7 +21,7 @@
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, Optional, Set
+from typing import Any
 
 from forgemesh.core.objects import Resource
 from forgemesh.core.reconciler import ReconcileContext, Reconciler, ReconcileResult
@@ -48,9 +48,9 @@ class ReconciliationController(Reconciler):
         self,
         registry: Any,
         policy_engine: PolicyEngine,
-        decision_provider: Optional[Any] = None,
-        scheduler: Optional[Any] = None,
-        workflow_runtime: Optional[Any] = None,
+        decision_provider: Any | None = None,
+        scheduler: Any | None = None,
+        workflow_runtime: Any | None = None,
     ) -> None:
         self._registry = registry
         self._policy = policy_engine
@@ -58,7 +58,7 @@ class ReconciliationController(Reconciler):
         self._scheduler = scheduler
         self._workflow = workflow_runtime
         # 已处理的去重键（内存级，P1 简化；生产环境应使用持久化存储）。
-        self._processed_keys: Set[str] = set()
+        self._processed_keys: set[str] = set()
 
     async def reconcile(self, ctx: ReconcileContext) -> ReconcileResult:
         """执行一轮 9 步协调。
@@ -205,7 +205,7 @@ class ReconciliationController(Reconciler):
         )
 
     @staticmethod
-    def _compute_diff(resource: Resource, observed: Dict[str, Any]) -> Dict[str, Any]:
+    def _compute_diff(resource: Resource, observed: dict[str, Any]) -> dict[str, Any]:
         """计算期望状态与观测状态的差异（步骤 2-3）。
 
         判定逻辑：

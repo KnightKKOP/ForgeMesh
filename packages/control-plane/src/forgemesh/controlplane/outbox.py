@@ -15,7 +15,8 @@ import json
 import sqlite3
 import time
 import uuid
-from typing import Any, Callable, Dict, List, Optional, Set
+from collections.abc import Callable
+from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -54,9 +55,9 @@ class OutboxEvent(BaseModel):
     aggregate_type: str
     aggregate_id: str
     event_type: str
-    payload: Dict[str, Any] = Field(default_factory=dict)
+    payload: dict[str, Any] = Field(default_factory=dict)
     created_at: float = Field(default_factory=time.time)
-    published_at: Optional[float] = None
+    published_at: float | None = None
     status: str = "pending"
 
 
@@ -71,7 +72,7 @@ class Outbox:
         conn: 可选的外部 SQLite 连接（用于与业务事务共享）。
     """
 
-    def __init__(self, db_path: str = ":memory:", conn: Optional[sqlite3.Connection] = None) -> None:
+    def __init__(self, db_path: str = ":memory:", conn: sqlite3.Connection | None = None) -> None:
         self._db_path = db_path
         self._conn = conn or sqlite3.connect(db_path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
@@ -108,7 +109,7 @@ class Outbox:
         )
         self._conn.commit()
 
-    def get_pending(self, limit: int = 100) -> List[OutboxEvent]:
+    def get_pending(self, limit: int = 100) -> list[OutboxEvent]:
         """获取待发布事件，按创建时间升序排列。"""
         rows = self._conn.execute(
             "SELECT * FROM outbox_events WHERE status = 'pending' ORDER BY created_at LIMIT ?",
@@ -143,7 +144,7 @@ class Outbox:
         )
         self._conn.commit()
 
-    def get_stats(self) -> Dict[str, int]:
+    def get_stats(self) -> dict[str, int]:
         """获取 Outbox 统计信息（各状态事件数量）。"""
         rows = self._conn.execute(
             "SELECT status, COUNT(*) as cnt FROM outbox_events GROUP BY status"
@@ -195,7 +196,7 @@ class Dispatcher:
         self._poll_interval = poll_interval
         self._batch_size = batch_size
         self._running = False
-        self._processed: Set[str] = set()  # 已处理的 event_id（幂等）
+        self._processed: set[str] = set()  # 已处理的 event_id（幂等）
 
     async def dispatch_once(self) -> int:
         """执行一轮分发，返回处理的事件数。"""
@@ -234,7 +235,7 @@ class IdempotentConsumer:
     """
 
     def __init__(self) -> None:
-        self._processed_ids: Set[str] = set()
+        self._processed_ids: set[str] = set()
 
     def is_processed(self, event_id: str) -> bool:
         """检查是否已处理过。"""

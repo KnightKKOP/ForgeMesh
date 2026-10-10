@@ -12,7 +12,7 @@
 from __future__ import annotations
 
 import asyncio
-from typing import Sequence
+from collections.abc import Sequence
 
 import pytest
 from forgemesh.decision.provider import (

@@ -10,7 +10,7 @@
 """
 from __future__ import annotations
 
-from typing import Any, List, Optional, Set
+from typing import Any
 
 from .api import PolicyAction, PolicyDecision, PolicyEngine
 from .rules import AuthzRule, QuotaRule, RuleSet
@@ -27,9 +27,9 @@ class DefaultPolicyEngine(PolicyEngine):
 
     def __init__(
         self,
-        authz_rules: Optional[List[AuthzRule]] = None,
-        quota_rules: Optional[List[QuotaRule]] = None,
-        high_risk_actions: Optional[Set[str]] = None,
+        authz_rules: list[AuthzRule] | None = None,
+        quota_rules: list[QuotaRule] | None = None,
+        high_risk_actions: set[str] | None = None,
     ) -> None:
         self._rule_set = RuleSet(
             authz_rules=authz_rules or [],

@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any
 
 import pytest
 import yaml
@@ -40,13 +40,13 @@ SCHEMAS_DIR = REPO_ROOT / "api" / "schemas"
 EXAMPLES_DIR = REPO_ROOT / "examples"
 
 
-def _load_json(path: Path) -> Dict[str, Any]:
+def _load_json(path: Path) -> dict[str, Any]:
     """读取 JSON 文件。"""
     with path.open("r", encoding="utf-8") as handle:
         return json.load(handle)
 
 
-def _load_yaml(path: Path) -> Dict[str, Any]:
+def _load_yaml(path: Path) -> dict[str, Any]:
     """读取 YAML 文件（单文档）。"""
     with path.open("r", encoding="utf-8") as handle:
         return yaml.safe_load(handle)

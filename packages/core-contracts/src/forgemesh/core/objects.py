@@ -20,7 +20,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Dict, List, Literal, Optional
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -49,13 +49,13 @@ class ObjectMeta(BaseModel):
     model_config = ConfigDict(extra="forbid", populate_by_name=True)
 
     name: str
-    namespace: Optional[str] = None
-    uid: Optional[str] = None
-    labels: Dict[str, str] = Field(default_factory=dict)
-    annotations: Dict[str, str] = Field(default_factory=dict)
-    resourceVersion: Optional[str] = None
+    namespace: str | None = None
+    uid: str | None = None
+    labels: dict[str, str] = Field(default_factory=dict)
+    annotations: dict[str, str] = Field(default_factory=dict)
+    resourceVersion: str | None = None
     generation: int = 0
-    tenant_id: Optional[str] = Field(default=None, alias="tenantId")
+    tenant_id: str | None = Field(default=None, alias="tenantId")
     observed_generation: int = Field(default=0, alias="observedGeneration")
 
 
@@ -76,7 +76,7 @@ class Condition(BaseModel):
     status: Literal["True", "False", "Unknown"]
     reason: str = ""
     message: str = ""
-    lastTransitionTime: Optional[datetime] = None
+    lastTransitionTime: datetime | None = None
 
 
 class Resource(BaseModel):
@@ -98,9 +98,9 @@ class Resource(BaseModel):
     apiVersion: str = GROUP_VERSION
     kind: str
     metadata: ObjectMeta
-    conditions: List[Condition] = Field(default_factory=list)
+    conditions: list[Condition] = Field(default_factory=list)
 
-    def with_generation_bump(self) -> "Resource":
+    def with_generation_bump(self) -> Resource:
         """返回一份深拷贝，并将其 ``metadata.generation`` 递增 1。
 
         保持不可变语义：不修改当前对象，便于在协调循环中安全地派生新期望版本。
@@ -109,7 +109,7 @@ class Resource(BaseModel):
         clone.metadata.generation += 1
         return clone
 
-    def set_condition(self, cond: Condition) -> "Resource":
+    def set_condition(self, cond: Condition) -> Resource:
         """写入/覆盖一条条件。
 
         同一 ``type`` 已存在时**就地覆盖**（保持原列表位置），否则追加。
@@ -123,7 +123,7 @@ class Resource(BaseModel):
             self.conditions.append(cond)
         return self
 
-    def get_condition(self, type: str) -> Optional[Condition]:
+    def get_condition(self, type: str) -> Condition | None:
         """按 ``type`` 返回条件；不存在时返回 ``None``。"""
         for existing in self.conditions:
             if existing.type == type:

@@ -16,7 +16,7 @@
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException
 from forgemesh.core.errors import ConflictError, NotFoundError
@@ -41,15 +41,15 @@ class ResourceCreateRequest(BaseModel):
 
     apiVersion: str = "forgemesh.io/v1alpha1"
     kind: str
-    metadata: Dict[str, Any]
-    spec: Optional[Dict[str, Any]] = None
-    status: Optional[Dict[str, Any]] = None
+    metadata: dict[str, Any]
+    spec: dict[str, Any] | None = None
+    status: dict[str, Any] | None = None
 
 
 class ResourceListResponse(BaseModel):
     """资源列表响应。"""
 
-    items: List[Dict[str, Any]]
+    items: list[dict[str, Any]]
     count: int
 
 
@@ -78,7 +78,7 @@ def _build_resource(body: ResourceCreateRequest, tenant_id: str) -> Resource:
 async def create_inference_service(
     body: ResourceCreateRequest,
     tenant_id: str = Depends(get_tenant_id),
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """创建推理服务。
 
     同名资源已存在时返回 HTTP 409（ConflictError）。
@@ -95,9 +95,9 @@ async def create_inference_service(
 @router.get("/inference-services")
 async def list_inference_services(
     tenant_id: str = Depends(get_tenant_id),
-    namespace: Optional[str] = None,
+    namespace: str | None = None,
     limit: int = 100,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """列出推理服务（可选按 namespace 过滤、limit 分页）。"""
     registry = get_registry()
     items = await registry.list(
@@ -110,8 +110,8 @@ async def list_inference_services(
 async def get_inference_service(
     name: str,
     tenant_id: str = Depends(get_tenant_id),
-    namespace: Optional[str] = None,
-) -> Dict[str, Any]:
+    namespace: str | None = None,
+) -> dict[str, Any]:
     """获取单个推理服务；不存在时返回 HTTP 404。"""
     registry = get_registry()
     try:
@@ -127,8 +127,8 @@ async def get_inference_service(
 async def delete_inference_service(
     name: str,
     tenant_id: str = Depends(get_tenant_id),
-    namespace: Optional[str] = None,
-) -> Dict[str, Any]:
+    namespace: str | None = None,
+) -> dict[str, Any]:
     """删除推理服务；不存在时返回 HTTP 404。"""
     registry = get_registry()
     try:
@@ -148,10 +148,10 @@ async def delete_inference_service(
 @router.get("/resources")
 async def list_resources(
     tenant_id: str = Depends(get_tenant_id),
-    kind: Optional[str] = None,
-    namespace: Optional[str] = None,
+    kind: str | None = None,
+    namespace: str | None = None,
     limit: int = 100,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """列出资源（可选按 kind / namespace 过滤）。
 
     未指定 ``kind`` 时返回空列表（P1 简化：避免全表扫描）。

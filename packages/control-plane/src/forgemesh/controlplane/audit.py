@@ -12,7 +12,7 @@ import json
 import sqlite3
 import time
 import uuid
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -55,12 +55,12 @@ class AuditEvent(BaseModel):
     audit_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     correlation_id: str
     tenant_id: str
-    actor: Optional[str] = None
+    actor: str | None = None
     action: str
     resource_type: str
     resource_id: str
     outcome: str  # success / failure / denied
-    details: Optional[Dict[str, Any]] = None
+    details: dict[str, Any] | None = None
     timestamp: float = Field(default_factory=time.time)
 
 
@@ -103,7 +103,7 @@ class AuditLog:
         self._conn.commit()
         return event.audit_id
 
-    def query_by_correlation(self, correlation_id: str) -> List[AuditEvent]:
+    def query_by_correlation(self, correlation_id: str) -> list[AuditEvent]:
         """按 correlation_id 查询调用链，按时间升序排列。"""
         rows = self._conn.execute(
             "SELECT * FROM audit_events WHERE correlation_id = ? ORDER BY timestamp",
@@ -111,7 +111,7 @@ class AuditLog:
         ).fetchall()
         return [self._row_to_event(r) for r in rows]
 
-    def query_by_tenant(self, tenant_id: str, limit: int = 100) -> List[AuditEvent]:
+    def query_by_tenant(self, tenant_id: str, limit: int = 100) -> list[AuditEvent]:
         """按租户查询审计记录，按时间降序排列。"""
         rows = self._conn.execute(
             "SELECT * FROM audit_events WHERE tenant_id = ? ORDER BY timestamp DESC LIMIT ?",

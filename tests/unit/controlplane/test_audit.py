@@ -12,7 +12,6 @@
 from __future__ import annotations
 
 import time
-from typing import Optional
 
 import pytest
 from forgemesh.controlplane.audit import AuditEvent, AuditLog
@@ -29,8 +28,8 @@ def _make_event(
     resource_type: str = "InferenceService",
     resource_id: str = "svc-1",
     outcome: str = "success",
-    details: Optional[dict] = None,
-    timestamp: Optional[float] = None,
+    details: dict | None = None,
+    timestamp: float | None = None,
 ) -> AuditEvent:
     """构造一个可复用的最小 AuditEvent。"""
     return AuditEvent(

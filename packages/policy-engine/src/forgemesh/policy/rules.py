@@ -10,8 +10,6 @@
 """
 from __future__ import annotations
 
-from typing import List, Optional
-
 from pydantic import BaseModel, ConfigDict, Field
 
 from .api import PolicyAction, PolicyDecision
@@ -34,9 +32,9 @@ class AuthzRule(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     action: str
-    tenant_id: Optional[str] = None  # None 表示对所有租户生效
+    tenant_id: str | None = None  # None 表示对所有租户生效
     effect: str  # "allow" or "deny"
-    conditions: List[str] = Field(default_factory=list)
+    conditions: list[str] = Field(default_factory=list)
     reason: str = ""
 
 
@@ -72,8 +70,8 @@ class RuleSet(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    authz_rules: List[AuthzRule] = Field(default_factory=list)
-    quota_rules: List[QuotaRule] = Field(default_factory=list)
+    authz_rules: list[AuthzRule] = Field(default_factory=list)
+    quota_rules: list[QuotaRule] = Field(default_factory=list)
 
     def check_authz(self, action: PolicyAction) -> PolicyDecision:
         """检查授权规则。默认拒绝（无匹配规则时 deny）。
@@ -82,7 +80,7 @@ class RuleSet(BaseModel):
         """
         matched_allow = False
         matched_degraded = False
-        degraded_obligations: List[str] = []
+        degraded_obligations: list[str] = []
 
         for rule in self.authz_rules:
             if rule.action != action.action:

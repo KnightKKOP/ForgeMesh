@@ -17,8 +17,8 @@
 
 from __future__ import annotations
 
-from enum import Enum
-from typing import Any, Dict, List, Optional, Set, Union
+from enum import StrEnum
+from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -35,7 +35,7 @@ except ImportError:  # pragma: no cover - 仅在核心包未就绪时触发
             self.details = details
 
 
-class PluginCategory(str, Enum):
+class PluginCategory(StrEnum):
     """插件类别。"""
 
     PROVIDER = "provider"
@@ -46,7 +46,7 @@ class PluginCategory(str, Enum):
     OBSERVABILITY = "observability"
 
 
-class PluginLifecycleState(str, Enum):
+class PluginLifecycleState(StrEnum):
     """插件治理生命周期状态（6 态）。
 
     终态：``UNINSTALLED``。
@@ -61,7 +61,7 @@ class PluginLifecycleState(str, Enum):
 
 
 # 合法生命周期转移（由插件管理器校验，插件不可自定义）。
-PLUGIN_TRANSITIONS: Dict[PluginLifecycleState, Set[PluginLifecycleState]] = {
+PLUGIN_TRANSITIONS: dict[PluginLifecycleState, set[PluginLifecycleState]] = {
     PluginLifecycleState.DISCOVERED: {
         PluginLifecycleState.VALIDATING,
     },
@@ -120,16 +120,16 @@ class PluginSpec(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     category: PluginCategory
-    compatibility: Dict[str, str] = Field(default_factory=dict)
-    provides: List[str] = Field(default_factory=list)
-    requires: List[str] = Field(default_factory=list)
-    permissions: List[str] = Field(default_factory=list)
-    isolation: Optional[str] = Field(default=None, description="隔离级别（in-process/restricted-rpc/sandbox，ADR-006）")
-    entrypoint: Optional[str] = Field(default=None, description="入口点标识")
-    artifactDigest: Optional[str] = Field(default=None, description="制品摘要（如 sha256:...），供应链安全")
-    signature: Optional[str] = Field(default=None, description="制品签名（如 cosign:...），供应链安全")
-    configuration: Dict[str, Any] = Field(default_factory=dict)
-    healthCheck: Dict[str, Any] = Field(default_factory=dict)
+    compatibility: dict[str, str] = Field(default_factory=dict)
+    provides: list[str] = Field(default_factory=list)
+    requires: list[str] = Field(default_factory=list)
+    permissions: list[str] = Field(default_factory=list)
+    isolation: str | None = Field(default=None, description="隔离级别（in-process/restricted-rpc/sandbox，ADR-006）")
+    entrypoint: str | None = Field(default=None, description="入口点标识")
+    artifactDigest: str | None = Field(default=None, description="制品摘要（如 sha256:...），供应链安全")
+    signature: str | None = Field(default=None, description="制品签名（如 cosign:...），供应链安全")
+    configuration: dict[str, Any] = Field(default_factory=dict)
+    healthCheck: dict[str, Any] = Field(default_factory=dict)
 
 
 class PluginManifest(BaseModel):
@@ -148,7 +148,7 @@ class PluginManifest(BaseModel):
     spec: PluginSpec
 
 
-def _coerce(state: Union[PluginLifecycleState, str]) -> PluginLifecycleState:
+def _coerce(state: PluginLifecycleState | str) -> PluginLifecycleState:
     """将输入规范化为 :class:`PluginLifecycleState`；未知取值抛异常。"""
     if isinstance(state, PluginLifecycleState):
         return state
@@ -159,8 +159,8 @@ def _coerce(state: Union[PluginLifecycleState, str]) -> PluginLifecycleState:
 
 
 def validate_plugin_transition(
-    cur: Union[PluginLifecycleState, str],
-    to: Union[PluginLifecycleState, str],
+    cur: PluginLifecycleState | str,
+    to: PluginLifecycleState | str,
 ) -> None:
     """校验插件生命周期状态转移是否合法。
 

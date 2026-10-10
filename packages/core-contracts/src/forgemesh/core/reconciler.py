@@ -17,7 +17,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import Any, Dict, Optional
+from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -38,7 +38,7 @@ class ReconcileContext(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     resource: Resource
-    observed: Dict[str, Any] = Field(default_factory=dict)
+    observed: dict[str, Any] = Field(default_factory=dict)
     correlation_id: str
     tenant_id: str
     dedup_key: str
@@ -55,8 +55,8 @@ class ReconcileResult(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    requeue_after: Optional[float] = None
-    status_patch: Dict[str, Any] = Field(default_factory=dict)
+    requeue_after: float | None = None
+    status_patch: dict[str, Any] = Field(default_factory=dict)
     done: bool = False
 
 

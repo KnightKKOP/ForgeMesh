@@ -19,13 +19,12 @@
 from __future__ import annotations
 
 from datetime import datetime
-from enum import Enum
-from typing import Optional
+from enum import StrEnum
 
 from pydantic import BaseModel, ConfigDict
 
 
-class AllocationStatus(str, Enum):
+class AllocationStatus(StrEnum):
     """分配状态。
 
     * ``ACTIVE``    —— 生效中（持有资源）。
@@ -54,10 +53,10 @@ class Allocation(BaseModel):
 
     resource_id: str
     tenant_id: str
-    owner_uid: Optional[str] = None
+    owner_uid: str | None = None
     idempotency_key: str
     status: AllocationStatus = AllocationStatus.ACTIVE
-    lease_until: Optional[datetime] = None
+    lease_until: datetime | None = None
 
 
 class ResourceLease(BaseModel):

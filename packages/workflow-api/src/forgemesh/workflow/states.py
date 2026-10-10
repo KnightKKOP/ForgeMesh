@@ -15,8 +15,7 @@
 
 from __future__ import annotations
 
-from enum import Enum
-from typing import Dict, Set, Union
+from enum import StrEnum
 
 try:  # 优先复用核心包的统一异常体系（阶段 0 契约）
     from forgemesh.core.errors import InvalidStateTransition
@@ -31,7 +30,7 @@ except ImportError:  # pragma: no cover - 仅在核心包未就绪时触发
             self.details = details
 
 
-class WorkflowStatus(str, Enum):
+class WorkflowStatus(StrEnum):
     """工作流运行状态（8 态）。
 
     终态（无出边）：``SUCCEEDED`` / ``FAILED`` / ``CANCELLED`` / ``TIMEDOUT``。
@@ -47,7 +46,7 @@ class WorkflowStatus(str, Enum):
     TIMEDOUT = "TimedOut"
 
 
-class StepStatus(str, Enum):
+class StepStatus(StrEnum):
     """步骤运行状态（10 态，含补偿语义）。
 
     终态（无出边）：``SKIPPED`` / ``COMPENSATED`` / ``COMPENSATION_FAILED`` / ``CANCELLED``。
@@ -68,7 +67,7 @@ class StepStatus(str, Enum):
 
 # 合法状态转移（由运行时校验，插件不可自定义，对齐 development-plan 5.4 / 6.3）。
 # 未列出的状态视为终态（无出边）。
-WORKFLOW_TRANSITIONS: Dict[WorkflowStatus, Set[WorkflowStatus]] = {
+WORKFLOW_TRANSITIONS: dict[WorkflowStatus, set[WorkflowStatus]] = {
     WorkflowStatus.PENDING: {
         WorkflowStatus.RUNNING,
         WorkflowStatus.CANCELLED,
@@ -98,7 +97,7 @@ WORKFLOW_TRANSITIONS: Dict[WorkflowStatus, Set[WorkflowStatus]] = {
 }
 
 # 步骤级合法转移（对齐 development-plan 5.4 / 6.3 的状态枚举）。
-STEP_TRANSITIONS: Dict[StepStatus, Set[StepStatus]] = {
+STEP_TRANSITIONS: dict[StepStatus, set[StepStatus]] = {
     StepStatus.PENDING: {
         StepStatus.RUNNING,
         StepStatus.SKIPPED,
@@ -136,7 +135,7 @@ STEP_TRANSITIONS: Dict[StepStatus, Set[StepStatus]] = {
 }
 
 
-def _coerce_workflow(status: Union[WorkflowStatus, str]) -> WorkflowStatus:
+def _coerce_workflow(status: WorkflowStatus | str) -> WorkflowStatus:
     """将输入规范化为 :class:`WorkflowStatus`；未知取值抛 InvalidStateTransition。"""
     if isinstance(status, WorkflowStatus):
         return status
@@ -146,7 +145,7 @@ def _coerce_workflow(status: Union[WorkflowStatus, str]) -> WorkflowStatus:
         raise InvalidStateTransition(f"unknown workflow status: {status!r}") from exc
 
 
-def _coerce_step(status: Union[StepStatus, str]) -> StepStatus:
+def _coerce_step(status: StepStatus | str) -> StepStatus:
     """将输入规范化为 :class:`StepStatus`；未知取值抛 InvalidStateTransition。"""
     if isinstance(status, StepStatus):
         return status
@@ -157,7 +156,7 @@ def _coerce_step(status: Union[StepStatus, str]) -> StepStatus:
 
 
 def validate_workflow_transition(
-    cur: Union[WorkflowStatus, str], to: Union[WorkflowStatus, str]
+    cur: WorkflowStatus | str, to: WorkflowStatus | str
 ) -> None:
     """校验工作流状态转移是否合法。
 
@@ -179,7 +178,7 @@ def validate_workflow_transition(
 
 
 def validate_step_transition(
-    cur: Union[StepStatus, str], to: Union[StepStatus, str]
+    cur: StepStatus | str, to: StepStatus | str
 ) -> None:
     """校验步骤状态转移是否合法。
 

@@ -13,7 +13,7 @@
 
 from __future__ import annotations
 
-from typing import Any, Dict, Optional
+from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -34,7 +34,7 @@ class Tenant(BaseModel):
 
     id: str
     status: str = DEFAULT_TENANT_STATUS
-    quota_policy_id: Optional[str] = None
+    quota_policy_id: str | None = None
 
 
 class Principal(BaseModel):
@@ -64,8 +64,8 @@ class QuotaPolicy(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    limits: Dict[str, Any] = Field(default_factory=dict)
-    burst: Dict[str, Any] = Field(default_factory=dict)
+    limits: dict[str, Any] = Field(default_factory=dict)
+    burst: dict[str, Any] = Field(default_factory=dict)
     enforcement: str = "hard"
 
 

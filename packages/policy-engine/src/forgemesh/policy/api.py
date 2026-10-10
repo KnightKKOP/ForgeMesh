@@ -12,7 +12,7 @@ Policy 负责授权、准入、配额规则与审批要求，**最终授权在 P
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import Any, Dict, List, Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -28,7 +28,7 @@ class PolicyAction(BaseModel):
 
     action: str
     tenant_id: str
-    resource: Dict[str, Any] = Field(default_factory=dict)
+    resource: dict[str, Any] = Field(default_factory=dict)
 
 
 class PolicyDecision(BaseModel):
@@ -44,7 +44,7 @@ class PolicyDecision(BaseModel):
 
     decision: Literal["allow", "deny", "degraded"]
     reason: str = ""
-    obligations: List[str] = Field(default_factory=list)
+    obligations: list[str] = Field(default_factory=list)
 
 
 class PolicyEngine(ABC):

@@ -25,12 +25,11 @@ from __future__ import annotations
 import argparse
 import asyncio
 import sys
-from typing import List, Optional
 
 from .commands import cmd_apply, cmd_delete, cmd_describe, cmd_get, cmd_list
 
 
-def main(argv: Optional[List[str]] = None) -> int:
+def main(argv: list[str] | None = None) -> int:
     """CLI 主入口。
 
     Args:

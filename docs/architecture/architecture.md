@@ -1,0 +1,1309 @@
+---
+title: ForgeMesh 最终版架构设计文档（Architecture Baseline）
+source: "ForgeMesh 最终版架构设计文档.md"
+source_version: v1.0
+source_date: 2026-10-09
+mirrored_by: Dev-1 工程骨架与治理
+mirrored_at: 2026-10-10
+note: >-
+  本文件为上游架构基线文档在仓库内的落盘副本（对应开发计划 17.1 / 0.2）。
+  正文内容原样引入、未作删改，仅新增本 YAML 头以标注来源与版本。
+  唯一事实来源：/Users/zhousmacmini/Code/ForgeMesh 最终版架构设计文档.md
+---
+是的，我建议再优化一次，而且这次应该把 ADR 从“建议清单”正式落实为架构约束。
+
+上一版已经明确了总体方向，但有些内容仍停留在“推荐采用什么”的层面。例如，WorkEngine 的执行语义、JEV 与资源调度的权责、插件隔离方式、事件可靠性、Agent 的任务恢复，以及插件升级期间的兼容性，都需要进一步明确，否则后续开发很容易出现不同模块各自合理、组合起来却不一致的情况。
+
+这次最终版将做三项调整：
+
+1. 把 12 项 ADR 全部作为已采纳的设计决策。 不再把这些方向留作待选方案；具体实现细节仍可通过后续 ADR 修订。
+2. 补齐关键接口和运行语义。 明确资源状态、控制器、工作流、决策、策略、调度、插件与 Agent 的责任边界。
+3. 把架构决策落实到工程规范。 包括数据一致性、失败恢复、安全隔离、版本兼容、测试标准和开源仓库结构。
+
+以下文档可以作为 ForgeMesh 的正式架构基线，建议保存为 `docs/architecture/architecture.md`。其中 `v1alpha1` 是建议的初始 API 版本，并不意味着接口已经实现或达到稳定版兼容承诺。
+
+# ForgeMesh 最终版架构设计文档
+
+Architecture Baseline · v1.0 · 2026-10-09
+
+ADR 已采纳
+
+开源基础设施
+
+插件微内核
+
+声明式控制平面
+
+多租户
+
+项目名称 ForgeMesh 为暂定名称。本文定义目标架构、必须遵循的设计约束和演进路线，不代表所有组件已经实现。
+
+## 目录
+
+1. 项目定位与设计目标
+2. 已采纳的 ADR 与架构原则
+3. 总体架构
+4. 核心微内核
+5. 声明式资源模型与协调控制器
+6. WorkEngine 工作流系统
+7. JEV 决策系统
+8. 插件系统与扩展协议
+9. GPU 与异构算力资源模型
+10. Node Agent 与执行平面
+11. 多租户、调度、QoS 与计量
+12. 数据模型与一致性
+13. API 与事件规范
+14. 安全架构
+15. 可观测性与运维
+16. 技术栈
+17. 开源项目结构与治理
+18. 测试与可靠性要求
+19. 实施路线图
+20. 架构验收标准
+
+# 1. 项目定位与设计目标
+
+## 1.1 项目定位
+
+ForgeMesh 是一个面向 AI 算力基础设施的开源自动化控制平台，负责把 GPU、推理运行时、模型、节点和计算资源组织成可声明、可编排、可治理、可观测的 AI 服务。
+
+它不是单纯的 GPU 自动部署脚本集合，也不是仅依赖 LLM 执行命令的自动化 Agent，而是由声明式资源模型、协调控制器、持久化工作流、类型化决策、策略治理和可插拔执行能力共同组成的基础设施平台。
+
+平台需要支持以下完整生命周期：
+
+- 发现、登记和验证计算节点及 GPU。
+- 检查驱动、设备能力、容器运行时与运行环境。
+- 自动准备模型、部署推理服务并执行健康验收。
+- 通过 JEV（TypeSafe Decision Model）进行结构化决策。
+- 通过 WorkEngine 执行可恢复的长流程。
+- 管理资源分配、释放、迁移与健康状态。
+- 实现多租户、配额、QoS、Token 限流和计量。
+- 通过插件支持 NVIDIA、MIG、vLLM 及未来的异构设备和其他推理运行时。
+- 为第三方开发者提供稳定的 API、插件 SDK、CLI 和扩展机制。
+
+## 1.2 架构目标
+
+| 目标   | 必须满足的设计要求                           |
+| ------ | -------------------------------------------- |
+| 可扩展 | 业务能力通过稳定接口扩展，不依赖修改核心代码 |
+| 可恢复 | 工作流、资源状态和关键副作用可追踪、可恢复   |
+| 可治理 | 决策、授权、资源分配与执行彼此独立           |
+| 声明式 | 用户定义目标，控制器持续协调实际状态         |
+| 可移植 | GPU、Runtime、工作流引擎与基础设施实现可替换 |
+| 多租户 | 身份、资源、工作流、数据与计量具有租户边界   |
+| 可观测 | 所有关键操作可通过统一关联 ID 追踪           |
+| 可运营 | 支持升级、回滚、恢复、诊断与兼容性检查       |
+| 可开源 | 公共契约、开发流程、许可证和兼容策略明确     |
+
+## 1.3 非目标
+
+ForgeMesh 不负责重新实现整个基础设施生态。
+
+- 不自行开发 GPU 驱动或通用容器运行时。
+- 不重新实现 vLLM 等推理引擎。
+- 不把 Kubernetes 作为唯一的执行后端。
+- 不要求所有插件都运行在同一个进程内。
+- 不要求所有决策必须由 JEV 或 LLM 完成。
+- 不让 LLM 绕过权限、配额、资源调度和安全检查。
+- 不在第一阶段同时实现所有厂商 GPU、所有工作流引擎和所有推理 Runtime。
+
+# 2. 已采纳的 ADR 与架构原则
+
+本节将前一版提出的 12 项 ADR 正式纳入架构基线。
+
+这里的“已采纳”表示项目选择了相应的架构方向；具体实现仍需通过接口定义、测试和后续 ADR 完善。
+
+## 2.1 ADR 总表
+
+| ADR     | 决策                               | 架构约束                              |
+| ------- | ---------------------------------- | ------------------------------------- |
+| ADR-001 | 微内核与插件分离                   | 核心定义稳定契约，插件实现具体能力    |
+| ADR-002 | 采用声明式资源模型                 | Desired State 与 Observed State 分离  |
+| ADR-003 | WorkEngine 采用可替换 Provider     | 执行引擎不直接决定领域模型            |
+| ADR-004 | JEV 不是唯一决策系统               | 支持规则、JEV、LLM 和其他 Provider    |
+| ADR-005 | Scheduler 与 Policy 拥有最终治理权 | 决策建议不能直接分配资源或授权        |
+| ADR-006 | 插件按信任级别隔离                 | 高风险或第三方插件采用隔离执行        |
+| ADR-007 | PostgreSQL 作为权威业务存储        | 缓存与事件系统不能取代权威状态        |
+| ADR-008 | 采用事务性 Outbox 与幂等消费者     | 关键业务事件不得依赖非原子双写        |
+| ADR-009 | Node Agent 采用受认证的任务协议    | 禁止默认执行任意远程 Shell            |
+| ADR-010 | 采用能力驱动的异构资源模型         | 厂商差异通过 Provider 显式表达        |
+| ADR-011 | 插件与工作流版本固定               | 升级不能破坏正在运行的任务            |
+| ADR-012 | 所有公共契约版本化                 | 通过 Schema、兼容性测试和弃用周期管理 |
+
+## 2.2 四条不可违背的架构不变量
+
+不变量一：核心掌握状态与治理权。
+
+插件可以执行操作，但不能绕过核心直接改变其他模块的权威状态。
+
+不变量二：目标状态与执行过程分离。
+
+资源是否应当存在、应当达到什么状态，由声明式资源和控制器决定；如何执行操作，由 WorkEngine 负责。
+
+不变量三：决策不等于授权。
+
+JEV 可以选择或推荐候选方案，但策略检查和资源可行性检查不能被跳过。
+
+不变量四：关键状态必须能够恢复和追溯。
+
+每次重要的资源分配、工作流执行、决策与插件调用，都必须具有稳定标识、版本和可查询的结果。
+
+# 3. 总体架构
+
+## 3.1 分层架构
+
+ForgeMesh 采用六个逻辑层次。
+
+### L1 · Access Layer
+
+REST API · CLI · Web Console · SDK
+
+统一外部入口、身份认证和 API 兼容性
+
+### L2 · Core Control Plane
+
+Resource Registry · Reconciliation · Policy · Scheduler · Plugin Manager · Audit
+
+权威状态、资源治理、权限与一致性
+
+### L3 · Orchestration & Decision
+
+WorkEngine API · Decision Router · JEV API · Workflow Providers
+
+可靠执行与结构化决策
+
+### L4 · Plugin Capability Layer
+
+GPU · Runtime · Model · MIG · Quantization · QoS · Metering
+
+可替换的领域能力实现
+
+### L5 · Execution Plane
+
+Node Agent · Kubernetes · Container Runtime · GPU · Inference Services
+
+实际资源操作与状态反馈
+
+### L6 · Platform Infrastructure
+
+PostgreSQL · Outbox/Event Bus · Object Storage · Secret Manager · Observability
+
+持久化、消息、制品、密钥与监控
+
+这些是逻辑边界，不要求一开始就部署成六组独立服务。
+
+## 3.2 总体架构图
+
+图表选项
+
+![mermaid-diagram (1)](/Users/zhousmacmini/Downloads/mermaid-diagram (1).png)
+
+## 3.3 模块交互的硬性规则
+
+1. 所有业务资源的权威状态由核心状态管理机制维护。
+2. 工作流不能直接绕过 Scheduler 分配 GPU。
+3. JEV 不能直接修改资源的最终状态。
+4. 插件不能直接写入其他插件的私有数据。
+5. 节点操作必须经过授权的执行协议。
+6. 外部事件只能触发协调，不能被无条件视为真实状态。
+7. 关键状态变更与对应事件使用事务性 Outbox 或等效可靠机制。
+8. 控制平面允许模块化单体部署；执行节点可以独立部署。
+
+# 4. 核心微内核
+
+## 4.1 核心模块职责
+
+| 模块                      | 职责                                     | 不应承担的职责                 |
+| ------------------------- | ---------------------------------------- | ------------------------------ |
+| Resource Registry         | 资源 Schema、权威状态、版本和变更记录    | 直接执行节点操作               |
+| Reconciliation Controller | 比较期望状态与实际状态、创建协调计划     | 自行实现所有设备驱动逻辑       |
+| Policy Engine             | 授权、准入、配额规则与审批要求           | 选择具体 GPU 的所有调度细节    |
+| Resource Scheduler        | 资源可行性、分配、冲突和释放             | 决定租户权限                   |
+| Decision Router           | 决策 Provider 选择、超时、降级和输出验证 | 直接执行高权限操作             |
+| Workflow Runtime API      | 统一工作流语义、持久化和执行记录契约     | 将领域模型绑定到特定工作流引擎 |
+| Plugin Manager            | 注册、能力发现、版本、生命周期和权限     | 替插件实现业务逻辑             |
+| Audit Manager             | 审计事件、关联标识与查询                 | 存储不受控的敏感数据副本       |
+
+## 4.2 核心模块部署原则
+
+初始实现采用模块化单体控制平面：
+
+- 核心模块位于一个受控的服务部署中。
+- Node Agent 作为独立的执行组件。
+- 插件可根据信任等级运行在进程内或独立进程。
+- PostgreSQL 是权威业务存储。
+- 事件总线在确有异步扩展需求时引入，不强制成为初始依赖。
+
+当控制器吞吐量、隔离需求或团队维护边界要求拆分时，再将特定模块部署为独立服务。拆分不能改变已定义的资源状态、接口和一致性语义。
+
+# 5. 声明式资源模型与协调控制器
+
+## 5.1 资源对象规范
+
+核心资源采用统一结构：
+
+YAML
+
+```
+apiVersion: forgemesh.io/v1alpha1
+kind: InferenceService
+
+metadata:
+  name: llama-service
+  namespace: team-a
+  labels:
+    environment: production
+
+spec:
+  model:
+    reference: models/llama
+
+  runtime:
+    provider: vllm
+
+  resources:
+    accelerator:
+      type: nvidia-gpu
+      count: 2
+      minMemoryGiB: 80
+
+  availability:
+    replicas: 1
+
+status:
+  phase: Pending
+  observedGeneration: 0
+  conditions: []
+```
+
+正式实现中，所有核心资源都应有强类型定义和 Schema 校验，不允许依赖未经验证的任意字典作为公共 API。
+
+## 5.2 `spec` 与 `status`
+
+- `spec` 表示用户希望达到的目标。
+- `status` 表示系统观察到的实际状态及其判断。
+- `generation` 表示目标配置版本。
+- `observedGeneration` 表示控制器已经处理的配置版本。
+- `conditions` 表示结构化状态条件。
+- `metadata.resourceVersion` 或等价版本字段用于并发控制。
+
+系统不能因为 `spec` 已经写入，就假定操作已经完成。
+
+## 5.3 资源状态机
+
+GPU、节点、工作流和推理服务不应共用一个简单的状态枚举。
+
+例如，推理服务可以定义：
+
+```
+Pending → Scheduling → Preparing → Deploying → Verifying → Ready
+```
+
+运行期间可能进入：
+
+- `Degraded`：服务部分可用或健康条件下降。
+- `Updating`：正在协调新的期望状态。
+- `Terminating`：正在释放资源。
+- `Failed`：达到明确的失败条件。
+- `Unknown`：无法可靠确认实际状态。
+
+`Ready` 不是永久状态。控制器必须能够在服务崩溃、节点离线或资源被外部修改后重新评估状态。
+
+## 5.4 Reconciliation Controller
+
+控制器执行以下闭环：
+
+1. 获取目标资源及当前版本。
+2. 查询实际设备、分配、工作流和服务状态。
+3. 比较目标与实际状态。
+4. 生成有前置条件的候选操作。
+5. 经过 Policy 与 Scheduler 验证。
+6. 通过 WorkEngine 执行。
+7. 重新观察实际状态。
+8. 更新 `status` 和审计记录。
+9. 根据结果安排下一次协调。
+
+控制器必须满足幂等性。重复处理同一事件不应重复创建资源、重复分配 GPU 或无意义地重启服务。
+
+## 5.5 控制器并发与领导权
+
+控制器应支持多实例部署，但不能依赖单进程内存锁保证全局正确性。
+
+必须使用数据库事务、资源版本、唯一约束、租约或等效机制处理：
+
+- 同一资源的并发协调。
+- 多个控制器实例重复处理事件。
+- 租户配额变化与资源申请之间的竞争。
+- 控制器重启后的未完成操作。
+
+领导者选举可以减少重复工作，但不能替代数据层面的并发保护。
+
+# 6. WorkEngine：持久化工作流系统
+
+## 6.1 ADR-003 的正式决定
+
+ForgeMesh 将定义自己的工作流运行契约，但不要求从第一天起自行开发一个功能完整的通用工作流引擎。
+
+推荐的实施方式：
+
+1. 在核心接口中定义工作流状态、步骤、持久化、幂等、重试、补偿和恢复语义。
+2. 建立参考执行 Provider，验证契约是否完整。
+3. 通过实际故障测试评估自有执行器与成熟工作流引擎的适用性。
+4. 必要时通过 Temporal 等 Provider 复用成熟执行能力。
+5. 不让业务资源模型依赖某个工作流引擎的内部类型。
+
+关键约束：可以替换执行后端，但不能因为替换后端而改变业务工作流的基本语义。
+
+## 6.2 内部结构
+
+图表选项
+
+![img](data:image/svg+xml;utf8,%3Csvg%20id%3D%22mermaid-_r_ot_%22%20width%3D%22564.7791748046875%22%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20class%3D%22flowchart%22%20height%3D%22832.1654663085938%22%20viewBox%3D%224%204%20564.7791748046875%20832.1654663085938%22%20role%3D%22graphics-document%20document%22%20aria-roledescription%3D%22flowchart-v2%22%3E%3Cstyle%3E%23mermaid-_r_ot_%7Bfont-family%3A%22-apple-system%22%2C%22BlinkMacSystemFont%22%2C%22Segoe%20UI%22%2C%22Roboto%22%2C%22Oxygen%22%2C%22Ubuntu%22%2C%22Cantarell%22%2C%22Helvetica%20Neue%22%2C%22Arial%22%2C%22sans-serif%22%3Bfont-size%3A14px%3Bfill%3Argb(255%2C%20255%2C%20255)%3B%7D%40keyframes%20edge-animation-frame%7Bfrom%7Bstroke-dashoffset%3A0%3B%7D%7D%40keyframes%20dash%7Bto%7Bstroke-dashoffset%3A0%3B%7D%7D%23mermaid-_r_ot_%20.edge-animation-slow%7Bstroke-dasharray%3A9%2C5!important%3Bstroke-dashoffset%3A900%3Banimation%3Adash%2050s%20linear%20infinite%3Bstroke-linecap%3Around%3B%7D%23mermaid-_r_ot_%20.edge-animation-fast%7Bstroke-dasharray%3A9%2C5!important%3Bstroke-dashoffset%3A900%3Banimation%3Adash%2020s%20linear%20infinite%3Bstroke-linecap%3Around%3B%7D%23mermaid-_r_ot_%20.error-icon%7Bfill%3Argb(33%2C%2033%2C%2033)%3B%7D%23mermaid-_r_ot_%20.error-text%7Bfill%3Argb(255%2C%20255%2C%20255)%3Bstroke%3Argb(255%2C%20255%2C%20255)%3B%7D%23mermaid-_r_ot_%20.edge-thickness-normal%7Bstroke-width%3A1px%3B%7D%23mermaid-_r_ot_%20.edge-thickness-thick%7Bstroke-width%3A3.5px%3B%7D%23mermaid-_r_ot_%20.edge-pattern-solid%7Bstroke-dasharray%3A0%3B%7D%23mermaid-_r_ot_%20.edge-thickness-invisible%7Bstroke-width%3A0%3Bfill%3Anone%3B%7D%23mermaid-_r_ot_%20.edge-pattern-dashed%7Bstroke-dasharray%3A3%3B%7D%23mermaid-_r_ot_%20.edge-pattern-dotted%7Bstroke-dasharray%3A2%3B%7D%23mermaid-_r_ot_%20.marker%7Bfill%3Argb(205%2C%20205%2C%20205)%3Bstroke%3Argb(205%2C%20205%2C%20205)%3B%7D%23mermaid-_r_ot_%20.marker.cross%7Bstroke%3Argb(205%2C%20205%2C%20205)%3B%7D%23mermaid-_r_ot_%20svg%7Bfont-family%3A%22-apple-system%22%2C%22BlinkMacSystemFont%22%2C%22Segoe%20UI%22%2C%22Roboto%22%2C%22Oxygen%22%2C%22Ubuntu%22%2C%22Cantarell%22%2C%22Helvetica%20Neue%22%2C%22Arial%22%2C%22sans-serif%22%3Bfont-size%3A14px%3B%7D%23mermaid-_r_ot_%20p%7Bmargin%3A0%3B%7D%23mermaid-_r_ot_%20.label%7Bfont-family%3A%22-apple-system%22%2C%22BlinkMacSystemFont%22%2C%22Segoe%20UI%22%2C%22Roboto%22%2C%22Oxygen%22%2C%22Ubuntu%22%2C%22Cantarell%22%2C%22Helvetica%20Neue%22%2C%22Arial%22%2C%22sans-serif%22%3Bcolor%3Argb(255%2C%20255%2C%20255)%3B%7D%23mermaid-_r_ot_%20.cluster-label%20text%7Bfill%3Argb(255%2C%20255%2C%20255)%3B%7D%23mermaid-_r_ot_%20.cluster-label%20span%7Bcolor%3Argb(255%2C%20255%2C%20255)%3B%7D%23mermaid-_r_ot_%20.cluster-label%20span%20p%7Bbackground-color%3Atransparent%3B%7D%23mermaid-_r_ot_%20.label%20text%2C%23mermaid-_r_ot_%20span%7Bfill%3Argb(255%2C%20255%2C%20255)%3Bcolor%3Argb(255%2C%20255%2C%20255)%3B%7D%23mermaid-_r_ot_%20.node%20rect%2C%23mermaid-_r_ot_%20.node%20circle%2C%23mermaid-_r_ot_%20.node%20ellipse%2C%23mermaid-_r_ot_%20.node%20polygon%2C%23mermaid-_r_ot_%20.node%20path%7Bfill%3Argb(9%2C%2023%2C%2044)%3Bstroke%3Argb(31%2C%2078%2C%20148)%3Bstroke-width%3A1px%3B%7D%23mermaid-_r_ot_%20.rough-node%20.label%20text%2C%23mermaid-_r_ot_%20.node%20.label%20text%2C%23mermaid-_r_ot_%20.image-shape%20.label%2C%23mermaid-_r_ot_%20.icon-shape%20.label%7Btext-anchor%3Amiddle%3B%7D%23mermaid-_r_ot_%20.node%20.katex%20path%7Bfill%3A%23000%3Bstroke%3A%23000%3Bstroke-width%3A1px%3B%7D%23mermaid-_r_ot_%20.rough-node%20.label%2C%23mermaid-_r_ot_%20.node%20.label%2C%23mermaid-_r_ot_%20.image-shape%20.label%2C%23mermaid-_r_ot_%20.icon-shape%20.label%7Btext-align%3Acenter%3B%7D%23mermaid-_r_ot_%20.node.clickable%7Bcursor%3Apointer%3B%7D%23mermaid-_r_ot_%20.root%20.anchor%20path%7Bfill%3Argb(205%2C%20205%2C%20205)!important%3Bstroke-width%3A0%3Bstroke%3Argb(205%2C%20205%2C%20205)%3B%7D%23mermaid-_r_ot_%20.arrowheadPath%7Bfill%3Argb(205%2C%20205%2C%20205)%3B%7D%23mermaid-_r_ot_%20.edgePath%20.path%7Bstroke%3Argb(205%2C%20205%2C%20205)%3Bstroke-width%3A2.0px%3B%7D%23mermaid-_r_ot_%20.flowchart-link%7Bstroke%3Argb(205%2C%20205%2C%20205)%3Bfill%3Anone%3B%7D%23mermaid-_r_ot_%20.edgeLabel%7Bbackground-color%3Argb(0%2C%200%2C%200)%3Btext-align%3Acenter%3B%7D%23mermaid-_r_ot_%20.edgeLabel%20p%7Bbackground-color%3Argb(0%2C%200%2C%200)%3B%7D%23mermaid-_r_ot_%20.edgeLabel%20rect%7Bopacity%3A0.5%3Bbackground-color%3Argb(0%2C%200%2C%200)%3Bfill%3Argb(0%2C%200%2C%200)%3B%7D%23mermaid-_r_ot_%20.labelBkg%7Bbackground-color%3Argba(0%2C%200%2C%200%2C%200.5)%3B%7D%23mermaid-_r_ot_%20.cluster%20rect%7Bfill%3Argb(33%2C%2033%2C%2033)%3Bstroke%3Argba(255%2C%20255%2C%20255%2C%200.05)%3Bstroke-width%3A1px%3B%7D%23mermaid-_r_ot_%20.cluster%20text%7Bfill%3Argb(255%2C%20255%2C%20255)%3B%7D%23mermaid-_r_ot_%20.cluster%20span%7Bcolor%3Argb(255%2C%20255%2C%20255)%3B%7D%23mermaid-_r_ot_%20div.mermaidTooltip%7Bposition%3Aabsolute%3Btext-align%3Acenter%3Bmax-width%3A200px%3Bpadding%3A2px%3Bfont-family%3A%22-apple-system%22%2C%22BlinkMacSystemFont%22%2C%22Segoe%20UI%22%2C%22Roboto%22%2C%22Oxygen%22%2C%22Ubuntu%22%2C%22Cantarell%22%2C%22Helvetica%20Neue%22%2C%22Arial%22%2C%22sans-serif%22%3Bfont-size%3A12px%3Bbackground%3Argb(33%2C%2033%2C%2033)%3Bborder%3A1px%20solid%20rgba(255%2C%20255%2C%20255%2C%200.05)%3Bborder-radius%3A2px%3Bpointer-events%3Anone%3Bz-index%3A100%3B%7D%23mermaid-_r_ot_%20.flowchartTitleText%7Btext-anchor%3Amiddle%3Bfont-size%3A18px%3Bfill%3Argb(255%2C%20255%2C%20255)%3B%7D%23mermaid-_r_ot_%20rect.text%7Bfill%3Anone%3Bstroke-width%3A0%3B%7D%23mermaid-_r_ot_%20.icon-shape%2C%23mermaid-_r_ot_%20.image-shape%7Bbackground-color%3Argb(0%2C%200%2C%200)%3Btext-align%3Acenter%3B%7D%23mermaid-_r_ot_%20.icon-shape%20p%2C%23mermaid-_r_ot_%20.image-shape%20p%7Bbackground-color%3Argb(0%2C%200%2C%200)%3Bpadding%3A2px%3B%7D%23mermaid-_r_ot_%20.icon-shape%20rect%2C%23mermaid-_r_ot_%20.image-shape%20rect%7Bopacity%3A0.5%3Bbackground-color%3Argb(0%2C%200%2C%200)%3Bfill%3Argb(0%2C%200%2C%200)%3B%7D%23mermaid-_r_ot_%20.label-icon%7Bdisplay%3Ainline-block%3Bheight%3A1em%3Boverflow%3Avisible%3Bvertical-align%3A-0.125em%3B%7D%23mermaid-_r_ot_%20.node%20.label-icon%20path%7Bfill%3AcurrentColor%3Bstroke%3Arevert%3Bstroke-width%3Arevert%3B%7D%23mermaid-_r_ot_%20.node%20text%7Bfont-size%3A16px%3Bfont-weight%3A600%3Bletter-spacing%3A-0.32px%3Bfill%3A%2399ceff%3B%7D%23mermaid-_r_ot_%20.edgeLabels%20text%7Bfont-size%3A13px%3Bfont-weight%3A600%3Bletter-spacing%3A-0.08px%3Bfill%3A%2399ceff%3B%7D%23mermaid-_r_ot_%20.node%20tspan%5Bfont-weight%3D%22normal%22%5D%2C%23mermaid-_r_ot_%20.edgeLabels%20tspan%5Bfont-weight%3D%22normal%22%5D%7Bfont-weight%3A600%3B%7D%23mermaid-_r_ot_%20.edgeLabel%20.label%20rect%7Bopacity%3A1%3Brx%3A13px%3Bry%3A13px%3Bfill%3A%23000e1a%3Bstroke%3Argb(26%2C%2062%2C%2095)%3Bstroke-width%3A1px%3B%7D%23mermaid-_r_ot_%20.node%20rect%2C%23mermaid-_r_ot_%20.node%20circle%2C%23mermaid-_r_ot_%20.node%20ellipse%2C%23mermaid-_r_ot_%20.node%20polygon%2C%23mermaid-_r_ot_%20.node%20path%7Bfill%3Argb(0%2C%2040%2C%2077)%3Bstroke%3Argba(255%2C%20255%2C%20255%2C%200.1)%3Bstroke-width%3A1px%3B%7D%23mermaid-_r_ot_%20.node%20rect%7Brx%3A16px%3Bry%3A16px%3B%7D%23mermaid-_r_ot_%20.node.mermaid-decision%20.label-container%7Bfill%3A%23000e1a%3Bstroke%3Argb(26%2C%2062%2C%2095)%3Bstroke-dasharray%3A2%202%3B%7D%23mermaid-_r_ot_%20.edgePaths%20.flowchart-link%7Bstroke%3Argb(26%2C%2062%2C%2095)%3Bstroke-width%3A1px%3Bstroke-linecap%3Around%3Bstroke-linejoin%3Around%3B%7D%23mermaid-_r_ot_%20.marker%7Bfill%3Argb(26%2C%2062%2C%2095)%3Bstroke%3Argb(26%2C%2062%2C%2095)%3B%7D%23mermaid-_r_ot_%20.node%7Bcolor-scheme%3Adark%3B%7D%23mermaid-_r_ot_%20%3Aroot%7B--mermaid-font-family%3A%22-apple-system%22%2C%22BlinkMacSystemFont%22%2C%22Segoe%20UI%22%2C%22Roboto%22%2C%22Oxygen%22%2C%22Ubuntu%22%2C%22Cantarell%22%2C%22Helvetica%20Neue%22%2C%22Arial%22%2C%22sans-serif%22%3B%7D%3C%2Fstyle%3E%3Cg%3E%3Cmarker%20id%3D%22mermaid-_r_ot__flowchart-v2-pointEnd%22%20class%3D%22marker%20flowchart-v2%22%20viewBox%3D%22-5%20-5%2010%2010%22%20refX%3D%220%22%20refY%3D%220%22%20markerUnits%3D%22userSpaceOnUse%22%20markerWidth%3D%2210%22%20markerHeight%3D%2210%22%20orient%3D%22auto%22%3E%3Cpath%20d%3D%22M%200%200%20L%204%200%20M%200.8180194846605362%20-3.181980515339464%20L%204%200%20L%200.8180194846605362%203.181980515339464%22%20class%3D%22arrowMarkerPath%22%20style%3D%22stroke-width%3A%201%3B%20stroke-dasharray%3A%20none%3B%20fill%3A%20none%3B%20stroke-linecap%3A%20round%3B%20stroke-linejoin%3A%20round%3B%22%3E%3C%2Fpath%3E%3C%2Fmarker%3E%3Cmarker%20id%3D%22mermaid-_r_ot__flowchart-v2-pointStart%22%20class%3D%22marker%20flowchart-v2%22%20viewBox%3D%22-5%20-5%2010%2010%22%20refX%3D%220%22%20refY%3D%220%22%20markerUnits%3D%22userSpaceOnUse%22%20markerWidth%3D%2210%22%20markerHeight%3D%2210%22%20orient%3D%22auto%22%3E%3Cpath%20d%3D%22M%200%200%20L%20-4%200%20M%20-0.8180194846605362%20-3.181980515339464%20L%20-4%200%20L%20-0.8180194846605362%203.181980515339464%22%20class%3D%22arrowMarkerPath%22%20style%3D%22stroke-width%3A%201%3B%20stroke-dasharray%3A%20none%3B%20fill%3A%20none%3B%20stroke-linecap%3A%20round%3B%20stroke-linejoin%3A%20round%3B%22%3E%3C%2Fpath%3E%3C%2Fmarker%3E%3Cmarker%20id%3D%22mermaid-_r_ot__flowchart-v2-circleEnd%22%20class%3D%22marker%20flowchart-v2%22%20viewBox%3D%220%200%2010%2010%22%20refX%3D%2211%22%20refY%3D%225%22%20markerUnits%3D%22userSpaceOnUse%22%20markerWidth%3D%2211%22%20markerHeight%3D%2211%22%20orient%3D%22auto%22%3E%3Ccircle%20cx%3D%225%22%20cy%3D%225%22%20r%3D%225%22%20class%3D%22arrowMarkerPath%22%20style%3D%22stroke-width%3A%201%3B%20stroke-dasharray%3A%201%2C%200%3B%22%3E%3C%2Fcircle%3E%3C%2Fmarker%3E%3Cmarker%20id%3D%22mermaid-_r_ot__flowchart-v2-circleStart%22%20class%3D%22marker%20flowchart-v2%22%20viewBox%3D%220%200%2010%2010%22%20refX%3D%22-1%22%20refY%3D%225%22%20markerUnits%3D%22userSpaceOnUse%22%20markerWidth%3D%2211%22%20markerHeight%3D%2211%22%20orient%3D%22auto%22%3E%3Ccircle%20cx%3D%225%22%20cy%3D%225%22%20r%3D%225%22%20class%3D%22arrowMarkerPath%22%20style%3D%22stroke-width%3A%201%3B%20stroke-dasharray%3A%201%2C%200%3B%22%3E%3C%2Fcircle%3E%3C%2Fmarker%3E%3Cmarker%20id%3D%22mermaid-_r_ot__flowchart-v2-crossEnd%22%20class%3D%22marker%20cross%20flowchart-v2%22%20viewBox%3D%220%200%2011%2011%22%20refX%3D%2212%22%20refY%3D%225.2%22%20markerUnits%3D%22userSpaceOnUse%22%20markerWidth%3D%2211%22%20markerHeight%3D%2211%22%20orient%3D%22auto%22%3E%3Cpath%20d%3D%22M%201%2C1%20l%209%2C9%20M%2010%2C1%20l%20-9%2C9%22%20class%3D%22arrowMarkerPath%22%20style%3D%22stroke-width%3A%202%3B%20stroke-dasharray%3A%201%2C%200%3B%22%3E%3C%2Fpath%3E%3C%2Fmarker%3E%3Cmarker%20id%3D%22mermaid-_r_ot__flowchart-v2-crossStart%22%20class%3D%22marker%20cross%20flowchart-v2%22%20viewBox%3D%220%200%2011%2011%22%20refX%3D%22-1%22%20refY%3D%225.2%22%20markerUnits%3D%22userSpaceOnUse%22%20markerWidth%3D%2211%22%20markerHeight%3D%2211%22%20orient%3D%22auto%22%3E%3Cpath%20d%3D%22M%201%2C1%20l%209%2C9%20M%2010%2C1%20l%20-9%2C9%22%20class%3D%22arrowMarkerPath%22%20style%3D%22stroke-width%3A%202%3B%20stroke-dasharray%3A%201%2C%200%3B%22%3E%3C%2Fpath%3E%3C%2Fmarker%3E%3C%2Fg%3E%3Cg%20class%3D%22subgraphs%22%3E%3C%2Fg%3E%3Cg%20class%3D%22nodes%22%3E%3Cg%20class%3D%22node%20default%22%20id%3D%22flowchart-Definition-0%22%20transform%3D%22translate(363.77588958740233%2C%2046.29999923706055)%22%3E%3Crect%20class%3D%22basic%20label-container%22%20style%3D%22%22%20x%3D%22-108.92704772949219%22%20y%3D%22-34.29999923706055%22%20width%3D%22217.85409545898438%22%20height%3D%2268.5999984741211%22%3E%3C%2Frect%3E%3Cg%20class%3D%22label%22%20style%3D%22%22%20transform%3D%22translate(0%2C%20-18.299999237060547)%22%3E%3Crect%3E%3C%2Frect%3E%3Cg%3E%3Crect%20class%3D%22background%22%20style%3D%22stroke%3A%20none%22%3E%3C%2Frect%3E%3Ctext%20y%3D%22-10.1%22%20style%3D%22%22%3E%3Ctspan%20class%3D%22text-outer-tspan%22%20x%3D%220%22%20y%3D%22-0.1em%22%20dy%3D%221.1em%22%3E%3Ctspan%20font-style%3D%22normal%22%20class%3D%22text-inner-tspan%22%20font-weight%3D%22normal%22%3EVersioned%3C%2Ftspan%3E%3Ctspan%20font-style%3D%22normal%22%20class%3D%22text-inner-tspan%22%20font-weight%3D%22normal%22%3E%20Workflow%3C%2Ftspan%3E%3C%2Ftspan%3E%3Ctspan%20class%3D%22text-outer-tspan%22%20x%3D%220%22%20y%3D%221em%22%20dy%3D%221.1em%22%3E%3Ctspan%20font-style%3D%22normal%22%20class%3D%22text-inner-tspan%22%20font-weight%3D%22normal%22%3EDefinition%3C%2Ftspan%3E%3C%2Ftspan%3E%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fg%3E%3C%2Fg%3E%3Cg%20class%3D%22node%20default%22%20id%3D%22flowchart-Validator-1%22%20transform%3D%22translate(363.77588958740233%2C%20154.89999771118164)%22%3E%3Crect%20class%3D%22basic%20label-container%22%20style%3D%22%22%20x%3D%22-109.078125%22%20y%3D%22-34.29999923706055%22%20width%3D%22218.15625%22%20height%3D%2268.5999984741211%22%3E%3C%2Frect%3E%3Cg%20class%3D%22label%22%20style%3D%22%22%20transform%3D%22translate(0%2C%20-18.299999237060547)%22%3E%3Crect%3E%3C%2Frect%3E%3Cg%3E%3Crect%20class%3D%22background%22%20style%3D%22stroke%3A%20none%22%3E%3C%2Frect%3E%3Ctext%20y%3D%22-10.1%22%20style%3D%22%22%3E%3Ctspan%20class%3D%22text-outer-tspan%22%20x%3D%220%22%20y%3D%22-0.1em%22%20dy%3D%221.1em%22%3E%3Ctspan%20font-style%3D%22normal%22%20class%3D%22text-inner-tspan%22%20font-weight%3D%22normal%22%3ESchema%3C%2Ftspan%3E%3Ctspan%20font-style%3D%22normal%22%20class%3D%22text-inner-tspan%22%20font-weight%3D%22normal%22%3E%20%26amp%3B%3C%2Ftspan%3E%3Ctspan%20font-style%3D%22normal%22%20class%3D%22text-inner-tspan%22%20font-weight%3D%22normal%22%3E%20Semantic%3C%2Ftspan%3E%3C%2Ftspan%3E%3Ctspan%20class%3D%22text-outer-tspan%22%20x%3D%220%22%20y%3D%221em%22%20dy%3D%221.1em%22%3E%3Ctspan%20font-style%3D%22normal%22%20class%3D%22text-inner-tspan%22%20font-weight%3D%22normal%22%3EValidator%3C%2Ftspan%3E%3C%2Ftspan%3E%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fg%3E%3C%2Fg%3E%3Cg%20class%3D%22node%20default%22%20id%3D%22flowchart-Planner-2%22%20transform%3D%22translate(363.77588958740233%2C%20259.1999969482422)%22%3E%3Crect%20class%3D%22basic%20label-container%22%20style%3D%22%22%20x%3D%22-100.2237548828125%22%20y%3D%22-30%22%20width%3D%22200.447509765625%22%20height%3D%2260%22%3E%3C%2Frect%3E%3Cg%20class%3D%22label%22%20style%3D%22%22%20transform%3D%22translate(0%2C%20-9.5)%22%3E%3Crect%3E%3C%2Frect%3E%3Cg%3E%3Crect%20class%3D%22background%22%20style%3D%22stroke%3A%20none%22%3E%3C%2Frect%3E%3Ctext%20y%3D%22-10.1%22%20style%3D%22%22%3E%3Ctspan%20class%3D%22text-outer-tspan%22%20x%3D%220%22%20y%3D%22-0.1em%22%20dy%3D%221.1em%22%3E%3Ctspan%20font-style%3D%22normal%22%20class%3D%22text-inner-tspan%22%20font-weight%3D%22normal%22%3EWorkflow%3C%2Ftspan%3E%3Ctspan%20font-style%3D%22normal%22%20class%3D%22text-inner-tspan%22%20font-weight%3D%22normal%22%3E%20Planner%3C%2Ftspan%3E%3C%2Ftspan%3E%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fg%3E%3C%2Fg%3E%3Cg%20class%3D%22node%20default%22%20id%3D%22flowchart-API-3%22%20transform%3D%22translate(363.77588958740233%2C%20359.1999969482422)%22%3E%3Crect%20class%3D%22basic%20label-container%22%20style%3D%22%22%20x%3D%22-116.98046875%22%20y%3D%22-30%22%20width%3D%22233.9609375%22%20height%3D%2260%22%3E%3C%2Frect%3E%3Cg%20class%3D%22label%22%20style%3D%22%22%20transform%3D%22translate(0%2C%20-9.5)%22%3E%3Crect%3E%3C%2Frect%3E%3Cg%3E%3Crect%20class%3D%22background%22%20style%3D%22stroke%3A%20none%22%3E%3C%2Frect%3E%3Ctext%20y%3D%22-10.1%22%20style%3D%22%22%3E%3Ctspan%20class%3D%22text-outer-tspan%22%20x%3D%220%22%20y%3D%22-0.1em%22%20dy%3D%221.1em%22%3E%3Ctspan%20font-style%3D%22normal%22%20class%3D%22text-inner-tspan%22%20font-weight%3D%22normal%22%3EWorkflow%3C%2Ftspan%3E%3Ctspan%20font-style%3D%22normal%22%20class%3D%22text-inner-tspan%22%20font-weight%3D%22normal%22%3E%20Runtime%3C%2Ftspan%3E%3Ctspan%20font-style%3D%22normal%22%20class%3D%22text-inner-tspan%22%20font-weight%3D%22normal%22%3E%20API%3C%2Ftspan%3E%3C%2Ftspan%3E%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fg%3E%3C%2Fg%3E%3Cg%20class%3D%22node%20default%22%20id%3D%22flowchart-State-4%22%20transform%3D%22translate(363.77588958740233%2C%20468.68272399902344)%22%3E%3Cpath%20d%3D%22M0%2C14.98848675977374%20a93.5703125%2C14.98848675977374%200%2C0%2C0%20187.140625%2C0%20a93.5703125%2C14.98848675977374%200%2C0%2C0%20-187.140625%2C0%20l0%2C48.98848675977374%20a93.5703125%2C14.98848675977374%200%2C0%2C0%20187.140625%2C0%20l0%2C-48.98848675977374%22%20class%3D%22basic%20label-container%22%20style%3D%22%22%20transform%3D%22translate(-93.5703125%2C%20-39.48273013966061)%22%3E%3C%2Fpath%3E%3Cg%20class%3D%22label%22%20style%3D%22%22%20transform%3D%22translate(0%2C%200)%22%3E%3Crect%3E%3C%2Frect%3E%3Cg%3E%3Crect%20class%3D%22background%22%20style%3D%22stroke%3A%20none%22%3E%3C%2Frect%3E%3Ctext%20y%3D%22-10.1%22%20style%3D%22%22%3E%3Ctspan%20class%3D%22text-outer-tspan%22%20x%3D%220%22%20y%3D%22-0.1em%22%20dy%3D%221.1em%22%3E%3Ctspan%20font-style%3D%22normal%22%20class%3D%22text-inner-tspan%22%20font-weight%3D%22normal%22%3EDurable%3C%2Ftspan%3E%3Ctspan%20font-style%3D%22normal%22%20class%3D%22text-inner-tspan%22%20font-weight%3D%22normal%22%3E%20Workflow%3C%2Ftspan%3E%3Ctspan%20font-style%3D%22normal%22%20class%3D%22text-inner-tspan%22%20font-weight%3D%22normal%22%3E%20State%3C%2Ftspan%3E%3C%2Ftspan%3E%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fg%3E%3C%2Fg%3E%3Cg%20class%3D%22node%20default%22%20id%3D%22flowchart-Dispatcher-5%22%20transform%3D%22translate(106.6226577758789%2C%20698.1654510498047)%22%3E%3Crect%20class%3D%22basic%20label-container%22%20style%3D%22%22%20x%3D%22-94.6226577758789%22%20y%3D%22-30%22%20width%3D%22189.2453155517578%22%20height%3D%2260%22%3E%3C%2Frect%3E%3Cg%20class%3D%22label%22%20style%3D%22%22%20transform%3D%22translate(0%2C%20-9.5)%22%3E%3Crect%3E%3C%2Frect%3E%3Cg%3E%3Crect%20class%3D%22background%22%20style%3D%22stroke%3A%20none%22%3E%3C%2Frect%3E%3Ctext%20y%3D%22-10.1%22%20style%3D%22%22%3E%3Ctspan%20class%3D%22text-outer-tspan%22%20x%3D%220%22%20y%3D%22-0.1em%22%20dy%3D%221.1em%22%3E%3Ctspan%20font-style%3D%22normal%22%20class%3D%22text-inner-tspan%22%20font-weight%3D%22normal%22%3ETask%3C%2Ftspan%3E%3Ctspan%20font-style%3D%22normal%22%20class%3D%22text-inner-tspan%22%20font-weight%3D%22normal%22%3E%20Dispatcher%3C%2Ftspan%3E%3C%2Ftspan%3E%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fg%3E%3C%2Fg%3E%3Cg%20class%3D%22node%20default%22%20id%3D%22flowchart-Executor-6%22%20transform%3D%22translate(473.62821197509766%2C%20798.1654510498047)%22%3E%3Crect%20class%3D%22basic%20label-container%22%20style%3D%22%22%20x%3D%22-87.15099334716797%22%20y%3D%22-30%22%20width%3D%22174.30198669433594%22%20height%3D%2260%22%3E%3C%2Frect%3E%3Cg%20class%3D%22label%22%20style%3D%22%22%20transform%3D%22translate(0%2C%20-9.5)%22%3E%3Crect%3E%3C%2Frect%3E%3Cg%3E%3Crect%20class%3D%22background%22%20style%3D%22stroke%3A%20none%22%3E%3C%2Frect%3E%3Ctext%20y%3D%22-10.1%22%20style%3D%22%22%3E%3Ctspan%20class%3D%22text-outer-tspan%22%20x%3D%220%22%20y%3D%22-0.1em%22%20dy%3D%221.1em%22%3E%3Ctspan%20font-style%3D%22normal%22%20class%3D%22text-inner-tspan%22%20font-weight%3D%22normal%22%3EStep%3C%2Ftspan%3E%3Ctspan%20font-style%3D%22normal%22%20class%3D%22text-inner-tspan%22%20font-weight%3D%22normal%22%3E%20Executor%3C%2Ftspan%3E%3C%2Ftspan%3E%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fg%3E%3C%2Fg%3E%3Cg%20class%3D%22node%20default%22%20id%3D%22flowchart-Recovery-7%22%20transform%3D%22translate(138.16354370117188%2C%20598.1654510498047)%22%3E%3Crect%20class%3D%22basic%20label-container%22%20style%3D%22%22%20x%3D%22-104.1378173828125%22%20y%3D%22-30%22%20width%3D%22208.275634765625%22%20height%3D%2260%22%3E%3C%2Frect%3E%3Cg%20class%3D%22label%22%20style%3D%22%22%20transform%3D%22translate(0%2C%20-9.5)%22%3E%3Crect%3E%3C%2Frect%3E%3Cg%3E%3Crect%20class%3D%22background%22%20style%3D%22stroke%3A%20none%22%3E%3C%2Frect%3E%3Ctext%20y%3D%22-10.1%22%20style%3D%22%22%3E%3Ctspan%20class%3D%22text-outer-tspan%22%20x%3D%220%22%20y%3D%22-0.1em%22%20dy%3D%221.1em%22%3E%3Ctspan%20font-style%3D%22normal%22%20class%3D%22text-inner-tspan%22%20font-weight%3D%22normal%22%3ERecovery%3C%2Ftspan%3E%3Ctspan%20font-style%3D%22normal%22%20class%3D%22text-inner-tspan%22%20font-weight%3D%22normal%22%3E%20Manager%3C%2Ftspan%3E%3C%2Ftspan%3E%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fg%3E%3C%2Fg%3E%3Cg%20class%3D%22node%20default%22%20id%3D%22flowchart-History-8%22%20transform%3D%22translate(382.48995208740234%2C%20598.1654510498047)%22%3E%3Crect%20class%3D%22basic%20label-container%22%20style%3D%22%22%20x%3D%22-100.18859100341797%22%20y%3D%22-30%22%20width%3D%22200.37718200683594%22%20height%3D%2260%22%3E%3C%2Frect%3E%3Cg%20class%3D%22label%22%20style%3D%22%22%20transform%3D%22translate(0%2C%20-9.5)%22%3E%3Crect%3E%3C%2Frect%3E%3Cg%3E%3Crect%20class%3D%22background%22%20style%3D%22stroke%3A%20none%22%3E%3C%2Frect%3E%3Ctext%20y%3D%22-10.1%22%20style%3D%22%22%3E%3Ctspan%20class%3D%22text-outer-tspan%22%20x%3D%220%22%20y%3D%22-0.1em%22%20dy%3D%221.1em%22%3E%3Ctspan%20font-style%3D%22normal%22%20class%3D%22text-inner-tspan%22%20font-weight%3D%22normal%22%3EExecution%3C%2Ftspan%3E%3Ctspan%20font-style%3D%22normal%22%20class%3D%22text-inner-tspan%22%20font-weight%3D%22normal%22%3E%20History%3C%2Ftspan%3E%3C%2Ftspan%3E%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fg%3E%3C%2Fg%3E%3C%2Fg%3E%3Cg%20class%3D%22edges%20edgePaths%22%3E%3Cpath%20d%3D%22M363.77588958740233%2C80.5999984741211L363.77588958740233%2C108.5999984741211%22%20id%3D%22L_Definition_Validator_0%22%20class%3D%22edge-thickness-normal%20edge-pattern-solid%20edge-thickness-normal%20edge-pattern-solid%20flowchart-link%22%20style%3D%22%3B%22%20data-edge%3D%22true%22%20data-et%3D%22edge%22%20data-id%3D%22L_Definition_Validator_0%22%20data-points%3D%22W3sieCI6MzYzLjc3NTg4OTU4NzQwMjMzLCJ5Ijo4MC41OTk5OTg0NzQxMjExfSx7IngiOjM2My43NzU4ODk1ODc0MDIzMywieSI6MTEyLjU5OTk5ODQ3NDEyMTF9XQ%3D%3D%22%20marker-end%3D%22url(%23mermaid-_r_ot__flowchart-v2-pointEnd)%22%3E%3C%2Fpath%3E%3Cpath%20d%3D%22M363.77588958740233%2C189.1999969482422L363.77588958740233%2C217.1999969482422%22%20id%3D%22L_Validator_Planner_0%22%20class%3D%22edge-thickness-normal%20edge-pattern-solid%20edge-thickness-normal%20edge-pattern-solid%20flowchart-link%22%20style%3D%22%3B%22%20data-edge%3D%22true%22%20data-et%3D%22edge%22%20data-id%3D%22L_Validator_Planner_0%22%20data-points%3D%22W3sieCI6MzYzLjc3NTg4OTU4NzQwMjMzLCJ5IjoxODkuMTk5OTk2OTQ4MjQyMn0seyJ4IjozNjMuNzc1ODg5NTg3NDAyMzMsInkiOjIyMS4xOTk5OTY5NDgyNDIyfV0%3D%22%20marker-end%3D%22url(%23mermaid-_r_ot__flowchart-v2-pointEnd)%22%3E%3C%2Fpath%3E%3Cpath%20d%3D%22M363.77588958740233%2C289.1999969482422L363.77588958740233%2C317.1999969482422%22%20id%3D%22L_Planner_API_0%22%20class%3D%22edge-thickness-normal%20edge-pattern-solid%20edge-thickness-normal%20edge-pattern-solid%20flowchart-link%22%20style%3D%22%3B%22%20data-edge%3D%22true%22%20data-et%3D%22edge%22%20data-id%3D%22L_Planner_API_0%22%20data-points%3D%22W3sieCI6MzYzLjc3NTg4OTU4NzQwMjMzLCJ5IjoyODkuMTk5OTk2OTQ4MjQyMn0seyJ4IjozNjMuNzc1ODg5NTg3NDAyMzMsInkiOjMyMS4xOTk5OTY5NDgyNDIyfV0%3D%22%20marker-end%3D%22url(%23mermaid-_r_ot__flowchart-v2-pointEnd)%22%3E%3C%2Fpath%3E%3Cpath%20d%3D%22M363.77588958740233%2C389.1999969482422L363.77588958740233%2C417.1999969482422%22%20id%3D%22L_API_State_0%22%20class%3D%22edge-thickness-normal%20edge-pattern-solid%20edge-thickness-normal%20edge-pattern-solid%20flowchart-link%22%20style%3D%22%3B%22%20data-edge%3D%22true%22%20data-et%3D%22edge%22%20data-id%3D%22L_API_State_0%22%20data-points%3D%22W3sieCI6MzYzLjc3NTg4OTU4NzQwMjMzLCJ5IjozODkuMTk5OTk2OTQ4MjQyMn0seyJ4IjozNjMuNzc1ODg5NTg3NDAyMzMsInkiOjQyMS4xOTk5OTY5NDgyNDIyfV0%3D%22%20marker-end%3D%22url(%23mermaid-_r_ot__flowchart-v2-pointEnd)%22%3E%3C%2Fpath%3E%3Cpath%20d%3D%22M307.6337020874023%2C505.16775369784995L307.6337020874023%2C508.1654510498047L307.6337020874023%2C521.38249502451Q307.6337020874023%2C523.1654510498047%20306.5479156497754%2C524.5796646121778L306.5479156497754%2C524.5796646121778Q305.4621292121485%2C525.9938781745509%20304.0479156497754%2C527.0796646121778L304.0479156497754%2C527.0796646121778Q302.6337020874023%2C528.1654510498047%20300.85074606210765%2C528.1654510498047L19.808682343654027%2C528.1654510498047Q18.025726318359375%2C528.1654510498047%2016.61151275598628%2C529.2512374874316L16.61151275598628%2C529.2512374874316Q15.197299193613185%2C530.3370239250585%2014.11151275598629%2C531.7512374874316L14.11151275598628%2C531.7512374874316Q13.025726318359375%2C533.1654510498047%2013.025726318359375%2C534.9484070750993L13.025726318359375%2C598.1654510498047L13.025726318359375%2C641.38249502451Q13.025726318359375%2C643.1654510498047%2014.11151275598628%2C644.5796646121778L14.11151275598629%2C644.5796646121778Q15.197299193613185%2C645.9938781745509%2016.61151275598628%2C647.0796646121778L16.61151275598628%2C647.0796646121778Q18.025726318359375%2C648.1654510498047%2019.808682343654027%2C648.1654510498047L68.29881582529129%2C648.1654510498047Q70.08177185058594%2C648.1654510498047%2071.49598541295903%2C649.2512374874316L71.49598541295903%2C649.2512374874316Q72.91019897533212%2C650.3370239250585%2073.99598541295902%2C651.7512374874316L73.99598541295903%2C651.7512374874316Q75.08177185058594%2C653.1654510498047%2075.08177185058594%2C654.9484070750993L75.08177185058594%2C658.1654510498047%22%20id%3D%22L_State_Dispatcher_0%22%20class%3D%22edge-thickness-normal%20edge-pattern-solid%20edge-thickness-normal%20edge-pattern-solid%20flowchart-link%22%20style%3D%22%3B%22%20data-edge%3D%22true%22%20data-et%3D%22edge%22%20data-id%3D%22L_State_Dispatcher_0%22%20data-points%3D%22W3sieCI6MzA3LjYzMzcwMjA4NzQwMjMsInkiOjUwNS4xNjc3NTM2OTc4NDk5NX0seyJ4IjozMDcuNjMzNzAyMDg3NDAyMywieSI6NTA4LjE2NTQ1MTA0OTgwNDd9LHsieCI6MzA3LjYzMzcwMjA4NzQwMjMsInkiOjUyOC4xNjU0NTEwNDk4MDQ3fSx7IngiOjEzLjAyNTcyNjMxODM1OTM3NSwieSI6NTI4LjE2NTQ1MTA0OTgwNDd9LHsieCI6MTMuMDI1NzI2MzE4MzU5Mzc1LCJ5Ijo1OTguMTY1NDUxMDQ5ODA0N30seyJ4IjoxMy4wMjU3MjYzMTgzNTkzNzUsInkiOjY0OC4xNjU0NTEwNDk4MDQ3fSx7IngiOjc1LjA4MTc3MTg1MDU4NTk0LCJ5Ijo2NDguMTY1NDUxMDQ5ODA0N30seyJ4Ijo3NS4wODE3NzE4NTA1ODU5NCwieSI6NjYyLjE2NTQ1MTA0OTgwNDd9XQ%3D%3D%22%20marker-end%3D%22url(%23mermaid-_r_ot__flowchart-v2-pointEnd)%22%3E%3C%2Fpath%3E%3Cpath%20d%3D%22M106.6226577758789%2C728.1654510498047L106.6226577758789%2C741.38249502451Q106.6226577758789%2C743.1654510498047%20107.70844421350581%2C744.5796646121778L107.70844421350583%2C744.5796646121778Q108.79423065113272%2C745.9938781745509%20110.20844421350581%2C747.0796646121778L110.20844421350581%2C747.0796646121778Q111.6226577758789%2C748.1654510498047%20113.40561380117356%2C748.1654510498047L437.79492483408035%2C748.1654510498047Q439.577880859375%2C748.1654510498047%20440.9920944217481%2C749.2512374874316L440.9920944217481%2C749.2512374874316Q442.4063079841212%2C750.3370239250585%20443.4920944217481%2C751.7512374874316L443.4920944217481%2C751.7512374874316Q444.577880859375%2C753.1654510498047%20444.577880859375%2C754.9484070750993L444.577880859375%2C758.1654510498047%22%20id%3D%22L_Dispatcher_Executor_0%22%20class%3D%22edge-thickness-normal%20edge-pattern-solid%20edge-thickness-normal%20edge-pattern-solid%20flowchart-link%22%20style%3D%22%3B%22%20data-edge%3D%22true%22%20data-et%3D%22edge%22%20data-id%3D%22L_Dispatcher_Executor_0%22%20data-points%3D%22W3sieCI6MTA2LjYyMjY1Nzc3NTg3ODksInkiOjcyOC4xNjU0NTEwNDk4MDQ3fSx7IngiOjEwNi42MjI2NTc3NzU4Nzg5LCJ5Ijo3NDguMTY1NDUxMDQ5ODA0N30seyJ4Ijo0NDQuNTc3ODgwODU5Mzc1LCJ5Ijo3NDguMTY1NDUxMDQ5ODA0N30seyJ4Ijo0NDQuNTc3ODgwODU5Mzc1LCJ5Ijo3NjIuMTY1NDUxMDQ5ODA0N31d%22%20marker-end%3D%22url(%23mermaid-_r_ot__flowchart-v2-pointEnd)%22%3E%3C%2Fpath%3E%3Cpath%20d%3D%22M502.6785430908203%2C768.1654510498047L502.6785430908203%2C698.1654510498047L502.6785430908203%2C598.1654510498047L502.6785430908203%2C534.9484070750993Q502.6785430908203%2C533.1654510498047%20501.5927566531934%2C531.7512374874316L501.5927566531934%2C531.7512374874316Q500.5069702155665%2C530.3370239250585%20499.0927566531934%2C529.2512374874316L499.0927566531934%2C529.2512374874316Q497.6785430908203%2C528.1654510498047%20495.89558706552566%2C528.1654510498047L426.701033112697%2C528.1654510498047Q424.91807708740237%2C528.1654510498047%20423.50386352502926%2C527.0796646121778L423.50386352502926%2C527.0796646121778Q422.08964996265615%2C525.9938781745509%20421.00386352502926%2C524.5796646121778L421.00386352502926%2C524.5796646121778Q419.91807708740237%2C523.1654510498047%20419.91807708740237%2C521.38249502451L419.91807708740237%2C508.1654510498047L419.91807708740237%2C509.16775369784995%22%20id%3D%22L_Executor_State_0%22%20class%3D%22edge-thickness-normal%20edge-pattern-solid%20edge-thickness-normal%20edge-pattern-solid%20flowchart-link%22%20style%3D%22%3B%22%20data-edge%3D%22true%22%20data-et%3D%22edge%22%20data-id%3D%22L_Executor_State_0%22%20data-points%3D%22W3sieCI6NTAyLjY3ODU0MzA5MDgyMDMsInkiOjc2OC4xNjU0NTEwNDk4MDQ3fSx7IngiOjUwMi42Nzg1NDMwOTA4MjAzLCJ5Ijo2OTguMTY1NDUxMDQ5ODA0N30seyJ4Ijo1MDIuNjc4NTQzMDkwODIwMywieSI6NTk4LjE2NTQ1MTA0OTgwNDd9LHsieCI6NTAyLjY3ODU0MzA5MDgyMDMsInkiOjUyOC4xNjU0NTEwNDk4MDQ3fSx7IngiOjQxOS45MTgwNzcwODc0MDIzNywieSI6NTI4LjE2NTQ1MTA0OTgwNDd9LHsieCI6NDE5LjkxODA3NzA4NzQwMjM3LCJ5Ijo1MDguMTY1NDUxMDQ5ODA0N30seyJ4Ijo0MTkuOTE4MDc3MDg3NDAyMzcsInkiOjUwNS4xNjc3NTM2OTc4NDk5NX1d%22%20marker-end%3D%22url(%23mermaid-_r_ot__flowchart-v2-pointEnd)%22%3E%3C%2Fpath%3E%3Cpath%20d%3D%22M345.0618270874023%2C507.86262212119385L345.0618270874023%2C508.1654510498047L345.0618270874023%2C541.38249502451Q345.0618270874023%2C543.1654510498047%20343.9760406497754%2C544.5796646121778L343.9760406497754%2C544.5796646121778Q342.89025421214853%2C545.9938781745509%20341.4760406497754%2C547.0796646121778L341.4760406497754%2C547.0796646121778Q340.0618270874023%2C548.1654510498047%20338.27887106210767%2C548.1654510498047L144.94649972646653%2C548.1654510498047Q143.16354370117188%2C548.1654510498047%20141.74933013879877%2C549.2512374874316L141.74933013879877%2C549.2512374874316Q140.3351165764257%2C550.3370239250585%20139.2493301387988%2C551.7512374874316L139.24933013879877%2C551.7512374874316Q138.16354370117188%2C553.1654510498047%20138.16354370117188%2C554.9484070750993L138.16354370117188%2C558.1654510498047%22%20id%3D%22L_State_Recovery_0%22%20class%3D%22edge-thickness-normal%20edge-pattern-solid%20edge-thickness-normal%20edge-pattern-solid%20flowchart-link%22%20style%3D%22%3B%22%20data-edge%3D%22true%22%20data-et%3D%22edge%22%20data-id%3D%22L_State_Recovery_0%22%20data-points%3D%22W3sieCI6MzQ1LjA2MTgyNzA4NzQwMjMsInkiOjUwNy44NjI2MjIxMjExOTM4NX0seyJ4IjozNDUuMDYxODI3MDg3NDAyMywieSI6NTA4LjE2NTQ1MTA0OTgwNDd9LHsieCI6MzQ1LjA2MTgyNzA4NzQwMjMsInkiOjU0OC4xNjU0NTEwNDk4MDQ3fSx7IngiOjEzOC4xNjM1NDM3MDExNzE4OCwieSI6NTQ4LjE2NTQ1MTA0OTgwNDd9LHsieCI6MTM4LjE2MzU0MzcwMTE3MTg4LCJ5Ijo1NjIuMTY1NDUxMDQ5ODA0N31d%22%20marker-end%3D%22url(%23mermaid-_r_ot__flowchart-v2-pointEnd)%22%3E%3C%2Fpath%3E%3Cpath%20d%3D%22M138.16354370117188%2C628.1654510498047L138.16354370117188%2C656.1654510498047%22%20id%3D%22L_Recovery_Dispatcher_0%22%20class%3D%22edge-thickness-normal%20edge-pattern-solid%20edge-thickness-normal%20edge-pattern-solid%20flowchart-link%22%20style%3D%22%3B%22%20data-edge%3D%22true%22%20data-et%3D%22edge%22%20data-id%3D%22L_Recovery_Dispatcher_0%22%20data-points%3D%22W3sieCI6MTM4LjE2MzU0MzcwMTE3MTg4LCJ5Ijo2MjguMTY1NDUxMDQ5ODA0N30seyJ4IjoxMzguMTYzNTQzNzAxMTcxODgsInkiOjY2MC4xNjU0NTEwNDk4MDQ3fV0%3D%22%20marker-end%3D%22url(%23mermaid-_r_ot__flowchart-v2-pointEnd)%22%3E%3C%2Fpath%3E%3Cpath%20d%3D%22M382.48995208740234%2C507.86262212119385L382.48995208740234%2C508.1654510498047L382.48995208740234%2C556.1654510498047%22%20id%3D%22L_State_History_0%22%20class%3D%22edge-thickness-normal%20edge-pattern-solid%20edge-thickness-normal%20edge-pattern-solid%20flowchart-link%22%20style%3D%22%3B%22%20data-edge%3D%22true%22%20data-et%3D%22edge%22%20data-id%3D%22L_State_History_0%22%20data-points%3D%22W3sieCI6MzgyLjQ4OTk1MjA4NzQwMjM0LCJ5Ijo1MDcuODYyNjIyMTIxMTkzODV9LHsieCI6MzgyLjQ4OTk1MjA4NzQwMjM0LCJ5Ijo1MDguMTY1NDUxMDQ5ODA0N30seyJ4IjozODIuNDg5OTUyMDg3NDAyMzQsInkiOjU2MC4xNjU0NTEwNDk4MDQ3fV0%3D%22%20marker-end%3D%22url(%23mermaid-_r_ot__flowchart-v2-pointEnd)%22%3E%3C%2Fpath%3E%3C%2Fg%3E%3Cg%20class%3D%22edgeLabels%22%3E%3Cg%3E%3Crect%20class%3D%22background%22%20style%3D%22stroke%3A%20none%22%3E%3C%2Frect%3E%3C%2Fg%3E%3Cg%3E%3Crect%20class%3D%22background%22%20style%3D%22stroke%3A%20none%22%3E%3C%2Frect%3E%3C%2Fg%3E%3Cg%3E%3Crect%20class%3D%22background%22%20style%3D%22stroke%3A%20none%22%3E%3C%2Frect%3E%3C%2Fg%3E%3Cg%3E%3Crect%20class%3D%22background%22%20style%3D%22stroke%3A%20none%22%3E%3C%2Frect%3E%3C%2Fg%3E%3Cg%3E%3Crect%20class%3D%22background%22%20style%3D%22stroke%3A%20none%22%3E%3C%2Frect%3E%3C%2Fg%3E%3Cg%3E%3Crect%20class%3D%22background%22%20style%3D%22stroke%3A%20none%22%3E%3C%2Frect%3E%3C%2Fg%3E%3Cg%3E%3Crect%20class%3D%22background%22%20style%3D%22stroke%3A%20none%22%3E%3C%2Frect%3E%3C%2Fg%3E%3Cg%3E%3Crect%20class%3D%22background%22%20style%3D%22stroke%3A%20none%22%3E%3C%2Frect%3E%3C%2Fg%3E%3Cg%3E%3Crect%20class%3D%22background%22%20style%3D%22stroke%3A%20none%22%3E%3C%2Frect%3E%3C%2Fg%3E%3Cg%3E%3Crect%20class%3D%22background%22%20style%3D%22stroke%3A%20none%22%3E%3C%2Frect%3E%3C%2Fg%3E%3Cg%20class%3D%22edgeLabel%22%3E%3Cg%20class%3D%22label%22%20data-id%3D%22L_Definition_Validator_0%22%20transform%3D%22translate(0%2C%200)%22%3E%3Ctext%20y%3D%22-10.1%22%3E%3Ctspan%20class%3D%22text-outer-tspan%22%20x%3D%220%22%20y%3D%22-0.1em%22%20dy%3D%221.1em%22%3E%3C%2Ftspan%3E%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fg%3E%3Cg%20class%3D%22edgeLabel%22%3E%3Cg%20class%3D%22label%22%20data-id%3D%22L_Validator_Planner_0%22%20transform%3D%22translate(0%2C%200)%22%3E%3Ctext%20y%3D%22-10.1%22%3E%3Ctspan%20class%3D%22text-outer-tspan%22%20x%3D%220%22%20y%3D%22-0.1em%22%20dy%3D%221.1em%22%3E%3C%2Ftspan%3E%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fg%3E%3Cg%20class%3D%22edgeLabel%22%3E%3Cg%20class%3D%22label%22%20data-id%3D%22L_Planner_API_0%22%20transform%3D%22translate(0%2C%200)%22%3E%3Ctext%20y%3D%22-10.1%22%3E%3Ctspan%20class%3D%22text-outer-tspan%22%20x%3D%220%22%20y%3D%22-0.1em%22%20dy%3D%221.1em%22%3E%3C%2Ftspan%3E%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fg%3E%3Cg%20class%3D%22edgeLabel%22%3E%3Cg%20class%3D%22label%22%20data-id%3D%22L_API_State_0%22%20transform%3D%22translate(0%2C%200)%22%3E%3Ctext%20y%3D%22-10.1%22%3E%3Ctspan%20class%3D%22text-outer-tspan%22%20x%3D%220%22%20y%3D%22-0.1em%22%20dy%3D%221.1em%22%3E%3C%2Ftspan%3E%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fg%3E%3Cg%20class%3D%22edgeLabel%22%3E%3Cg%20class%3D%22label%22%20data-id%3D%22L_State_Dispatcher_0%22%20transform%3D%22translate(0%2C%200)%22%3E%3Ctext%20y%3D%22-10.1%22%3E%3Ctspan%20class%3D%22text-outer-tspan%22%20x%3D%220%22%20y%3D%22-0.1em%22%20dy%3D%221.1em%22%3E%3C%2Ftspan%3E%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fg%3E%3Cg%20class%3D%22edgeLabel%22%3E%3Cg%20class%3D%22label%22%20data-id%3D%22L_Dispatcher_Executor_0%22%20transform%3D%22translate(0%2C%200)%22%3E%3Ctext%20y%3D%22-10.1%22%3E%3Ctspan%20class%3D%22text-outer-tspan%22%20x%3D%220%22%20y%3D%22-0.1em%22%20dy%3D%221.1em%22%3E%3C%2Ftspan%3E%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fg%3E%3Cg%20class%3D%22edgeLabel%22%3E%3Cg%20class%3D%22label%22%20data-id%3D%22L_Executor_State_0%22%20transform%3D%22translate(0%2C%200)%22%3E%3Ctext%20y%3D%22-10.1%22%3E%3Ctspan%20class%3D%22text-outer-tspan%22%20x%3D%220%22%20y%3D%22-0.1em%22%20dy%3D%221.1em%22%3E%3C%2Ftspan%3E%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fg%3E%3Cg%20class%3D%22edgeLabel%22%3E%3Cg%20class%3D%22label%22%20data-id%3D%22L_State_Recovery_0%22%20transform%3D%22translate(0%2C%200)%22%3E%3Ctext%20y%3D%22-10.1%22%3E%3Ctspan%20class%3D%22text-outer-tspan%22%20x%3D%220%22%20y%3D%22-0.1em%22%20dy%3D%221.1em%22%3E%3C%2Ftspan%3E%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fg%3E%3Cg%20class%3D%22edgeLabel%22%3E%3Cg%20class%3D%22label%22%20data-id%3D%22L_Recovery_Dispatcher_0%22%20transform%3D%22translate(0%2C%200)%22%3E%3Ctext%20y%3D%22-10.1%22%3E%3Ctspan%20class%3D%22text-outer-tspan%22%20x%3D%220%22%20y%3D%22-0.1em%22%20dy%3D%221.1em%22%3E%3C%2Ftspan%3E%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fg%3E%3Cg%20class%3D%22edgeLabel%22%3E%3Cg%20class%3D%22label%22%20data-id%3D%22L_State_History_0%22%20transform%3D%22translate(0%2C%200)%22%3E%3Ctext%20y%3D%22-10.1%22%3E%3Ctspan%20class%3D%22text-outer-tspan%22%20x%3D%220%22%20y%3D%22-0.1em%22%20dy%3D%221.1em%22%3E%3C%2Ftspan%3E%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fg%3E%3C%2Fg%3E%3C%2Fsvg%3E)
+
+## 6.3 工作流与步骤状态
+
+工作流状态：
+
+- `Pending`
+- `Running`
+- `Waiting`
+- `Compensating`
+- `Succeeded`
+- `Failed`
+- `Cancelled`
+- `TimedOut`
+
+步骤状态：
+
+- `Pending`
+- `Running`
+- `Retrying`
+- `Succeeded`
+- `Failed`
+- `Skipped`
+- `Compensating`
+- `Compensated`
+- `CompensationFailed`
+- `Cancelled`
+
+状态转移必须由运行时验证，不能由插件随意指定。
+
+## 6.4 执行语义
+
+WorkEngine 必须定义：
+
+| 能力     | 必须满足的语义                             |
+| -------- | ------------------------------------------ |
+| 持久化   | 步骤和工作流状态可以在进程重启后恢复       |
+| 幂等     | 重复请求不会无条件重复创建副作用           |
+| 重试     | 按错误类型、次数、退避策略和时限控制       |
+| 超时     | 明确区分步骤超时、工作流超时与外部任务超时 |
+| 取消     | 明确区分停止后续步骤和清理既有副作用       |
+| 补偿     | 对可补偿操作执行反向动作或恢复流程         |
+| 审批     | 支持等待人工审批或外部事件                 |
+| 版本固定 | 运行实例记录定义及执行 Provider 版本       |
+| 结果查询 | 能查询执行结果，避免不确定状态下盲目重试   |
+
+不能承诺所有外部操作都是 exactly-once。更实际的设计是：持久化执行状态 + 至少一次调度能力 + 幂等操作 + 外部结果核验。
+
+## 6.5 工作流定义示例
+
+YAML
+
+```
+apiVersion: forgemesh.io/v1alpha1
+kind: WorkflowDefinition
+
+metadata:
+  name: gpu-onboarding
+
+spec:
+  timeout: 2h
+
+  inputs:
+    nodeId:
+      type: string
+    tenantId:
+      type: string
+
+  steps:
+    - id: discover
+      uses: gpu.discovery
+      with:
+        nodeId: "${inputs.nodeId}"
+
+    - id: preflight
+      uses: gpu.preflight
+      needs: [discover]
+
+    - id: plan
+      uses: decision.route
+      needs: [preflight]
+
+    - id: authorize
+      uses: policy.admission
+      needs: [plan]
+
+    - id: prepare
+      uses: runtime.prepare
+      needs: [authorize]
+
+    - id: deploy
+      uses: inference.deploy
+      needs: [prepare]
+
+    - id: verify
+      uses: inference.verify
+      needs: [deploy]
+
+    - id: commit
+      uses: resource.mark-ready
+      needs: [verify]
+```
+
+该示例定义了逻辑结构。正式 DSL 还必须规定表达式语法、类型验证、错误处理、并行步骤、补偿、敏感输入和执行权限。
+
+`commit` 必须重新验证资源版本、分配所有权和验收条件，而不能简单地将数据库字段改为 `Ready`。
+
+## 6.6 工作流与 Controller 的关系
+
+- Controller 判断是否需要执行新的协调动作。
+- WorkEngine 执行一次有边界的操作流程。
+- WorkEngine 完成后，Controller 重新观察实际状态。
+- 如果实际状态仍未达到目标，Controller 决定是否继续协调。
+- 如果失败无法自动恢复，资源进入可诊断状态，并允许人工介入。
+
+Controller 不应持续创建大量相同工作流来处理同一个未解决问题。需要为同一资源的协调任务建立去重键和并发限制。
+
+# 7. JEV：结构化决策系统
+
+## 7.1 ADR-004 与 ADR-005 的正式决定
+
+JEV 是平台的类型化决策模型，不是唯一决策后端，也不是安全授权系统。
+
+架构上拆分为：
+
+- `Decision API`：稳定的决策契约。
+- `Decision Router`：Provider 选择、超时、熔断和输出验证。
+- `JEV Provider`：JEV 的具体实现或适配器。
+- `Rules Provider`：确定性规则。
+- `LLM Provider`：模型辅助推理。
+- `Policy Engine`：最终授权与策略判断。
+- `Scheduler`：资源可行性与实际分配。
+
+## 7.2 决策链路
+
+图表选项
+
+![img](data:image/svg+xml;utf8,%3Csvg%20id%3D%22mermaid-_r_p1_%22%20width%3D%22278.7135009765625%22%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20class%3D%22flowchart%22%20height%3D%221150.5999755859375%22%20viewBox%3D%224%204%20278.7135009765625%201150.5999755859375%22%20role%3D%22graphics-document%20document%22%20aria-roledescription%3D%22flowchart-v2%22%3E%3Cstyle%3E%23mermaid-_r_p1_%7Bfont-family%3A%22-apple-system%22%2C%22BlinkMacSystemFont%22%2C%22Segoe%20UI%22%2C%22Roboto%22%2C%22Oxygen%22%2C%22Ubuntu%22%2C%22Cantarell%22%2C%22Helvetica%20Neue%22%2C%22Arial%22%2C%22sans-serif%22%3Bfont-size%3A14px%3Bfill%3Argb(255%2C%20255%2C%20255)%3B%7D%40keyframes%20edge-animation-frame%7Bfrom%7Bstroke-dashoffset%3A0%3B%7D%7D%40keyframes%20dash%7Bto%7Bstroke-dashoffset%3A0%3B%7D%7D%23mermaid-_r_p1_%20.edge-animation-slow%7Bstroke-dasharray%3A9%2C5!important%3Bstroke-dashoffset%3A900%3Banimation%3Adash%2050s%20linear%20infinite%3Bstroke-linecap%3Around%3B%7D%23mermaid-_r_p1_%20.edge-animation-fast%7Bstroke-dasharray%3A9%2C5!important%3Bstroke-dashoffset%3A900%3Banimation%3Adash%2020s%20linear%20infinite%3Bstroke-linecap%3Around%3B%7D%23mermaid-_r_p1_%20.error-icon%7Bfill%3Argb(33%2C%2033%2C%2033)%3B%7D%23mermaid-_r_p1_%20.error-text%7Bfill%3Argb(255%2C%20255%2C%20255)%3Bstroke%3Argb(255%2C%20255%2C%20255)%3B%7D%23mermaid-_r_p1_%20.edge-thickness-normal%7Bstroke-width%3A1px%3B%7D%23mermaid-_r_p1_%20.edge-thickness-thick%7Bstroke-width%3A3.5px%3B%7D%23mermaid-_r_p1_%20.edge-pattern-solid%7Bstroke-dasharray%3A0%3B%7D%23mermaid-_r_p1_%20.edge-thickness-invisible%7Bstroke-width%3A0%3Bfill%3Anone%3B%7D%23mermaid-_r_p1_%20.edge-pattern-dashed%7Bstroke-dasharray%3A3%3B%7D%23mermaid-_r_p1_%20.edge-pattern-dotted%7Bstroke-dasharray%3A2%3B%7D%23mermaid-_r_p1_%20.marker%7Bfill%3Argb(205%2C%20205%2C%20205)%3Bstroke%3Argb(205%2C%20205%2C%20205)%3B%7D%23mermaid-_r_p1_%20.marker.cross%7Bstroke%3Argb(205%2C%20205%2C%20205)%3B%7D%23mermaid-_r_p1_%20svg%7Bfont-family%3A%22-apple-system%22%2C%22BlinkMacSystemFont%22%2C%22Segoe%20UI%22%2C%22Roboto%22%2C%22Oxygen%22%2C%22Ubuntu%22%2C%22Cantarell%22%2C%22Helvetica%20Neue%22%2C%22Arial%22%2C%22sans-serif%22%3Bfont-size%3A14px%3B%7D%23mermaid-_r_p1_%20p%7Bmargin%3A0%3B%7D%23mermaid-_r_p1_%20.label%7Bfont-family%3A%22-apple-system%22%2C%22BlinkMacSystemFont%22%2C%22Segoe%20UI%22%2C%22Roboto%22%2C%22Oxygen%22%2C%22Ubuntu%22%2C%22Cantarell%22%2C%22Helvetica%20Neue%22%2C%22Arial%22%2C%22sans-serif%22%3Bcolor%3Argb(255%2C%20255%2C%20255)%3B%7D%23mermaid-_r_p1_%20.cluster-label%20text%7Bfill%3Argb(255%2C%20255%2C%20255)%3B%7D%23mermaid-_r_p1_%20.cluster-label%20span%7Bcolor%3Argb(255%2C%20255%2C%20255)%3B%7D%23mermaid-_r_p1_%20.cluster-label%20span%20p%7Bbackground-color%3Atransparent%3B%7D%23mermaid-_r_p1_%20.label%20text%2C%23mermaid-_r_p1_%20span%7Bfill%3Argb(255%2C%20255%2C%20255)%3Bcolor%3Argb(255%2C%20255%2C%20255)%3B%7D%23mermaid-_r_p1_%20.node%20rect%2C%23mermaid-_r_p1_%20.node%20circle%2C%23mermaid-_r_p1_%20.node%20ellipse%2C%23mermaid-_r_p1_%20.node%20polygon%2C%23mermaid-_r_p1_%20.node%20path%7Bfill%3Argb(9%2C%2023%2C%2044)%3Bstroke%3Argb(31%2C%2078%2C%20148)%3Bstroke-width%3A1px%3B%7D%23mermaid-_r_p1_%20.rough-node%20.label%20text%2C%23mermaid-_r_p1_%20.node%20.label%20text%2C%23mermaid-_r_p1_%20.image-shape%20.label%2C%23mermaid-_r_p1_%20.icon-shape%20.label%7Btext-anchor%3Amiddle%3B%7D%23mermaid-_r_p1_%20.node%20.katex%20path%7Bfill%3A%23000%3Bstroke%3A%23000%3Bstroke-width%3A1px%3B%7D%23mermaid-_r_p1_%20.rough-node%20.label%2C%23mermaid-_r_p1_%20.node%20.label%2C%23mermaid-_r_p1_%20.image-shape%20.label%2C%23mermaid-_r_p1_%20.icon-shape%20.label%7Btext-align%3Acenter%3B%7D%23mermaid-_r_p1_%20.node.clickable%7Bcursor%3Apointer%3B%7D%23mermaid-_r_p1_%20.root%20.anchor%20path%7Bfill%3Argb(205%2C%20205%2C%20205)!important%3Bstroke-width%3A0%3Bstroke%3Argb(205%2C%20205%2C%20205)%3B%7D%23mermaid-_r_p1_%20.arrowheadPath%7Bfill%3Argb(205%2C%20205%2C%20205)%3B%7D%23mermaid-_r_p1_%20.edgePath%20.path%7Bstroke%3Argb(205%2C%20205%2C%20205)%3Bstroke-width%3A2.0px%3B%7D%23mermaid-_r_p1_%20.flowchart-link%7Bstroke%3Argb(205%2C%20205%2C%20205)%3Bfill%3Anone%3B%7D%23mermaid-_r_p1_%20.edgeLabel%7Bbackground-color%3Argb(0%2C%200%2C%200)%3Btext-align%3Acenter%3B%7D%23mermaid-_r_p1_%20.edgeLabel%20p%7Bbackground-color%3Argb(0%2C%200%2C%200)%3B%7D%23mermaid-_r_p1_%20.edgeLabel%20rect%7Bopacity%3A0.5%3Bbackground-color%3Argb(0%2C%200%2C%200)%3Bfill%3Argb(0%2C%200%2C%200)%3B%7D%23mermaid-_r_p1_%20.labelBkg%7Bbackground-color%3Argba(0%2C%200%2C%200%2C%200.5)%3B%7D%23mermaid-_r_p1_%20.cluster%20rect%7Bfill%3Argb(33%2C%2033%2C%2033)%3Bstroke%3Argba(255%2C%20255%2C%20255%2C%200.05)%3Bstroke-width%3A1px%3B%7D%23mermaid-_r_p1_%20.cluster%20text%7Bfill%3Argb(255%2C%20255%2C%20255)%3B%7D%23mermaid-_r_p1_%20.cluster%20span%7Bcolor%3Argb(255%2C%20255%2C%20255)%3B%7D%23mermaid-_r_p1_%20div.mermaidTooltip%7Bposition%3Aabsolute%3Btext-align%3Acenter%3Bmax-width%3A200px%3Bpadding%3A2px%3Bfont-family%3A%22-apple-system%22%2C%22BlinkMacSystemFont%22%2C%22Segoe%20UI%22%2C%22Roboto%22%2C%22Oxygen%22%2C%22Ubuntu%22%2C%22Cantarell%22%2C%22Helvetica%20Neue%22%2C%22Arial%22%2C%22sans-serif%22%3Bfont-size%3A12px%3Bbackground%3Argb(33%2C%2033%2C%2033)%3Bborder%3A1px%20solid%20rgba(255%2C%20255%2C%20255%2C%200.05)%3Bborder-radius%3A2px%3Bpointer-events%3Anone%3Bz-index%3A100%3B%7D%23mermaid-_r_p1_%20.flowchartTitleText%7Btext-anchor%3Amiddle%3Bfont-size%3A18px%3Bfill%3Argb(255%2C%20255%2C%20255)%3B%7D%23mermaid-_r_p1_%20rect.text%7Bfill%3Anone%3Bstroke-width%3A0%3B%7D%23mermaid-_r_p1_%20.icon-shape%2C%23mermaid-_r_p1_%20.image-shape%7Bbackground-color%3Argb(0%2C%200%2C%200)%3Btext-align%3Acenter%3B%7D%23mermaid-_r_p1_%20.icon-shape%20p%2C%23mermaid-_r_p1_%20.image-shape%20p%7Bbackground-color%3Argb(0%2C%200%2C%200)%3Bpadding%3A2px%3B%7D%23mermaid-_r_p1_%20.icon-shape%20rect%2C%23mermaid-_r_p1_%20.image-shape%20rect%7Bopacity%3A0.5%3Bbackground-color%3Argb(0%2C%200%2C%200)%3Bfill%3Argb(0%2C%200%2C%200)%3B%7D%23mermaid-_r_p1_%20.label-icon%7Bdisplay%3Ainline-block%3Bheight%3A1em%3Boverflow%3Avisible%3Bvertical-align%3A-0.125em%3B%7D%23mermaid-_r_p1_%20.node%20.label-icon%20path%7Bfill%3AcurrentColor%3Bstroke%3Arevert%3Bstroke-width%3Arevert%3B%7D%23mermaid-_r_p1_%20.node%20text%7Bfont-size%3A16px%3Bfont-weight%3A600%3Bletter-spacing%3A-0.32px%3Bfill%3A%2399ceff%3B%7D%23mermaid-_r_p1_%20.edgeLabels%20text%7Bfont-size%3A13px%3Bfont-weight%3A600%3Bletter-spacing%3A-0.08px%3Bfill%3A%2399ceff%3B%7D%23mermaid-_r_p1_%20.node%20tspan%5Bfont-weight%3D%22normal%22%5D%2C%23mermaid-_r_p1_%20.edgeLabels%20tspan%5Bfont-weight%3D%22normal%22%5D%7Bfont-weight%3A600%3B%7D%23mermaid-_r_p1_%20.edgeLabel%20.label%20rect%7Bopacity%3A1%3Brx%3A13px%3Bry%3A13px%3Bfill%3A%23000e1a%3Bstroke%3Argb(26%2C%2062%2C%2095)%3Bstroke-width%3A1px%3B%7D%23mermaid-_r_p1_%20.node%20rect%2C%23mermaid-_r_p1_%20.node%20circle%2C%23mermaid-_r_p1_%20.node%20ellipse%2C%23mermaid-_r_p1_%20.node%20polygon%2C%23mermaid-_r_p1_%20.node%20path%7Bfill%3Argb(0%2C%2040%2C%2077)%3Bstroke%3Argba(255%2C%20255%2C%20255%2C%200.1)%3Bstroke-width%3A1px%3B%7D%23mermaid-_r_p1_%20.node%20rect%7Brx%3A16px%3Bry%3A16px%3B%7D%23mermaid-_r_p1_%20.node.mermaid-decision%20.label-container%7Bfill%3A%23000e1a%3Bstroke%3Argb(26%2C%2062%2C%2095)%3Bstroke-dasharray%3A2%202%3B%7D%23mermaid-_r_p1_%20.edgePaths%20.flowchart-link%7Bstroke%3Argb(26%2C%2062%2C%2095)%3Bstroke-width%3A1px%3Bstroke-linecap%3Around%3Bstroke-linejoin%3Around%3B%7D%23mermaid-_r_p1_%20.marker%7Bfill%3Argb(26%2C%2062%2C%2095)%3Bstroke%3Argb(26%2C%2062%2C%2095)%3B%7D%23mermaid-_r_p1_%20.node%7Bcolor-scheme%3Adark%3B%7D%23mermaid-_r_p1_%20%3Aroot%7B--mermaid-font-family%3A%22-apple-system%22%2C%22BlinkMacSystemFont%22%2C%22Segoe%20UI%22%2C%22Roboto%22%2C%22Oxygen%22%2C%22Ubuntu%22%2C%22Cantarell%22%2C%22Helvetica%20Neue%22%2C%22Arial%22%2C%22sans-serif%22%3B%7D%3C%2Fstyle%3E%3Cg%3E%3Cmarker%20id%3D%22mermaid-_r_p1__flowchart-v2-pointEnd%22%20class%3D%22marker%20flowchart-v2%22%20viewBox%3D%22-5%20-5%2010%2010%22%20refX%3D%220%22%20refY%3D%220%22%20markerUnits%3D%22userSpaceOnUse%22%20markerWidth%3D%2210%22%20markerHeight%3D%2210%22%20orient%3D%22auto%22%3E%3Cpath%20d%3D%22M%200%200%20L%204%200%20M%200.8180194846605362%20-3.181980515339464%20L%204%200%20L%200.8180194846605362%203.181980515339464%22%20class%3D%22arrowMarkerPath%22%20style%3D%22stroke-width%3A%201%3B%20stroke-dasharray%3A%20none%3B%20fill%3A%20none%3B%20stroke-linecap%3A%20round%3B%20stroke-linejoin%3A%20round%3B%22%3E%3C%2Fpath%3E%3C%2Fmarker%3E%3Cmarker%20id%3D%22mermaid-_r_p1__flowchart-v2-pointStart%22%20class%3D%22marker%20flowchart-v2%22%20viewBox%3D%22-5%20-5%2010%2010%22%20refX%3D%220%22%20refY%3D%220%22%20markerUnits%3D%22userSpaceOnUse%22%20markerWidth%3D%2210%22%20markerHeight%3D%2210%22%20orient%3D%22auto%22%3E%3Cpath%20d%3D%22M%200%200%20L%20-4%200%20M%20-0.8180194846605362%20-3.181980515339464%20L%20-4%200%20L%20-0.8180194846605362%203.181980515339464%22%20class%3D%22arrowMarkerPath%22%20style%3D%22stroke-width%3A%201%3B%20stroke-dasharray%3A%20none%3B%20fill%3A%20none%3B%20stroke-linecap%3A%20round%3B%20stroke-linejoin%3A%20round%3B%22%3E%3C%2Fpath%3E%3C%2Fmarker%3E%3Cmarker%20id%3D%22mermaid-_r_p1__flowchart-v2-circleEnd%22%20class%3D%22marker%20flowchart-v2%22%20viewBox%3D%220%200%2010%2010%22%20refX%3D%2211%22%20refY%3D%225%22%20markerUnits%3D%22userSpaceOnUse%22%20markerWidth%3D%2211%22%20markerHeight%3D%2211%22%20orient%3D%22auto%22%3E%3Ccircle%20cx%3D%225%22%20cy%3D%225%22%20r%3D%225%22%20class%3D%22arrowMarkerPath%22%20style%3D%22stroke-width%3A%201%3B%20stroke-dasharray%3A%201%2C%200%3B%22%3E%3C%2Fcircle%3E%3C%2Fmarker%3E%3Cmarker%20id%3D%22mermaid-_r_p1__flowchart-v2-circleStart%22%20class%3D%22marker%20flowchart-v2%22%20viewBox%3D%220%200%2010%2010%22%20refX%3D%22-1%22%20refY%3D%225%22%20markerUnits%3D%22userSpaceOnUse%22%20markerWidth%3D%2211%22%20markerHeight%3D%2211%22%20orient%3D%22auto%22%3E%3Ccircle%20cx%3D%225%22%20cy%3D%225%22%20r%3D%225%22%20class%3D%22arrowMarkerPath%22%20style%3D%22stroke-width%3A%201%3B%20stroke-dasharray%3A%201%2C%200%3B%22%3E%3C%2Fcircle%3E%3C%2Fmarker%3E%3Cmarker%20id%3D%22mermaid-_r_p1__flowchart-v2-crossEnd%22%20class%3D%22marker%20cross%20flowchart-v2%22%20viewBox%3D%220%200%2011%2011%22%20refX%3D%2212%22%20refY%3D%225.2%22%20markerUnits%3D%22userSpaceOnUse%22%20markerWidth%3D%2211%22%20markerHeight%3D%2211%22%20orient%3D%22auto%22%3E%3Cpath%20d%3D%22M%201%2C1%20l%209%2C9%20M%2010%2C1%20l%20-9%2C9%22%20class%3D%22arrowMarkerPath%22%20style%3D%22stroke-width%3A%202%3B%20stroke-dasharray%3A%201%2C%200%3B%22%3E%3C%2Fpath%3E%3C%2Fmarker%3E%3Cmarker%20id%3D%22mermaid-_r_p1__flowchart-v2-crossStart%22%20class%3D%22marker%20cross%20flowchart-v2%22%20viewBox%3D%220%200%2011%2011%22%20refX%3D%22-1%22%20refY%3D%225.2%22%20markerUnits%3D%22userSpaceOnUse%22%20markerWidth%3D%2211%22%20markerHeight%3D%2211%22%20orient%3D%22auto%22%3E%3Cpath%20d%3D%22M%201%2C1%20l%209%2C9%20M%2010%2C1%20l%20-9%2C9%22%20class%3D%22arrowMarkerPath%22%20style%3D%22stroke-width%3A%202%3B%20stroke-dasharray%3A%201%2C%200%3B%22%3E%3C%2Fpath%3E%3C%2Fmarker%3E%3C%2Fg%3E%3Cg%20class%3D%22subgraphs%22%3E%3C%2Fg%3E%3Cg%20class%3D%22nodes%22%3E%3Cg%20class%3D%22node%20default%22%20id%3D%22flowchart-Request-0%22%20transform%3D%22translate(144.36067708333334%2C%2042)%22%3E%3Crect%20class%3D%22basic%20label-container%22%20style%3D%22%22%20x%3D%22-99.234375%22%20y%3D%22-30%22%20width%3D%22198.46875%22%20height%3D%2260%22%3E%3C%2Frect%3E%3Cg%20class%3D%22label%22%20style%3D%22%22%20transform%3D%22translate(0%2C%20-9.5)%22%3E%3Crect%3E%3C%2Frect%3E%3Cg%3E%3Crect%20class%3D%22background%22%20style%3D%22stroke%3A%20none%22%3E%3C%2Frect%3E%3Ctext%20y%3D%22-10.1%22%20style%3D%22%22%3E%3Ctspan%20class%3D%22text-outer-tspan%22%20x%3D%220%22%20y%3D%22-0.1em%22%20dy%3D%221.1em%22%3E%3Ctspan%20font-style%3D%22normal%22%20class%3D%22text-inner-tspan%22%20font-weight%3D%22normal%22%3EDecision%3C%2Ftspan%3E%3Ctspan%20font-style%3D%22normal%22%20class%3D%22text-inner-tspan%22%20font-weight%3D%22normal%22%3E%20Request%3C%2Ftspan%3E%3C%2Ftspan%3E%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fg%3E%3C%2Fg%3E%3Cg%20class%3D%22node%20default%22%20id%3D%22flowchart-Context-1%22%20transform%3D%22translate(144.36067708333334%2C%20142)%22%3E%3Crect%20class%3D%22basic%20label-container%22%20style%3D%22%22%20x%3D%22-117.1143798828125%22%20y%3D%22-30%22%20width%3D%22234.228759765625%22%20height%3D%2260%22%3E%3C%2Frect%3E%3Cg%20class%3D%22label%22%20style%3D%22%22%20transform%3D%22translate(0%2C%20-9.5)%22%3E%3Crect%3E%3C%2Frect%3E%3Cg%3E%3Crect%20class%3D%22background%22%20style%3D%22stroke%3A%20none%22%3E%3C%2Frect%3E%3Ctext%20y%3D%22-10.1%22%20style%3D%22%22%3E%3Ctspan%20class%3D%22text-outer-tspan%22%20x%3D%220%22%20y%3D%22-0.1em%22%20dy%3D%221.1em%22%3E%3Ctspan%20font-style%3D%22normal%22%20class%3D%22text-inner-tspan%22%20font-weight%3D%22normal%22%3ETyped%3C%2Ftspan%3E%3Ctspan%20font-style%3D%22normal%22%20class%3D%22text-inner-tspan%22%20font-weight%3D%22normal%22%3E%20Context%3C%2Ftspan%3E%3Ctspan%20font-style%3D%22normal%22%20class%3D%22text-inner-tspan%22%20font-weight%3D%22normal%22%3E%20Builder%3C%2Ftspan%3E%3C%2Ftspan%3E%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fg%3E%3C%2Fg%3E%3Cg%20class%3D%22node%20default%22%20id%3D%22flowchart-Router-2%22%20transform%3D%22translate(144.36067708333334%2C%20242)%22%3E%3Crect%20class%3D%22basic%20label-container%22%20style%3D%22%22%20x%3D%22-93.64807510375977%22%20y%3D%22-30%22%20width%3D%22187.29615020751953%22%20height%3D%2260%22%3E%3C%2Frect%3E%3Cg%20class%3D%22label%22%20style%3D%22%22%20transform%3D%22translate(0%2C%20-9.5)%22%3E%3Crect%3E%3C%2Frect%3E%3Cg%3E%3Crect%20class%3D%22background%22%20style%3D%22stroke%3A%20none%22%3E%3C%2Frect%3E%3Ctext%20y%3D%22-10.1%22%20style%3D%22%22%3E%3Ctspan%20class%3D%22text-outer-tspan%22%20x%3D%220%22%20y%3D%22-0.1em%22%20dy%3D%221.1em%22%3E%3Ctspan%20font-style%3D%22normal%22%20class%3D%22text-inner-tspan%22%20font-weight%3D%22normal%22%3EDecision%3C%2Ftspan%3E%3Ctspan%20font-style%3D%22normal%22%20class%3D%22text-inner-tspan%22%20font-weight%3D%22normal%22%3E%20Router%3C%2Ftspan%3E%3C%2Ftspan%3E%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fg%3E%3C%2Fg%3E%3Cg%20class%3D%22node%20default%22%20id%3D%22flowchart-Provider-3%22%20transform%3D%22translate(144.36067708333334%2C%20342)%22%3E%3Crect%20class%3D%22basic%20label-container%22%20style%3D%22%22%20x%3D%22-130.35281372070312%22%20y%3D%22-30%22%20width%3D%22260.70562744140625%22%20height%3D%2260%22%3E%3C%2Frect%3E%3Cg%20class%3D%22label%22%20style%3D%22%22%20transform%3D%22translate(0%2C%20-9.5)%22%3E%3Crect%3E%3C%2Frect%3E%3Cg%3E%3Crect%20class%3D%22background%22%20style%3D%22stroke%3A%20none%22%3E%3C%2Frect%3E%3Ctext%20y%3D%22-10.1%22%20style%3D%22%22%3E%3Ctspan%20class%3D%22text-outer-tspan%22%20x%3D%220%22%20y%3D%22-0.1em%22%20dy%3D%221.1em%22%3E%3Ctspan%20font-style%3D%22normal%22%20class%3D%22text-inner-tspan%22%20font-weight%3D%22normal%22%3EJEV%3C%2Ftspan%3E%3Ctspan%20font-style%3D%22normal%22%20class%3D%22text-inner-tspan%22%20font-weight%3D%22normal%22%3E%20%2F%3C%2Ftspan%3E%3Ctspan%20font-style%3D%22normal%22%20class%3D%22text-inner-tspan%22%20font-weight%3D%22normal%22%3E%20Rules%3C%2Ftspan%3E%3Ctspan%20font-style%3D%22normal%22%20class%3D%22text-inner-tspan%22%20font-weight%3D%22normal%22%3E%20%2F%3C%2Ftspan%3E%3Ctspan%20font-style%3D%22normal%22%20class%3D%22text-inner-tspan%22%20font-weight%3D%22normal%22%3E%20LLM%3C%2Ftspan%3E%3Ctspan%20font-style%3D%22normal%22%20class%3D%22text-inner-tspan%22%20font-weight%3D%22normal%22%3E%20Provider%3C%2Ftspan%3E%3C%2Ftspan%3E%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fg%3E%3C%2Fg%3E%3Cg%20class%3D%22node%20default%22%20id%3D%22flowchart-Validate-4%22%20transform%3D%22translate(144.36067708333334%2C%20446.29999923706055)%22%3E%3Crect%20class%3D%22basic%20label-container%22%20style%3D%22%22%20x%3D%22-100.35546875%22%20y%3D%22-34.29999923706055%22%20width%3D%22200.7109375%22%20height%3D%2268.5999984741211%22%3E%3C%2Frect%3E%3Cg%20class%3D%22label%22%20style%3D%22%22%20transform%3D%22translate(0%2C%20-18.299999237060547)%22%3E%3Crect%3E%3C%2Frect%3E%3Cg%3E%3Crect%20class%3D%22background%22%20style%3D%22stroke%3A%20none%22%3E%3C%2Frect%3E%3Ctext%20y%3D%22-10.1%22%20style%3D%22%22%3E%3Ctspan%20class%3D%22text-outer-tspan%22%20x%3D%220%22%20y%3D%22-0.1em%22%20dy%3D%221.1em%22%3E%3Ctspan%20font-style%3D%22normal%22%20class%3D%22text-inner-tspan%22%20font-weight%3D%22normal%22%3ESchema%3C%2Ftspan%3E%3Ctspan%20font-style%3D%22normal%22%20class%3D%22text-inner-tspan%22%20font-weight%3D%22normal%22%3E%20%26amp%3B%3C%2Ftspan%3E%3Ctspan%20font-style%3D%22normal%22%20class%3D%22text-inner-tspan%22%20font-weight%3D%22normal%22%3E%20Output%3C%2Ftspan%3E%3C%2Ftspan%3E%3Ctspan%20class%3D%22text-outer-tspan%22%20x%3D%220%22%20y%3D%221em%22%20dy%3D%221.1em%22%3E%3Ctspan%20font-style%3D%22normal%22%20class%3D%22text-inner-tspan%22%20font-weight%3D%22normal%22%3EValidation%3C%2Ftspan%3E%3C%2Ftspan%3E%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fg%3E%3C%2Fg%3E%3Cg%20class%3D%22node%20default%22%20id%3D%22flowchart-Policy-5%22%20transform%3D%22translate(144.36067708333334%2C%20550.5999984741211)%22%3E%3Crect%20class%3D%22basic%20label-container%22%20style%3D%22%22%20x%3D%22-97.3359375%22%20y%3D%22-30%22%20width%3D%22194.671875%22%20height%3D%2260%22%3E%3C%2Frect%3E%3Cg%20class%3D%22label%22%20style%3D%22%22%20transform%3D%22translate(0%2C%20-9.5)%22%3E%3Crect%3E%3C%2Frect%3E%3Cg%3E%3Crect%20class%3D%22background%22%20style%3D%22stroke%3A%20none%22%3E%3C%2Frect%3E%3Ctext%20y%3D%22-10.1%22%20style%3D%22%22%3E%3Ctspan%20class%3D%22text-outer-tspan%22%20x%3D%220%22%20y%3D%22-0.1em%22%20dy%3D%221.1em%22%3E%3Ctspan%20font-style%3D%22normal%22%20class%3D%22text-inner-tspan%22%20font-weight%3D%22normal%22%3EPolicy%3C%2Ftspan%3E%3Ctspan%20font-style%3D%22normal%22%20class%3D%22text-inner-tspan%22%20font-weight%3D%22normal%22%3E%20Evaluation%3C%2Ftspan%3E%3C%2Ftspan%3E%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fg%3E%3C%2Fg%3E%3Cg%20class%3D%22node%20default%22%20id%3D%22flowchart-Schedule-6%22%20transform%3D%22translate(144.36067708333334%2C%20650.5999984741211)%22%3E%3Crect%20class%3D%22basic%20label-container%22%20style%3D%22%22%20x%3D%22-108.91578674316406%22%20y%3D%22-30%22%20width%3D%22217.83157348632812%22%20height%3D%2260%22%3E%3C%2Frect%3E%3Cg%20class%3D%22label%22%20style%3D%22%22%20transform%3D%22translate(0%2C%20-9.5)%22%3E%3Crect%3E%3C%2Frect%3E%3Cg%3E%3Crect%20class%3D%22background%22%20style%3D%22stroke%3A%20none%22%3E%3C%2Frect%3E%3Ctext%20y%3D%22-10.1%22%20style%3D%22%22%3E%3Ctspan%20class%3D%22text-outer-tspan%22%20x%3D%220%22%20y%3D%22-0.1em%22%20dy%3D%221.1em%22%3E%3Ctspan%20font-style%3D%22normal%22%20class%3D%22text-inner-tspan%22%20font-weight%3D%22normal%22%3EResource%3C%2Ftspan%3E%3Ctspan%20font-style%3D%22normal%22%20class%3D%22text-inner-tspan%22%20font-weight%3D%22normal%22%3E%20Feasibility%3C%2Ftspan%3E%3C%2Ftspan%3E%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fg%3E%3C%2Fg%3E%3Cg%20class%3D%22node%20default%20%20mermaid-decision%22%20id%3D%22flowchart-Approval-7%22%20transform%3D%22translate(144.36067708333334%2C%20750.5999984741211)%22%3E%3Crect%20class%3D%22basic%20label-container%22%20style%3D%22%22%20x%3D%22-107.13671875%22%20y%3D%22-30%22%20width%3D%22214.2734375%22%20height%3D%2260%22%3E%3C%2Frect%3E%3Cg%20class%3D%22label%22%20style%3D%22%22%20transform%3D%22translate(0%2C%20-9.5)%22%3E%3Crect%3E%3C%2Frect%3E%3Cg%3E%3Crect%20class%3D%22background%22%20style%3D%22stroke%3A%20none%22%3E%3C%2Frect%3E%3Ctext%20y%3D%22-10.1%22%20style%3D%22%22%3E%3Ctspan%20class%3D%22text-outer-tspan%22%20x%3D%220%22%20y%3D%22-0.1em%22%20dy%3D%221.1em%22%3E%3Ctspan%20font-style%3D%22normal%22%20class%3D%22text-inner-tspan%22%20font-weight%3D%22normal%22%3EApproval%3C%2Ftspan%3E%3Ctspan%20font-style%3D%22normal%22%20class%3D%22text-inner-tspan%22%20font-weight%3D%22normal%22%3E%20Required%3F%3C%2Ftspan%3E%3C%2Ftspan%3E%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fg%3E%3C%2Fg%3E%3Cg%20class%3D%22node%20default%22%20id%3D%22flowchart-Human-8%22%20transform%3D%22translate(108.6484375%2C%20916.5999984741211)%22%3E%3Crect%20class%3D%22basic%20label-container%22%20style%3D%22%22%20x%3D%22-96.6484375%22%20y%3D%22-30%22%20width%3D%22193.296875%22%20height%3D%2260%22%3E%3C%2Frect%3E%3Cg%20class%3D%22label%22%20style%3D%22%22%20transform%3D%22translate(0%2C%20-9.5)%22%3E%3Crect%3E%3C%2Frect%3E%3Cg%3E%3Crect%20class%3D%22background%22%20style%3D%22stroke%3A%20none%22%3E%3C%2Frect%3E%3Ctext%20y%3D%22-10.1%22%20style%3D%22%22%3E%3Ctspan%20class%3D%22text-outer-tspan%22%20x%3D%220%22%20y%3D%22-0.1em%22%20dy%3D%221.1em%22%3E%3Ctspan%20font-style%3D%22normal%22%20class%3D%22text-inner-tspan%22%20font-weight%3D%22normal%22%3EHuman%3C%2Ftspan%3E%3Ctspan%20font-style%3D%22normal%22%20class%3D%22text-inner-tspan%22%20font-weight%3D%22normal%22%3E%20Approval%3C%2Ftspan%3E%3C%2Ftspan%3E%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fg%3E%3C%2Fg%3E%3Cg%20class%3D%22node%20default%22%20id%3D%22flowchart-Execute-9%22%20transform%3D%22translate(147.8046875%2C%201016.5999984741211)%22%3E%3Crect%20class%3D%22basic%20label-container%22%20style%3D%22%22%20x%3D%22-117.46875%22%20y%3D%22-30%22%20width%3D%22234.9375%22%20height%3D%2260%22%3E%3C%2Frect%3E%3Cg%20class%3D%22label%22%20style%3D%22%22%20transform%3D%22translate(0%2C%20-9.5)%22%3E%3Crect%3E%3C%2Frect%3E%3Cg%3E%3Crect%20class%3D%22background%22%20style%3D%22stroke%3A%20none%22%3E%3C%2Frect%3E%3Ctext%20y%3D%22-10.1%22%20style%3D%22%22%3E%3Ctspan%20class%3D%22text-outer-tspan%22%20x%3D%220%22%20y%3D%22-0.1em%22%20dy%3D%221.1em%22%3E%3Ctspan%20font-style%3D%22normal%22%20class%3D%22text-inner-tspan%22%20font-weight%3D%22normal%22%3EWorkEngine%3C%2Ftspan%3E%3Ctspan%20font-style%3D%22normal%22%20class%3D%22text-inner-tspan%22%20font-weight%3D%22normal%22%3E%20Execution%3C%2Ftspan%3E%3C%2Ftspan%3E%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fg%3E%3C%2Fg%3E%3Cg%20class%3D%22node%20default%22%20id%3D%22flowchart-Record-10%22%20transform%3D%22translate(147.8046875%2C%201116.599998474121)%22%3E%3Crect%20class%3D%22basic%20label-container%22%20style%3D%22%22%20x%3D%22-123.58203125%22%20y%3D%22-30%22%20width%3D%22247.1640625%22%20height%3D%2260%22%3E%3C%2Frect%3E%3Cg%20class%3D%22label%22%20style%3D%22%22%20transform%3D%22translate(0%2C%20-9.5)%22%3E%3Crect%3E%3C%2Frect%3E%3Cg%3E%3Crect%20class%3D%22background%22%20style%3D%22stroke%3A%20none%22%3E%3C%2Frect%3E%3Ctext%20y%3D%22-10.1%22%20style%3D%22%22%3E%3Ctspan%20class%3D%22text-outer-tspan%22%20x%3D%220%22%20y%3D%22-0.1em%22%20dy%3D%221.1em%22%3E%3Ctspan%20font-style%3D%22normal%22%20class%3D%22text-inner-tspan%22%20font-weight%3D%22normal%22%3EDecision%3C%2Ftspan%3E%3Ctspan%20font-style%3D%22normal%22%20class%3D%22text-inner-tspan%22%20font-weight%3D%22normal%22%3E%20%26amp%3B%3C%2Ftspan%3E%3Ctspan%20font-style%3D%22normal%22%20class%3D%22text-inner-tspan%22%20font-weight%3D%22normal%22%3E%20Audit%3C%2Ftspan%3E%3Ctspan%20font-style%3D%22normal%22%20class%3D%22text-inner-tspan%22%20font-weight%3D%22normal%22%3E%20Record%3C%2Ftspan%3E%3C%2Ftspan%3E%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fg%3E%3C%2Fg%3E%3C%2Fg%3E%3Cg%20class%3D%22edges%20edgePaths%22%3E%3Cpath%20d%3D%22M144.36067708333334%2C72L144.36067708333334%2C100%22%20id%3D%22L_Request_Context_0%22%20class%3D%22edge-thickness-normal%20edge-pattern-solid%20edge-thickness-normal%20edge-pattern-solid%20flowchart-link%22%20style%3D%22%3B%22%20data-edge%3D%22true%22%20data-et%3D%22edge%22%20data-id%3D%22L_Request_Context_0%22%20data-points%3D%22W3sieCI6MTQ0LjM2MDY3NzA4MzMzMzM0LCJ5Ijo3Mn0seyJ4IjoxNDQuMzYwNjc3MDgzMzMzMzQsInkiOjEwNH1d%22%20marker-end%3D%22url(%23mermaid-_r_p1__flowchart-v2-pointEnd)%22%3E%3C%2Fpath%3E%3Cpath%20d%3D%22M144.36067708333334%2C172L144.36067708333334%2C200%22%20id%3D%22L_Context_Router_0%22%20class%3D%22edge-thickness-normal%20edge-pattern-solid%20edge-thickness-normal%20edge-pattern-solid%20flowchart-link%22%20style%3D%22%3B%22%20data-edge%3D%22true%22%20data-et%3D%22edge%22%20data-id%3D%22L_Context_Router_0%22%20data-points%3D%22W3sieCI6MTQ0LjM2MDY3NzA4MzMzMzM0LCJ5IjoxNzJ9LHsieCI6MTQ0LjM2MDY3NzA4MzMzMzM0LCJ5IjoyMDR9XQ%3D%3D%22%20marker-end%3D%22url(%23mermaid-_r_p1__flowchart-v2-pointEnd)%22%3E%3C%2Fpath%3E%3Cpath%20d%3D%22M144.36067708333334%2C272L144.36067708333334%2C300%22%20id%3D%22L_Router_Provider_0%22%20class%3D%22edge-thickness-normal%20edge-pattern-solid%20edge-thickness-normal%20edge-pattern-solid%20flowchart-link%22%20style%3D%22%3B%22%20data-edge%3D%22true%22%20data-et%3D%22edge%22%20data-id%3D%22L_Router_Provider_0%22%20data-points%3D%22W3sieCI6MTQ0LjM2MDY3NzA4MzMzMzM0LCJ5IjoyNzJ9LHsieCI6MTQ0LjM2MDY3NzA4MzMzMzM0LCJ5IjozMDR9XQ%3D%3D%22%20marker-end%3D%22url(%23mermaid-_r_p1__flowchart-v2-pointEnd)%22%3E%3C%2Fpath%3E%3Cpath%20d%3D%22M144.36067708333334%2C372L144.36067708333334%2C400%22%20id%3D%22L_Provider_Validate_0%22%20class%3D%22edge-thickness-normal%20edge-pattern-solid%20edge-thickness-normal%20edge-pattern-solid%20flowchart-link%22%20style%3D%22%3B%22%20data-edge%3D%22true%22%20data-et%3D%22edge%22%20data-id%3D%22L_Provider_Validate_0%22%20data-points%3D%22W3sieCI6MTQ0LjM2MDY3NzA4MzMzMzM0LCJ5IjozNzJ9LHsieCI6MTQ0LjM2MDY3NzA4MzMzMzM0LCJ5Ijo0MDR9XQ%3D%3D%22%20marker-end%3D%22url(%23mermaid-_r_p1__flowchart-v2-pointEnd)%22%3E%3C%2Fpath%3E%3Cpath%20d%3D%22M144.36067708333334%2C480.5999984741211L144.36067708333334%2C508.5999984741211%22%20id%3D%22L_Validate_Policy_0%22%20class%3D%22edge-thickness-normal%20edge-pattern-solid%20edge-thickness-normal%20edge-pattern-solid%20flowchart-link%22%20style%3D%22%3B%22%20data-edge%3D%22true%22%20data-et%3D%22edge%22%20data-id%3D%22L_Validate_Policy_0%22%20data-points%3D%22W3sieCI6MTQ0LjM2MDY3NzA4MzMzMzM0LCJ5Ijo0ODAuNTk5OTk4NDc0MTIxMX0seyJ4IjoxNDQuMzYwNjc3MDgzMzMzMzQsInkiOjUxMi41OTk5OTg0NzQxMjExfV0%3D%22%20marker-end%3D%22url(%23mermaid-_r_p1__flowchart-v2-pointEnd)%22%3E%3C%2Fpath%3E%3Cpath%20d%3D%22M144.36067708333334%2C580.5999984741211L144.36067708333334%2C608.5999984741211%22%20id%3D%22L_Policy_Schedule_0%22%20class%3D%22edge-thickness-normal%20edge-pattern-solid%20edge-thickness-normal%20edge-pattern-solid%20flowchart-link%22%20style%3D%22%3B%22%20data-edge%3D%22true%22%20data-et%3D%22edge%22%20data-id%3D%22L_Policy_Schedule_0%22%20data-points%3D%22W3sieCI6MTQ0LjM2MDY3NzA4MzMzMzM0LCJ5Ijo1ODAuNTk5OTk4NDc0MTIxMX0seyJ4IjoxNDQuMzYwNjc3MDgzMzMzMzQsInkiOjYxMi41OTk5OTg0NzQxMjExfV0%3D%22%20marker-end%3D%22url(%23mermaid-_r_p1__flowchart-v2-pointEnd)%22%3E%3C%2Fpath%3E%3Cpath%20d%3D%22M144.36067708333334%2C680.5999984741211L144.36067708333334%2C708.5999984741211%22%20id%3D%22L_Schedule_Approval_0%22%20class%3D%22edge-thickness-normal%20edge-pattern-solid%20edge-thickness-normal%20edge-pattern-solid%20flowchart-link%22%20style%3D%22%3B%22%20data-edge%3D%22true%22%20data-et%3D%22edge%22%20data-id%3D%22L_Schedule_Approval_0%22%20data-points%3D%22W3sieCI6MTQ0LjM2MDY3NzA4MzMzMzM0LCJ5Ijo2ODAuNTk5OTk4NDc0MTIxMX0seyJ4IjoxNDQuMzYwNjc3MDgzMzMzMzQsInkiOjcxMi41OTk5OTg0NzQxMjExfV0%3D%22%20marker-end%3D%22url(%23mermaid-_r_p1__flowchart-v2-pointEnd)%22%3E%3C%2Fpath%3E%3Cpath%20d%3D%22M108.6484375%2C780.5999984741211L108.6484375%2C874.5999984741211%22%20id%3D%22L_Approval_Human_0%22%20class%3D%22edge-thickness-normal%20edge-pattern-solid%20edge-thickness-normal%20edge-pattern-solid%20flowchart-link%22%20style%3D%22%3B%22%20data-edge%3D%22true%22%20data-et%3D%22edge%22%20data-id%3D%22L_Approval_Human_0%22%20data-points%3D%22W3sieCI6MTA4LjY0ODQzNzUsInkiOjc4MC41OTk5OTg0NzQxMjExfSx7IngiOjEwOC42NDg0Mzc1LCJ5Ijo4NzguNTk5OTk4NDc0MTIxMX1d%22%20marker-end%3D%22url(%23mermaid-_r_p1__flowchart-v2-pointEnd)%22%3E%3C%2Fpath%3E%3Cpath%20d%3D%22M180.07291666666666%2C780.5999984741211L180.07291666666666%2C793.8170424488264Q180.07291666666666%2C795.5999984741211%20181.15870310429358%2C797.0142120364942L181.15870310429358%2C797.0142120364942Q182.24448954192047%2C798.4284255988673%20183.65870310429358%2C799.5142120364942L183.65870310429358%2C799.5142120364942Q185.07291666666666%2C800.5999984741211%20186.8558726919613%2C800.5999984741211L218.51391897470535%2C800.5999984741211Q220.296875%2C800.5999984741211%20221.7110885623731%2C801.685784911748L221.7110885623731%2C801.685784911748Q223.12530212474618%2C802.7715713493749%20224.21108856237308%2C804.185784911748L224.2110885623731%2C804.185784911748Q225.296875%2C805.5999984741211%20225.296875%2C807.3829544994157L225.296875%2C916.5999984741211L225.296875%2C959.8170424488264Q225.296875%2C961.5999984741211%20224.2110885623731%2C963.0142120364942L224.21108856237308%2C963.0142120364942Q223.12530212474618%2C964.4284255988673%20221.7110885623731%2C965.5142120364942L221.7110885623731%2C965.5142120364942Q220.296875%2C966.5999984741211%20218.51391897470535%2C966.5999984741211L193.74389352529465%2C966.5999984741211Q191.9609375%2C966.5999984741211%20190.5467239376269%2C967.685784911748L190.5467239376269%2C967.685784911748Q189.13251037525382%2C968.7715713493749%20188.04672393762692%2C970.185784911748L188.0467239376269%2C970.185784911748Q186.9609375%2C971.5999984741211%20186.9609375%2C973.3829544994157L186.9609375%2C976.5999984741211%22%20id%3D%22L_Approval_Execute_0%22%20class%3D%22edge-thickness-normal%20edge-pattern-solid%20edge-thickness-normal%20edge-pattern-solid%20flowchart-link%22%20style%3D%22%3B%22%20data-edge%3D%22true%22%20data-et%3D%22edge%22%20data-id%3D%22L_Approval_Execute_0%22%20data-points%3D%22W3sieCI6MTgwLjA3MjkxNjY2NjY2NjY2LCJ5Ijo3ODAuNTk5OTk4NDc0MTIxMX0seyJ4IjoxODAuMDcyOTE2NjY2NjY2NjYsInkiOjgwMC41OTk5OTg0NzQxMjExfSx7IngiOjIyNS4yOTY4NzUsInkiOjgwMC41OTk5OTg0NzQxMjExfSx7IngiOjIyNS4yOTY4NzUsInkiOjkxNi41OTk5OTg0NzQxMjExfSx7IngiOjIyNS4yOTY4NzUsInkiOjk2Ni41OTk5OTg0NzQxMjExfSx7IngiOjE4Ni45NjA5Mzc1LCJ5Ijo5NjYuNTk5OTk4NDc0MTIxMX0seyJ4IjoxODYuOTYwOTM3NSwieSI6OTgwLjU5OTk5ODQ3NDEyMTF9XQ%3D%3D%22%20marker-end%3D%22url(%23mermaid-_r_p1__flowchart-v2-pointEnd)%22%3E%3C%2Fpath%3E%3Cpath%20d%3D%22M108.6484375%2C946.5999984741211L108.6484375%2C974.5999984741211%22%20id%3D%22L_Human_Execute_0%22%20class%3D%22edge-thickness-normal%20edge-pattern-solid%20edge-thickness-normal%20edge-pattern-solid%20flowchart-link%22%20style%3D%22%3B%22%20data-edge%3D%22true%22%20data-et%3D%22edge%22%20data-id%3D%22L_Human_Execute_0%22%20data-points%3D%22W3sieCI6MTA4LjY0ODQzNzUsInkiOjk0Ni41OTk5OTg0NzQxMjExfSx7IngiOjEwOC42NDg0Mzc1LCJ5Ijo5NzguNTk5OTk4NDc0MTIxMX1d%22%20marker-end%3D%22url(%23mermaid-_r_p1__flowchart-v2-pointEnd)%22%3E%3C%2Fpath%3E%3Cpath%20d%3D%22M147.8046875%2C1046.599998474121L147.8046875%2C1074.599998474121%22%20id%3D%22L_Execute_Record_0%22%20class%3D%22edge-thickness-normal%20edge-pattern-solid%20edge-thickness-normal%20edge-pattern-solid%20flowchart-link%22%20style%3D%22%3B%22%20data-edge%3D%22true%22%20data-et%3D%22edge%22%20data-id%3D%22L_Execute_Record_0%22%20data-points%3D%22W3sieCI6MTQ3LjgwNDY4NzUsInkiOjEwNDYuNTk5OTk4NDc0MTIxfSx7IngiOjE0Ny44MDQ2ODc1LCJ5IjoxMDc4LjU5OTk5ODQ3NDEyMX1d%22%20marker-end%3D%22url(%23mermaid-_r_p1__flowchart-v2-pointEnd)%22%3E%3C%2Fpath%3E%3C%2Fg%3E%3Cg%20class%3D%22edgeLabels%22%3E%3Cg%3E%3Crect%20class%3D%22background%22%20style%3D%22stroke%3A%20none%22%3E%3C%2Frect%3E%3C%2Fg%3E%3Cg%3E%3Crect%20class%3D%22background%22%20style%3D%22stroke%3A%20none%22%3E%3C%2Frect%3E%3C%2Fg%3E%3Cg%3E%3Crect%20class%3D%22background%22%20style%3D%22stroke%3A%20none%22%3E%3C%2Frect%3E%3C%2Fg%3E%3Cg%3E%3Crect%20class%3D%22background%22%20style%3D%22stroke%3A%20none%22%3E%3C%2Frect%3E%3C%2Fg%3E%3Cg%3E%3Crect%20class%3D%22background%22%20style%3D%22stroke%3A%20none%22%3E%3C%2Frect%3E%3C%2Fg%3E%3Cg%3E%3Crect%20class%3D%22background%22%20style%3D%22stroke%3A%20none%22%3E%3C%2Frect%3E%3C%2Fg%3E%3Cg%3E%3Crect%20class%3D%22background%22%20style%3D%22stroke%3A%20none%22%3E%3C%2Frect%3E%3C%2Fg%3E%3Cg%3E%3Crect%20class%3D%22background%22%20style%3D%22stroke%3A%20none%22%3E%3C%2Frect%3E%3C%2Fg%3E%3Cg%3E%3Crect%20class%3D%22background%22%20style%3D%22stroke%3A%20none%22%3E%3C%2Frect%3E%3C%2Fg%3E%3Cg%20class%3D%22edgeLabel%22%3E%3Cg%20class%3D%22label%22%20data-id%3D%22L_Request_Context_0%22%20transform%3D%22translate(0%2C%200)%22%3E%3Ctext%20y%3D%22-10.1%22%3E%3Ctspan%20class%3D%22text-outer-tspan%22%20x%3D%220%22%20y%3D%22-0.1em%22%20dy%3D%221.1em%22%3E%3C%2Ftspan%3E%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fg%3E%3Cg%20class%3D%22edgeLabel%22%3E%3Cg%20class%3D%22label%22%20data-id%3D%22L_Context_Router_0%22%20transform%3D%22translate(0%2C%200)%22%3E%3Ctext%20y%3D%22-10.1%22%3E%3Ctspan%20class%3D%22text-outer-tspan%22%20x%3D%220%22%20y%3D%22-0.1em%22%20dy%3D%221.1em%22%3E%3C%2Ftspan%3E%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fg%3E%3Cg%20class%3D%22edgeLabel%22%3E%3Cg%20class%3D%22label%22%20data-id%3D%22L_Router_Provider_0%22%20transform%3D%22translate(0%2C%200)%22%3E%3Ctext%20y%3D%22-10.1%22%3E%3Ctspan%20class%3D%22text-outer-tspan%22%20x%3D%220%22%20y%3D%22-0.1em%22%20dy%3D%221.1em%22%3E%3C%2Ftspan%3E%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fg%3E%3Cg%20class%3D%22edgeLabel%22%3E%3Cg%20class%3D%22label%22%20data-id%3D%22L_Provider_Validate_0%22%20transform%3D%22translate(0%2C%200)%22%3E%3Ctext%20y%3D%22-10.1%22%3E%3Ctspan%20class%3D%22text-outer-tspan%22%20x%3D%220%22%20y%3D%22-0.1em%22%20dy%3D%221.1em%22%3E%3C%2Ftspan%3E%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fg%3E%3Cg%20class%3D%22edgeLabel%22%3E%3Cg%20class%3D%22label%22%20data-id%3D%22L_Validate_Policy_0%22%20transform%3D%22translate(0%2C%200)%22%3E%3Ctext%20y%3D%22-10.1%22%3E%3Ctspan%20class%3D%22text-outer-tspan%22%20x%3D%220%22%20y%3D%22-0.1em%22%20dy%3D%221.1em%22%3E%3C%2Ftspan%3E%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fg%3E%3Cg%20class%3D%22edgeLabel%22%3E%3Cg%20class%3D%22label%22%20data-id%3D%22L_Policy_Schedule_0%22%20transform%3D%22translate(0%2C%200)%22%3E%3Ctext%20y%3D%22-10.1%22%3E%3Ctspan%20class%3D%22text-outer-tspan%22%20x%3D%220%22%20y%3D%22-0.1em%22%20dy%3D%221.1em%22%3E%3C%2Ftspan%3E%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fg%3E%3Cg%20class%3D%22edgeLabel%22%3E%3Cg%20class%3D%22label%22%20data-id%3D%22L_Schedule_Approval_0%22%20transform%3D%22translate(0%2C%200)%22%3E%3Ctext%20y%3D%22-10.1%22%3E%3Ctspan%20class%3D%22text-outer-tspan%22%20x%3D%220%22%20y%3D%22-0.1em%22%20dy%3D%221.1em%22%3E%3C%2Ftspan%3E%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fg%3E%3Cg%20class%3D%22edgeLabel%22%20transform%3D%22translate(108.2421875%2C%20833.5999984741211)%22%3E%3Cg%20class%3D%22label%22%20data-id%3D%22L_Approval_Human_0%22%20transform%3D%22translate(-11.09375%2C-8)%22%3E%3Cg%3E%3Crect%20class%3D%22background%22%20style%3D%22%22%20x%3D%22-12%22%20y%3D%22-5%22%20width%3D%2246.1875%22%20height%3D%2226%22%3E%3C%2Frect%3E%3Ctext%20y%3D%22-10.1%22%20style%3D%22%22%3E%3Ctspan%20class%3D%22text-outer-tspan%22%20x%3D%220%22%20y%3D%22-0.1em%22%20dy%3D%221.1em%22%3E%3Ctspan%20font-style%3D%22normal%22%20class%3D%22text-inner-tspan%22%20font-weight%3D%22normal%22%3EYes%3C%2Ftspan%3E%3C%2Ftspan%3E%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fg%3E%3C%2Fg%3E%3Cg%20class%3D%22edgeLabel%22%20transform%3D%22translate(225.04296875%2C%20833.5999984741211)%22%3E%3Cg%20class%3D%22label%22%20data-id%3D%22L_Approval_Execute_0%22%20transform%3D%22translate(-8.74609375%2C-8)%22%3E%3Cg%3E%3Crect%20class%3D%22background%22%20style%3D%22%22%20x%3D%22-12%22%20y%3D%22-5%22%20width%3D%2241.4921875%22%20height%3D%2226%22%3E%3C%2Frect%3E%3Ctext%20y%3D%22-10.1%22%20style%3D%22%22%3E%3Ctspan%20class%3D%22text-outer-tspan%22%20x%3D%220%22%20y%3D%22-0.1em%22%20dy%3D%221.1em%22%3E%3Ctspan%20font-style%3D%22normal%22%20class%3D%22text-inner-tspan%22%20font-weight%3D%22normal%22%3ENo%3C%2Ftspan%3E%3C%2Ftspan%3E%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fg%3E%3C%2Fg%3E%3Cg%20class%3D%22edgeLabel%22%3E%3Cg%20class%3D%22label%22%20data-id%3D%22L_Human_Execute_0%22%20transform%3D%22translate(0%2C%200)%22%3E%3Ctext%20y%3D%22-10.1%22%3E%3Ctspan%20class%3D%22text-outer-tspan%22%20x%3D%220%22%20y%3D%22-0.1em%22%20dy%3D%221.1em%22%3E%3C%2Ftspan%3E%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fg%3E%3Cg%20class%3D%22edgeLabel%22%3E%3Cg%20class%3D%22label%22%20data-id%3D%22L_Execute_Record_0%22%20transform%3D%22translate(0%2C%200)%22%3E%3Ctext%20y%3D%22-10.1%22%3E%3Ctspan%20class%3D%22text-outer-tspan%22%20x%3D%220%22%20y%3D%22-0.1em%22%20dy%3D%221.1em%22%3E%3C%2Ftspan%3E%3C%2Ftext%3E%3C%2Fg%3E%3C%2Fg%3E%3C%2Fg%3E%3C%2Fsvg%3E)
+
+如果策略拒绝或资源不可行，流程不能继续执行。Router 应记录拒绝原因，并根据任务风险决定是否允许尝试其他候选方案。
+
+## 7.3 决策接口
+
+以下为概念性 Python 契约：
+
+Python
+
+运行
+
+```
+from typing import Protocol, Sequence
+from pydantic import BaseModel
+
+
+class DecisionRequest(BaseModel):
+    request_id: str
+    tenant_id: str
+    operation: str
+    context: dict
+
+
+class DecisionCandidate(BaseModel):
+    candidate_id: str
+    action: str
+    parameters: dict
+    rationale: list[str]
+    confidence: float | None = None
+
+
+class DecisionProvider(Protocol):
+    async def decide(
+        self,
+        request: DecisionRequest,
+    ) -> Sequence[DecisionCandidate]:
+        ...
+```
+
+正式实现中，`context` 和 `parameters` 应逐步替换为有 Schema 的强类型模型或类型化联合体。对关键操作不应允许任意自由结构直接进入执行层。
+
+## 7.4 决策结果的审计要求
+
+每次决策至少应记录：
+
+- 请求 ID、租户 ID、操作类型。
+- 输入上下文的版本或摘要。
+- Provider 标识与版本。
+- 候选方案及理由。
+- 结果 Schema 校验状态。
+- Policy 检查结果。
+- Scheduler 可行性检查结果。
+- 人工审批状态。
+- 最终选择、拒绝原因与执行结果。
+- 耗时、超时、错误和降级情况。
+
+LLM 的置信度不能用作授权凭证。对于模型输入、提示模板和检索结果，应保存足以复现决策过程的版本与摘要，同时遵守敏感数据最小化原则。
+
+## 7.5 Provider 降级
+
+建议采用明确的降级策略：
+
+1. 首选 Provider 在时限内返回有效候选。
+2. 超时或返回非法结果时，按策略尝试备用 Provider。
+3. 高风险操作不允许通过降级绕过授权或审批。
+4. 如果没有可接受的候选方案，返回明确的失败或人工处理状态。
+5. 记录每次 Provider 尝试及其结果。
+
+不能把“JEV 不可用”自动解释为“允许执行默认操作”。
+
+# 8. 插件系统与扩展协议
+
+## 8.1 插件分类
+
+| 类型          | 示例                            | 权限与治理                   |
+| ------------- | ------------------------------- | ---------------------------- |
+| Provider      | WorkEngine、JEV、Scheduler 后端 | 核心依赖，升级需要兼容性检查 |
+| Hardware      | NVIDIA、AMD、MIG                | 访问受限设备操作接口         |
+| Runtime       | vLLM、Kubernetes、容器运行时    | 管理指定运行时资源           |
+| Capability    | 模型下载、量化、缓存            | 仅开放所需能力               |
+| Policy        | QoS、准入策略                   | 受控的策略评估接口           |
+| Observability | 指标、日志、追踪导出            | 默认只读                     |
+
+## 8.2 插件 Manifest
+
+YAML
+
+```
+apiVersion: forgemesh.io/v1alpha1
+kind: PluginManifest
+
+metadata:
+  id: forgemesh.runtime.vllm
+  version: 1.0.0
+
+spec:
+  category: runtime
+
+  compatibility:
+    coreApi: "v1alpha1"
+
+  provides:
+    - inference.runtime
+    - inference.healthcheck
+
+  requires:
+    - resource.registry
+
+  permissions:
+    - resource.read
+    - inference.deploy
+    - inference.inspect
+
+  configuration:
+    schema: ./config.schema.json
+
+  healthCheck:
+    mode: rpc
+```
+
+正式规范还应包括：
+
+- 插件入口点和协议版本。
+- 制品摘要与签名。
+- 依赖及兼容性范围。
+- 运行身份和权限集合。
+- 资源限制。
+- 配置 Schema 和密钥引用。
+- 健康检查与优雅停机能力。
+
+## 8.3 插件生命周期
+
+建议使用以下生命周期：
+
+```
+Discovered → Validating → Installed → Enabled → Disabled → Uninstalled
+```
+
+运行状态另外维护：
+
+```
+Healthy / Degraded / Unhealthy
+```
+
+不能把健康状态与安装状态混成同一个字段。
+
+关键规则：
+
+- 安装前验证 Manifest、来源、签名和兼容性。
+- 启用前验证依赖与权限。
+- 停用前检查未完成任务。
+- 运行实例记录实际使用的插件版本。
+- 升级期间允许新旧版本按明确规则并存。
+- 不因卸载插件而自动删除它创建的所有业务资源。
+
+## 8.4 插件隔离
+
+按照 ADR-006，插件采用分级隔离：
+
+- 可信、低风险的核心扩展可以进程内运行。
+- 具有外部依赖、较高故障风险的插件优先独立进程运行。
+- 第三方或不可信插件必须通过受限 RPC 与核心交互。
+- 高权限操作通过专用的授权执行接口完成。
+
+不能因为插件符合 SDK 接口，就认为它是安全的。进程内插件通常继承宿主进程的权限，无法提供可靠的安全隔离。
+
+## 8.5 插件接口原则
+
+插件只应获得完成自身工作所需的最小能力：
+
+- 读取必要的资源快照。
+- 提交类型化的操作请求。
+- 返回结构化结果。
+- 发布经过校验的能力与状态信息。
+- 使用受控的事件和审计接口。
+
+插件不得任意写入其他插件的内部数据库表，也不能绕过核心接口直接修改权威资源状态。
+
+# 9. GPU 与异构算力资源模型
+
+## 9.1 核心资源实体
+
+建议区分：
+
+- `Node`：物理或虚拟执行节点。
+- `Accelerator`：物理 GPU 或其他加速器。
+- `DeviceInstance`：可分配的设备实例。
+- `DeviceProfile`：设备能力模板。
+- `Topology`：设备之间的互联拓扑。
+- `Allocation`：资源分配记录。
+- `ResourceLease`：资源使用租约。
+- `HealthReport`：设备健康和可用性。
+- `RuntimeInstance`：运行时实例。
+- `InferenceService`：推理服务资源。
+
+## 9.2 能力驱动模型
+
+YAML
+
+```
+apiVersion: forgemesh.io/v1alpha1
+kind: DeviceProfile
+
+metadata:
+  name: nvidia-high-memory
+
+spec:
+  vendor: nvidia
+
+  capabilities:
+    minMemoryGiB: 80
+    partitioning:
+      supported: true
+      provider: nvidia.mig
+    topology:
+      discovery: supported
+
+  runtimes:
+    - vllm
+
+  constraints:
+    allocationMode: exclusive
+```
+
+该对象用于表达资源需求和能力，不代表实际设备一定具备相应能力。实际支持情况必须由 Provider 探测并验证。
+
+## 9.3 资源分配
+
+调度器至少需要考虑：
+
+- 设备健康状态。
+- 显存容量与实际可用量。
+- 设备占用和租户配额。
+- 多 GPU 互联拓扑。
+- 模型与推理运行时兼容性。
+- 设备分区能力。
+- 共享或独占策略。
+- 资源租约和回收机制。
+
+## 9.4 MIG 与异构设备
+
+MIG 的创建、删除、实例发现和健康检查应由 NVIDIA MIG Provider 实现。通用 Scheduler 只依赖统一的资源能力和分配契约。
+
+对于其他厂商设备，如果分区、显存管理或隔离能力与 NVIDIA 不同，应明确报告能力差异。统一 API 不等于强行统一所有硬件行为。
+
+# 10. Node Agent 与执行平面
+
+## 10.1 职责
+
+Node Agent 是节点侧受控执行组件，负责：
+
+- 设备和驱动探测。
+- 本地运行时管理。
+- 健康检查。
+- 执行授权任务。
+- 汇报资源快照和任务状态。
+- 处理断线重连与任务恢复。
+- 限制本地任务的权限、时间和资源使用。
+
+## 10.2 通信协议
+
+推荐使用双向认证的 gRPC/Protobuf，或具备等效身份认证、版本协商和消息完整性保障的协议。
+
+协议必须支持：
+
+- Agent 注册与身份认证。
+- 能力和版本协商。
+- 任务下发、取消和查询。
+- 执行结果与健康状态上报。
+- 心跳和离线检测。
+- 重复任务去重。
+- 断线重连。
+- Agent 与控制平面的兼容性检查。
+
+## 10.3 任务语义
+
+Agent 只接受有类型的任务，例如：
+
+- `ProbeGpu`
+- `ValidateDriver`
+- `PrepareRuntime`
+- `DeployInferenceService`
+- `InspectService`
+- `ReleaseAllocation`
+
+任务需要有：
+
+- `task_id`
+- `execution_id`
+- `idempotency_key`
+- `deadline`
+- `requested_permissions`
+- `input_schema_version`
+- `correlation_id`
+
+Agent 断线重连后必须查询未完成任务的真实状态，再决定是否重试。不能仅因为控制平面没有收到结果，就认定原操作失败。
+
+# 11. 多租户、调度、QoS 与计量
+
+## 11.1 多租户边界
+
+多租户不仅是给每个对象添加 `tenant_id`。必须覆盖：
+
+- 身份认证和授权。
+- 资源可见性。
+- GPU 分配和资源回收。
+- 工作流执行权限。
+- 插件调用权限。
+- 模型和密钥访问。
+- Token 限流与 QoS。
+- 计量数据归属。
+- 审计数据访问。
+
+租户上下文必须在 API、数据库查询、事件消费和插件调用等边界进行验证。
+
+## 11.2 配额、调度、QoS 与计量分离
+
+| 组件          | 负责的问题                         |
+| ------------- | ---------------------------------- |
+| Policy Engine | 操作是否被允许？                   |
+| Quota         | 租户最多能申请多少资源？           |
+| Scheduler     | 具体分配哪些资源？                 |
+| QoS           | 资源紧张时如何处理优先级和公平性？ |
+| Rate Limiter  | 请求或 Token 速率是否超限？        |
+| Metering      | 实际消耗了多少资源？               |
+
+这些模块共享资源和租户数据，但不能被合并成一个没有明确责任的通用策略插件。
+
+## 11.3 Token 计量
+
+建议分别记录：
+
+- 输入 Token。
+- 输出 Token。
+- 缓存命中与相关用量。
+- 成功、失败和取消请求的用量。
+- 请求次数和并发量。
+- 关联的服务、模型和租户。
+
+计量口径必须在接口和文档中明确。不同推理运行时的统计来源可能不同，应保留来源、采样时间和计量版本。
+
+计量数据应采用追加式记录。纠错时新增修正事件，而不是无痕覆盖历史记录。
+
+## 11.4 QoS 演进
+
+建议按以下顺序推进：
+
+1. 基础资源配额与硬限制。
+2. 请求速率、并发和 Token 限流。
+3. 服务优先级与排队策略。
+4. 公平调度和资源保留。
+5. 基于 SLA 的弹性调整。
+6. 跨资源池优化。
+
+GPU 抢占、服务迁移和动态 MIG 重配置应作为独立能力设计，不应在基础调度尚未稳定时默认启用。
+
+# 12. 数据模型与一致性
+
+## 12.1 存储职责
+
+| 存储                  | 职责                                             |
+| --------------------- | ------------------------------------------------ |
+| PostgreSQL            | 权威资源状态、工作流状态、租户、配置和审计元数据 |
+| Transactional Outbox  | 可靠记录需要发布的业务事件                       |
+| Event Bus             | 可选的异步事件分发                               |
+| Object Storage        | 模型、制品、诊断包和大型执行产物                 |
+| Metrics Store         | 指标与告警                                       |
+| Logs / Traces Backend | 日志和调用链                                     |
+| Secret Manager        | 密钥与敏感配置                                   |
+
+Redis 可以用于缓存、短期协调或限流，但不应成为唯一的权威业务状态存储。
+
+## 12.2 核心实体
+
+| 实体                 | 关键字段                                            |
+| -------------------- | --------------------------------------------------- |
+| `Tenant`             | `id`、`status`、`quota_policy_id`                   |
+| `Principal`          | `id`、`tenant_id`、`identity_type`                  |
+| `Node`               | `id`、`agent_version`、`health`、`last_seen_at`     |
+| `Accelerator`        | `id`、`node_id`、`vendor`、`model`、`memory_bytes`  |
+| `DeviceInstance`     | `id`、`parent_id`、`profile`、`health`              |
+| `Allocation`         | `id`、`tenant_id`、`resource_id`、`lease_until`     |
+| `InferenceService`   | `id`、`tenant_id`、`spec`、`status`、`generation`   |
+| `WorkflowDefinition` | `id`、`version`、`definition_digest`                |
+| `WorkflowRun`        | `id`、`definition_version`、`status`                |
+| `WorkflowStepRun`    | `id`、`run_id`、`step_id`、`attempt`、`status`      |
+| `PluginInstallation` | `id`、`plugin_id`、`version`、`health`              |
+| `DecisionRecord`     | `id`、`provider`、`input_digest`、`policy_result`   |
+| `UsageRecord`        | `id`、`tenant_id`、`usage_type`、`quantity`         |
+| `AuditEvent`         | `id`、`actor`、`action`、`target`、`correlation_id` |
+
+## 12.3 事务与事件可靠性
+
+根据 ADR-008，关键业务事件采用事务性 Outbox。
+
+典型流程：
+
+1. 在同一个数据库事务中更新资源状态。
+2. 在同一事务中写入待发布事件。
+3. Outbox Dispatcher 异步发布事件。
+4. 发布成功后记录处理状态。
+5. 消费者根据事件 ID 幂等处理。
+
+事件总线可能重复投递，消费者必须支持去重。不能假设消息只会到达一次，也不能把消息投递成功直接视为业务执行成功。
+
+## 12.4 资源分配一致性
+
+GPU 分配需要防止并发冲突。
+
+推荐组合使用：
+
+- 数据库事务。
+- 唯一约束。
+- 资源版本检查。
+- 分配租约。
+- 幂等键。
+- 必要时的协调锁。
+
+分配前需要检查资源仍然可用；分配后需要通过实际设备状态确认分配是否生效。
+
+# 13. API 与事件规范
+
+## 13.1 API 分类
+
+- 管理 API： 租户、插件、资源、策略和工作流定义。
+- 运行 API： 创建任务、查询状态、取消、审批和诊断。
+- 扩展 API： Provider 调用、插件注册、能力发现和 Agent 通信。
+
+对外 API 使用版本前缀，例如 `/api/v1/`。资源 Schema、插件协议、工作流定义和事件格式分别维护自己的版本。
+
+## 13.2 事件结构
+
+YAML
+
+```
+eventId: evt-123
+eventType: inference.service.ready
+schemaVersion: v1
+occurredAt: "2026-10-09T12:00:00Z"
+
+tenantId: team-a
+resourceId: llama-service
+correlationId: corr-456
+
+producer:
+  component: inference-controller
+  version: 1.0.0
+
+data:
+  phase: Ready
+```
+
+这是示例结构。正式规范必须明确字段必需性、兼容规则、顺序保证、重复投递和敏感字段处理。
+
+## 13.3 兼容性策略
+
+- 工作流定义版本不可变。
+- 工作流实例固定其定义版本。
+- 插件实例记录实际插件版本。
+- API 字段删除需要经过弃用周期。
+- Provider 通过能力声明进行版本协商。
+- 核心升级前执行插件兼容性检查。
+- 不能支持兼容运行的插件，应阻止升级或进入明确的降级状态。
+
+# 14. 安全架构
+
+## 14.1 基础原则
+
+1. 最小权限和默认拒绝。
+2. 关键操作独立授权。
+3. 租户间严格隔离。
+4. 敏感信息不进入普通日志。
+5. 高权限操作使用专用执行器。
+6. 第三方插件采用隔离执行。
+7. 远程节点通信经过认证。
+8. 关键操作有审计记录。
+9. 模型和插件制品具有来源与完整性校验机制。
+
+## 14.2 高风险操作
+
+应特别管理：
+
+- 驱动安装与升级。
+- 节点重启。
+- MIG 配置变更。
+- GPU 强制释放。
+- 插件安装与升级。
+- 模型制品来源变更。
+- 租户配额修改。
+- 高权限系统操作。
+
+是否需要人工审批应由可审计的策略决定。预先授权的自动化操作可以自动执行，但不能因此失去权限边界和审计。
+
+## 14.3 供应链安全
+
+插件、模型和容器镜像应逐步支持：
+
+- 来源记录。
+- 制品摘要校验。
+- 签名验证。
+- 受控仓库和下载来源策略。
+- 依赖及镜像扫描。
+- 版本固定。
+- 可审计的升级与回滚。
+
+# 15. 可观测性与运维
+
+## 15.1 三类观测数据
+
+- Metrics：系统状态与趋势。
+- Logs：具体执行过程。
+- Traces：跨模块调用链。
+
+三者应共享资源 ID、工作流 ID、租户 ID 和 `correlation_id` 等关联字段，同时避免将密钥、令牌和完整敏感请求写入观测数据。
+
+## 15.2 关键指标
+
+| 类别     | 指标                                 |
+| -------- | ------------------------------------ |
+| 控制平面 | API 延迟、错误率、控制器队列积压     |
+| 工作流   | 成功率、执行耗时、重试率、恢复耗时   |
+| GPU      | 健康度、显存、利用率、分配时长       |
+| 推理服务 | 请求延迟、吞吐、错误率、模型加载耗时 |
+| 多租户   | 配额使用率、拒绝次数、限流次数       |
+| 插件     | 调用延迟、失败率、健康状态           |
+| 决策     | Provider 延迟、失败率、降级次数      |
+| Agent    | 在线率、心跳延迟、任务失败率         |
+
+## 15.3 统一诊断包
+
+诊断包应包括：
+
+- 资源状态快照。
+- 工作流定义版本和执行历史。
+- 插件版本与健康状态。
+- 决策记录和策略拒绝原因。
+- 相关日志、指标和追踪信息。
+- Agent 与运行时版本。
+- 故障分类和建议恢复步骤。
+
+诊断包生成时必须过滤敏感信息，并根据租户权限限制下载和查看。
+
+# 16. 技术栈与工程实现
+
+## 16.1 推荐技术栈
+
+| 领域         | 推荐方案                           |
+| ------------ | ---------------------------------- |
+| 核心语言     | Python                             |
+| API          | FastAPI、OpenAPI                   |
+| 数据验证     | Pydantic 或等效强类型 Schema       |
+| 权威数据库   | PostgreSQL                         |
+| 事务事件     | Transactional Outbox               |
+| Agent 协议   | gRPC / Protobuf 或等价版本化 RPC   |
+| 工作流       | 自有运行契约、可替换 Provider      |
+| GPU          | NVIDIA Provider 起步，后续扩展厂商 |
+| 推理 Runtime | vLLM Provider 起步                 |
+| 观测         | OpenTelemetry、Prometheus 兼容体系 |
+| 制品         | OCI 镜像、对象存储、制品摘要       |
+| 密钥         | Secret Manager                     |
+| 开发工具     | CLI、Python SDK、OpenAPI           |
+| 部署         | 容器化，支持单机与 Kubernetes 部署 |
+
+这些是默认建议，不是要求所有能力必须使用某个特定产品。选型时应优先考虑接口稳定性、故障恢复、可测试性和运维成本。
+
+## 16.2 工作流引擎实施策略
+
+先完成：
+
+- 工作流定义 Schema。
+- 运行状态机。
+- 步骤执行契约。
+- 幂等与重试。
+- 补偿与取消。
+- 状态恢复。
+- 执行历史与版本固定。
+
+之后再评估自有参考执行器或成熟工作流引擎 Provider。避免在尚未定义运行语义前，先将整个业务模型绑定到某个引擎。
+
+# 17. 开源仓库与项目治理
+
+## 17.1 推荐仓库结构
+
+```
+forgemesh/
+├── README.md
+├── LICENSE
+├── CONTRIBUTING.md
+├── CODE_OF_CONDUCT.md
+├── SECURITY.md
+├── GOVERNANCE.md
+├── pyproject.toml
+├── Makefile
+│
+├── docs/
+│   ├── architecture/
+│   │   ├── architecture.md
+│   │   ├── control-plane.md
+│   │   ├── workflow-engine.md
+│   │   ├── decision-model.md
+│   │   ├── plugin-system.md
+│   │   ├── security.md
+│   │   └── tenancy-qos.md
+│   ├── design-decisions/
+│   ├── plugin-development/
+│   ├── api/
+│   ├── operations/
+│   └── tutorials/
+│
+├── api/
+│   ├── openapi/
+│   ├── protobuf/
+│   └── schemas/
+│
+├── packages/
+│   ├── core-contracts/
+│   ├── resource-model/
+│   ├── policy-engine/
+│   ├── decision-api/
+│   ├── workflow-api/
+│   ├── plugin-sdk/
+│   ├── control-plane/
+│   ├── workflow-runtime/
+│   ├── node-agent/
+│   └── cli/
+│
+├── plugins/
+│   ├── decision-rules/
+│   ├── decision-jev/
+│   ├── workflow-reference/
+│   ├── gpu-nvidia/
+│   ├── runtime-vllm/
+│   ├── qos-basic/
+│   └── metering-basic/
+│
+├── deploy/
+│   ├── docker/
+│   ├── kubernetes/
+│   └── examples/
+│
+├── tests/
+│   ├── unit/
+│   ├── contract/
+│   ├── integration/
+│   ├── e2e/
+│   ├── chaos/
+│   └── security/
+│
+└── examples/
+    ├── single-node/
+    ├── multi-node/
+    └── multi-tenant/
+```
+
+## 17.2 开源治理要求
+
+- 通过 ADR 记录重大架构决策。
+- 明确维护者、模块 Owner 和评审责任。
+- 对公共接口变更执行兼容性评审。
+- 提供插件开发模板和契约测试套件。
+- 建立安全漏洞披露与响应流程。
+- 维护发布、版本和弃用政策。
+- 将架构文档和开发指南纳入持续集成检查。
+- 对第三方插件建立最低质量与安全要求。
+
+## 17.3 许可证
+
+Apache License 2.0 是合理的默认候选方案。正式发布前，需要检查依赖许可证兼容性、第三方代码来源、贡献者许可安排和商标使用规则。
+
+# 18. 测试与可靠性要求
+
+## 18.1 测试分层
+
+| 测试层        | 核心内容                             |
+| ------------- | ------------------------------------ |
+| Unit          | 状态机、策略、调度约束、类型转换     |
+| Contract      | 插件 API、Provider 协议、Schema 兼容 |
+| Integration   | 数据库、Outbox、Agent、容器运行时    |
+| E2E           | 从 GPU 发现到推理服务验收的完整闭环  |
+| Chaos         | 节点离线、进程重启、事件重复、超时   |
+| Security      | 越权、租户隔离、插件权限和密钥泄露   |
+| Compatibility | 插件版本、工作流版本和核心升级       |
+| Performance   | 调度吞吐、任务积压、恢复速度         |
+
+## 18.2 必须通过的架构不变量测试
+
+- 相同幂等请求不会重复创建资源分配。
+- 未授权的操作不会因为 JEV 推荐而执行。
+- 两个并发工作流不能同时独占分配同一 GPU。
+- 控制平面重启后，已持久化工作流可以恢复或进入明确的人工处理状态。
+- 外部任务执行成功但回报丢失时，恢复流程不会盲目重复执行不可幂等操作。
+- 工作流历史能够追溯到实际使用的定义版本和插件版本。
+- 不同租户无法读取彼此的私有资源与审计数据。
+- 插件升级不会静默改变既有工作流实例的执行定义。
+- 节点失联后，资源状态不会未经验证就被标记为可用。
+- 计量修正不会无痕覆盖历史记录。
+
+# 19. 实施路线图
+
+完整开源项目应按架构依赖关系推进，而不是以最短时间完成演示为目标。
+
+### 阶段 0：架构与领域契约
+
+Foundation
+
+- 固化 ADR-001 至 ADR-012。
+- 定义资源模型、状态机、租户模型和公共接口。
+- 完成威胁模型、插件权限模型和版本策略。
+- 建立 Schema、契约测试与 ADR 模板。
+
+### 阶段 1：核心控制平面
+
+- Resource Registry、Policy、Plugin Manager。
+- PostgreSQL 权威状态与资源版本控制。
+- Reconciliation Controller。
+- API、CLI、基础审计和 Outbox。
+
+### 阶段 2：工作流与决策
+
+- WorkEngine 运行契约和参考执行器。
+- 恢复、幂等、重试、补偿和取消。
+- Decision Router、JEV Provider 和规则 Provider。
+- 审批、决策记录和策略校验。
+
+### 阶段 3：执行平面与 GPU 生命周期
+
+- Node Agent、认证协议和任务幂等。
+- NVIDIA GPU 发现、预检和健康检查。
+- vLLM 部署、服务验收与资源回收。
+- 完整故障恢复测试。
+
+### 阶段 4：生产级治理
+
+- 多租户配额、QoS 和 Token 计量。
+- 统一指标、日志、追踪和诊断包。
+- 插件签名、隔离、升级和兼容性验证。
+- 安全测试与灾难恢复演练。
+
+### 阶段 5：扩展与生态
+
+- MIG 和异构 GPU Provider。
+- 更多 Runtime 与工作流 Provider。
+- 插件 SDK、示例和开发者认证测试。
+- 社区治理、稳定 API 与正式版本发布。
+
+各阶段应以可验证的完成标准结束，而不只是以功能开发完成为标准。例如，阶段 3 只有在节点离线、控制平面重启、重复事件和资源回收等场景通过测试后，才算完成。
+
+# 20. 架构验收标准
+
+在正式进入稳定版发布之前，ForgeMesh 应满足以下要求。
+
+## 20.1 架构完整性
+
+- ADR-001 至 ADR-012 已落实到接口、代码结构和测试。
+- 核心模块与插件边界明确。
+- 所有公共 Schema 均有版本。
+- Resource Registry、Controller、WorkEngine、JEV 和 Scheduler 的职责无歧义。
+
+## 20.2 可靠性
+
+- 资源状态与实际执行结果可核验。
+- 工作流具有持久化、恢复、幂等、重试和补偿机制。
+- 关键业务事件使用事务性 Outbox 或等效机制。
+- 并发资源分配受到事务和约束保护。
+- Agent 断线重连后可以查询和恢复未完成任务。
+
+## 20.3 安全
+
+- JEV 无法绕过 Policy 和 Scheduler。
+- 租户隔离覆盖资源、工作流、审计和计量。
+- 插件权限可声明、验证和限制。
+- 高风险插件具备隔离执行机制。
+- 节点任务经过认证、授权和参数校验。
+- 敏感数据有明确的存储、日志和诊断包处理规则。
+
+## 20.4 可扩展性
+
+- 至少有一个完整的 GPU Provider。
+- 至少有一个完整的推理 Runtime Provider。
+- WorkEngine 的运行契约不绑定唯一执行引擎。
+- 决策 Provider 可以替换。
+- 异构设备能够通过能力声明表达差异。
+- 插件升级与工作流版本固定有自动化测试。
+
+## 20.5 可运营性
+
+- 有统一的日志、指标、追踪与诊断关联 ID。
+- 有可查询的工作流历史和审计记录。
+- 有故障恢复、备份和灾难恢复文档。
+- 有插件开发指南、API 文档和兼容性测试套件。
+- 有明确的开源许可证、贡献指南和安全响应流程。
+
+# 最终架构结论
+
+ForgeMesh 的最终架构不是“把所有东西都做成插件”，而是建立一套稳定、可治理的核心协议，再让插件提供具体的能力实现。
+
+这套架构的核心责任划分是：
+
+- Resource Registry 定义并维护资源状态。
+- Reconciliation Controller 让实际状态持续趋近期望状态。
+- WorkEngine 可靠地执行有明确边界的工作流。
+- JEV / Decision Router 生成、选择和解释候选决策。
+- Policy Engine 判断操作是否被允许。
+- Scheduler 选择并安全分配资源。
+- Plugin System 扩展硬件、运行时和领域能力。
+- Node Agent 在受控权限下执行节点操作。
+- Audit / Observability 让所有关键行为可追踪、可诊断。
+
+最重要的是，不要让某个具体框架、工作流引擎、LLM 或 GPU 厂商决定整个系统的架构。公共契约、状态一致性、执行可靠性和安全边界才是项目长期应该守住的部分。
+
+这就是建议作为 ForgeMesh 后续设计、开发、代码评审和社区贡献依据的最终架构基线。

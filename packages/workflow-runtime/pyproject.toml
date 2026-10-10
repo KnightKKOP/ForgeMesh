@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "forgemesh-workflow-runtime"
+version = "0.0.1"
+description = "ForgeMesh workflow runtime reference provider skeleton (placeholder, no execution)"
+requires-python = ">=3.9"
+dependencies = [
+    "pydantic>=2,<3",
+    "forgemesh-core",
+    "forgemesh-workflow-api",
+]
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+namespaces = true

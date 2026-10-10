@@ -1,0 +1,24 @@
+apiVersion: forgemesh.io/v1alpha1
+kind: PluginManifest
+metadata:
+  id: forgemesh.runtime.vllm
+  version: 0.0.1
+spec:
+  category: runtime
+  compatibility:
+    coreApi: v1alpha1
+    minCoreVersion: "0.1.0"
+  provides:
+    - inference.runtime
+    - inference.healthcheck
+  requires:
+    - resource.registry
+  permissions:
+    - resource.read
+    - inference.deploy
+    - inference.inspect
+  isolation: restricted-rpc
+  entrypoint: "python -m forgemesh_runtime_vllm"
+  healthCheck:
+    mode: rpc
+    timeoutMs: 2000

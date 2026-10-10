@@ -1,0 +1,8 @@
+# ForgeMesh Kubernetes 命名空间（阶段 0 占位）
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: forgemesh
+  labels:
+    app.kubernetes.io/name: forgemesh
+    app.kubernetes.io/part-of: forgemesh

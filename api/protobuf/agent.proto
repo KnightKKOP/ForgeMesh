@@ -1,0 +1,135 @@
+// ForgeMesh Node Agent 协议（Protobuf 草案）
+//
+// 对齐 architecture 10.2/10.3 与 development-plan 5.9。
+// 约束：
+//   * Agent 只接受有类型任务，禁止 RunShell/EXEC 等任意命令（ADR-009）。
+//   * 幂等键 idempotency_key 用于断线重连后的重复任务去重。
+//   * correlation_id 贯穿全链路（INV-4）。
+//   * 为避免对 google/protobuf/timestamp.proto 的编译期依赖，本草案以
+//     RFC 3339 字符串承载 deadline / completed_at（例如 "2026-10-09T12:00:00Z"）。
+//     正式实现可替换为 google.protobuf.Timestamp。
+
+syntax = "proto3";
+
+package forgemesh.agent.v1alpha1;
+
+// 任务类型枚举：仅存在有类型的受控任务。
+enum TaskType {
+  TASK_TYPE_UNSPECIFIED = 0;
+  PROBE_GPU = 1;                 // 探测 GPU 与能力
+  VALIDATE_DRIVER = 2;           // 驱动/运行时预检
+  PREPARE_RUNTIME = 3;           // 准备运行时/模型
+  DEPLOY_INFERENCE_SERVICE = 4;  // 部署推理服务
+  INSPECT_SERVICE = 5;           // 检查服务
+  RELEASE_ALLOCATION = 6;        // 释放资源
+  // 注意：不存在 RUN_SHELL / EXEC 任意命令类型（ADR-009）。
+}
+
+// 任务下发单元。
+message Task {
+  string task_id = 1;                        // 全局任务标识
+  string execution_id = 2;                   // 一次执行尝试标识
+  string idempotency_key = 3;                // 幂等键（重连去重）
+  string deadline = 4;                       // RFC 3339；空表示无超时
+  repeated string requested_permissions = 5; // 请求的最小权限集合
+  string input_schema_version = 6;           // 输入 Schema 版本（ADR-012）
+  string correlation_id = 7;                 // 全链路关联 ID（INV-4）
+  TaskType type = 8;                         // 任务类型
+  bytes input = 9;                           // 由 input_schema 校验的类型化载荷
+}
+
+// 任务执行结果。
+message TaskResult {
+  string task_id = 1;
+  string execution_id = 2;
+
+  enum State {
+    STATE_UNSPECIFIED = 0;
+    SUCCEEDED = 1;
+    FAILED = 2;
+    CANCELLED = 3;
+    TIMED_OUT = 4;
+    UNKNOWN = 5;
+  }
+
+  State state = 3;
+  bytes output = 4;
+  string output_schema_version = 5;
+  string error_code = 6;
+  string error_message = 7;
+  string completed_at = 8; // RFC 3339；替代 google.protobuf.Timestamp
+}
+
+// Agent 心跳（含运行中执行列表，用于重连恢复）。
+message Heartbeat {
+  string agent_id = 1;
+  string agent_version = 2;
+  string core_api_version = 3;
+  repeated string running_execution_ids = 4;
+  string sent_at = 5; // RFC 3339
+}
+
+message HeartbeatAck {
+  bool accepted = 1;
+  string control_plane_time = 2; // RFC 3339
+}
+
+// 注册请求/响应（双向认证 + 能力协商）。
+message RegisterRequest {
+  string agent_id = 1;
+  string agent_version = 2;
+  repeated string capabilities = 3;
+  repeated string supported_task_types = 4;
+  string core_api_version = 5;
+}
+
+message RegisterResponse {
+  bool accepted = 1;
+  string session_id = 2;
+  string heartbeat_interval = 3; // 例如 "10s"
+  string control_plane_version = 4;
+}
+
+// 任务进度（流式）。
+message TaskProgress {
+  string task_id = 1;
+  string execution_id = 2;
+  int32 percent = 3;
+  string stage = 4;
+  string message = 5;
+  string occurred_at = 6; // RFC 3339
+}
+
+message CancelRequest {
+  string task_id = 1;
+  string execution_id = 2;
+  string reason = 3;
+}
+
+message PollTaskRequest {
+  string agent_id = 1;
+  repeated string running_execution_ids = 2; // 上报在途，便于恢复
+}
+
+message PollTaskResponse {
+  bool has_task = 1;
+  Task task = 2;
+  string poll_after = 3; // 无任务时的建议轮询间隔，例如 "5s"
+}
+
+message ReportResultRequest {
+  TaskResult result = 1;
+}
+
+message ReportResultResponse {
+  bool accepted = 1;
+}
+
+// Node Agent 服务：控制平面侧实现，Agent 作为客户端调用。
+service NodeAgent {
+  rpc Register(RegisterRequest) returns (RegisterResponse);   // 注册与兼容性/能力协商
+  rpc Heartbeat(Heartbeat) returns (HeartbeatAck);            // 心跳与离线检测
+  rpc PollTask(PollTaskRequest) returns (PollTaskResponse);   // 拉取待执行任务
+  rpc ReportResult(ReportResultRequest) returns (ReportResultResponse); // 上报结果
+  rpc CancelTask(CancelRequest) returns (TaskResult);         // 取消任务
+}

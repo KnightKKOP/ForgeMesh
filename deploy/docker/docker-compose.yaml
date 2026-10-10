@@ -1,0 +1,56 @@
+# ForgeMesh 本地拓扑（阶段 0）
+#
+# 说明：阶段 0 仅交付契约、骨架与占位；本文件描述【目标拓扑】，暂不实际运行
+#       （当前开发环境无 docker / postgres）。各服务镜像/Dockerfile 将在后续阶段补齐。
+# 目标拓扑：postgres（权威状态） + control-plane（Python 控制平面） + gateway（Go 网关）。
+version: "3.9"
+
+services:
+  postgres:
+    image: postgres:15
+    environment:
+      POSTGRES_USER: forgemesh
+      POSTGRES_PASSWORD: forgemesh
+      POSTGRES_DB: forgemesh
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U forgemesh"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    # 阶段 0：控制平面【不连接】数据库；本服务仅为后续阶段预置。
+
+  control-plane:
+    # 占位：镜像/Dockerfile 尚未提供（见 deploy/docker/Dockerfile.control-plane）。
+    image: forgemesh/control-plane:0.0.1
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile.control-plane
+    environment:
+      FORGEMESH_ENV: local
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request;urllib.request.urlopen('http://localhost:8080/healthz')\""]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  gateway:
+    # 占位：Go 网关（Dev-5）作为统一外部入口，转发至 control-plane。
+    image: forgemesh/gateway:0.0.1
+    environment:
+      FORGEMESH_UPSTREAM: http://control-plane:8080
+    ports:
+      - "8000:8000"
+    depends_on:
+      - control-plane
+
+volumes:
+  pgdata:

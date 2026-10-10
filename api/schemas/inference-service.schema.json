@@ -1,0 +1,195 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://forgemesh.io/schemas/inference-service.schema.json",
+  "title": "InferenceService",
+  "description": "ForgeMesh 声明式推理服务资源（forgemesh.io/v1alpha1）。对齐 development-plan 5.1 / 6.1 与 ADR-002/010/011。",
+  "type": "object",
+  "required": ["apiVersion", "kind", "metadata", "spec"],
+  "additionalProperties": false,
+  "properties": {
+    "apiVersion": {
+      "type": "string",
+      "const": "forgemesh.io/v1alpha1",
+      "description": "资源组/版本。"
+    },
+    "kind": {
+      "type": "string",
+      "const": "InferenceService"
+    },
+    "metadata": {
+      "$ref": "#/$defs/ObjectMeta"
+    },
+    "spec": {
+      "$ref": "#/$defs/InferenceServiceSpec"
+    },
+    "status": {
+      "$ref": "#/$defs/InferenceServiceStatus"
+    }
+  },
+  "$defs": {
+    "ObjectMeta": {
+      "type": "object",
+      "description": "公共元数据（camelCase）。uid/generation/resourceVersion 等由系统维护。",
+      "required": ["name"],
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "type": "string",
+          "pattern": "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$",
+          "minLength": 1,
+          "maxLength": 253,
+          "description": "资源名（同 kind + namespace 内唯一，RFC 1123 子集）。"
+        },
+        "namespace": {
+          "type": "string",
+          "description": "租户内逻辑命名空间。"
+        },
+        "tenantId": {
+          "type": "string",
+          "description": "租户边界标识（多租户隔离，INV 多租户不变量）。"
+        },
+        "uid": {
+          "type": "string",
+          "description": "稳定标识，生命周期内不变（系统维护）。"
+        },
+        "labels": {
+          "type": "object",
+          "additionalProperties": {"type": "string"}
+        },
+        "annotations": {
+          "type": "object",
+          "additionalProperties": {"type": "string"}
+        },
+        "resourceVersion": {
+          "type": "string",
+          "description": "乐观并发 CAS 版本（系统维护）。"
+        },
+        "generation": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "期望状态版本，spec 变更时递增（系统维护）。"
+        },
+        "observedGeneration": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "ModelRef": {
+      "type": "object",
+      "description": "模型引用（仅引用，不内嵌制品）。",
+      "required": ["reference"],
+      "additionalProperties": false,
+      "properties": {
+        "reference": {"type": "string", "minLength": 1},
+        "digest": {
+          "type": "string",
+          "description": "制品摘要（供应链校验），如 sha256:...。"
+        }
+      }
+    },
+    "RuntimeRef": {
+      "type": "object",
+      "description": "推理运行时引用（版本固定，ADR-011）。",
+      "required": ["provider"],
+      "additionalProperties": false,
+      "properties": {
+        "provider": {"type": "string", "minLength": 1},
+        "version": {
+          "type": "string",
+          "description": "固定版本，如 0.6.3。"
+        }
+      }
+    },
+    "AcceleratorSpec": {
+      "type": "object",
+      "description": "加速器申请（能力驱动，ADR-010）。",
+      "required": ["type", "minMemoryGiB"],
+      "additionalProperties": false,
+      "properties": {
+        "type": {"type": "string", "minLength": 1, "description": "如 nvidia-gpu。"},
+        "count": {"type": "integer", "minimum": 1, "default": 1},
+        "minMemoryGiB": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "单卡最低显存（GiB）。"
+        }
+      }
+    },
+    "ResourcesSpec": {
+      "type": "object",
+      "required": ["accelerator"],
+      "additionalProperties": false,
+      "properties": {
+        "accelerator": {"$ref": "#/$defs/AcceleratorSpec"}
+      }
+    },
+    "AvailabilitySpec": {
+      "type": "object",
+      "description": "可用性期望。",
+      "additionalProperties": false,
+      "properties": {
+        "replicas": {"type": "integer", "minimum": 0, "default": 1}
+      }
+    },
+    "InferenceServiceSpec": {
+      "type": "object",
+      "description": "期望状态（Desired State）。",
+      "required": ["model", "runtime", "resources"],
+      "additionalProperties": false,
+      "properties": {
+        "model": {"$ref": "#/$defs/ModelRef"},
+        "runtime": {"$ref": "#/$defs/RuntimeRef"},
+        "resources": {"$ref": "#/$defs/ResourcesSpec"},
+        "availability": {"$ref": "#/$defs/AvailabilitySpec"}
+      }
+    },
+    "Condition": {
+      "type": "object",
+      "required": ["type", "status"],
+      "additionalProperties": false,
+      "properties": {
+        "type": {"type": "string"},
+        "status": {"type": "string", "enum": ["True", "False", "Unknown"]},
+        "reason": {"type": "string"},
+        "message": {"type": "string"},
+        "lastTransitionTime": {"type": "string", "format": "date-time"}
+      }
+    },
+    "InferenceServiceStatus": {
+      "type": "object",
+      "description": "实际状态（Observed State）。",
+      "required": ["phase"],
+      "additionalProperties": false,
+      "properties": {
+        "phase": {
+          "type": "string",
+          "description": "生命周期阶段（11 态）。",
+          "enum": [
+            "Pending",
+            "Scheduling",
+            "Preparing",
+            "Deploying",
+            "Verifying",
+            "Ready",
+            "Degraded",
+            "Updating",
+            "Terminating",
+            "Failed",
+            "Unknown"
+          ]
+        },
+        "observedGeneration": {"type": "integer", "minimum": 0, "default": 0},
+        "conditions": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/Condition"}
+        },
+        "endpoint": {
+          "type": ["string", "null"],
+          "description": "服务就绪后的访问端点；未就绪为 null。"
+        },
+        "lastError": {"type": ["string", "null"]}
+      }
+    }
+  }
+}

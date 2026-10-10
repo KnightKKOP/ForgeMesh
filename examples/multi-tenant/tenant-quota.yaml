@@ -1,0 +1,26 @@
+# ForgeMesh 多租户与配额示例
+# 对齐 docs/architecture/development-plan.md 6.6 与 architecture 11.2。
+apiVersion: forgemesh.io/v1alpha1
+kind: Tenant
+metadata:
+  name: team-a
+spec:
+  status: active
+  quotaPolicyId: quota-standard
+  administrators:
+    - "user:alice"
+---
+apiVersion: forgemesh.io/v1alpha1
+kind: QuotaPolicy
+metadata:
+  name: quota-standard
+spec:
+  limits:
+    accelerators:
+      nvidia-gpu: { max: 8, exclusive: true }
+    concurrentWorkflows: { max: 20 }
+    tokensPerMinute: { max: 200000 }
+  burst:
+    tokensPerMinute: 250000      # 突发上限
+  enforcement: hard              # hard | soft
+  # 配额变更竞争须由事务/唯一约束保护（architecture 11.2 / 12.4）。

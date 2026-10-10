@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "forgemesh-cli"
+version = "0.0.1"
+description = "ForgeMesh command line interface skeleton (apply/get/describe/version)"
+requires-python = ">=3.9"
+dependencies = [
+    "forgemesh-core",
+]
+
+[project.scripts]
+forgemesh = "forgemesh.cli.main:main"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+namespaces = true

@@ -1,0 +1,332 @@
+openapi: 3.1.0
+info:
+  title: ForgeMesh Control Plane API
+  version: 0.0.1
+  description: >-
+    ForgeMesh 阶段 0 对外 API 骨架（仅契约，不实现）。外部入口统一经 Go 网关
+    （/api/v1/ 版本前缀）；本文件描述控制平面资源/运行 API 与探针。
+    统一响应信封与错误码见 components。资源权威 Schema 见 api/schemas/。
+    阶段 0 所有端点均返回 501 Not Implemented（占位）。
+servers:
+  - url: http://localhost:8080
+    description: 本地控制平面（Go 网关前置）
+tags:
+  - name: inference-services
+  - name: workflows
+  - name: decisions
+  - name: probes
+
+paths:
+  /healthz:
+    get:
+      tags: [probes]
+      summary: 存活探针
+      operationId: healthz
+      responses:
+        "200":
+          description: 进程存活
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthResponse"
+  /readyz:
+    get:
+      tags: [probes]
+      summary: 就绪探针
+      operationId: readyz
+      responses:
+        "200":
+          description: 就绪
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthResponse"
+        "503":
+          description: 未就绪
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /api/v1/inference-services:
+    get:
+      tags: [inference-services]
+      summary: 列出推理服务
+      operationId: listInferenceServices
+      parameters:
+        - name: tenantId
+          in: query
+          schema:
+            type: string
+        - name: namespace
+          in: query
+          schema:
+            type: string
+      responses:
+        "200":
+          description: 列表
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/InferenceServiceList"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+    post:
+      tags: [inference-services]
+      summary: 创建推理服务（声明式）
+      operationId: createInferenceService
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/InferenceService"
+      responses:
+        "201":
+          description: 已创建
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/InferenceService"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "501":
+          $ref: "#/components/responses/NotImplemented"
+
+  /api/v1/inference-services/{name}:
+    parameters:
+      - name: name
+        in: path
+        required: true
+        schema:
+          type: string
+    get:
+      tags: [inference-services]
+      summary: 获取推理服务
+      operationId: getInferenceService
+      responses:
+        "200":
+          description: 资源
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/InferenceService"
+        "404":
+          $ref: "#/components/responses/NotFound"
+    delete:
+      tags: [inference-services]
+      summary: 删除推理服务
+      operationId: deleteInferenceService
+      responses:
+        "202":
+          description: 已受理删除（异步）
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/InferenceService"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "501":
+          $ref: "#/components/responses/NotImplemented"
+
+  /api/v1/workflows:
+    post:
+      tags: [workflows]
+      summary: 启动工作流运行
+      operationId: startWorkflow
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/WorkflowRunRequest"
+      responses:
+        "202":
+          description: 已受理
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/WorkflowRun"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "501":
+          $ref: "#/components/responses/NotImplemented"
+
+  /api/v1/decisions:
+    post:
+      tags: [decisions]
+      summary: 请求一次结构化决策（决策≠授权；授权由 Scheduler/Policy 完成）
+      operationId: requestDecision
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/DecisionRequest"
+      responses:
+        "200":
+          description: 决策结果（含可查询的决策追踪）
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DecisionResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "501":
+          $ref: "#/components/responses/NotImplemented"
+
+components:
+  schemas:
+    HealthResponse:
+      type: object
+      required: [status]
+      properties:
+        status:
+          type: string
+          enum: [ok, degraded, down]
+        version:
+          type: string
+        component:
+          type: string
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code:
+              type: string
+              description: 机器可读错误码，如 CONFLICT / NOT_FOUND。
+            message:
+              type: string
+            details:
+              type: object
+              additionalProperties: true
+            correlationId:
+              type: string
+    InferenceService:
+      type: object
+      description: "权威 Schema: api/schemas/inference-service.schema.json（此处为骨架摘要）。"
+      additionalProperties: true
+      required: [apiVersion, kind, metadata, spec]
+      properties:
+        apiVersion:
+          type: string
+        kind:
+          type: string
+        metadata:
+          type: object
+          additionalProperties: true
+        spec:
+          type: object
+          additionalProperties: true
+        status:
+          type: object
+          additionalProperties: true
+    InferenceServiceList:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/InferenceService"
+        nextPageToken:
+          type: string
+    WorkflowRunRequest:
+      type: object
+      required: [definition, version]
+      properties:
+        definition:
+          type: string
+          description: WorkflowDefinition 名称
+        version:
+          type: integer
+          description: 定义版本（不可变）。
+        inputs:
+          type: object
+          additionalProperties: true
+    WorkflowRun:
+      type: object
+      required: [runId, state]
+      properties:
+        runId:
+          type: string
+        state:
+          type: string
+          enum: [Pending, Running, Waiting, Succeeded, Failed, Cancelled, TimedOut, Compensating]
+        definitionVersion:
+          type: integer
+    DecisionRequest:
+      type: object
+      required: [question, context]
+      properties:
+        question:
+          type: string
+        context:
+          type: object
+          additionalProperties: true
+        requiredCapabilities:
+          type: array
+          items:
+            type: string
+    DecisionResponse:
+      type: object
+      required: [decisionId, outcome, rationale]
+      properties:
+        decisionId:
+          type: string
+          description: 决策可查询（审计）。
+        outcome:
+          type: string
+        rationale:
+          type: string
+        trace:
+          type: object
+          additionalProperties: true
+        degraded:
+          type: boolean
+          description: 是否走了 Provider 降级路径。
+  responses:
+    BadRequest:
+      description: 请求不合法
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    Unauthorized:
+      description: 未认证
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    Forbidden:
+      description: 无权限
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    NotFound:
+      description: 资源不存在
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    Conflict:
+      description: 并发冲突/已存在
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    NotImplemented:
+      description: 阶段 0 占位，尚未实现
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"

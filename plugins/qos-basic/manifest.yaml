@@ -1,0 +1,23 @@
+apiVersion: forgemesh.io/v1alpha1
+kind: PluginManifest
+metadata:
+  id: forgemesh.qos.basic
+  version: 0.0.1
+spec:
+  category: policy
+  compatibility:
+    coreApi: v1alpha1
+    minCoreVersion: "0.1.0"
+  provides:
+    - policy.qos
+  requires:
+    - policy.engine
+    - resource.registry
+  permissions:
+    - resource.read
+    - policy.evaluate
+  isolation: restricted-rpc
+  entrypoint: "python -m forgemesh_qos_basic"
+  healthCheck:
+    mode: rpc
+    timeoutMs: 2000

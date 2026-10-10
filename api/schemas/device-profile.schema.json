@@ -1,0 +1,88 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://forgemesh.io/schemas/device-profile.schema.json",
+  "title": "DeviceProfile",
+  "description": "ForgeMesh 设备能力画像。对齐 development-plan 6.4 与 architecture 9.2（能力驱动模型）。声明能力≠实际具备；实际支持由 Provider 探测并验证。",
+  "type": "object",
+  "required": ["apiVersion", "kind", "metadata", "spec"],
+  "additionalProperties": false,
+  "properties": {
+    "apiVersion": {
+      "type": "string",
+      "const": "forgemesh.io/v1alpha1"
+    },
+    "kind": {
+      "type": "string",
+      "const": "DeviceProfile"
+    },
+    "metadata": {
+      "type": "object",
+      "required": ["name"],
+      "additionalProperties": false,
+      "properties": {
+        "name": {"type": "string", "minLength": 1},
+        "labels": {
+          "type": "object",
+          "additionalProperties": {"type": "string"}
+        },
+        "annotations": {
+          "type": "object",
+          "additionalProperties": {"type": "string"}
+        }
+      }
+    },
+    "spec": {
+      "type": "object",
+      "required": ["vendor", "capabilities", "runtimes", "constraints"],
+      "additionalProperties": false,
+      "properties": {
+        "vendor": {
+          "type": "string",
+          "minLength": 1,
+          "description": "设备厂商，如 nvidia / amd。"
+        },
+        "capabilities": {
+          "type": "object",
+          "description": "声明的能力画像（须由 Provider 探测验证）。",
+          "additionalProperties": true,
+          "properties": {
+            "minMemoryGiB": {"type": "integer", "minimum": 0},
+            "computeCapability": {"type": "string"},
+            "partitioning": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "supported": {"type": "boolean"},
+                "provider": {"type": "string", "description": "如 nvidia.mig。"}
+              }
+            },
+            "topology": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "discovery": {"type": "string", "enum": ["supported", "unsupported"]}
+              }
+            }
+          }
+        },
+        "runtimes": {
+          "type": "array",
+          "description": "支持的运行时标识，如 vllm。",
+          "items": {"type": "string", "minLength": 1},
+          "uniqueItems": true
+        },
+        "constraints": {
+          "type": "object",
+          "additionalProperties": true,
+          "properties": {
+            "allocationMode": {
+              "type": "string",
+              "enum": ["exclusive", "shared"],
+              "description": "独占/共享分配策略。"
+            }
+          }
+        }
+      }
+    }
+  }
+}

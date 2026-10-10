@@ -1,0 +1,79 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# 同一分支的重复触发仅保留最新一次
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  python:
+    name: Python ${{ matrix.python-version }} · lint & test
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.9", "3.11"]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Upgrade packaging toolchain
+        run: python -m pip install -U pip setuptools wheel
+
+      - name: Install dev dependencies
+        run: python -m pip install -r requirements-dev.txt
+
+      # 使用 --no-deps：子包之间通过本地私有的 forgemesh-* 名称互依赖，
+      # 按字母序逐个解析式安装会让 pip 误向 PyPI 查找尚未安装的兄弟包。
+      # 外部依赖已在上一部 requirements-dev.txt 中安装，跨包依赖由本循环满足。
+      - name: Install packages (editable)
+        run: |
+          for p in packages/*/; do
+            if [ -f "$p/pyproject.toml" ]; then
+              echo ">> pip install --no-deps -e $p"
+              python -m pip install --no-deps -e "$p"
+            fi
+          done
+
+      - name: Ruff lint
+        run: python -m ruff check .
+
+      - name: Pytest
+        run: python -m pytest
+
+  go:
+    name: Go gateway · build & test
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: gateway
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+          cache: true
+          cache-dependency-path: gateway/go.sum
+
+      - name: Go build
+        run: go build ./...
+
+      - name: Go test
+        run: go test ./...

@@ -1,0 +1,102 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://forgemesh.io/schemas/plugin-manifest.schema.json",
+  "title": "PluginManifest",
+  "description": "ForgeMesh 插件清单。对齐 architecture 8.2 与 development-plan 5.7 / 6.3。声明能力(provides)与依赖(requires)及最小权限集合；声明能力≠实际具备，运行时须经探测与验证（ADR-006 隔离）。",
+  "type": "object",
+  "required": ["apiVersion", "kind", "metadata", "spec"],
+  "additionalProperties": false,
+  "properties": {
+    "apiVersion": {
+      "type": "string",
+      "const": "forgemesh.io/v1alpha1"
+    },
+    "kind": {
+      "type": "string",
+      "const": "PluginManifest"
+    },
+    "metadata": {
+      "type": "object",
+      "required": ["id", "version"],
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^[a-z0-9]+(\\.[a-z0-9-]+)+$",
+          "description": "反向域名风格插件标识，如 forgemesh.runtime.vllm。"
+        },
+        "version": {
+          "type": "string",
+          "description": "语义化版本，如 1.0.0。"
+        }
+      }
+    },
+    "spec": {
+      "type": "object",
+      "required": ["category", "provides", "requires", "permissions"],
+      "additionalProperties": false,
+      "properties": {
+        "category": {
+          "type": "string",
+          "description": "插件分类（architecture 8.1）。",
+          "enum": ["provider", "hardware", "runtime", "capability", "policy", "observability"]
+        },
+        "provides": {
+          "type": "array",
+          "description": "向平台暴露的能力标识。",
+          "items": {"type": "string", "minLength": 1},
+          "uniqueItems": true
+        },
+        "requires": {
+          "type": "array",
+          "description": "依赖的平台能力/契约标识。",
+          "items": {"type": "string", "minLength": 1},
+          "uniqueItems": true
+        },
+        "permissions": {
+          "type": "array",
+          "description": "最小权限集合（按信任级别授予，ADR-006）。",
+          "items": {"type": "string", "minLength": 1},
+          "uniqueItems": true
+        },
+        "compatibility": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "coreApi": {"type": "string"},
+            "minCoreVersion": {"type": "string"}
+          }
+        },
+        "isolation": {
+          "type": "string",
+          "enum": ["in-process", "restricted-rpc", "sandbox"],
+          "description": "隔离级别（ADR-006）。"
+        },
+        "entrypoint": {"type": "string"},
+        "artifactDigest": {
+          "type": "string",
+          "description": "制品摘要，如 sha256:...（供应链安全）。"
+        },
+        "signature": {
+          "type": "string",
+          "description": "制品签名，如 cosign:...（供应链安全）。"
+        },
+        "configuration": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "schema": {"type": "string", "description": "配置 JSON Schema 路径。"}
+          }
+        },
+        "healthCheck": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "mode": {"type": "string", "enum": ["none", "rpc", "http", "exec"]},
+            "timeoutMs": {"type": "integer", "minimum": 0}
+          }
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,24 @@
+apiVersion: forgemesh.io/v1alpha1
+kind: PluginManifest
+metadata:
+  id: forgemesh.workflow.reference
+  version: 0.0.1
+spec:
+  category: provider
+  compatibility:
+    coreApi: v1alpha1
+    minCoreVersion: "0.1.0"
+  provides:
+    - workflow.runtime
+  requires:
+    - resource.registry
+    - event.stream
+  permissions:
+    - resource.read
+    - resource.write
+    - workflow.execute
+  isolation: restricted-rpc
+  entrypoint: "python -m forgemesh_workflow_reference"
+  healthCheck:
+    mode: rpc
+    timeoutMs: 2000

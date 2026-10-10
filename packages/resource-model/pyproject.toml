@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "forgemesh-resource-model"
+version = "0.0.1"
+description = "ForgeMesh declarative resource model (InferenceService / Node / Allocation / Tenant ...)"
+requires-python = ">=3.9"
+dependencies = [
+    "pydantic>=2,<3",
+    "forgemesh-core",
+]
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+namespaces = true

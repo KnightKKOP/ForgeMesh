@@ -1,0 +1,58 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+*.so
+
+# ---- Go ----
+/gateway/bin/
+/bin/
+*.test
+*.out
+vendor/
+
+# ---- IDE / OS ----
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*~
+
+# ---- Tooling (CodeArts / agent) ----
+.codeartsdoer/
+.arts/
+.codearts-doer-for-coding/
+.codebuddy/
+
+# ---- Secrets / env ----
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+secrets/
+!**/*.example
+
+# ---- Artifacts / logs ----
+*.log
+*.tmp
+diagnostics-*.zip
+
+# ---- Node (tooling only) ----
+node_modules/

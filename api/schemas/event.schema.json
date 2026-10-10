@@ -1,0 +1,79 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://forgemesh.io/schemas/event.schema.json",
+  "title": "DomainEvent",
+  "description": "ForgeMesh 领域事件信封。对齐 architecture 13.2 与 development-plan 6.5。事件由 Transactional Outbox 发布，消费者须按 (eventId) 幂等去重；data 内不得包含明文密钥。",
+  "type": "object",
+  "required": [
+    "eventId",
+    "eventType",
+    "schemaVersion",
+    "occurredAt",
+    "tenantId",
+    "resourceId",
+    "correlationId",
+    "producer",
+    "data"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "eventId": {
+      "type": "string",
+      "minLength": 1,
+      "description": "事件唯一标识，用于消费端幂等去重。"
+    },
+    "eventType": {
+      "type": "string",
+      "minLength": 1,
+      "description": "点分事件类型，如 inference.service.ready。"
+    },
+    "schemaVersion": {
+      "type": "string",
+      "minLength": 1,
+      "description": "事件 data 载荷 Schema 版本，如 v1。"
+    },
+    "occurredAt": {
+      "type": "string",
+      "format": "date-time",
+      "description": "事件发生时间（RFC 3339 / ISO 8601 UTC）。"
+    },
+    "tenantId": {
+      "type": "string",
+      "minLength": 1,
+      "description": "租户边界（多租户隔离）。"
+    },
+    "resourceId": {
+      "type": "string",
+      "minLength": 1,
+      "description": "关联资源的逻辑标识（如 name 或 uid）。"
+    },
+    "resourceUid": {
+      "type": "string",
+      "description": "关联资源稳定 uid（可选，INV-4 可追溯）。"
+    },
+    "resourceVersion": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "事件发生时资源版本（可选）。"
+    },
+    "correlationId": {
+      "type": "string",
+      "minLength": 1,
+      "description": "全链路关联 ID（INV-4）。"
+    },
+    "producer": {
+      "type": "object",
+      "description": "事件生产者。",
+      "required": ["component", "version"],
+      "additionalProperties": false,
+      "properties": {
+        "component": {"type": "string", "minLength": 1},
+        "version": {"type": "string", "minLength": 1}
+      }
+    },
+    "data": {
+      "type": "object",
+      "description": "事件类型特定的载荷；不得包含明文密钥/凭证。"
+    }
+  }
+}

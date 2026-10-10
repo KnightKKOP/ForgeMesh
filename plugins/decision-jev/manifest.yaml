@@ -1,0 +1,23 @@
+apiVersion: forgemesh.io/v1alpha1
+kind: PluginManifest
+metadata:
+  id: forgemesh.decision.jev
+  version: 0.0.1
+spec:
+  category: provider
+  compatibility:
+    coreApi: v1alpha1
+    minCoreVersion: "0.1.0"
+  provides:
+    - decision.provider.jev
+  requires:
+    - decision.routing
+    - resource.registry
+  permissions:
+    - resource.read
+    - decision.evaluate
+  isolation: restricted-rpc
+  entrypoint: "python -m forgemesh_decision_jev"
+  healthCheck:
+    mode: rpc
+    timeoutMs: 3000

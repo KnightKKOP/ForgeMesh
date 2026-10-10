@@ -1,0 +1,64 @@
+# ForgeMesh 控制平面 Kubernetes 部署（阶段 0 占位）
+#
+# 说明：阶段 0 仅提供骨架，镜像占位、无 DB 依赖（探针恒为 ok）。
+#      生产部署需补齐：资源请求/限制、serviceAccount、NetworkPolicy、
+#      PodDisruptionBudget、Secret 引用（密钥不落盘）与多副本领导权选举。
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: forgemesh-control-plane
+  namespace: forgemesh
+  labels:
+    app.kubernetes.io/name: control-plane
+    app.kubernetes.io/part-of: forgemesh
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: control-plane
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: control-plane
+    spec:
+      containers:
+        - name: control-plane
+          image: forgemesh/control-plane:0.0.1   # 占位镜像
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8080
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: forgemesh-control-plane
+  namespace: forgemesh
+  labels:
+    app.kubernetes.io/name: control-plane
+spec:
+  selector:
+    app.kubernetes.io/name: control-plane
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http

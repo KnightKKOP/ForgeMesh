@@ -1,0 +1,11 @@
+# ForgeMesh 开发依赖（仅开发/CI 使用，不参与运行时打包）
+# 运行时依赖由各子包自带 pyproject.toml 声明。
+pip>=23
+setuptools>=68
+wheel
+pytest>=7
+pytest-cov
+ruff
+pydantic>=2,<3
+jsonschema
+pyyaml

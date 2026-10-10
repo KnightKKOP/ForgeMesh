@@ -1,0 +1,30 @@
+# ForgeMesh InferenceService 示例（单节点）
+# 契约：api/schemas/inference-service.schema.json
+# 对齐 docs/architecture/development-plan.md 6.1。
+apiVersion: forgemesh.io/v1alpha1
+kind: InferenceService
+metadata:
+  name: llama-service
+  namespace: team-a
+  tenantId: team-a
+  labels:
+    environment: production
+spec:
+  model:
+    reference: models/llama
+    digest: sha256:9f2c...
+  runtime:
+    provider: vllm
+    version: "0.6.3"          # 版本固定（ADR-011）
+  resources:
+    accelerator:
+      type: nvidia-gpu
+      count: 2
+      minMemoryGiB: 80
+  availability:
+    replicas: 1
+status:
+  phase: Pending
+  observedGeneration: 0
+  conditions: []
+  endpoint: null

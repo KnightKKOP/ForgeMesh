@@ -70,8 +70,8 @@ def test_inference_service_cross_representation() -> None:
 
     注：示例 YAML 的 ``status.endpoint`` 与 Python ``InferenceServiceStatus``
     尚未对齐（阶段 0 已知限制），构造前剔除该字段以聚焦已实现字段的一致性。
-    同理，``Resource`` 基类的顶层 ``conditions`` 不在 InferenceService Schema
-    顶层定义，序列化后剔除再校验。
+    同理，``Resource`` 基类的顶层 ``conditions`` / ``finalizers``（受控删除
+    生命周期字段）不在 InferenceService Schema 顶层定义，序列化后剔除再校验。
     """
     yaml_dict = _load_yaml(EXAMPLES_DIR / "single-node" / "inference-service.yaml")
 
@@ -85,8 +85,9 @@ def test_inference_service_cross_representation() -> None:
 
     # 序列化回 dict（排除 None 值，因 Schema 的 uid/resourceVersion 不接受 null）
     dumped = obj.model_dump(by_alias=True, exclude_none=True)
-    # Resource 基类顶层 conditions 不在 InferenceService Schema 顶层定义
+    # Resource 基类顶层 conditions / finalizers 不在 InferenceService Schema 顶层定义
     dumped.pop("conditions", None)
+    dumped.pop("finalizers", None)
 
     # JSON Schema 校验
     schema = _load_json(SCHEMAS_DIR / "inference-service.schema.json")
@@ -234,9 +235,7 @@ def test_decision_request_risk_and_deadline() -> None:
     assert default_req.deadline_ms == 2000
     # 非法风险等级必须被拒绝
     with pytest.raises(ValidationError):
-        DecisionRequest(
-            request_id="r3", tenant_id="t1", operation="op", risk_level="extreme"
-        )
+        DecisionRequest(request_id="r3", tenant_id="t1", operation="op", risk_level="extreme")
 
 
 # ---------------------------------------------------------------------------

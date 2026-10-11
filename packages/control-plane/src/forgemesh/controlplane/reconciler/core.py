@@ -15,26 +15,60 @@
 8. **重观察**：收集执行后的新观测状态（P1 简化为标记完成）。
 9. **更新 status + 安排下次**：写回 status patch，返回 requeue_after。
 
+终止协调（Terminating，对齐 architecture.md §5.3/§12.4 与 development-plan
+第 7 章删除闭环）
+--------------------------------------------------------------------
+观测 ``phase == Terminating`` 时不走 9 步差异收敛，改走受控释放子流程：
+
+1. 调用注入的 :class:`ReleaseProvider` 释放外部副作用（停止实例、归还 GPU
+   租约等；未注入时为 Noop 语义，仅移除 finalizer）；失败 → 保持
+   ``Terminating`` 并 requeue 重试；
+2. 移除默认 release finalizer（``forgemesh.io/resource-release``）并 CAS 写回；
+3. finalizers 全部清空后：释放关联 Allocation（若存在 Active）→ 物理 DELETE
+   → 记审计日志。
+
 兼容 Python 3.9+。
 """
 
 from __future__ import annotations
 
+import contextlib
 import logging
-from typing import Any
+from typing import Any, Protocol
 
+from forgemesh.core.errors import ConflictError, NotFoundError
 from forgemesh.core.objects import Resource
 from forgemesh.core.reconciler import ReconcileContext, Reconciler, ReconcileResult
 from forgemesh.policy.api import PolicyAction, PolicyEngine
 
+from ..registry.store import DEFAULT_RELEASE_FINALIZER
+
 logger = logging.getLogger(__name__)
+
+
+class ReleaseProvider(Protocol):
+    """受控释放 Provider 协议（控制平面侧，不绑定具体运行时插件）。
+
+    职责：在资源进入 ``Terminating`` 后释放其外部副作用（停止推理实例、
+    释放 GPU 租约、分配核验等）。实现方（如 vLLM 运行时适配器）应保证
+    **幂等**：同一资源重复调用不得产生重复副作用。
+
+    ``release`` 正常返回视为释放成功；抛出任意异常视为释放失败——协调器
+    将保持 ``Terminating`` 并 requeue 重试，**不会**物理删除资源（GPU 不泄漏
+    也不误删）。协议刻意不依赖插件包类型（``plugins/*``），由组装方桥接。
+    """
+
+    async def release(self, resource: Resource) -> None:
+        """释放 ``resource`` 持有的外部资源；失败时抛出异常。"""
+        ...
 
 
 class ReconciliationController(Reconciler):
     """9 步协调闭环控制器。
 
     将资源的期望状态（spec）收敛到实际状态（observed），保证幂等性
-    （同一 ``dedup_key`` 不重复产生副作用）且 Policy 校验不可绕过（INV-3）。
+    （同一 ``dedup_key`` 不重复产生副作用）且 Policy 校验不可绕过（INV-3）；
+    ``Terminating`` 资源改走受控释放 → 清空 finalizer → 物理删除闭环。
 
     Args:
         registry: 资源注册表（权威状态，``ResourceRegistry`` 实例）。
@@ -42,6 +76,8 @@ class ReconciliationController(Reconciler):
         decision_provider: 可选决策 Provider（生成候选动作，仅建议非授权）。
         scheduler: 可选调度器（资源分配的唯一执行点）。
         workflow_runtime: 可选工作流运行时（执行协调工作流）。
+        release_provider: 可选受控释放 Provider（``Terminating`` 时释放外部
+            副作用）；``None`` 为 Noop 语义——仅移除 finalizer 后物理删除。
     """
 
     def __init__(
@@ -51,17 +87,19 @@ class ReconciliationController(Reconciler):
         decision_provider: Any | None = None,
         scheduler: Any | None = None,
         workflow_runtime: Any | None = None,
+        release_provider: ReleaseProvider | None = None,
     ) -> None:
         self._registry = registry
         self._policy = policy_engine
         self._decision = decision_provider
         self._scheduler = scheduler
         self._workflow = workflow_runtime
+        self._release_provider = release_provider
         # 已处理的去重键（内存级，P1 简化；生产环境应使用持久化存储）。
         self._processed_keys: set[str] = set()
 
     async def reconcile(self, ctx: ReconcileContext) -> ReconcileResult:
-        """执行一轮 9 步协调。
+        """执行一轮 9 步协调（或 Terminating 受控释放子流程）。
 
         幂等保证：若 ``ctx.dedup_key`` 已处理过，直接返回 ``done=True``，
         不产生任何重复副作用。
@@ -78,6 +116,11 @@ class ReconciliationController(Reconciler):
 
         resource = ctx.resource
         observed = ctx.observed
+
+        # 终止协调优先于差异收敛：删除闭环（受控释放 → 清空 finalizer →
+        # 物理删除）。注意：失败路径不登记 dedup_key，保证 requeue 重试。
+        if self._effective_phase(ctx) == "Terminating":
+            return await self._reconcile_terminating(ctx)
 
         # 步骤 1-3：获取资源 / 查询观测 / 比较差异
         diff = self._compute_diff(resource, observed)
@@ -216,6 +259,138 @@ class ReconciliationController(Reconciler):
             status_patch={"conditions": conditions},
         )
 
+    # ------------------------------------------------------------------ #
+    # 终止协调（受控释放 → 清空 finalizer → 物理删除）
+    # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def _effective_phase(ctx: ReconcileContext) -> str | None:
+        """提取资源的有效生命周期 phase。
+
+        优先取观测快照 ``ctx.observed["phase"]``（与 :meth:`_compute_diff`
+        一致的口径）；观测缺失时回退到资源对象自带的 ``status.phase``
+        （强类型子类）。基类资源无 phase 时返回 ``None``。
+        """
+        phase = ctx.observed.get("phase")
+        if phase is None:
+            status = getattr(ctx.resource, "status", None)
+            phase = getattr(status, "phase", None)
+        return str(phase) if phase is not None else None
+
+    async def _reconcile_terminating(self, ctx: ReconcileContext) -> ReconcileResult:
+        """``Terminating`` 受控释放子流程（删除闭环）。
+
+        步骤（对齐 architecture.md §5.3/§12.4 与 development-plan 第 7 章）：
+
+        1. ``release_provider.release(resource)``（未注入 → Noop）；异常 →
+           保持 ``Terminating`` + requeue 重试（不物理删除，GPU 不误删）；
+        2. 读取最新资源，移除默认 release finalizer 后 CAS 写回；仍有其他
+           finalizer → 等待（requeue）；
+        3. finalizers 清空 → 释放关联 Allocation（P1 约定：以
+           ``{kind}/{name}`` 作为 ``allocations.resource_id`` 关联键，由
+           Scheduler 装配方对齐）→ 物理 DELETE → 记审计日志。
+
+        失败路径**不**登记 ``_processed_keys``，保证 requeue 后可重试。
+        """
+        resource = ctx.resource
+
+        # 步骤 1：受控释放外部副作用（Provider 缺省 → Noop，仅移除 finalizer）。
+        if self._release_provider is not None:
+            try:
+                await self._release_provider.release(resource)
+            except Exception as exc:  # noqa: BLE001 - 释放失败需保持 Terminating 重试
+                logger.warning("release provider failed (keep Terminating): %s", exc)
+                return ReconcileResult(
+                    done=False,
+                    requeue_after=10.0,
+                    status_patch={
+                        "conditions": [
+                            {
+                                "type": "Terminating",
+                                "status": "False",
+                                "reason": "ReleaseFailed",
+                                "message": str(exc),
+                            }
+                        ]
+                    },
+                )
+
+        if self._registry is None:
+            logger.warning(
+                "terminating resource cannot be finalized without a registry: %s",
+                ctx.dedup_key,
+            )
+            return ReconcileResult(done=False, requeue_after=30.0)
+
+        meta = resource.metadata
+
+        # 步骤 2：移除默认 release finalizer（基于最新版本，CAS 写回）。
+        try:
+            current = await self._registry.get(
+                resource.kind, meta.namespace, meta.name, ctx.tenant_id
+            )
+        except NotFoundError:
+            # 已被并发删除：视为完成。
+            self._processed_keys.add(ctx.dedup_key)
+            return ReconcileResult(done=True)
+
+        current.finalizers = [f for f in current.finalizers if f != DEFAULT_RELEASE_FINALIZER]
+        if current.finalizers:
+            # 仍有其他 finalizer 持有方未完成清理：写回并等待。
+            try:
+                await self._registry.put(current, expected_version=current.metadata.resourceVersion)
+            except ConflictError:
+                # 版本漂移：下轮重读重试。
+                return ReconcileResult(done=False, requeue_after=5.0)
+            return ReconcileResult(
+                done=False,
+                requeue_after=5.0,
+                status_patch={
+                    "conditions": [
+                        {
+                            "type": "Terminating",
+                            "status": "False",
+                            "reason": "WaitingFinalizers",
+                            "message": f"waiting finalizers: {current.finalizers}",
+                        }
+                    ]
+                },
+            )
+
+        # 步骤 3：finalizers 已清空 → 释放关联 Allocation → 物理 DELETE。
+        allocation_key = f"{resource.kind}/{meta.name}"
+        get_active = getattr(self._registry, "get_active_allocation", None)
+        if callable(get_active):
+            active = await get_active(allocation_key, ctx.tenant_id)
+            if active is not None:
+                release = getattr(self._registry, "release_allocation", None)
+                if callable(release):
+                    await release(
+                        active["id"],
+                        ctx.tenant_id,
+                        reason=f"resource {allocation_key} deleted",
+                    )
+        with contextlib.suppress(NotFoundError):
+            # 已被并发删除：幂等完成
+            await self._registry.delete(
+                resource.kind,
+                meta.namespace,
+                meta.name,
+                ctx.tenant_id,
+                actor="reconciler",
+                correlation_id=ctx.correlation_id,
+            )
+        self._processed_keys.add(ctx.dedup_key)
+        logger.info(
+            "resource physically deleted after finalizers cleared: kind=%s name=%s "
+            "tenant_id=%s correlation_id=%s",
+            resource.kind,
+            meta.name,
+            ctx.tenant_id,
+            ctx.correlation_id,
+        )
+        return ReconcileResult(done=True, requeue_after=None)
+
     @staticmethod
     def _compute_diff(resource: Resource, observed: dict[str, Any]) -> dict[str, Any]:
         """计算期望状态与观测状态的差异（步骤 2-3）。
@@ -261,4 +436,4 @@ class ReconciliationController(Reconciler):
         }
 
 
-__all__ = ["ReconciliationController"]
+__all__ = ["ReleaseProvider", "ReconciliationController"]

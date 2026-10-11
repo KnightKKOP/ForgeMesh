@@ -5,7 +5,8 @@
 * ``InferenceService`` 合法转移链（Pending→...→Ready）通过；
 * **非法转移被拒**（如 Ready→Scheduling 抛 ``InvalidStateTransition``）；
 * ``Ready`` 到 ``Degraded`` / ``Updating`` / ``Terminating`` 的双向/单向语义；
-* ``Terminating`` / ``Failed`` / ``Unknown`` 终态无出边；
+* 所有非终态（含 ``Failed`` / ``Unknown``，人工清理入口）→ ``Terminating``；
+* ``Terminating`` 唯一终态无出边（finalizer 清空后由注册表物理删除）；
 * ``Allocation`` 的 ``Active → {Released, Expired}`` 单向语义；
 * 自定义 ``StateMachine`` 的 ``can`` / ``validate`` 行为。
 """
@@ -47,9 +48,7 @@ pytestmark = pytest.mark.unit
         (InferencePhase.READY, InferencePhase.TERMINATING),
     ],
 )
-def test_inference_legal_transitions_pass(
-    current: InferencePhase, target: InferencePhase
-) -> None:
+def test_inference_legal_transitions_pass(current: InferencePhase, target: InferencePhase) -> None:
     """合法转移：``can`` 为 True 且 ``validate`` 不抛异常。"""
     assert INFERENCE_STATE_MACHINE.can(current.value, target.value) is True
     INFERENCE_STATE_MACHINE.validate(current.value, target.value)  # 不抛异常
@@ -62,9 +61,7 @@ def test_ready_to_scheduling_is_rejected() -> None:
             InferencePhase.READY.value, InferencePhase.SCHEDULING.value
         )
     assert (
-        INFERENCE_STATE_MACHINE.can(
-            InferencePhase.READY.value, InferencePhase.SCHEDULING.value
-        )
+        INFERENCE_STATE_MACHINE.can(InferencePhase.READY.value, InferencePhase.SCHEDULING.value)
         is False
     )
 
@@ -91,23 +88,39 @@ def test_backward_transition_is_rejected() -> None:
     ],
 )
 @pytest.mark.parametrize("sink", [InferencePhase.FAILED, InferencePhase.UNKNOWN])
-def test_any_non_terminal_state_can_fail(
-    source: InferencePhase, sink: InferencePhase
-) -> None:
+def test_any_non_terminal_state_can_fail(source: InferencePhase, sink: InferencePhase) -> None:
     """除终止/吸收态外，任意状态均可转移到 Failed / Unknown。"""
     INFERENCE_STATE_MACHINE.validate(source.value, sink.value)
 
 
 @pytest.mark.parametrize(
-    "terminal",
-    [InferencePhase.TERMINATING, InferencePhase.FAILED, InferencePhase.UNKNOWN],
+    "source",
+    [
+        InferencePhase.PENDING,
+        InferencePhase.SCHEDULING,
+        InferencePhase.PREPARING,
+        InferencePhase.DEPLOYING,
+        InferencePhase.VERIFYING,
+        InferencePhase.READY,
+        InferencePhase.DEGRADED,
+        InferencePhase.UPDATING,
+        InferencePhase.FAILED,
+        InferencePhase.UNKNOWN,
+    ],
 )
-def test_terminal_states_have_no_outgoing(terminal: InferencePhase) -> None:
-    """终态 / 吸收态无出边，任何转移都被拒。"""
-    assert INFERENCE_TRANSITIONS[terminal.value] == set()
+def test_any_state_can_terminate(source: InferencePhase) -> None:
+    """删除入口对所有现实状态可达：任意非终态（含 Failed/Unknown 人工清理）
+    → Terminating 均合法。"""
+    assert INFERENCE_STATE_MACHINE.can(source.value, InferencePhase.TERMINATING.value) is True
+    INFERENCE_STATE_MACHINE.validate(source.value, InferencePhase.TERMINATING.value)
+
+
+def test_terminating_has_no_outgoing() -> None:
+    """Terminating 为唯一终态：无出边（finalizer 清空后由注册表物理删除）。"""
+    assert INFERENCE_TRANSITIONS[InferencePhase.TERMINATING.value] == set()
     for target in InferencePhase:
         with pytest.raises(InvalidStateTransition):
-            INFERENCE_STATE_MACHINE.validate(terminal.value, target.value)
+            INFERENCE_STATE_MACHINE.validate(InferencePhase.TERMINATING.value, target.value)
 
 
 def test_unknown_source_state_is_rejected() -> None:
@@ -122,9 +135,7 @@ def test_unknown_source_state_is_rejected() -> None:
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize(
-    "target", [AllocationStatus.RELEASED, AllocationStatus.EXPIRED]
-)
+@pytest.mark.parametrize("target", [AllocationStatus.RELEASED, AllocationStatus.EXPIRED])
 def test_allocation_active_transitions_allowed(target: AllocationStatus) -> None:
     """Active → {Released, Expired} 为合法转移。"""
     ALLOCATION_STATE_MACHINE.validate(AllocationStatus.ACTIVE.value, target.value)
@@ -165,9 +176,7 @@ def test_state_machine_copies_transition_sets() -> None:
 
 def test_state_machine_validate_raises_with_details() -> None:
     """非法转移异常应携带机器名与允许集合，便于诊断。"""
-    machine = StateMachine(
-        states={"A", "B", "C"}, transitions={"A": {"B"}}, name="demo"
-    )
+    machine = StateMachine(states={"A", "B", "C"}, transitions={"A": {"B"}}, name="demo")
     with pytest.raises(InvalidStateTransition) as excinfo:
         machine.validate("A", "C")
 

@@ -127,15 +127,20 @@ paths:
           $ref: "#/components/responses/NotFound"
     delete:
       tags: [inference-services]
-      summary: 删除推理服务
+      summary: 删除推理服务（受控删除：finalizer 驱动受控释放）
       operationId: deleteInferenceService
       responses:
         "202":
-          description: 已受理删除（异步）
+          description: >
+            已受理删除（异步）——资源持有 finalizer（或有外部副作用自动追加），
+            置为 Terminating，由协调器驱动「受控释放 GPU → 清空 finalizer →
+            物理删除」闭环（development-plan 第 7 章）。
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/InferenceService"
+                $ref: "#/components/schemas/TerminatingResponse"
+        "204":
+          description: 已直接删除（无 finalizer，无外部副作用）
         "404":
           $ref: "#/components/responses/NotFound"
 
@@ -244,6 +249,20 @@ components:
             $ref: "#/components/schemas/InferenceService"
         nextPageToken:
           type: string
+    TerminatingResponse:
+      type: object
+      description: >
+        受控删除受理响应：资源持有 finalizer（或有外部副作用自动追加默认
+        finalizer），已置为 Terminating，等待协调器完成受控释放后物理删除。
+      required: [name, phase]
+      properties:
+        name:
+          type: string
+          description: 资源名
+        phase:
+          type: string
+          enum: [Terminating]
+          description: 受理后的生命周期阶段（固定 Terminating）
     WorkflowRunRequest:
       type: object
       required: [definition, version]

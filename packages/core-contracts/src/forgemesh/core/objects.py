@@ -91,6 +91,10 @@ class Resource(BaseModel):
         kind: 资源类型标识（如 ``InferenceService``）。
         metadata: 公共元数据。
         conditions: 资源条件集合（同一 ``type`` 至多一条）。
+        finalizers: 受控删除的阻塞器列表；非空时删除请求仅将资源置为
+            ``Terminating``，由各 finalizer 持有方完成清理（如释放 GPU）
+            并移除自身，全部清空后才允许物理删除（对齐 development-plan
+            第 7 章除闭环）。旧序列化 payload 无此字段时视为 ``[]``。
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -99,6 +103,7 @@ class Resource(BaseModel):
     kind: str
     metadata: ObjectMeta
     conditions: list[Condition] = Field(default_factory=list)
+    finalizers: list[str] = Field(default_factory=list)
 
     def with_generation_bump(self) -> Resource:
         """返回一份深拷贝，并将其 ``metadata.generation`` 递增 1。

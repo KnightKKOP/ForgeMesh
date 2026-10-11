@@ -5,7 +5,7 @@
 * 创建 → 查询往返；
 * 重复创建返回 409；
 * 查询不存在返回 404；
-* 删除后查询返回 404；
+* 删除：无副作用资源 204 直接物理删除；有副作用态（Ready）202 Terminating；
 * 列表返回多个资源；
 * 缺失 ``X-Tenant-Id`` 头返回 400。
 
@@ -14,11 +14,24 @@
 
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from forgemesh.controlplane.api import create_api_router
-from forgemesh.controlplane.api.dependencies import init_registry
+from forgemesh.controlplane.api.dependencies import get_registry, init_registry
+from forgemesh.core.objects import ObjectMeta
+from forgemesh.resource.inference import (
+    AcceleratorSpec,
+    InferencePhase,
+    InferenceService,
+    InferenceServiceSpec,
+    InferenceServiceStatus,
+    ModelRef,
+    ResourcesSpec,
+    RuntimeRef,
+)
 
 TENANT_HEADERS = {"X-Tenant-Id": "tenant-a"}
 
@@ -43,9 +56,7 @@ def _payload(name: str = "svc-1", namespace: str = "default") -> dict:
 
 def test_create_and_get_inference_service(client: TestClient) -> None:
     """POST 创建 → GET 查询返回同一资源。"""
-    resp = client.post(
-        "/api/v1/inference-services", json=_payload(), headers=TENANT_HEADERS
-    )
+    resp = client.post("/api/v1/inference-services", json=_payload(), headers=TENANT_HEADERS)
     assert resp.status_code == 200, resp.text
     created = resp.json()
     assert created["kind"] == "InferenceService"
@@ -64,9 +75,7 @@ def test_create_and_get_inference_service(client: TestClient) -> None:
 def test_create_conflict(client: TestClient) -> None:
     """重复创建同名资源返回 409。"""
     client.post("/api/v1/inference-services", json=_payload(), headers=TENANT_HEADERS)
-    resp = client.post(
-        "/api/v1/inference-services", json=_payload(), headers=TENANT_HEADERS
-    )
+    resp = client.post("/api/v1/inference-services", json=_payload(), headers=TENANT_HEADERS)
     assert resp.status_code == 409, resp.text
 
 
@@ -81,15 +90,14 @@ def test_get_not_found(client: TestClient) -> None:
 
 
 def test_delete_inference_service(client: TestClient) -> None:
-    """DELETE 后 GET 返回 404。"""
+    """无副作用资源 DELETE → 204 直接物理删除；随后 GET 404。"""
     client.post("/api/v1/inference-services", json=_payload(), headers=TENANT_HEADERS)
     resp = client.delete(
         "/api/v1/inference-services/svc-1",
         headers=TENANT_HEADERS,
         params={"namespace": "default"},
     )
-    assert resp.status_code == 200, resp.text
-    assert resp.json()["status"] == "deleted"
+    assert resp.status_code == 204, resp.text
 
     resp2 = client.get(
         "/api/v1/inference-services/svc-1",
@@ -97,6 +105,40 @@ def test_delete_inference_service(client: TestClient) -> None:
         params={"namespace": "default"},
     )
     assert resp2.status_code == 404, resp2.text
+
+
+def test_delete_terminating_returns_202(client: TestClient) -> None:
+    """有副作用态（Ready）资源 DELETE → 202 + Terminating（受控删除受理）。"""
+    # 通过全局 registry 写入带 status.phase=Ready 的强类型资源
+    # （API 创建的基类资源无 phase，走 204 路径）。
+    registry = get_registry()
+    svc = InferenceService(
+        metadata=ObjectMeta(
+            name="svc-ready", namespace="default", tenant_id="tenant-a", generation=1
+        ),
+        spec=InferenceServiceSpec(
+            model=ModelRef(reference="models/llama"),
+            runtime=RuntimeRef(provider="vllm"),
+            resources=ResourcesSpec(
+                accelerator=AcceleratorSpec(type="nvidia-gpu", count=1, minMemoryGiB=16)
+            ),
+        ),
+        status=InferenceServiceStatus(phase=InferencePhase.READY),
+    )
+    asyncio.run(registry.put(svc))
+
+    resp = client.delete(
+        "/api/v1/inference-services/svc-ready",
+        headers=TENANT_HEADERS,
+        params={"namespace": "default"},
+    )
+    assert resp.status_code == 202, resp.text
+    body = resp.json()
+    assert body["name"] == "svc-ready"
+    assert body["phase"] == "Terminating"
+    # 资源仍存在（等待协调器受控释放后物理删除）
+    row = registry._conn.execute("SELECT phase FROM resources WHERE name='svc-ready'").fetchone()
+    assert row is not None and row["phase"] == "Terminating"
 
 
 def test_list_inference_services(client: TestClient) -> None:

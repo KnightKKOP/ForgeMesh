@@ -2,19 +2,34 @@
 
 覆盖：幂等去重键、差异计算、Policy 三态
 （allow/deny/require_approval——degraded 已按 architecture 7.5 移除）、
-Scheduler 分配成功与失败、幂等性。
+Scheduler 分配成功与失败、幂等性，以及 Terminating 受控删除闭环
+（ReleaseProvider 释放 → 移除 finalizer → 释放 Allocation → 物理删除）。
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
 from typing import Any
 
 import pytest
 from forgemesh.controlplane.reconciler import ReconciliationController, compute_dedup_key
+from forgemesh.controlplane.registry import SQLiteRegistry
+from forgemesh.core.errors import NotFoundError
 from forgemesh.core.objects import ObjectMeta, Resource
 from forgemesh.core.reconciler import ReconcileContext
 from forgemesh.policy.api import PolicyDecision
+from forgemesh.resource.allocation import Allocation
+from forgemesh.resource.inference import (
+    AcceleratorSpec,
+    InferencePhase,
+    InferenceService,
+    InferenceServiceSpec,
+    InferenceServiceStatus,
+    ModelRef,
+    ResourcesSpec,
+    RuntimeRef,
+)
 
 # ---------------------------------------------------------------------- #
 # 测试辅助
@@ -145,9 +160,7 @@ def test_reconcile_no_diff_returns_done():
     observed = {"phase": "Ready"}
     ctx = make_context(resource, observed)
     allow = PolicyDecision(decision="allow", reason="ok")
-    controller = ReconciliationController(
-        registry=None, policy_engine=MockPolicyEngine(allow)
-    )
+    controller = ReconciliationController(registry=None, policy_engine=MockPolicyEngine(allow))
     result = asyncio.run(controller.reconcile(ctx))
     assert result.done is True
     assert result.requeue_after is None
@@ -160,9 +173,7 @@ def test_reconcile_policy_deny_stops():
     observed = {"phase": "Pending"}
     ctx = make_context(resource, observed)
     deny = PolicyDecision(decision="deny", reason="not allowed")
-    controller = ReconciliationController(
-        registry=None, policy_engine=MockPolicyEngine(deny)
-    )
+    controller = ReconciliationController(registry=None, policy_engine=MockPolicyEngine(deny))
     result = asyncio.run(controller.reconcile(ctx))
     assert result.done is False
     assert result.requeue_after == 30.0
@@ -178,9 +189,7 @@ def test_reconcile_policy_allow_proceeds():
     observed = {"phase": "Pending"}
     ctx = make_context(resource, observed)
     allow = PolicyDecision(decision="allow", reason="ok")
-    controller = ReconciliationController(
-        registry=None, policy_engine=MockPolicyEngine(allow)
-    )
+    controller = ReconciliationController(registry=None, policy_engine=MockPolicyEngine(allow))
     result = asyncio.run(controller.reconcile(ctx))
     assert result.done is True
     conditions = result.status_patch["conditions"]
@@ -218,9 +227,7 @@ def test_reconcile_idempotent():
     observed = {"phase": "Pending"}
     ctx = make_context(resource, observed, dedup_key="dup-1")
     allow = PolicyDecision(decision="allow", reason="ok")
-    controller = ReconciliationController(
-        registry=None, policy_engine=MockPolicyEngine(allow)
-    )
+    controller = ReconciliationController(registry=None, policy_engine=MockPolicyEngine(allow))
     # 第一次调用：正常处理
     result1 = asyncio.run(controller.reconcile(ctx))
     assert result1.done is True
@@ -266,3 +273,190 @@ def test_reconcile_allocation_failure():
     conditions = result.status_patch["conditions"]
     assert any(c["reason"] == "AllocationFailed" for c in conditions)
     assert any(c["status"] == "False" for c in conditions)
+
+
+# ---------------------------------------------------------------------- #
+# Terminating 受控删除闭环（architecture §5.3/§12.4 / development-plan 第 7 章）
+# ---------------------------------------------------------------------- #
+
+
+class StubReleaseProvider:
+    """Stub ReleaseProvider：记录调用，可配置抛异常模拟释放失败。"""
+
+    def __init__(self, fail: bool = False) -> None:
+        self.fail = fail
+        self.released: list[str] = []
+
+    async def release(self, resource: Resource) -> None:
+        self.released.append(resource.metadata.name)
+        if self.fail:
+            raise RuntimeError("release failed: gpu driver error")
+
+
+def make_inference_service(
+    name: str = "svc-1",
+    tenant_id: str = "tenant-1",
+    phase: InferencePhase = InferencePhase.READY,
+) -> InferenceService:
+    """构造带 spec/status 的 InferenceService（phase 由 status 携带）。"""
+    return InferenceService(
+        metadata=ObjectMeta(name=name, tenant_id=tenant_id, generation=1),
+        spec=InferenceServiceSpec(
+            model=ModelRef(reference="models/llama"),
+            runtime=RuntimeRef(provider="vllm"),
+            resources=ResourcesSpec(
+                accelerator=AcceleratorSpec(type="nvidia-gpu", count=1, minMemoryGiB=16)
+            ),
+        ),
+        status=InferenceServiceStatus(phase=phase),
+    )
+
+
+def _terminating_context(
+    registry: SQLiteRegistry,
+    name: str = "svc-1",
+    tenant_id: str = "tenant-1",
+    dedup_key: str = "term-1",
+) -> ReconcileContext:
+    """构造 Terminating 资源的协调上下文（resource 以注册表读回为准注入）。"""
+    resource = asyncio.run(registry.get("InferenceService", None, name, tenant_id))
+    return ReconcileContext(
+        resource=resource,
+        observed={"phase": "Terminating"},
+        correlation_id="corr-term",
+        tenant_id=tenant_id,
+        dedup_key=dedup_key,
+    )
+
+
+def _make_controller(
+    registry: SQLiteRegistry,
+    release_provider: Any | None = None,
+) -> ReconciliationController:
+    allow = PolicyDecision(decision="allow", reason="ok")
+    return ReconciliationController(
+        registry=registry,
+        policy_engine=MockPolicyEngine(allow),
+        release_provider=release_provider,
+    )
+
+
+@pytest.mark.unit
+def test_terminating_full_delete_closure():
+    """删除闭环：Ready → DELETE(Terminating) → reconcile 释放 → finalizer 清空
+    → Allocation Released → 物理删除。"""
+    reg = SQLiteRegistry()
+    asyncio.run(reg.put(make_inference_service()))
+    # 建立关联 Allocation（P1 约定：resource_id = "{kind}/{name}"）
+    asyncio.run(
+        reg.put_allocation(
+            Allocation(
+                resource_id="InferenceService/svc-1",
+                tenant_id="tenant-1",
+                idempotency_key="alloc-key-1",
+            )
+        )
+    )
+    # DELETE 受理：Ready 有副作用 → 自动加 finalizer → Terminating
+    delete_result = asyncio.run(reg.request_delete("InferenceService", None, "svc-1", "tenant-1"))
+    assert delete_result.deleted is False
+
+    stub = StubReleaseProvider()
+    controller = _make_controller(reg, release_provider=stub)
+    ctx = _terminating_context(reg)
+
+    result = asyncio.run(controller.reconcile(ctx))
+
+    # 释放被调用且仅一次
+    assert stub.released == ["svc-1"]
+    # 协调完成（物理删除成功）
+    assert result.done is True
+    assert result.requeue_after is None
+    # 资源已物理删除
+    with pytest.raises(NotFoundError):
+        asyncio.run(reg.get("InferenceService", None, "svc-1", "tenant-1"))
+    # Allocation 已释放（Active → Released）
+    allocs = asyncio.run(reg.list_allocations("tenant-1"))
+    assert len(allocs) == 1
+    assert allocs[0]["status"] == "Released"
+    assert allocs[0]["released_at"] is not None
+
+
+@pytest.mark.unit
+def test_terminating_release_failure_keeps_terminating():
+    """release 抛异常 → 保持 Terminating + requeue 重试（不物理删除）。"""
+    reg = SQLiteRegistry()
+    asyncio.run(reg.put(make_inference_service()))
+    asyncio.run(reg.request_delete("InferenceService", None, "svc-1", "tenant-1"))
+
+    stub = StubReleaseProvider(fail=True)
+    controller = _make_controller(reg, release_provider=stub)
+    ctx = _terminating_context(reg)
+
+    result = asyncio.run(controller.reconcile(ctx))
+
+    assert result.done is False
+    assert result.requeue_after == 10.0
+    conditions = result.status_patch["conditions"]
+    assert any(c["reason"] == "ReleaseFailed" for c in conditions)
+    # 资源仍在且保持 Terminating（不物理删除、GPU 不误删）
+    row = reg._conn.execute("SELECT phase FROM resources WHERE name='svc-1'").fetchone()
+    assert row is not None and row["phase"] == "Terminating"
+    # 失败不登记 dedup_key：同 key 下一轮仍会重试
+    assert ctx.dedup_key not in controller._processed_keys
+
+
+@pytest.mark.unit
+def test_terminating_noop_provider_still_deletes():
+    """未注入 release_provider（Noop 语义）→ 仅移除 finalizer 后物理删除。"""
+    reg = SQLiteRegistry()
+    asyncio.run(reg.put(make_inference_service()))
+    asyncio.run(reg.request_delete("InferenceService", None, "svc-1", "tenant-1"))
+
+    controller = _make_controller(reg)  # release_provider=None
+    ctx = _terminating_context(reg)
+
+    result = asyncio.run(controller.reconcile(ctx))
+
+    assert result.done is True
+    row = reg._conn.execute("SELECT phase FROM resources WHERE name='svc-1'").fetchone()
+    assert row is None  # 已物理删除
+
+
+@pytest.mark.unit
+def test_terminating_waits_for_other_finalizers():
+    """仍有其他 finalizer 持有方 → 移除默认 release finalizer 后等待（requeue）。"""
+    reg = SQLiteRegistry()
+    svc = make_inference_service()
+    svc.finalizers = ["example.com/cleanup", "forgemesh.io/resource-release"]
+    asyncio.run(reg.put(svc))
+    asyncio.run(reg.request_delete("InferenceService", None, "svc-1", "tenant-1"))
+
+    controller = _make_controller(reg)
+    ctx = _terminating_context(reg)
+
+    result = asyncio.run(controller.reconcile(ctx))
+
+    assert result.done is False
+    assert result.requeue_after == 5.0
+    conditions = result.status_patch["conditions"]
+    assert any(c["reason"] == "WaitingFinalizers" for c in conditions)
+    # 默认 release finalizer 已被移除，自定义 finalizer 保留
+    body = reg._conn.execute("SELECT finalizers FROM resources WHERE name='svc-1'").fetchone()
+    assert json.loads(body["finalizers"]) == ["example.com/cleanup"]
+
+
+@pytest.mark.unit
+def test_non_terminating_phase_skips_delete_path():
+    """Pending 资源不走删除子流程（走正常差异收敛）。"""
+    reg = SQLiteRegistry()
+    asyncio.run(reg.put(make_inference_service(phase=InferencePhase.PENDING)))
+    allow = PolicyDecision(decision="allow", reason="ok")
+    controller = ReconciliationController(registry=reg, policy_engine=MockPolicyEngine(allow))
+    resource = make_resource(generation=1, observed_generation=0)
+    ctx = make_context(resource, {"phase": "Pending"})
+    result = asyncio.run(controller.reconcile(ctx))
+    # 正常收敛路径：done=True，资源未被删除
+    assert result.done is True
+    row = reg._conn.execute("SELECT phase FROM resources WHERE name='svc-1'").fetchone()
+    assert row is not None and row["phase"] == "Pending"

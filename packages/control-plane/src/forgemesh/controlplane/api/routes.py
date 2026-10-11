@@ -5,7 +5,9 @@
 * ``POST   /inference-services``          —— 创建推理服务
 * ``GET    /inference-services``          —— 列出推理服务
 * ``GET    /inference-services/{name}``   —— 获取单个推理服务
-* ``DELETE /inference-services/{name}``   —— 删除推理服务
+* ``DELETE /inference-services/{name}``   —— 删除推理服务（受控删除：无
+  finalizer → 204 物理删除；有 finalizer → 202 ``Terminating``，协调器驱动
+  受控释放后物理删除，见 development-plan 第 7 章）
 * ``POST   /workflows``                   —— 启动工作流运行（development-plan 5.4）
 * ``POST   /decisions``                   —— 结构化决策（决策≠授权，development-plan 5.5）
 * ``GET    /resources``                   —— 通用资源列表（可选 kind 过滤）
@@ -27,7 +29,7 @@ from typing import Any
 from uuid import uuid4
 
 from fastapi import APIRouter, Depends, Header, HTTPException
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from forgemesh.core.errors import ConflictError, NotFoundError
 from forgemesh.core.objects import ObjectMeta, Resource
 from forgemesh.decision.provider import DecisionRequest as InternalDecisionRequest
@@ -142,14 +144,24 @@ async def delete_inference_service(
     name: str,
     tenant_id: str = Depends(get_tenant_id),
     namespace: str | None = None,
-) -> dict[str, Any]:
-    """删除推理服务；不存在时返回 HTTP 404。"""
+) -> Any:
+    """删除推理服务（受控删除语义，对齐 development-plan 第 7 章除闭环）。
+
+    * 无 finalizer（无外部副作用，如 Pending/Failed）→ **204** 直接物理删除；
+    * 有 finalizer（含 Ready 等有副作用态自动追加默认 finalizer）→ **202**，
+      资源置为 ``Terminating``，由协调器驱动「受控释放 GPU → 清空 finalizer
+      → 物理删除」；响应体 ``{"name": ..., "phase": "Terminating"}``。
+
+    不存在时返回 HTTP 404（不变）。
+    """
     registry = get_registry()
     try:
-        await registry.delete("InferenceService", namespace, name, tenant_id)
+        result = await registry.request_delete("InferenceService", namespace, name, tenant_id)
     except NotFoundError as exc:
         raise HTTPException(status_code=404, detail=f"InferenceService '{name}' not found") from exc
-    return {"status": "deleted"}
+    if result.deleted:
+        return Response(status_code=204)
+    return JSONResponse(status_code=202, content={"name": name, "phase": "Terminating"})
 
 
 # ------------------------------------------------------------------ #

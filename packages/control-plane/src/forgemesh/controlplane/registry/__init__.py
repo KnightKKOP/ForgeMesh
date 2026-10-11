@@ -2,6 +2,16 @@
 
 from __future__ import annotations
 
-from .store import SQLiteRegistry
+from .store import (
+    DEFAULT_RELEASE_FINALIZER,
+    SIDE_EFFECT_PHASES,
+    RequestDeleteResult,
+    SQLiteRegistry,
+)
 
-__all__ = ["SQLiteRegistry"]
+__all__ = [
+    "DEFAULT_RELEASE_FINALIZER",
+    "SIDE_EFFECT_PHASES",
+    "RequestDeleteResult",
+    "SQLiteRegistry",
+]

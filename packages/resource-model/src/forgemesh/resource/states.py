@@ -14,10 +14,14 @@
 
     Pending → Scheduling → Preparing → Deploying → Verifying → Ready
     Ready ↔ Degraded / Updating
-    Ready → Terminating
-    任意（Terminating 除外）→ Failed / Unknown
-    Terminating → ∅（终态，无出边）
-    Failed / Unknown → ∅（吸收态，无出边）
+    任意非终态（含 Failed / Unknown）→ Terminating（删除入口，受控释放）
+    任意非终态 → Failed / Unknown
+    Terminating → ∅（唯一终态，无出边；finalizer 清空后由注册表物理删除）
+
+其中 ``Terminating`` 是**唯一终态**：进入后无任何出边，由协调器驱动
+「受控释放 → 清空 finalizer → 物理删除」闭环（对齐 development-plan 第 7 章）。
+``Failed`` / ``Unknown`` 不再是吸收态——允许 ``Failed / Unknown → Terminating``
+以便人工清理失败资源（删除入口必须对所有现实状态可达）。
 
 **分配转移语义**（``ALLOCATION_TRANSITIONS``）::
 
@@ -112,30 +116,36 @@ class StateMachine:
 INFERENCE_STATES: set[str] = {phase.value for phase in InferencePhase}
 
 #: ``InferenceService`` 权威转移表。键为源状态，值为允许的目标状态集合。
-#: ``Failed`` / ``Unknown`` 为吸收态，``Terminating`` 为终态，三者均无出边。
+#: ``Terminating`` 为唯一终态（无出边，finalizer 清空后物理删除）；其余所有
+#: 状态（含 ``Failed`` / ``Unknown``，供人工清理）均可转移到 ``Terminating``。
 INFERENCE_TRANSITIONS: dict[str, set[str]] = {
     InferencePhase.PENDING.value: {
         InferencePhase.SCHEDULING.value,
+        InferencePhase.TERMINATING.value,
         InferencePhase.FAILED.value,
         InferencePhase.UNKNOWN.value,
     },
     InferencePhase.SCHEDULING.value: {
         InferencePhase.PREPARING.value,
+        InferencePhase.TERMINATING.value,
         InferencePhase.FAILED.value,
         InferencePhase.UNKNOWN.value,
     },
     InferencePhase.PREPARING.value: {
         InferencePhase.DEPLOYING.value,
+        InferencePhase.TERMINATING.value,
         InferencePhase.FAILED.value,
         InferencePhase.UNKNOWN.value,
     },
     InferencePhase.DEPLOYING.value: {
         InferencePhase.VERIFYING.value,
+        InferencePhase.TERMINATING.value,
         InferencePhase.FAILED.value,
         InferencePhase.UNKNOWN.value,
     },
     InferencePhase.VERIFYING.value: {
         InferencePhase.READY.value,
+        InferencePhase.TERMINATING.value,
         InferencePhase.FAILED.value,
         InferencePhase.UNKNOWN.value,
     },
@@ -148,17 +158,23 @@ INFERENCE_TRANSITIONS: dict[str, set[str]] = {
     },
     InferencePhase.DEGRADED.value: {
         InferencePhase.READY.value,
+        InferencePhase.TERMINATING.value,
         InferencePhase.FAILED.value,
         InferencePhase.UNKNOWN.value,
     },
     InferencePhase.UPDATING.value: {
         InferencePhase.READY.value,
+        InferencePhase.TERMINATING.value,
         InferencePhase.FAILED.value,
         InferencePhase.UNKNOWN.value,
     },
     InferencePhase.TERMINATING.value: set(),
-    InferencePhase.FAILED.value: set(),
-    InferencePhase.UNKNOWN.value: set(),
+    InferencePhase.FAILED.value: {
+        InferencePhase.TERMINATING.value,
+    },
+    InferencePhase.UNKNOWN.value: {
+        InferencePhase.TERMINATING.value,
+    },
 }
 
 #: ``InferenceService`` 状态机单例（便于直接调用 ``validate`` / ``can``）。

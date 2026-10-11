@@ -160,7 +160,8 @@ jobs:
           import json, pathlib, sys
           schema_dir = pathlib.Path('$schema_dir')
           errors = 0
-          for f in sorted(schema_dir.glob('*.json')):
+          files = sorted(schema_dir.glob('*.json'))
+          for f in files:
               try:
                   json.loads(f.read_text())
               except Exception as e:
@@ -168,5 +169,5 @@ jobs:
                   errors += 1
           if errors:
               sys.exit(1)
-          print(f'OK: {schema_count} JSON Schema(s) parsed successfully')
+          print(f'OK: {len(files)} JSON Schema(s) parsed successfully')
           "

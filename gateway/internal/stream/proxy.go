@@ -5,43 +5,73 @@
 //   - 逐块读取上游响应并立即 Flush，保证 token 实时到达客户端。
 //   - 通过继承客户端请求的 context，客户端断开会自动取消上游请求，避免资源泄漏。
 //
+// 路由语义：入站路径 /api/v1/inference/{svc}/chat 中的 {svc} 通过 Resolver
+// 解析为推理服务实例 endpoint，按简单轮询选择一个实例转发（实例级负载均衡），
+// 并依据转发成败向 Resolver 上报，驱动健康摘流与冷却恢复。
+//
 // 安全约束（见开发计划 §14.1）：仅做转发，不缓存、不落盘任何响应内容。
 package stream
 
 import (
+	"context"
+	"encoding/json"
+	"errors"
 	"io"
 	"log"
 	"net"
 	"net/http"
 	"net/url"
 	"strings"
+	"sync/atomic"
 	"time"
+
+	"github.com/Mekoforge/ForgeMesh/gateway/internal/upstream"
 )
 
 // readBufferSize 是单次读取上游响应体的缓冲区大小。
 const readBufferSize = 32 * 1024
 
+// Resolver 抽象「推理服务名 → 实例 endpoint 列表」的解析与健康上报，
+// 由 upstream.Resolver 实现；以接口注入便于测试替换。
+type Resolver interface {
+	// Resolve 返回服务的健康实例 endpoint 列表（如 "http://10.0.0.1:8000"）。
+	Resolve(ctx context.Context, svc, tenantID string) ([]string, error)
+	// ReportFailure 上报一次实例转发失败（驱动摘流）。
+	ReportFailure(endpoint string)
+	// ReportSuccess 上报一次实例转发成功（清零失败计数）。
+	ReportSuccess(endpoint string)
+}
+
 // Proxy 是流式代理处理器，实现 http.Handler。
 type Proxy struct {
-	upstream *url.URL
-	client   *http.Client
-	logger   *log.Logger
+	resolver     Resolver
+	tenantHeader string
+	client       *http.Client
+	logger       *log.Logger
+	rr           atomic.Uint64 // 轮询计数器
 }
 
 // New 构造流式代理。
 //
+// resolver 提供按服务名的实例解析；tenantHeader 为提取租户身份的请求头名
+// （与 Authz 中间件一致）；logger 为 nil 时使用 log.Default()。
+//
 // 客户端不设置整体超时（流式连接可能长时间保持），仅对响应头到达设置超时，
 // 防止上游僵死连接长期占用资源。
-func New(target *url.URL, logger *log.Logger) *Proxy {
+func New(resolver Resolver, tenantHeader string, logger *log.Logger) *Proxy {
 	if logger == nil {
 		logger = log.Default()
 	}
-	if target == nil {
-		panic("stream: New 需要非空 target")
+	if resolver == nil {
+		panic("stream: New 需要非空 resolver")
+	}
+	if tenantHeader == "" {
+		tenantHeader = "X-Tenant-ID"
 	}
 	return &Proxy{
-		upstream: target,
-		logger:   logger,
+		resolver:     resolver,
+		tenantHeader: tenantHeader,
+		logger:       logger,
 		client: &http.Client{
 			Transport: &http.Transport{
 				ResponseHeaderTimeout: 30 * time.Second,
@@ -56,13 +86,51 @@ func New(target *url.URL, logger *log.Logger) *Proxy {
 	}
 }
 
-// ServeHTTP 转发单个流式请求。
+// ServeHTTP 解析 {svc} → 选择实例 → 转发单个流式请求。
 func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	svc := r.PathValue("svc")
+	if svc == "" {
+		writeJSONError(w, http.StatusBadRequest, "MISSING_SERVICE", "路径缺少推理服务名 {svc}")
+		return
+	}
+	tenantID := r.Header.Get(p.tenantHeader)
+
+	endpoints, err := p.resolver.Resolve(r.Context(), svc, tenantID)
+	if err != nil {
+		p.logger.Printf("stream resolve error: corr=%s svc=%s tenant=%s err=%v",
+			r.Header.Get("X-Correlation-ID"), svc, tenantID, err)
+		status, code := classifyResolveError(err)
+		writeJSONError(w, status, code, err.Error())
+		return
+	}
+	if len(endpoints) == 0 {
+		writeJSONError(w, http.StatusServiceUnavailable, "NO_HEALTHY_UPSTREAM",
+			"推理服务 "+svc+" 当前没有可用实例")
+		return
+	}
+
+	// 简单轮询：原子递增取模，保证多实例间均匀分发。
+	endpoint := endpoints[int(p.rr.Add(1))%len(endpoints)]
+	target, err := url.Parse(endpoint)
+	if err != nil || target.Scheme == "" || target.Host == "" {
+		p.logger.Printf("stream invalid endpoint: corr=%s svc=%s endpoint=%q err=%v",
+			r.Header.Get("X-Correlation-ID"), svc, endpoint, err)
+		p.resolver.ReportFailure(endpoint)
+		writeJSONError(w, http.StatusBadGateway, "INVALID_UPSTREAM",
+			"实例地址非法: "+endpoint)
+		return
+	}
+
+	p.forward(w, r, target, endpoint)
+}
+
+// forward 执行单次流式转发，并依据结果向 Resolver 上报健康度。
+func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, target *url.URL, endpoint string) {
 	// 使用客户端请求的 context：客户端断开时，Go 运行时会取消该 context，
 	// 进而取消这里的上游请求，实现“断连即取消上游”。
 	ctx := r.Context()
 
-	req, err := http.NewRequestWithContext(ctx, r.Method, p.buildUpstreamURL(r.URL), r.Body)
+	req, err := http.NewRequestWithContext(ctx, r.Method, buildUpstreamURL(target, r.URL), r.Body)
 	if err != nil {
 		http.Error(w, http.StatusText(http.StatusBadGateway), http.StatusBadGateway)
 		return
@@ -75,11 +143,21 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	resp, err := p.client.Do(req)
 	if err != nil {
-		p.logger.Printf("stream upstream error: corr=%s path=%s err=%v", r.Header.Get("X-Correlation-ID"), r.URL.Path, err)
+		p.logger.Printf("stream upstream error: corr=%s path=%s endpoint=%s err=%v",
+			r.Header.Get("X-Correlation-ID"), r.URL.Path, endpoint, err)
+		p.resolver.ReportFailure(endpoint)
 		http.Error(w, http.StatusText(http.StatusBadGateway), http.StatusBadGateway)
 		return
 	}
 	defer resp.Body.Close()
+
+	// 实例返回 5xx 视为实例侧故障（计入摘流），但响应仍透传给客户端；
+	// 4xx 属客户端问题，不计故障。
+	upstreamFailed := resp.StatusCode >= 500
+	if upstreamFailed {
+		p.resolver.ReportFailure(endpoint)
+
+	}
 
 	// 透传上游头，但剔除 hop-by-hop 头，避免连接语义污染。
 	dst := w.Header()
@@ -109,6 +187,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if n > 0 {
 			if _, writeErr := w.Write(buf[:n]); writeErr != nil {
 				// 客户端已断开：直接返回，defer 会关闭上游响应体并取消上游请求。
+				// 断连属客户端行为，不计入实例健康度。
 				return
 			}
 			if flusher != nil {
@@ -116,8 +195,20 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		if readErr != nil {
+			// 客户端断开导致上游请求被取消：属客户端行为，不计实例健康度。
+			if errors.Is(readErr, context.Canceled) || errors.Is(readErr, context.DeadlineExceeded) {
+				return
+			}
 			if readErr != io.EOF {
-				p.logger.Printf("stream read error: corr=%s path=%s err=%v", r.Header.Get("X-Correlation-ID"), r.URL.Path, readErr)
+				// 上游流中途异常终止：计一次实例失败。
+				p.logger.Printf("stream read error: corr=%s path=%s endpoint=%s err=%v",
+					r.Header.Get("X-Correlation-ID"), r.URL.Path, endpoint, readErr)
+				p.resolver.ReportFailure(endpoint)
+				return
+			}
+			// 流完整读尽：实例工作正常（5xx 响应已单独计失败，不覆盖）。
+			if !upstreamFailed {
+				p.resolver.ReportSuccess(endpoint)
 			}
 			return
 		}
@@ -128,10 +219,42 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// buildUpstreamURL 拼接上游基路径与入站请求路径，避免出现双斜杠。
-func (p *Proxy) buildUpstreamURL(in *url.URL) string {
-	u := *p.upstream
-	u.Path = singleJoiningSlash(p.upstream.Path, in.Path)
+// classifyResolveError 将解析错误映射为 (HTTP 状态码, 错误码)。
+// 服务缺失/未就绪/无实例 → 503；控制平面自身故障 → 502。
+func classifyResolveError(err error) (int, string) {
+	switch {
+	case errors.Is(err, upstream.ErrServiceNotFound),
+		errors.Is(err, upstream.ErrNotReady),
+		errors.Is(err, upstream.ErrNoEndpoints),
+		errors.Is(err, upstream.ErrNoHealthyEndpoints):
+		return http.StatusServiceUnavailable, "NO_HEALTHY_UPSTREAM"
+	default:
+		return http.StatusBadGateway, "UPSTREAM_RESOLVE_FAILED"
+	}
+}
+
+// writeJSONError 输出与控制平面错误信封风格对齐的 JSON 错误体：
+//
+//	{"error":{"code":"...","message":"..."}}
+func writeJSONError(w http.ResponseWriter, status int, code, message string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	body := struct {
+		Error struct {
+			Code    string `json:"code"`
+			Message string `json:"message"`
+		} `json:"error"`
+	}{}
+	body.Error.Code = code
+	body.Error.Message = message
+	// 序列化失败只可能源于内部构造，忽略并保留已写出的状态码。
+	_ = json.NewEncoder(w).Encode(body)
+}
+
+// buildUpstreamURL 拼接实例基路径与入站请求路径，避免出现双斜杠。
+func buildUpstreamURL(base *url.URL, in *url.URL) string {
+	u := *base
+	u.Path = singleJoiningSlash(base.Path, in.Path)
 	u.RawQuery = in.RawQuery
 	return u.String()
 }

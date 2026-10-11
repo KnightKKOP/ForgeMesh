@@ -8,7 +8,8 @@
 //	ANY  /api/v1/inference-services[/...]      反代到 Python 控制平面
 //	ANY  /api/v1/workflows[/...]               反代到 Python 控制平面
 //	ANY  /api/v1/decisions[/...]               反代到 Python 控制平面
-//	ANY  /api/v1/inference/{svc}/chat          SSE 流式代理
+//	ANY  /api/v1/inference/{svc}/chat          SSE 流式代理（{svc} 经 Resolver
+//	                                          解析为实例 endpoint，轮询分发）
 //
 // 中间件链（执行顺序）：Recovery → Correlation → Authz → RateLimit → Route。
 // Recovery 作为最外层兜底全量请求；探针刻意不经过鉴权/限流，保证健康检查可用。
@@ -19,6 +20,7 @@ import (
 	"log"
 	"net/http"
 	"net/url"
+	"time"
 
 	"github.com/Mekoforge/ForgeMesh/gateway/internal/config"
 	"github.com/Mekoforge/ForgeMesh/gateway/internal/health"
@@ -62,7 +64,19 @@ func New(cfg config.Config, logger *log.Logger) (*Router, error) {
 
 	hc := health.New(cfg.UpstreamURL)
 	proxy := upstream.New(target, cfg.CorrelationHeader, cfg.TenantHeader, logger)
-	streamProxy := stream.New(target, logger)
+
+	// 推理路由解析器：以控制平面为数据源，把 {svc} 解析为实例 endpoint 列表。
+	// 零值/负值配置回退默认，保持对旧配置的向后兼容。
+	resolverTTL := time.Duration(cfg.ResolverTTLSeconds) * time.Second
+	if resolverTTL <= 0 {
+		resolverTTL = upstream.DefaultResolverTTL
+	}
+	unhealthyCooldown := time.Duration(cfg.UnhealthyCooldownSeconds) * time.Second
+	if unhealthyCooldown <= 0 {
+		unhealthyCooldown = upstream.DefaultUnhealthyCooldown
+	}
+	resolver := upstream.NewResolver(cfg.UpstreamURL, nil, resolverTTL, unhealthyCooldown, logger)
+	streamProxy := stream.New(resolver, cfg.TenantHeader, logger)
 
 	// 精细路由仅在 API 前缀内匹配（顶层已按 /api/v1/ 分流）。
 	apiMux := http.NewServeMux()

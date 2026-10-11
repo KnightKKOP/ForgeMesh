@@ -103,8 +103,7 @@ paths:
           $ref: "#/components/responses/BadRequest"
         "409":
           $ref: "#/components/responses/Conflict"
-        "501":
-          $ref: "#/components/responses/NotImplemented"
+
 
   /api/v1/inference-services/{name}:
     parameters:
@@ -139,8 +138,7 @@ paths:
                 $ref: "#/components/schemas/InferenceService"
         "404":
           $ref: "#/components/responses/NotFound"
-        "501":
-          $ref: "#/components/responses/NotImplemented"
+
 
   /api/v1/workflows:
     post:
@@ -162,8 +160,7 @@ paths:
                 $ref: "#/components/schemas/WorkflowRun"
         "400":
           $ref: "#/components/responses/BadRequest"
-        "501":
-          $ref: "#/components/responses/NotImplemented"
+
 
   /api/v1/decisions:
     post:
@@ -185,8 +182,7 @@ paths:
                 $ref: "#/components/schemas/DecisionResponse"
         "400":
           $ref: "#/components/responses/BadRequest"
-        "501":
-          $ref: "#/components/responses/NotImplemented"
+
 
 components:
   schemas:
@@ -333,9 +329,4 @@ components:
         application/json:
           schema:
             $ref: "#/components/schemas/Error"
-    NotImplemented:
-      description: 阶段 0 占位，尚未实现
-      content:
-        application/json:
-          schema:
-            $ref: "#/components/schemas/Error"
+

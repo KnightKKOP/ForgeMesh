@@ -10,6 +10,8 @@ requires-python = ">=3.9"
 dependencies = [
     "pydantic>=2,<3",
     "forgemesh-core",
+    "forgemesh-workflow-api",
+    "forgemesh-decision-api",
 ]
 
 [project.optional-dependencies]

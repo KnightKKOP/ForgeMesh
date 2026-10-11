@@ -12,7 +12,7 @@
 from __future__ import annotations
 
 from .provider import DecisionCandidate, DecisionProvider, DecisionRequest
-from .router import Attempt, DecisionResult, DecisionRouter
+from .router import Attempt, DecisionResult, DecisionRouter, RouteStatus
 
 __all__ = [
     "DecisionRequest",
@@ -21,4 +21,5 @@ __all__ = [
     "Attempt",
     "DecisionResult",
     "DecisionRouter",
+    "RouteStatus",
 ]

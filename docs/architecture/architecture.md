@@ -60,6 +60,7 @@ ADR 已采纳
 18. 测试与可靠性要求
 19. 实施路线图
 20. 架构验收标准
+附录 A. 状态转移矩阵
 
 # 1. 项目定位与设计目标
 
@@ -109,7 +110,7 @@ ForgeMesh 不负责重新实现整个基础设施生态。
 
 # 2. 已采纳的 ADR 与架构原则
 
-本节将前一版提出的 12 项 ADR 正式纳入架构基线。
+本节将前一版提出的 13 项 ADR 正式纳入架构基线。
 
 这里的“已采纳”表示项目选择了相应的架构方向；具体实现仍需通过接口定义、测试和后续 ADR 完善。
 
@@ -129,6 +130,7 @@ ForgeMesh 不负责重新实现整个基础设施生态。
 | ADR-010 | 采用能力驱动的异构资源模型         | 厂商差异通过 Provider 显式表达        |
 | ADR-011 | 插件与工作流版本固定               | 升级不能破坏正在运行的任务            |
 | ADR-012 | 所有公共契约版本化                 | 通过 Schema、兼容性测试和弃用周期管理 |
+| ADR-013 | 权威存储 SQLite 先行、PostgreSQL 为目标态 | SQL 方言限定兼容子集，PG 独有特性不进核心路径 |
 
 ## 2.2 四条不可违背的架构不变量
 
@@ -156,9 +158,9 @@ ForgeMesh 采用六个逻辑层次。
 
 ### L1 · Access Layer
 
-REST API · CLI · Web Console · SDK
+REST API · CLI · Web Console · SDK · Data Plane Gateway（Go）· 推理流量入口
 
-统一外部入口、身份认证和 API 兼容性
+统一外部入口、身份认证和 API 兼容性；数据平面网关承担推理请求路由、流式转发与实例健康摘流
 
 ### L2 · Core Control Plane
 
@@ -309,6 +311,12 @@ Pending → Scheduling → Preparing → Deploying → Verifying → Ready
 
 `Ready` 不是永久状态。控制器必须能够在服务崩溃、节点离线或资源被外部修改后重新评估状态。
 
+受控删除语义：
+
+- 任意非吸收态（含 `Failed` 与 `Unknown`）都可以进入 `Terminating`，保证删除入口对所有现实状态可达，失败资源可以被人工清理。
+- `Terminating` 是唯一的删除终态：进入后没有出边，由 finalizer 清空驱动注册表执行物理删除（见 5.6）。
+- 合法转移的完整集合以附录 A 的权威转移矩阵为准。
+
 ## 5.4 Reconciliation Controller
 
 控制器执行以下闭环：
@@ -337,6 +345,30 @@ Pending → Scheduling → Preparing → Deploying → Verifying → Ready
 - 控制器重启后的未完成操作。
 
 领导者选举可以减少重复工作，但不能替代数据层面的并发保护。
+
+## 5.6 Finalizer 与受控删除
+
+资源删除必须走受控删除闭环，不允许在存在未释放副作用时直接物理删除。
+
+finalizer 语义：
+
+- 资源通过 `metadata.finalizers` 列表声明未完成的清理责任。
+- 默认 finalizer 为 `forgemesh.io/resource-release`，负责 GPU 等底层资源的受控释放。
+- finalizer 非空的资源收到删除请求时，只进入 `Terminating`，不物理删除。
+- finalizer 全部清空后，注册表才执行物理删除。
+
+受控删除闭环：
+
+1. `request_delete`：删除请求到达，资源转入 `Terminating`。
+2. `ReleaseProvider`：协调器调用受控释放 Provider 清理外部副作用（Provider 未注入时为 Noop 语义）。
+3. 清空 finalizer：移除 `forgemesh.io/resource-release` 并 CAS 写回；仍有其他 finalizer 时等待重入。
+4. 物理删除：finalizers 为空后释放关联 Allocation 并删除资源记录。
+
+失败重入与幂等要求：
+
+- 释放失败的资源保持 `Terminating` 并等待下一次调和重入，不回退状态。
+- 每一步都必须幂等：重复释放、重复清空 finalizer 不得产生二次副作用。
+- 清空 finalizer 必须基于最新资源版本做 CAS 写回，避免并发覆盖。
 
 # 6. WorkEngine：持久化工作流系统
 
@@ -479,7 +511,7 @@ Controller 不应持续创建大量相同工作流来处理同一个未解决问
 
 ## 7.1 ADR-004 与 ADR-005 的正式决定
 
-JEV 是平台的类型化决策模型，不是唯一决策后端，也不是安全授权系统。
+JEV（TypeSafe Decision Model，类型化决策模型）是平台的标准决策表达，不是唯一决策后端，也不是安全授权系统。
 
 架构上拆分为：
 
@@ -858,7 +890,7 @@ GPU 抢占、服务迁移和动态 MIG 重配置应作为独立能力设计，�
 
 | 存储                  | 职责                                             |
 | --------------------- | ------------------------------------------------ |
-| PostgreSQL            | 权威资源状态、工作流状态、租户、配置和审计元数据 |
+| PostgreSQL            | 权威资源状态、工作流状态、租户、配置和审计元数据（实施过渡期 SQLite 先行，见 ADR-013） |
 | Transactional Outbox  | 可靠记录需要发布的业务事件                       |
 | Event Bus             | 可选的异步事件分发                               |
 | Object Storage        | 模型、制品、诊断包和大型执行产物                 |
@@ -916,12 +948,14 @@ GPU 分配需要防止并发冲突。
 
 分配前需要检查资源仍然可用；分配后需要通过实际设备状态确认分配是否生效。
 
+Allocation 持久化必须保证「同一资源至多一个 Active 分配」：以 `resource_id` 上的部分唯一索引（`WHERE status = 'Active'`）作为数据库层最终防线，配合分配状态机校验（`Active → Released / Expired`，终态不可逆），防止并发调和产生双重独占。
+
 # 13. API 与事件规范
 
 ## 13.1 API 分类
 
 - 管理 API： 租户、插件、资源、策略和工作流定义。
-- 运行 API： 创建任务、查询状态、取消、审批和诊断。
+- 运行 API： 创建任务、查询状态、取消、审批和诊断；`POST /api/v1/workflows`（启动工作流运行）与 `POST /api/v1/decisions`（结构化决策请求）已在 OpenAPI 契约中定义。
 - 扩展 API： Provider 调用、插件注册、能力发现和 Agent 通信。
 
 对外 API 使用版本前缀，例如 `/api/v1/`。资源 Schema、插件协议、工作流定义和事件格式分别维护自己的版本。
@@ -1045,6 +1079,7 @@ data:
 | 领域         | 推荐方案                           |
 | ------------ | ---------------------------------- |
 | 核心语言     | Python                             |
+| 数据平面网关 | Go 1.22（REST 反代 / SSE 流式 / 实例路由 / 摘流） |
 | API          | FastAPI、OpenAPI                   |
 | 数据验证     | Pydantic 或等效强类型 Schema       |
 | 权威数据库   | PostgreSQL                         |
@@ -1122,12 +1157,22 @@ forgemesh/
 │   ├── node-agent/
 │   └── cli/
 │
+├── gateway/
+│   ├── go.mod
+│   └── internal/
+│       ├── config/
+│       ├── router/
+│       ├── stream/
+│       └── upstream/
+│
 ├── plugins/
 │   ├── decision-rules/
 │   ├── decision-jev/
 │   ├── workflow-reference/
+│   ├── workflow-temporal/
 │   ├── gpu-nvidia/
 │   ├── runtime-vllm/
+│   ├── runtime-tgi/
 │   ├── qos-basic/
 │   └── metering-basic/
 │
@@ -1139,10 +1184,12 @@ forgemesh/
 ├── tests/
 │   ├── unit/
 │   ├── contract/
+│   ├── compat/
 │   ├── integration/
 │   ├── e2e/
 │   ├── chaos/
-│   └── security/
+│   ├── security/
+│   └── performance/
 │
 └── examples/
     ├── single-node/
@@ -1178,7 +1225,7 @@ Apache License 2.0 是合理的默认候选方案。正式发布前，需要检�
 | Chaos         | 节点离线、进程重启、事件重复、超时   |
 | Security      | 越权、租户隔离、插件权限和密钥泄露   |
 | Compatibility | 插件版本、工作流版本和核心升级       |
-| Performance   | 调度吞吐、任务积压、恢复速度         |
+| Performance   | 调度吞吐、任务积压、恢复速度（`tests/performance` 已落地 4 项基准：API P99、协调吞吐、重启恢复、冲突正确性；网关流式首字节基准属 Go 网关 CI 范围） |
 
 ## 18.2 必须通过的架构不变量测试
 
@@ -1249,7 +1296,7 @@ Foundation
 
 ## 20.1 架构完整性
 
-- ADR-001 至 ADR-012 已落实到接口、代码结构和测试。
+- ADR-001 至 ADR-013 已落实到接口、代码结构和测试。
 - 核心模块与插件边界明确。
 - 所有公共 Schema 均有版本。
 - Resource Registry、Controller、WorkEngine、JEV 和 Scheduler 的职责无歧义。
@@ -1287,6 +1334,77 @@ Foundation
 - 有故障恢复、备份和灾难恢复文档。
 - 有插件开发指南、API 文档和兼容性测试套件。
 - 有明确的开源许可证、贡献指南和安全响应流程。
+
+## 20.6 已知限制
+
+- 控制平面的 `InferenceServiceStatus` 尚无 `endpoints` 字段，而数据平面网关已按契约消费 `status.endpoints`：字段缺失或无可健康实例时，网关明确返回 503，不静默降级。该字段在控制平面补齐后，推理流量路由链路自动打通，是 v1.1 的演进方向。
+
+# 附录 A. 状态转移矩阵
+
+本附录给出权威状态转移表。合法转移由运行时状态机统一校验（白名单语义：未列出的转移一律非法），插件不得自定义。权威实现来源：
+
+- 推理服务与资源分配：`packages/resource-model/src/forgemesh/resource/states.py`
+- 工作流与步骤：`packages/workflow-api/src/forgemesh/workflow/states.py`
+
+## A.1 推理服务（InferenceService）
+
+| 源状态      | 允许的目标状态                                   |
+| ----------- | ------------------------------------------------ |
+| Pending     | Scheduling、Terminating、Failed、Unknown         |
+| Scheduling  | Preparing、Terminating、Failed、Unknown          |
+| Preparing   | Deploying、Terminating、Failed、Unknown          |
+| Deploying   | Verifying、Terminating、Failed、Unknown          |
+| Verifying   | Ready、Terminating、Failed、Unknown              |
+| Ready       | Degraded、Updating、Terminating、Failed、Unknown |
+| Degraded    | Ready、Terminating、Failed、Unknown              |
+| Updating    | Ready、Terminating、Failed、Unknown              |
+| Terminating | —（终态：finalizer 清空后物理删除，见 5.6）     |
+| Failed      | Terminating（供人工清理失败资源）                |
+| Unknown     | Terminating（供人工清理状态不明资源）            |
+
+`Terminating` 是唯一删除终态；`Failed` 与 `Unknown` 不是吸收态，必须可达 `Terminating`。
+
+## A.2 资源分配（Allocation）
+
+| 源状态   | 允许的目标状态     |
+| -------- | ------------------ |
+| Active   | Released、Expired  |
+| Released | —（终态，不可逆） |
+| Expired  | —（终态，不可逆） |
+
+并发约束：同一资源至多一个 Active 分配（部分唯一索引，见 12.4）。
+
+## A.3 工作流运行（WorkflowRun）
+
+| 源状态       | 允许的目标状态                                            |
+| ------------ | --------------------------------------------------------- |
+| Pending      | Running、Cancelled                                        |
+| Running      | Waiting、Compensating、Succeeded、Failed、Cancelled、TimedOut |
+| Waiting      | Running、Cancelled、TimedOut                              |
+| Compensating | Failed、Cancelled                                         |
+| Succeeded    | —（终态）                                                 |
+| Failed       | —（终态）                                                 |
+| Cancelled    | —（终态）                                                 |
+| TimedOut     | —（终态）                                                 |
+
+## A.4 步骤运行（StepRun）
+
+| 源状态             | 允许的目标状态                                  |
+| ------------------ | ----------------------------------------------- |
+| Pending            | Running、Skipped、Cancelled                     |
+| Running            | Retrying、Succeeded、Failed、Compensating、Cancelled |
+| Retrying           | Running、Failed、Cancelled                      |
+| Succeeded          | Compensating（取消/失败时的反向补偿）           |
+| Failed             | Compensating、Cancelled                         |
+| Compensating       | Compensated、CompensationFailed                 |
+| Skipped            | —（终态）                                       |
+| Compensated        | —（终态）                                       |
+| CompensationFailed | —（终态）                                       |
+| Cancelled          | —（终态）                                       |
+
+## A.5 插件生命周期（规划态）
+
+插件安装状态 `Discovered → Validating → Installed → Enabled → Disabled → Uninstalled` 与运行健康状态 `Healthy / Degraded / Unhealthy`（见 8.3）目前为规划约定，尚未在代码中固化为权威转移表；固化后应并入本附录。
 
 # 最终架构结论
 

@@ -14,6 +14,28 @@
 * ``resource_version`` 在 DB 中为 ``INTEGER``，对外的
   ``metadata.resourceVersion`` 为字符串（对齐契约 ``Optional[str]``）。
 
+受控删除（finalizer 语义，对齐 architecture.md §5.3/§12.4 与 development-plan
+第 7 章）
+------------------------------------------------------------------------
+* ``resources`` 表以元数据列 ``phase`` 持久化生命周期阶段（与 ``generation``
+  等并列，由强类型子类的 ``status.phase`` 提取；基类 ``Resource`` 无 phase，
+  列为 ``NULL``），以 ``finalizers`` 列镜像 payload 中的 finalizer 列表。
+* :meth:`request_delete` 为删除入口：finalizers 非空（或 phase 属于有副作用
+  态，自动追加默认 finalizer）→ 置 ``phase='Terminating'`` 持久化并交由协调器
+  驱动「受控释放 → 清空 finalizer → 物理删除」；否则直接物理 DELETE
+  （与既有 ``delete()`` 行为一致，向后兼容）。
+* ``put()`` 的 Update-CAS 路径按 kind 接入权威状态机（``INFERENCE_STATE_MACHINE``
+  等）校验 phase 转移：非法跳变抛
+  :class:`~forgemesh.core.errors.InvalidStateTransition`；首次创建（无旧记录）
+  与不受管 kind 跳过校验。
+
+Allocation 持久化
+------------------
+``allocations`` 表持久化 :class:`~forgemesh.resource.allocation.Allocation`
+（``Active | Released | Expired``），以**部分唯一索引**
+``idx_allocations_one_active_per_resource`` 兜底「同一 ``resource_id`` 至多一个
+Active 分配」；``release_allocation`` 走 ``ALLOCATION_STATE_MACHINE`` 校验。
+
 租户隔离
 --------
 所有查询均以 ``tenant_id`` 作为首要过滤条件；跨租户访问一律视为
@@ -28,12 +50,41 @@ import asyncio
 import base64
 import builtins
 import json
+import logging
 import sqlite3
+from dataclasses import dataclass, field
 from typing import Any
+from uuid import uuid4
 
 from forgemesh.core.errors import ConflictError, NotFoundError
 from forgemesh.core.objects import Resource
 from forgemesh.core.registry import ResourceRegistry
+from forgemesh.resource.allocation import Allocation, AllocationStatus
+from forgemesh.resource.inference import InferenceService
+from forgemesh.resource.states import ALLOCATION_STATE_MACHINE, INFERENCE_STATE_MACHINE
+from pydantic import ValidationError
+
+logger = logging.getLogger(__name__)
+
+#: kind → 权威状态机映射；未登记的 kind 视为不受管，put() 跳过转移校验。
+_KIND_STATE_MACHINES = {
+    "InferenceService": INFERENCE_STATE_MACHINE,
+}
+
+#: kind → 强类型资源模型注册表：读回时按 kind 反序列化，保留 spec / status；
+#: 未登记 kind 回退基类并投影到基类已知字段（兼容第三方 kind / 旧 payload）。
+_KIND_MODELS: dict[str, type[Resource]] = {
+    "InferenceService": InferenceService,
+}
+
+#: 默认受控释放 finalizer：由协调器在 ReleaseProvider 成功释放后移除。
+DEFAULT_RELEASE_FINALIZER = "forgemesh.io/resource-release"
+
+#: 视为「有外部副作用」的 phase：request_delete 时自动追加默认 finalizer，
+#: 先受控释放 GPU/实例再物理删除。Pending/Scheduling/Failed/Unknown 无外部
+#: 副作用，直接物理删除（向后兼容）。
+SIDE_EFFECT_PHASES = frozenset({"Ready", "Degraded", "Updating", "Deploying", "Verifying"})
+
 
 #: 建表与建索引 DDL（幂等执行）。
 _SCHEMA_SQL = """\
@@ -46,6 +97,8 @@ CREATE TABLE IF NOT EXISTS resources (
     resource_version INTEGER NOT NULL DEFAULT 0,
     generation INTEGER NOT NULL DEFAULT 0,
     observed_generation INTEGER NOT NULL DEFAULT 0,
+    phase TEXT,
+    finalizers TEXT NOT NULL DEFAULT '[]',
     body TEXT NOT NULL,
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
     updated_at TEXT NOT NULL DEFAULT (datetime('now')),
@@ -53,7 +106,34 @@ CREATE TABLE IF NOT EXISTS resources (
 );
 CREATE INDEX IF NOT EXISTS idx_resources_kind ON resources(tenant_id, kind);
 CREATE INDEX IF NOT EXISTS idx_resources_labels ON resources(tenant_id, kind, namespace);
+CREATE TABLE IF NOT EXISTS allocations (
+    id TEXT PRIMARY KEY,
+    tenant_id TEXT NOT NULL,
+    resource_id TEXT NOT NULL,
+    status TEXT NOT NULL,
+    idempotency_key TEXT UNIQUE,
+    lease_until TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    released_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_allocations_tenant ON allocations(tenant_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_allocations_one_active_per_resource
+    ON allocations(resource_id) WHERE status = 'Active';
 """
+
+
+@dataclass(frozen=True)
+class RequestDeleteResult:
+    """:meth:`SQLiteRegistry.request_delete` 的结果。
+
+    Attributes:
+        deleted: ``True`` 表示已物理删除；``False`` 表示进入 ``Terminating``
+            受控释放流程（等待协调器清空 finalizer 后删除）。
+        finalizers: 删除请求受理时资源持有的 finalizer 列表（物理删除时为空）。
+    """
+
+    deleted: bool
+    finalizers: builtins.list[str] = field(default_factory=list)
 
 
 class SQLiteRegistry(ResourceRegistry):
@@ -75,9 +155,57 @@ class SQLiteRegistry(ResourceRegistry):
     # ------------------------------------------------------------------ #
 
     def _init_schema(self) -> None:
-        """创建表与索引（幂等）。"""
+        """创建表与索引（幂等），并对存量库做列迁移。"""
         self._conn.executescript(_SCHEMA_SQL)
+        self._migrate_legacy_resources()
         self._conn.commit()
+
+    def _migrate_legacy_resources(self) -> None:
+        """存量库幂等迁移：以 ``PRAGMA table_info`` 探测后补 ``phase`` /
+        ``finalizers`` 列（内存库 ``:memory:`` 每次新建无此问题，但保持幂等）。
+
+        旧结构库文件（v1.0.0 及之前）无这两列；``ALTER TABLE ADD COLUMN``
+        幂等执行，重复打开不报错。
+        """
+        columns = {row["name"] for row in self._conn.execute("PRAGMA table_info(resources)")}
+        if "phase" not in columns:
+            self._conn.execute("ALTER TABLE resources ADD COLUMN phase TEXT")
+            logger.info("migrated legacy resources table: added column 'phase'")
+        if "finalizers" not in columns:
+            self._conn.execute(
+                "ALTER TABLE resources ADD COLUMN finalizers TEXT NOT NULL DEFAULT '[]'"
+            )
+            logger.info("migrated legacy resources table: added column 'finalizers'")
+
+    @staticmethod
+    def _extract_phase(resource: Resource) -> str | None:
+        """从资源对象提取生命周期 phase。
+
+        仅受管 kind 的强类型子类（如 ``InferenceService``）在 ``status.phase``
+        上携带 phase；基类 ``Resource`` 返回 ``None``。
+        """
+        status = getattr(resource, "status", None)
+        phase = getattr(status, "phase", None)
+        return str(phase) if phase is not None else None
+
+    @staticmethod
+    def _validate_phase_transition(kind: str, current: str | None, target: str | None) -> None:
+        """按 kind 接入权威状态机校验 ``current → target`` 转移。
+
+        跳过校验的情形（均不产生副作用）：
+
+        * kind 不在 :data:`_KIND_STATE_MACHINES`（不受管 kind）；
+        * ``current`` / ``target`` 任一为 ``None``（旧 payload 无 phase，或
+          写入方不携带 phase 的基类资源——向后兼容）；
+        * ``current == target``（同状态重写，非转移）。
+
+        Raises:
+            InvalidStateTransition: 非法跳变（如 ``Pending → Ready``）。
+        """
+        machine = _KIND_STATE_MACHINES.get(kind)
+        if machine is None or current is None or target is None or current == target:
+            return
+        machine.validate(current, target)
 
     @staticmethod
     def _encode_token(namespace: str | None, name: str) -> str:
@@ -97,8 +225,27 @@ class SQLiteRegistry(ResourceRegistry):
 
     @staticmethod
     def _row_to_resource(row: sqlite3.Row) -> Resource:
-        """将数据库行反序列化为 :class:`Resource`。"""
-        return Resource.model_validate_json(row["body"])
+        """将数据库行反序列化为 :class:`Resource`。
+
+        受管 kind（登记于 :data:`_KIND_MODELS`）优先按强类型子类解析（保留
+        ``spec`` / ``status``）；解析失败（如基类形状的 payload——部分调用方
+        与既有测试直接以基类 ``Resource`` 写入）或 kind 未登记时，回退基类并
+        投影到基类已知字段（丢弃未知扩展字段），保证旧 payload / 第三方 kind
+        的读回兼容。
+        """
+        body = row["body"]
+        data = json.loads(body)
+        if isinstance(data, dict):
+            model = _KIND_MODELS.get(data.get("kind", ""))
+            if model is not None:
+                try:
+                    return model.model_validate_json(body)
+                except ValidationError:
+                    pass  # 基类形状 payload：回退基类投影
+        known_fields = Resource.model_fields
+        return Resource.model_validate(
+            {key: value for key, value in data.items() if key in known_fields}
+        )
 
     # ------------------------------------------------------------------ #
     # ResourceRegistry 契约实现
@@ -152,12 +299,15 @@ class SQLiteRegistry(ResourceRegistry):
         kind = resource.kind
         generation = meta.generation
         observed_generation = meta.observed_generation
+        phase = self._extract_phase(resource)
+        finalizers_json = json.dumps(list(resource.finalizers))
 
         def _put() -> Resource:
             cur = self._conn.cursor()
             try:
                 if expected_version is None:
                     # ---- Create ----
+                    # 首次创建无旧记录，跳过状态机校验（初始 phase 任意合法值）。
                     new_version = 0
                     stored = resource.model_copy(deep=True)
                     stored.metadata.resourceVersion = str(new_version)
@@ -165,8 +315,9 @@ class SQLiteRegistry(ResourceRegistry):
                     cur.execute(
                         "INSERT INTO resources "
                         "(tenant_id, kind, namespace, name, uid, "
-                        " resource_version, generation, observed_generation, body) "
-                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        " resource_version, generation, observed_generation, "
+                        " phase, finalizers, body) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                         (
                             tenant_id,
                             kind,
@@ -176,6 +327,8 @@ class SQLiteRegistry(ResourceRegistry):
                             new_version,
                             generation,
                             observed_generation,
+                            phase,
+                            finalizers_json,
                             body,
                         ),
                     )
@@ -183,13 +336,23 @@ class SQLiteRegistry(ResourceRegistry):
                     return stored
                 # ---- Update-CAS ----
                 expected_int = int(expected_version)
+                # 状态机接线：按 kind 校验 phase 转移（旧记录无 phase / 不受管
+                # kind / 同状态重写时跳过；非法跳变抛 InvalidStateTransition）。
+                old_row = cur.execute(
+                    "SELECT phase FROM resources "
+                    "WHERE tenant_id=? AND kind=? AND namespace IS ? AND name=?",
+                    (tenant_id, kind, namespace, name),
+                ).fetchone()
+                if old_row is not None:
+                    self._validate_phase_transition(kind, old_row["phase"], phase)
                 new_version = expected_int + 1
                 stored = resource.model_copy(deep=True)
                 stored.metadata.resourceVersion = str(new_version)
                 body = stored.model_dump_json(by_alias=True)
                 cur.execute(
                     "UPDATE resources SET uid=?, resource_version=?, generation=?, "
-                    " observed_generation=?, body=?, updated_at=datetime('now') "
+                    " observed_generation=?, phase=?, finalizers=?, body=?, "
+                    " updated_at=datetime('now') "
                     "WHERE tenant_id=? AND kind=? AND namespace IS ? AND name=? "
                     " AND resource_version=?",
                     (
@@ -197,6 +360,8 @@ class SQLiteRegistry(ResourceRegistry):
                         new_version,
                         generation,
                         observed_generation,
+                        phase,
+                        finalizers_json,
                         body,
                         tenant_id,
                         kind,
@@ -296,6 +461,270 @@ class SQLiteRegistry(ResourceRegistry):
 
         await asyncio.to_thread(_delete)
 
+    async def request_delete(
+        self,
+        kind: str,
+        namespace: str | None,
+        name: str,
+        tenant_id: str,
+        actor: str | None = None,
+        correlation_id: str | None = None,
+    ) -> RequestDeleteResult:
+        """受控删除入口：finalizer 非空 → ``Terminating``；为空 → 物理 DELETE。
+
+        规则（对齐 architecture.md §5.3/§12.4 与 development-plan 第 7 章删除
+        闭环；``phase`` 存于 ``resources.phase`` 元数据列，权威状态机校验）：
+
+        * 资源已处于 ``Terminating`` → 幂等返回（不重复递增版本）；
+        * finalizers 非空 → 持久化 ``phase='Terminating'``（非法转移抛
+          :class:`~forgemesh.core.errors.InvalidStateTransition`），返回
+          ``deleted=False``，由协调器驱动受控释放；
+        * finalizers 为空且 phase 属于有副作用态（:data:`SIDE_EFFECT_PHASES`，
+          如 ``Ready``）→ 自动追加默认 finalizer
+          :data:`DEFAULT_RELEASE_FINALIZER` 后同上；
+        * 其余（Pending/Scheduling/Failed/Unknown/无 phase）无外部副作用，
+          直接物理 DELETE（与 :meth:`delete` 行为一致，向后兼容）。
+
+        payload 与 ``finalizers`` 列双写保持一致；子类 payload 的
+        ``status.phase``（若存在）同步为 ``Terminating``，基类 payload 不引入
+        ``status`` 子树。
+
+        Args:
+            kind: 资源类型标识。
+            namespace: 命名空间（可为 ``None``）。
+            name: 资源名。
+            tenant_id: 租户标识（多租户边界）。
+            actor: 操作发起者标识（审计用）。
+            correlation_id: 关联追踪标识（审计用）。
+
+        Returns:
+            :class:`RequestDeleteResult`：``deleted=True`` 已物理删除；
+            ``deleted=False`` 已进入 ``Terminating``。
+
+        Raises:
+            NotFoundError: 目标资源不存在（或跨租户不可见）。
+            InvalidStateTransition: 当前 phase 不允许转移到 ``Terminating``。
+        """
+        terminating = "Terminating"
+
+        def _request_delete() -> RequestDeleteResult:
+            cur = self._conn.cursor()
+            row = cur.execute(
+                "SELECT body, phase, finalizers, resource_version FROM resources "
+                "WHERE tenant_id=? AND kind=? AND namespace IS ? AND name=?",
+                (tenant_id, kind, namespace, name),
+            ).fetchone()
+            if row is None:
+                raise NotFoundError(
+                    f"resource not found: kind={kind} "
+                    f"namespace={namespace!r} name={name} tenant_id={tenant_id}",
+                )
+            phase = row["phase"]
+            current_finalizers = json.loads(row["finalizers"] or "[]")
+            if phase == terminating:
+                # 幂等：删除请求已受理，仍在受控释放流程中。
+                return RequestDeleteResult(False, list(current_finalizers))
+            effective = list(current_finalizers)
+            if not effective and phase in SIDE_EFFECT_PHASES:
+                effective.append(DEFAULT_RELEASE_FINALIZER)
+            if not effective:
+                # 无 finalizer 且无外部副作用 → 直接物理删除（向后兼容）。
+                cur.execute(
+                    "DELETE FROM resources "
+                    "WHERE tenant_id=? AND kind=? AND namespace IS ? AND name=?",
+                    (tenant_id, kind, namespace, name),
+                )
+                if cur.rowcount == 0:
+                    self._conn.rollback()
+                    raise NotFoundError(
+                        f"resource not found: kind={kind} "
+                        f"namespace={namespace!r} name={name} tenant_id={tenant_id}",
+                    )
+                self._conn.commit()
+                return RequestDeleteResult(True, [])
+            # finalizer 非空（或自动追加）→ 受控删除：置 Terminating。
+            self._validate_phase_transition(kind, phase, terminating)
+            new_version = row["resource_version"] + 1
+            body = json.loads(row["body"])
+            body["finalizers"] = effective
+            # 仅当 payload 已携带 status 子树（强类型子类）时同步 phase；
+            # 基类 payload 不引入 status，保证读回基类 Resource 可解析。
+            if isinstance(body.get("status"), dict):
+                body["status"]["phase"] = terminating
+            # payload 内的 metadata.resourceVersion 与 DB 列保持同步（列权威），
+            # 否则读回对象的 CAS 依据会与列漂移。
+            metadata = body.get("metadata")
+            if isinstance(metadata, dict):
+                metadata["resourceVersion"] = str(new_version)
+            cur.execute(
+                "UPDATE resources SET body=?, phase=?, finalizers=?, "
+                " resource_version=?, updated_at=datetime('now') "
+                "WHERE tenant_id=? AND kind=? AND namespace IS ? AND name=?",
+                (
+                    json.dumps(body, ensure_ascii=False),
+                    terminating,
+                    json.dumps(effective),
+                    new_version,
+                    tenant_id,
+                    kind,
+                    namespace,
+                    name,
+                ),
+            )
+            if cur.rowcount == 0:
+                self._conn.rollback()
+                raise ConflictError(
+                    f"request_delete raced with concurrent write: kind={kind} "
+                    f"namespace={namespace!r} name={name} tenant_id={tenant_id}",
+                )
+            self._conn.commit()
+            logger.info(
+                "delete requested: kind=%s name=%s tenant_id=%s → Terminating "
+                "(finalizers=%s, actor=%s, correlation_id=%s)",
+                kind,
+                name,
+                tenant_id,
+                effective,
+                actor,
+                correlation_id,
+            )
+            return RequestDeleteResult(False, effective)
+
+        return await asyncio.to_thread(_request_delete)
+
+    # ------------------------------------------------------------------ #
+    # Allocation 持久化（development-plan 7.2 DDL）
+    # ------------------------------------------------------------------ #
+
+    async def put_allocation(self, allocation: Allocation) -> str:
+        """插入分配记录，返回新生成的分配 id。
+
+        同一 ``resource_id`` 已存在 ``Active`` 分配时，由部分唯一索引
+        ``idx_allocations_one_active_per_resource`` 兜底拒绝；重复
+        ``idempotency_key`` 由唯一约束拒绝；两者均转
+        :class:`~forgemesh.core.errors.ConflictError`。
+
+        Args:
+            allocation: 分配记录（``status`` 默认 ``Active``）。
+
+        Returns:
+            新分配的 ``id``（``uuid4().hex``）。
+        """
+
+        def _put_allocation() -> str:
+            allocation_id = uuid4().hex
+            try:
+                self._conn.execute(
+                    "INSERT INTO allocations "
+                    "(id, tenant_id, resource_id, status, idempotency_key, lease_until) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    (
+                        allocation_id,
+                        allocation.tenant_id,
+                        allocation.resource_id,
+                        allocation.status.value,
+                        allocation.idempotency_key,
+                        (
+                            allocation.lease_until.isoformat()
+                            if allocation.lease_until is not None
+                            else None
+                        ),
+                    ),
+                )
+                self._conn.commit()
+            except sqlite3.IntegrityError as exc:
+                self._conn.rollback()
+                message = str(exc)
+                if "idempotency_key" in message:
+                    raise ConflictError(
+                        f"duplicate allocation idempotency_key: {allocation.idempotency_key!r}",
+                    ) from exc
+                raise ConflictError(
+                    "resource already has an active allocation: "
+                    f"resource_id={allocation.resource_id!r}",
+                ) from exc
+            return allocation_id
+
+        return await asyncio.to_thread(_put_allocation)
+
+    async def get_active_allocation(
+        self,
+        resource_id: str,
+        tenant_id: str,
+    ) -> dict[str, Any] | None:
+        """读取 ``resource_id`` 当前唯一的 Active 分配；不存在返回 ``None``。
+
+        强制以 ``tenant_id`` 过滤（与 resources 一致的多租户边界）。
+        """
+
+        def _get_active() -> dict[str, Any] | None:
+            row = self._conn.execute(
+                "SELECT * FROM allocations WHERE tenant_id=? AND resource_id=? AND status=?",
+                (tenant_id, resource_id, AllocationStatus.ACTIVE.value),
+            ).fetchone()
+            return dict(row) if row is not None else None
+
+        return await asyncio.to_thread(_get_active)
+
+    async def release_allocation(
+        self,
+        allocation_id: str,
+        tenant_id: str,
+        reason: str | None = None,
+    ) -> None:
+        """将分配 ``Active → Released``（走 ``ALLOCATION_STATE_MACHINE`` 校验）。
+
+        Args:
+            allocation_id: 分配 id。
+            tenant_id: 租户标识（多租户边界，强制过滤）。
+            reason: 释放原因（P1 仅记录日志，供审计追溯）。
+
+        Raises:
+            NotFoundError: 分配不存在（或跨租户不可见）。
+            InvalidStateTransition: 当前状态非 ``Active``（终态不可逆）。
+        """
+
+        def _release() -> None:
+            row = self._conn.execute(
+                "SELECT status FROM allocations WHERE tenant_id=? AND id=?",
+                (tenant_id, allocation_id),
+            ).fetchone()
+            if row is None:
+                raise NotFoundError(
+                    f"allocation not found: id={allocation_id} tenant_id={tenant_id}",
+                )
+            ALLOCATION_STATE_MACHINE.validate(row["status"], AllocationStatus.RELEASED.value)
+            self._conn.execute(
+                "UPDATE allocations SET status=?, released_at=datetime('now') "
+                "WHERE tenant_id=? AND id=?",
+                (AllocationStatus.RELEASED.value, tenant_id, allocation_id),
+            )
+            self._conn.commit()
+            if reason is not None:
+                logger.debug(
+                    "allocation released: id=%s tenant_id=%s reason=%s",
+                    allocation_id,
+                    tenant_id,
+                    reason,
+                )
+
+        await asyncio.to_thread(_release)
+
+    async def list_allocations(
+        self,
+        tenant_id: str,
+    ) -> builtins.list[dict[str, Any]]:
+        """列出租户的全部分配记录（含终态），强制租户过滤。"""
+
+        def _list_allocations() -> list[dict[str, Any]]:
+            rows = self._conn.execute(
+                "SELECT * FROM allocations WHERE tenant_id=? ORDER BY created_at, id",
+                (tenant_id,),
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+        return await asyncio.to_thread(_list_allocations)
+
     # ------------------------------------------------------------------ #
     # 生命周期
     # ------------------------------------------------------------------ #
@@ -305,4 +734,9 @@ class SQLiteRegistry(ResourceRegistry):
         await asyncio.to_thread(self._conn.close)
 
 
-__all__ = ["SQLiteRegistry"]
+__all__ = [
+    "DEFAULT_RELEASE_FINALIZER",
+    "SIDE_EFFECT_PHASES",
+    "RequestDeleteResult",
+    "SQLiteRegistry",
+]

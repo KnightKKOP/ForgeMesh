@@ -1,10 +1,12 @@
 package router
 
 import (
+	"fmt"
 	"io"
 	"log"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/Mekoforge/ForgeMesh/gateway/internal/config"
@@ -119,5 +121,83 @@ func TestApi_UnknownRouteAllowedThroughChain(t *testing.T) {
 	// 关联 ID 中间件应已生效。
 	if rec.Header().Get("X-Correlation-ID") == "" {
 		t.Fatal("未知路由也应携带关联 ID 响应头")
+	}
+}
+
+// TestInferenceChat_ResolvesEndpoint 端到端验证推理路由：
+// 控制平面返回 Ready + 实例 endpoint，SSE 请求应被转发到该实例并透传流式响应。
+func TestInferenceChat_ResolvesEndpoint(t *testing.T) {
+	sseData := "data: token-1\n\ndata: token-2\n\n"
+	var instanceGotPath, instanceGotTenant string
+	instance := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		instanceGotPath = req.URL.Path
+		instanceGotTenant = req.Header.Get("X-Tenant-ID")
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(sseData))
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+	}))
+	defer instance.Close()
+
+	// 模拟控制平面：GET /api/v1/inference-services/{svc} 返回实例地址。
+	controlPlane := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if req.URL.Path != "/api/v1/inference-services/svc-a" {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, fmt.Sprintf(
+			`{"apiVersion":"forgemesh/v1","kind":"InferenceService","metadata":{"name":"svc-a"},`+
+				`"spec":{},"status":{"phase":"Ready","endpoints":[%q]}}`, instance.URL))
+	}))
+	defer controlPlane.Close()
+
+	r := newTestRouter(t, controlPlane.URL)
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/inference/svc-a/chat", nil)
+	req.Header.Set("X-Tenant-ID", "tenant-a")
+	r.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("推理请求应 200，实际 %d（body=%s）", rec.Code, rec.Body.String())
+	}
+	if got := rec.Body.String(); got != sseData {
+		t.Fatalf("SSE 数据应原样透传，\nwant %q\ngot  %q", sseData, got)
+	}
+	if ct := rec.Header().Get("Content-Type"); ct != "text/event-stream" {
+		t.Fatalf("Content-Type 应为 text/event-stream，实际 %q", ct)
+	}
+	if instanceGotPath != "/api/v1/inference/svc-a/chat" {
+		t.Fatalf("实例收到路径不符: %q", instanceGotPath)
+	}
+	if instanceGotTenant != "tenant-a" {
+		t.Fatalf("租户头应透传到实例，实际 %q", instanceGotTenant)
+	}
+}
+
+// TestInferenceChat_ServiceNotFound 验证服务不存在时返回 503 与 NO_HEALTHY_UPSTREAM 信封。
+func TestInferenceChat_ServiceNotFound(t *testing.T) {
+	controlPlane := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = io.WriteString(w, `{"detail":"not found"}`)
+	}))
+	defer controlPlane.Close()
+
+	r := newTestRouter(t, controlPlane.URL)
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/inference/nope/chat", nil)
+	req.Header.Set("X-Tenant-ID", "tenant-a")
+	r.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("服务不存在应 503，实际 %d", rec.Code)
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, `"code":"NO_HEALTHY_UPSTREAM"`) {
+		t.Fatalf("错误体应含 NO_HEALTHY_UPSTREAM，实际: %s", body)
 	}
 }

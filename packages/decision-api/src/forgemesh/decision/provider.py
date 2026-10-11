@@ -10,7 +10,7 @@ JEV 只回答「有哪些候选动作」，**不**分配资源、**不**写资�
 from __future__ import annotations
 
 from collections.abc import Sequence
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -23,8 +23,10 @@ class DecisionRequest(BaseModel):
         tenant_id: 租户标识（全边界强制隔离）。
         operation: 操作语义标识（如 ``inference.schedule``）。
         context: 决策上下文。生产实现应逐步替换为强类型联合体。
-        risk_level: 风险等级（low/medium/high），高风险触发降级保护。
-        deadline_ms: 决策时限（毫秒），超时视为失败。
+        risk_level: 风险等级（low/medium/high），高风险触发降级保护
+            （对齐 development-plan 5.5，默认 ``low``）。
+        deadline_ms: 决策时限（毫秒），超时视为失败
+            （对齐 development-plan 5.5，默认 2000）。
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -33,8 +35,12 @@ class DecisionRequest(BaseModel):
     tenant_id: str
     operation: str
     context: dict[str, Any] = Field(default_factory=dict)
-    risk_level: str | None = Field(default=None, description="风险等级（low/medium/high），高风险触发降级保护")
-    deadline_ms: int | None = Field(default=None, ge=1, description="决策时限（毫秒），超时视为失败")
+    risk_level: Literal["low", "medium", "high"] = Field(
+        default="low", description="风险等级（low/medium/high），高风险触发降级保护"
+    )
+    deadline_ms: int = Field(
+        default=2000, ge=1, description="决策时限（毫秒），超时视为失败"
+    )
 
 
 class DecisionCandidate(BaseModel):

@@ -34,6 +34,7 @@ markers = [
     "contract: 契约测试（每次 PR）",
     "integration: 集成测试（每日）",
     "e2e: 端到端测试（每阶段/每夜）",
+    "performance: 性能基准测试（每次 PR，宽松阈值）",
 ]
 
 [tool.coverage.run]

@@ -15,22 +15,26 @@ import (
 
 // 环境变量名。全部以 GATEWAY_ 前缀，避免与 Python 控制平面冲突。
 const (
-	envListenAddr        = "GATEWAY_LISTEN_ADDR"
-	envUpstreamURL       = "GATEWAY_UPSTREAM_URL"
-	envRateLimitRPS      = "GATEWAY_RATE_LIMIT_RPS"
-	envRateLimitBurst    = "GATEWAY_RATE_LIMIT_BURST"
-	envTenantHeader      = "GATEWAY_TENANT_HEADER"
-	envCorrelationHeader = "GATEWAY_CORRELATION_HEADER"
+	envListenAddr               = "GATEWAY_LISTEN_ADDR"
+	envUpstreamURL              = "GATEWAY_UPSTREAM_URL"
+	envRateLimitRPS             = "GATEWAY_RATE_LIMIT_RPS"
+	envRateLimitBurst           = "GATEWAY_RATE_LIMIT_BURST"
+	envTenantHeader             = "GATEWAY_TENANT_HEADER"
+	envCorrelationHeader        = "GATEWAY_CORRELATION_HEADER"
+	envResolverTTLSeconds       = "GATEWAY_RESOLVER_TTL_SECONDS"
+	envUnhealthyCooldownSeconds = "GATEWAY_UNHEALTHY_COOLDOWN_SECONDS"
 )
 
 // 默认值。
 const (
-	defaultListenAddr        = ":8081"
-	defaultUpstreamURL       = "http://127.0.0.1:8080"
-	defaultRateLimitRPS      = 50.0
-	defaultRateLimitBurst    = 100
-	defaultTenantHeader      = "X-Tenant-ID"
-	defaultCorrelationHeader = "X-Correlation-ID"
+	defaultListenAddr               = ":8081"
+	defaultUpstreamURL              = "http://127.0.0.1:8080"
+	defaultRateLimitRPS             = 50.0
+	defaultRateLimitBurst           = 100
+	defaultTenantHeader             = "X-Tenant-ID"
+	defaultCorrelationHeader        = "X-Correlation-ID"
+	defaultResolverTTLSeconds       = 5
+	defaultUnhealthyCooldownSeconds = 10
 )
 
 // Config 描述网关运行所需的全部配置项。
@@ -47,6 +51,10 @@ type Config struct {
 	TenantHeader string
 	// CorrelationHeader 承载链路关联 ID 的请求头名称。
 	CorrelationHeader string
+	// ResolverTTLSeconds 服务→实例列表缓存的 TTL（秒），正整数。
+	ResolverTTLSeconds int
+	// UnhealthyCooldownSeconds 实例被摘流后的冷却时长（秒），正整数。
+	UnhealthyCooldownSeconds int
 }
 
 // Load 从环境变量读取配置；未设置项使用默认值。
@@ -76,6 +84,24 @@ func Load() (Config, error) {
 		return Config{}, fmt.Errorf("config: %s 必须为正整数，当前为 %d", envRateLimitBurst, burst)
 	}
 	cfg.RateLimitBurst = burst
+
+	ttlSec, err := getIntEnv(envResolverTTLSeconds, defaultResolverTTLSeconds)
+	if err != nil {
+		return Config{}, err
+	}
+	if ttlSec <= 0 {
+		return Config{}, fmt.Errorf("config: %s 必须为正整数，当前为 %d", envResolverTTLSeconds, ttlSec)
+	}
+	cfg.ResolverTTLSeconds = ttlSec
+
+	cooldownSec, err := getIntEnv(envUnhealthyCooldownSeconds, defaultUnhealthyCooldownSeconds)
+	if err != nil {
+		return Config{}, err
+	}
+	if cooldownSec <= 0 {
+		return Config{}, fmt.Errorf("config: %s 必须为正整数，当前为 %d", envUnhealthyCooldownSeconds, cooldownSec)
+	}
+	cfg.UnhealthyCooldownSeconds = cooldownSec
 
 	// 归一化上游地址：去掉结尾斜杠，避免与请求路径拼接时出现双斜杠。
 	cfg.UpstreamURL = strings.TrimRight(strings.TrimSpace(cfg.UpstreamURL), "/")

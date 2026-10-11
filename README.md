@@ -82,6 +82,7 @@ forgemesh/
 ├── deploy/                     # docker / kubernetes / observability
 ├── tests/                      # unit / contract / compat / e2e / chaos / security
 ├── examples/                   # single-node / multi-node / multi-tenant 示例
+├── scripts/                    # CI 校验脚本（manifest/OpenAPI/元数据/插件冒烟）
 │
 └── docs/
     ├── architecture/           # 架构基线与开发计划
@@ -192,7 +193,7 @@ ForgeMesh v1.0.0 是首个稳定版本，涵盖以下核心能力：
 
 | 类型 | 数量 |
 |------|------|
-| Python 测试 | **898** |
+| Python 测试 | **1115** |
 | Go 测试 | 全部通过 |
 | ruff 检查 | All checks passed |
 
@@ -225,6 +226,7 @@ ForgeMesh 通过可插拔架构支持 6 种插件类型：
 | M4 | P3 | ✅ 完成 | 执行平面与 GPU 生命周期 |
 | M5 | P4 | ✅ 完成 | 生产级治理 |
 | M6 | P5 | ✅ 完成 | 扩展与生态（v1.0.0 发布） |
+| v1.1 | — | ✅ 已交付 | 可信基线（阶段 A–E），见 [`v1.1-development-plan.md`](docs/architecture/v1.1-development-plan.md) |
 
 > 里程碑定义与准入/准出条件（DoD）见 [`development-plan.md`](docs/architecture/development-plan.md)。
 

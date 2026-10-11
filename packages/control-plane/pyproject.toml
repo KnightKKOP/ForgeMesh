@@ -5,8 +5,8 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "forgemesh-control-plane"
 version = "0.0.1"
-description = "ForgeMesh control plane HTTP service skeleton (contract placeholder, no DB in phase 0)"
-requires-python = ">=3.9"
+description = "ForgeMesh control plane: SQLite-backed registry, reconciler, policy, plugin manager, outbox, audit and REST API"
+requires-python = ">=3.12"
 dependencies = [
     "pydantic>=2,<3",
     "forgemesh-core",

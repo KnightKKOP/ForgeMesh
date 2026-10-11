@@ -3,6 +3,7 @@
 # 说明：阶段 0 仅交付契约、骨架与占位；本文件描述【目标拓扑】，暂不实际运行
 #       （当前开发环境无 docker / postgres）。各服务镜像/Dockerfile 将在后续阶段补齐。
 # 目标拓扑：postgres（权威状态） + control-plane（Python 控制平面） + gateway（Go 网关）。
+# ADR-013: v1.0.x 权威存储为 SQLite，仅允许单控制平面实例写同一权威库；不得扩展 replicas
 version: "3.9"
 
 services:

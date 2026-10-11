@@ -151,7 +151,8 @@ ForgeMesh v1.0.0 是首个稳定版本，涵盖以下核心能力：
 ### 核心控制平面（M2）
 - **资源注册中心**：SQLite 持久化，乐观并发 CAS，租户隔离，分页游标
 - **协调控制器**：9 步声明式闭环（获取→查询→比较→生成候选→策略校验→调度分配→执行→重观察→更新状态）
-- **策略引擎**：allow/deny/degraded 三态决策，配额规则，高风险审批触发
+- **策略引擎**：allow/deny/require_approval 三态决策，配额规则，高风险审批触发
+  - 说明：Decision Router 的 `OK/FALLBACK_REQUIRED/FAILED` 是决策路由层的另一组状态，与 Policy 三态不混用
 - **插件管理器**：Manifest 解析校验，生命周期状态机，能力发现，权限授予
 - **审计与 Outbox**：事务性 Outbox，异步事件发布，幂等消费，correlation_id 全链路
 - **REST API 与 CLI**：资源 CRUD，状态查询，任务管理，租户上下文注入

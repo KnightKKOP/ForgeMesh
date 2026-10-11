@@ -126,7 +126,7 @@ Signed-off-by: Zhang San <zhangsan@example.com>
   - `contract`：插件 API、Provider 协议、Schema 兼容性——每次 PR 必跑。
   - `integration` / `e2e` / `chaos` / `security`：由 CI 分阶段执行。
 - **新增公共契约（接口/Schema/事件）必须附带契约测试**，确保版本兼容。
-- 测试应可重复、无外部副作用、不依赖真实 GPU/数据库（阶段 0）。
+- 测试应可重复、无外部副作用、不依赖真实 GPU/数据库（单元/契约测试）。
 - 保持覆盖率不下降；核心模块（`packages/core-contracts`、`packages/resource-model`）优先。
 
 > 测试布局见 `tests/unit`、`tests/contract`、`tests/integration`、`tests/e2e`、`tests/chaos`、`tests/security`。

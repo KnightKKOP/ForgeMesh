@@ -5,8 +5,8 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "forgemesh-cli"
 version = "0.0.1"
-description = "ForgeMesh command line interface skeleton (apply/get/describe/version)"
-requires-python = ">=3.9"
+description = "ForgeMesh command line interface (apply/get/describe/version)"
+requires-python = ">=3.12"
 dependencies = [
     "forgemesh-core",
 ]

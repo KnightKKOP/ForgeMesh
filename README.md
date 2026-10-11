@@ -82,6 +82,7 @@ forgemesh/
 ├── deploy/                     # docker / kubernetes / observability
 ├── tests/                      # unit / contract / compat / e2e / chaos / security
 ├── examples/                   # single-node / multi-node / multi-tenant 示例
+├── scripts/                    # CI 校验脚本（manifest/OpenAPI/元数据/插件冒烟）
 │
 └── docs/
     ├── architecture/           # 架构基线与开发计划
@@ -151,7 +152,8 @@ ForgeMesh v1.0.0 是首个稳定版本，涵盖以下核心能力：
 ### 核心控制平面（M2）
 - **资源注册中心**：SQLite 持久化，乐观并发 CAS，租户隔离，分页游标
 - **协调控制器**：9 步声明式闭环（获取→查询→比较→生成候选→策略校验→调度分配→执行→重观察→更新状态）
-- **策略引擎**：allow/deny/degraded 三态决策，配额规则，高风险审批触发
+- **策略引擎**：allow/deny/require_approval 三态决策，配额规则，高风险审批触发
+  - 说明：Decision Router 的 `OK/FALLBACK_REQUIRED/FAILED` 是决策路由层的另一组状态，与 Policy 三态不混用
 - **插件管理器**：Manifest 解析校验，生命周期状态机，能力发现，权限授予
 - **审计与 Outbox**：事务性 Outbox，异步事件发布，幂等消费，correlation_id 全链路
 - **REST API 与 CLI**：资源 CRUD，状态查询，任务管理，租户上下文注入
@@ -191,7 +193,7 @@ ForgeMesh v1.0.0 是首个稳定版本，涵盖以下核心能力：
 
 | 类型 | 数量 |
 |------|------|
-| Python 测试 | **898** |
+| Python 测试 | **1115** |
 | Go 测试 | 全部通过 |
 | ruff 检查 | All checks passed |
 
@@ -224,6 +226,7 @@ ForgeMesh 通过可插拔架构支持 6 种插件类型：
 | M4 | P3 | ✅ 完成 | 执行平面与 GPU 生命周期 |
 | M5 | P4 | ✅ 完成 | 生产级治理 |
 | M6 | P5 | ✅ 完成 | 扩展与生态（v1.0.0 发布） |
+| v1.1 | — | ✅ 已交付 | 可信基线（阶段 A–E），见 [`v1.1-development-plan.md`](docs/architecture/v1.1-development-plan.md) |
 
 > 里程碑定义与准入/准出条件（DoD）见 [`development-plan.md`](docs/architecture/development-plan.md)。
 

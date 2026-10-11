@@ -23,6 +23,4 @@ spec:
   healthCheck:
     mode: rpc
     timeoutMs: 2000
-  capabilities:
-    - text-generation
-    - streaming
+

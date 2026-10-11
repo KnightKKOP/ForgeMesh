@@ -5,8 +5,8 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "forgemesh-node-agent"
 version = "0.0.1"
-description = "ForgeMesh node agent skeleton (typed tasks only, idempotency, reconnect recovery)"
-requires-python = ">=3.9"
+description = "ForgeMesh node agent (typed tasks only, idempotency, reconnect recovery)"
+requires-python = ">=3.12"
 dependencies = [
     "pydantic>=2,<3",
     "forgemesh-core",

@@ -5,8 +5,8 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "forgemesh-workflow-runtime"
 version = "0.0.1"
-description = "ForgeMesh workflow runtime reference provider skeleton (placeholder, no execution)"
-requires-python = ">=3.9"
+description = "ForgeMesh workflow runtime: persistent execution engine with DSL, compensation and approval"
+requires-python = ">=3.12"
 dependencies = [
     "pydantic>=2,<3",
     "forgemesh-core",

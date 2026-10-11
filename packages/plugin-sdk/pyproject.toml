@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "forgemesh-plugin-sdk"
 version = "0.0.1"
 description = "ForgeMesh plugin SDK contract (PluginManifest, lifecycle, permissions, isolation)"
-requires-python = ">=3.9"
+requires-python = ">=3.12"
 dependencies = [
     "pydantic>=2,<3",
     "forgemesh-core",

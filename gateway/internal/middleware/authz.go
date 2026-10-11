@@ -37,6 +37,12 @@ func Authz(tenantHeader string) Middleware {
 
 			// TODO(生产): 校验 JWT/OIDC，解析 Subject/Scopes/TokenID，
 			//             并按路由执行 Authorize 判定。
+			//
+			// 防御性覆写（WP-D1）：以受信解析值（TrimSpace 后的首个值）覆写入站
+			// 租户头，消除多值头/空白填充歧义——下游转发链（反代、流式代理、
+			// 限流 key）重新读取请求头时拿到的与鉴权上下文严格同源，客户端
+			// 伪造的头部变体无法造成“鉴权身份 ≠ 转发身份”的横向越权。
+			r.Header.Set(tenantHeader, tenant)
 			ctx := WithTenant(r.Context(), tenant)
 			next.ServeHTTP(w, r.WithContext(ctx))
 		})
@@ -74,6 +80,8 @@ func AuthzWithToken(tenantHeader string, validTokens map[string]bool) Middleware
 				http.Error(w, "401 Unauthorized: missing tenant identity", http.StatusUnauthorized)
 				return
 			}
+			// 防御性覆写：与 Authz 一致，以受信解析值覆写入站租户头（见上方注释）。
+			r.Header.Set(tenantHeader, tenant)
 			ctx := WithTenant(r.Context(), tenant)
 			next.ServeHTTP(w, r.WithContext(ctx))
 		})

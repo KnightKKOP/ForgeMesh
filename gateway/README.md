@@ -44,18 +44,59 @@ ForgeMesh 的**统一外部入口**与**高性能流式代理**。与 Python 控
 
 ### 中间件链
 
-执行顺序（外层 → 内层）：
+执行顺序（外层 → 内层，与 `router.go` 实际组装一致，并由
+`internal/middleware/chain_test.go` 验证）：
 
 ```
-Recovery → Correlation → RateLimit → Authz → Route
+Recovery → Correlation → Authz → RateLimit → Route
 ```
 
 - **Recovery**：兜底 panic → 500，记录堆栈，进程不退出（最外层，覆盖全量请求）。
 - **Correlation**：缺失则用 `crypto/rand` 生成 128-bit hex 关联 ID，注入 context 与响应头；已携带则透传。
-- **RateLimit**：按租户令牌桶限流，超限 `429 + Retry-After`（探针路径豁免）。
-- **Authz**：解析租户身份注入 context；缺失返回 `401`（探针路径豁免）。
+- **Authz**：解析租户身份注入 context，并以受信解析值**覆写**入站租户头；缺失返回 `401`（探针路径豁免）。
+- **RateLimit**：按租户令牌桶限流，超限 `429 + Retry-After`；位于 Authz 之后，被拒请求不消耗令牌。
 
 > 说明：探针刻意不经过鉴权/限流，保证负载均衡健康检查始终可用。
+> 注意：`internal/middleware/middleware.go` 包注释中的链序描述
+> （RateLimit 在 Authz 之前）为历史笔误，以本节与实际代码为准。
+
+### Header 转发与剥离策略
+
+两个转发方向的 header 策略（受信来源与处理动作）：
+
+**方向一：客户端 → 网关 → Python 控制平面**（资源类反代，`upstream/client.go`）
+
+| Header | 策略 | 受信来源与说明 |
+| --- | --- | --- |
+| `X-Tenant-ID`（可经 `GATEWAY_TENANT_HEADER` 配置） | **覆写后转发** | Authz 以受信解析值（TrimSpace 后首个值）**覆写**入站头再放行，下游读到的与鉴权上下文严格同源；多值/空白填充变体在入口即被规范化 |
+| `X-Correlation-ID`（可配置） | 生成/透传 | Correlation 中间件受信：缺失则生成 128-bit hex，已携带则原样透传（跨服务链路连续） |
+| `X-Forwarded-*`（For/Proto/Host） | 网关注入 | ReverseProxy `SetXForwarded` 标准注入，标记经代理的事实 |
+| `Host`、`Content-Length` | 剥离后重写 | 由出站 Transport 按上游语义重写，避免长度/主机不一致 |
+| hop-by-hop 头（`Connection`/`Keep-Alive`/`TE`/`Upgrade` 等） | 剥离 | 逐跳语义不跨节点转发 |
+
+**方向二：客户端 → 网关 → 推理实例**（SSE 流式代理，`stream/proxy.go`）
+
+| Header | 策略 | 受信来源与说明 |
+| --- | --- | --- |
+| `X-Tenant-ID` | 覆写后转发 | 同方向一：经 Authz 规范化的受信值（已注入 context，转发头与之一致），同时作为 Resolver 查询与多租户缓存隔离的 key |
+| `X-Correlation-ID` | 透传 | 由 Correlation 中间件保证存在（缺失时已生成） |
+| `Authorization`（Bearer） | 透传 | 客户端凭证原样递交实例，网关不解析不存储 |
+| `Accept` | **强制覆写** | 网关强制 `text/event-stream`，保证流式语义 |
+| `Host`、`Content-Length` | 剥离后重写 | 同方向一 |
+| hop-by-hop 头（双向） | 剥离 | 请求与响应两个方向均过滤 |
+
+**响应方向（上游/实例 → 客户端）**：非 hop-by-hop 头透传；流式响应强制
+`Content-Type: text/event-stream`、`Cache-Control: no-cache`、`X-Accel-Buffering: no`。
+
+**安全缺陷记录（WP-D1，已修复）**：修复前 Authz 仅校验租户头存在性、不回写
+请求头，下游（反代/流式代理/限流 key）重新读取客户端**原始头**——多值头
+（两条 `X-Tenant-ID`）或空白填充值可造成"鉴权身份 ≠ 转发身份"的横向越权
+（confused deputy）。最小防御修复：`Authz`/`AuthzWithToken` 校验通过后以
+受信解析值覆写入站租户头（`internal/middleware/authz.go`），回归测试见
+`internal/router/tenant_security_test.go`。
+已知骨架限制：Authz 尚未接入 JWT/OIDC 签名校验，租户身份本质仍是
+"客户端声明 + 控制平面二次校验"（零信任边界，见 `authz.go` 注释与
+`internal/upstream/resolver.go` 按租户隔离的缓存设计）。
 
 ---
 
@@ -69,6 +110,8 @@ Recovery → Correlation → RateLimit → Authz → Route
 | `GATEWAY_RATE_LIMIT_BURST` | `100` | 每租户令牌桶容量（突发上限） |
 | `GATEWAY_TENANT_HEADER` | `X-Tenant-ID` | 租户身份请求头 |
 | `GATEWAY_CORRELATION_HEADER` | `X-Correlation-ID` | 链路关联 ID 请求头 |
+| `GATEWAY_RESOLVER_TTL_SECONDS` | `5` | 推理服务→实例列表缓存 TTL（秒） |
+| `GATEWAY_UNHEALTHY_COOLDOWN_SECONDS` | `10` | 实例连续 3 次失败被摘流后的冷却时长（秒） |
 
 ---
 
@@ -134,11 +177,11 @@ go test ./...
 flowchart LR
     C[Client] --> R[Recovery]
     R --> CO[Correlation]
-    CO --> RL[RateLimit\n租户令牌桶]
-    RL -->|429| C
-    RL --> AZ[Authz\n解析租户]
+    CO --> AZ[Authz\n解析并覆写租户头]
     AZ -->|401| C
-    AZ --> RT{Route}
+    AZ --> RL[RateLimit\n租户令牌桶]
+    RL -->|429| C
+    RL --> RT{Route}
     RT -->|/healthz /readyz| H[Probe]
     RT -->|/api/v1/resources 等| UP[ReverseProxy]
     RT -->|/api/v1/inference/{svc}/chat| SP[SSE StreamProxy]

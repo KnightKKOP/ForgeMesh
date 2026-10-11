@@ -4,7 +4,9 @@ metadata:
   id: forgemesh.workflow.temporal
   version: 0.0.1
 spec:
-  category: workflow
+  # schema plugin-manifest.schema.json 的 category 枚举不含 "workflow"；
+  # 同类工作流插件 workflow-reference 亦为 provider，故对齐为 provider。
+  category: provider
   compatibility:
     coreApi: v1alpha1
     minCoreVersion: "0.1.0"
@@ -24,7 +26,4 @@ spec:
   healthCheck:
     mode: rpc
     timeoutMs: 2000
-  capabilities:
-    - temporal
-    - compensation
-    - approval
+

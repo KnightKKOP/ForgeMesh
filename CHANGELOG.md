@@ -3,6 +3,16 @@
 本文件记录 ForgeMesh 所有显著变更，遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/) 格式，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/) 规范。
 
+## [1.0.1] - Unreleased
+
+### Fixed
+
+- 勘误：1.0.0 变更日志 P1 段中"PostgreSQL 权威存储（ADR-007）：Repository 模式、迁移脚本"的表述与实际不符——v1.0.0 实际交付为 SQLite 权威存储先行（`SQLiteRegistry` 实现 `ResourceRegistry` 抽象、CAS 乐观并发 `resource_version`），未引入 PostgreSQL 部署与迁移脚本。PostgreSQL 仍为权威存储目标态（ADR-007），过渡决策与迁移判据详见 [ADR-013](docs/design-decisions/adr-013.md)。
+
+### Added
+
+- 新增 [ADR-013](docs/design-decisions/adr-013.md)：权威存储采用 SQLite 先行、PostgreSQL 为目标态的过渡决策。
+
 ## [1.0.0] - 2026-10-11
 
 首个稳定版本。API 兼容性冻结，major 版本内保证向后兼容。
@@ -32,7 +42,7 @@
 - 事务性 Outbox（ADR-008）：事件与状态原子写入、幂等消费者
 - 对外 REST API 实现（FastAPI）：推理服务 CRUD、工作流启动、决策请求
 - CLI 工具包 `cli`：声明式资源管理命令行
-- PostgreSQL 权威存储（ADR-007）：Repository 模式、迁移脚本
+- SQLite 权威存储先行（ADR-013 过渡决策）：ResourceRegistry 抽象、CAS 乐观并发（resource_version）；PostgreSQL 迁移判据见 ADR-013
 - 统一响应信封与错误码体系
 - 累计 215 测试
 

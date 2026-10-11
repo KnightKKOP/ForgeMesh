@@ -1,20 +1,29 @@
 openapi: 3.1.0
 info:
   title: ForgeMesh Control Plane API
-  version: 0.0.1
+  version: 1.0.0
   description: >-
-    ForgeMesh 阶段 0 对外 API 骨架（仅契约，不实现）。外部入口统一经 Go 网关
+    ForgeMesh v1.0.0 稳定版对外 API。外部入口统一经 Go 网关
     （/api/v1/ 版本前缀）；本文件描述控制平面资源/运行 API 与探针。
     统一响应信封与错误码见 components。资源权威 Schema 见 api/schemas/。
-    阶段 0 所有端点均返回 501 Not Implemented（占位）。
+    v1.0 为首个稳定版本，major 版本内保证 API 兼容性（见 docs/releases/v1.0.md）。
+  x-stability: stable
+  x-deprecation-policy: >-
+    端点或字段弃用时使用 x-deprecated: true 扩展字段标记，并附带 x-deprecated-since
+    记录弃用版本、x-deprecated-removal 记录计划移除版本。弃用端点至少保留 2 个
+    minor 版本（见 docs/releases/v1.0.md 弃用政策章节）。
 servers:
   - url: http://localhost:8080
     description: 本地控制平面（Go 网关前置）
 tags:
   - name: inference-services
+    description: 推理服务声明式生命周期管理（创建/查询/删除）
   - name: workflows
+    description: 工作流运行启动与状态查询
   - name: decisions
+    description: 结构化决策请求（决策≠授权；授权由 Scheduler/Policy 完成）
   - name: probes
+    description: 存活与就绪探针
 
 paths:
   /healthz:

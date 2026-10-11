@@ -1,6 +1,7 @@
 """ReconciliationController 9 步协调闭环单元测试。
 
-覆盖：幂等去重键、差异计算、Policy 三态（allow/deny/degraded）、
+覆盖：幂等去重键、差异计算、Policy 三态
+（allow/deny/require_approval——degraded 已按 architecture 7.5 移除）、
 Scheduler 分配成功与失败、幂等性。
 """
 
@@ -188,20 +189,26 @@ def test_reconcile_policy_allow_proceeds():
 
 
 @pytest.mark.unit
-def test_reconcile_policy_degraded():
-    """Policy 返回 degraded → done=True, conditions 有 Ready/Unknown。"""
+def test_reconcile_policy_require_approval_blocks():
+    """Policy 返回 require_approval → 不产生副作用，requeue 等人工审批。"""
     resource = make_resource(generation=1, observed_generation=0)
     observed = {"phase": "Pending"}
     ctx = make_context(resource, observed)
-    degraded = PolicyDecision(decision="degraded", reason="quota near limit")
+    approval = PolicyDecision(
+        decision="require_approval", reason="high-risk action requires approval"
+    )
+    scheduler = MockScheduler()
     controller = ReconciliationController(
-        registry=None, policy_engine=MockPolicyEngine(degraded)
+        registry=None, policy_engine=MockPolicyEngine(approval), scheduler=scheduler
     )
     result = asyncio.run(controller.reconcile(ctx))
-    assert result.done is True
+    # 审批未通过：不完成、不分配（高风险不允许绕过审批，architecture 7.5）
+    assert result.done is False
+    assert result.requeue_after == 30.0
+    assert scheduler.allocate_called is False
     conditions = result.status_patch["conditions"]
     assert any(c["status"] == "Unknown" for c in conditions)
-    assert any(c["reason"] == "PolicyDegraded" for c in conditions)
+    assert any(c["reason"] == "PolicyApprovalRequired" for c in conditions)
 
 
 @pytest.mark.unit

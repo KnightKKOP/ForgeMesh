@@ -195,17 +195,20 @@ def test_plugin_manifest_schema_has_supply_chain_fields() -> None:
 
 @pytest.mark.contract
 def test_policy_decision_three_states() -> None:
-    """PolicyDecision：allow / deny / degraded 三态均可构造。"""
+    """PolicyDecision：allow / deny / require_approval 三态均可构造。"""
     assert PolicyDecision(decision="allow").decision == "allow"
     assert PolicyDecision(decision="deny").decision == "deny"
-    assert PolicyDecision(decision="degraded").decision == "degraded"
+    assert PolicyDecision(decision="require_approval").decision == "require_approval"
 
 
 @pytest.mark.contract
 def test_policy_decision_rejects_invalid_state() -> None:
-    """PolicyDecision：非法状态（maybe）必须被拒绝。"""
+    """PolicyDecision：非法状态（maybe/degraded）必须被拒绝。"""
     with pytest.raises(ValidationError):
         PolicyDecision(decision="maybe")
+    # degraded（降级放行）已按 architecture 7.5 移除，不得再作为决策类型
+    with pytest.raises(ValidationError):
+        PolicyDecision(decision="degraded")
 
 
 # ---------------------------------------------------------------------------
@@ -215,7 +218,7 @@ def test_policy_decision_rejects_invalid_state() -> None:
 
 @pytest.mark.contract
 def test_decision_request_risk_and_deadline() -> None:
-    """DecisionRequest：risk_level 与 deadline_ms 字段可构造且值正确。"""
+    """DecisionRequest：risk_level 与 deadline_ms 字段可构造且默认值正确。"""
     req = DecisionRequest(
         request_id="r1",
         tenant_id="t1",
@@ -225,6 +228,15 @@ def test_decision_request_risk_and_deadline() -> None:
     )
     assert req.risk_level == "high"
     assert req.deadline_ms == 1000
+    # 强类型恢复（development-plan 5.5）：默认 low / 2000
+    default_req = DecisionRequest(request_id="r2", tenant_id="t1", operation="op")
+    assert default_req.risk_level == "low"
+    assert default_req.deadline_ms == 2000
+    # 非法风险等级必须被拒绝
+    with pytest.raises(ValidationError):
+        DecisionRequest(
+            request_id="r3", tenant_id="t1", operation="op", risk_level="extreme"
+        )
 
 
 # ---------------------------------------------------------------------------

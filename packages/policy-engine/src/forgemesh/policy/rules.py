@@ -1,9 +1,12 @@
 """策略规则模型：授权规则与配额规则。
 
-对齐 development-plan 5.6 / architecture 4.1。
+对齐 development-plan 5.6 / architecture 4.1；三态语义恢复见
+development-plan 5.6 与 architecture 7.5（degraded 降级放行已移除，
+条件/告警信息改由 ``obligations`` 表达，高风险审批走 ``require_approval``）。
 
-* :class:`AuthzRule` —— 授权规则，支持无条件 allow / deny 与有条件 allow（degraded）。
-* :class:`QuotaRule` —— 配额规则，超限 deny、接近上限 degraded。
+* :class:`AuthzRule` —— 授权规则，支持无条件 allow / deny 与有条件 allow
+  （条件记入 obligations，不改变 allow 语义）。
+* :class:`QuotaRule` —— 配额规则，超限 deny、接近上限 allow + 告警约束。
 * :class:`RuleSet` —— 规则集合，组合授权与配额检查。
 
 兼容 Python 3.9+。
@@ -18,15 +21,17 @@ from .api import PolicyAction, PolicyDecision
 class AuthzRule(BaseModel):
     """授权规则：允许或拒绝特定 action + tenant 组合。
 
-    当 ``effect="allow"`` 且 ``conditions`` 非空时，表示有条件授权，
-    判定结果为 ``degraded``（降级放行，需满足附带约束）。
+    当 ``effect="allow"`` 且 ``conditions`` 非空时，表示有条件授权：
+    判定结果为 ``allow`` 且条件记入 ``obligations``（对齐
+    development-plan 5.6 / architecture 7.5——降级放行态已移除，
+    条件约束不改变 allow 语义，由执行侧强制满足）。
 
     Attributes:
         action: 操作标识（如 ``inference.deploy``）。
         tenant_id: 租户标识；``None`` 表示对所有租户生效。
         effect: 授权效果——``"allow"`` 或 ``"deny"``。
-        conditions: 附加约束列表；非空时 allow 降级为 degraded。
-        reason: 自定义拒绝/降级理由（供审计）。
+        conditions: 附加约束列表；非空时作为 obligations 附加到 allow 结果。
+        reason: 自定义拒绝理由（供审计）。
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -76,11 +81,12 @@ class RuleSet(BaseModel):
     def check_authz(self, action: PolicyAction) -> PolicyDecision:
         """检查授权规则。默认拒绝（无匹配规则时 deny）。
 
-        匹配优先级：deny 立即生效 > 无条件 allow > 有条件 allow(degraded)。
+        匹配优先级：deny 立即生效 > 无条件 allow > 有条件 allow
+        （条件记入 obligations）。
         """
         matched_allow = False
-        matched_degraded = False
-        degraded_obligations: list[str] = []
+        matched_conditional = False
+        conditional_obligations: list[str] = []
 
         for rule in self.authz_rules:
             if rule.action != action.action:
@@ -95,18 +101,18 @@ class RuleSet(BaseModel):
                 )
             if rule.effect == "allow":
                 if rule.conditions:
-                    matched_degraded = True
-                    degraded_obligations.extend(rule.conditions)
+                    matched_conditional = True
+                    conditional_obligations.extend(rule.conditions)
                 else:
                     matched_allow = True
 
         if matched_allow:
             return PolicyDecision(decision="allow", reason="authz rule matched")
-        if matched_degraded:
+        if matched_conditional:
             return PolicyDecision(
-                decision="degraded",
+                decision="allow",
                 reason="authz rule matched with conditions",
-                obligations=degraded_obligations,
+                obligations=conditional_obligations,
             )
         # 默认拒绝
         return PolicyDecision(
@@ -115,7 +121,7 @@ class RuleSet(BaseModel):
         )
 
     def check_quota(self, action: PolicyAction) -> PolicyDecision:
-        """检查配额规则。超配额 deny，接近上限 degraded，否则 allow。"""
+        """检查配额规则。超配额 deny，接近上限 allow + 告警约束，否则 allow。"""
         for rule in self.quota_rules:
             if rule.tenant_id != action.tenant_id:
                 continue
@@ -131,7 +137,7 @@ class RuleSet(BaseModel):
                 )
             if rule.current_count >= rule.max_count * rule.warning_threshold:
                 return PolicyDecision(
-                    decision="degraded",
+                    decision="allow",
                     reason=f"quota near limit: {resource_kind} "
                     f"current={rule.current_count}, max={rule.max_count}",
                     obligations=["monitor_quota"],

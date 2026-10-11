@@ -126,6 +126,27 @@ class ReconciliationController(Reconciler):
                 },
             )
 
+        if policy_result.decision == "require_approval":
+            # 高风险操作要求人工审批：不产生任何副作用（不分配、不执行
+            # 工作流），requeue 等待人工审批后重新协调（对齐
+            # development-plan 5.6 三态 / architecture 7.5——高风险操作
+            # 不允许在审批前放行）
+            self._processed_keys.add(ctx.dedup_key)
+            return ReconcileResult(
+                done=False,
+                requeue_after=30.0,
+                status_patch={
+                    "conditions": [
+                        {
+                            "type": "Ready",
+                            "status": "Unknown",
+                            "reason": "PolicyApprovalRequired",
+                            "message": policy_result.reason,
+                        }
+                    ]
+                },
+            )
+
         # 步骤 6：Scheduler 分配（如果需要且调度器可用）
         allocation_ref = None
         if self._scheduler is not None and diff.get("needs_allocation"):
@@ -171,26 +192,17 @@ class ReconciliationController(Reconciler):
                 logger.warning("workflow start failed: %s", exc)
 
         # 步骤 8-9：重观察 + 更新 status
+        # 走到这里 policy_result.decision 只能是 "allow"（deny /
+        # require_approval 已提前返回），故直接标记 Reconciled
         self._processed_keys.add(ctx.dedup_key)
-        conditions = []
-        if policy_result.decision == "degraded":
-            conditions.append(
-                {
-                    "type": "Ready",
-                    "status": "Unknown",
-                    "reason": "PolicyDegraded",
-                    "message": policy_result.reason,
-                }
-            )
-        else:
-            conditions.append(
-                {
-                    "type": "Ready",
-                    "status": "True",
-                    "reason": "Reconciled",
-                    "message": "reconciliation completed",
-                }
-            )
+        conditions = [
+            {
+                "type": "Ready",
+                "status": "True",
+                "reason": "Reconciled",
+                "message": "reconciliation completed",
+            }
+        ]
 
         # allocation_ref / run_ref 在 P1 暂仅记日志，生产环境应写入 status
         if allocation_ref is not None:

@@ -11,10 +11,11 @@ Policy 只回答「是否允许」，不负责具体资源分配。
 
 from __future__ import annotations
 
-from .api import PolicyAction, PolicyDecision, PolicyEngine
+from .api import PolicyAction, PolicyDecision, PolicyDecisionType, PolicyEngine
 
 __all__ = [
     "PolicyAction",
     "PolicyDecision",
+    "PolicyDecisionType",
     "PolicyEngine",
 ]

@@ -16,6 +16,17 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
+#: 策略判定三态（对齐 development-plan 5.6 / architecture 7.2、14.2）。
+#:
+#: * ``allow`` —— 允许（可附带 obligations 约束，如「必须记录审计」）；
+#: * ``deny`` —— 拒绝（**默认拒绝**：无法判定时返回 deny）；
+#: * ``require_approval`` —— 高风险等场景要求人工审批，**不是放行**，
+#:   审批通过前不得执行（architecture 7.5：高风险操作不允许通过降级绕过审批）。
+#:
+#: 注：历史实现中的 ``degraded``（降级放行）与架构文档 §7.5 冲突，已移除；
+#: 降级/条件类信息改由 ``reason`` 与 ``obligations`` 表达，不作为决策类型。
+PolicyDecisionType = Literal["allow", "deny", "require_approval"]
+
 
 class PolicyAction(BaseModel):
     """待鉴权的操作。
@@ -32,19 +43,25 @@ class PolicyAction(BaseModel):
 
 
 class PolicyDecision(BaseModel):
-    """策略判定结果（三态：allow / deny / degraded）。
+    """策略判定结果（三态：allow / deny / require_approval）。
 
     Attributes:
-        decision: 判定结论——``allow``（允许）、``deny``（拒绝）、``degraded``（降级放行，附带约束）。
+        decision: 判定结论——``allow``（允许，可带约束）、``deny``（拒绝）、
+            ``require_approval``（要求人工审批，审批通过前不放行）。
         reason: 判定理由（供审计/解释）。
-        obligations: 附加约束（如「必须记录审计」）。
+        obligations: 附加约束（如「必须记录审计」「require_mfa」）；
+            条件授权、配额接近上限等降级类信息在此表达，**不改变** allow 语义。
+        policy_id: 命中的策略规则标识（用于审计追溯，development-plan 5.6）。
+        approvers: 要求的审批人列表（``require_approval`` 时有效）。
     """
 
     model_config = ConfigDict(extra="forbid")
 
-    decision: Literal["allow", "deny", "degraded"]
+    decision: PolicyDecisionType
     reason: str = ""
     obligations: list[str] = Field(default_factory=list)
+    policy_id: str | None = None
+    approvers: list[str] | None = None
 
 
 class PolicyEngine(ABC):
@@ -62,8 +79,9 @@ class PolicyEngine(ABC):
             action: 待鉴权操作。
 
         Returns:
-            三态判定 :class:`PolicyDecision`：``allow`` / ``deny`` / ``degraded``。
-            **默认拒绝**：无法判定时返回 ``deny``。
+            三态判定 :class:`PolicyDecision`：``allow`` / ``deny`` / ``require_approval``。
+            **默认拒绝**：无法判定时返回 ``deny``；高风险操作返回
+            ``require_approval``，审批通过前不放行。
         """
         raise NotImplementedError
 
@@ -71,5 +89,6 @@ class PolicyEngine(ABC):
 __all__ = [
     "PolicyAction",
     "PolicyDecision",
+    "PolicyDecisionType",
     "PolicyEngine",
 ]

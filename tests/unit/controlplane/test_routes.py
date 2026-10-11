@@ -96,7 +96,13 @@ def _ok_result(degraded: bool = False) -> DecisionResult:
         rationale=["首选可用"],
         confidence=0.9,
     )
-    return DecisionResult(candidates=[candidate], chosen=candidate, success=True, attempts=attempts)
+    return DecisionResult(
+        candidates=[candidate],
+        chosen=candidate,
+        success=True,
+        status="OK",
+        attempts=attempts,
+    )
 
 
 @pytest.fixture()
@@ -255,7 +261,11 @@ def test_decision_degraded_path(client: TestClient) -> None:
 
 def test_decision_no_candidate(client: TestClient) -> None:
     """全部 Provider 失败：503 错误信封（绝不默认放行），attempts 入 details。"""
-    failed = DecisionResult(success=False, error="no provider returned a valid candidate")
+    failed = DecisionResult(
+        success=False,
+        status="FAILED",
+        error="no provider returned a valid candidate",
+    )
     init_decision_router(StubDecisionRouter(result=failed))
     resp = client.post(
         "/api/v1/decisions",

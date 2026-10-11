@@ -42,6 +42,7 @@ from forgemesh.core.reconciler import ReconcileContext, Reconciler, ReconcileRes
 from forgemesh.policy.api import PolicyAction, PolicyEngine
 
 from ..registry.store import DEFAULT_RELEASE_FINALIZER
+from .dedup import ProcessedKeyStore
 
 logger = logging.getLogger(__name__)
 
@@ -78,6 +79,9 @@ class ReconciliationController(Reconciler):
         workflow_runtime: 可选工作流运行时（执行协调工作流）。
         release_provider: 可选受控释放 Provider（``Terminating`` 时释放外部
             副作用）；``None`` 为 Noop 语义——仅移除 finalizer 后物理删除。
+        processed_store: 可选去重键持久化存储（对齐 architecture §5.5"不能
+            依赖单进程内存状态保证全局正确性"）；``None``（默认）时回退
+            内存 set 行为，向后兼容既有测试与单进程部署。
     """
 
     def __init__(
@@ -88,6 +92,7 @@ class ReconciliationController(Reconciler):
         scheduler: Any | None = None,
         workflow_runtime: Any | None = None,
         release_provider: ReleaseProvider | None = None,
+        processed_store: ProcessedKeyStore | None = None,
     ) -> None:
         self._registry = registry
         self._policy = policy_engine
@@ -95,14 +100,17 @@ class ReconciliationController(Reconciler):
         self._scheduler = scheduler
         self._workflow = workflow_runtime
         self._release_provider = release_provider
-        # 已处理的去重键（内存级，P1 简化；生产环境应使用持久化存储）。
+        self._processed_store = processed_store
+        # 已处理的去重键（内存级回退路径；processed_store 注入时以 SQLite
+        # 持久化为准——architecture §5.5 不依赖单进程内存状态）。
         self._processed_keys: set[str] = set()
 
     async def reconcile(self, ctx: ReconcileContext) -> ReconcileResult:
         """执行一轮 9 步协调（或 Terminating 受控释放子流程）。
 
         幂等保证：若 ``ctx.dedup_key`` 已处理过，直接返回 ``done=True``，
-        不产生任何重复副作用。
+        不产生任何重复副作用。注入 ``processed_store`` 时该检查基于
+        SQLite 持久化状态（进程重启后依然生效）。
 
         Args:
             ctx: 协调上下文（含资源、观测状态、租户边界、去重键）。
@@ -110,8 +118,12 @@ class ReconciliationController(Reconciler):
         Returns:
             :class:`ReconcileResult`：含 ``done`` / ``requeue_after`` / ``status_patch``。
         """
-        # 幂等检查：已处理的 dedup_key 直接返回 done
-        if ctx.dedup_key in self._processed_keys:
+        # 幂等检查：已处理的 dedup_key 直接返回 done（持久化 store 优先，
+        # 回退内存 set 保持向后兼容）。
+        if self._processed_store is not None:
+            if await self._processed_store.seen(ctx.dedup_key):
+                return ReconcileResult(done=True, requeue_after=None)
+        elif ctx.dedup_key in self._processed_keys:
             return ReconcileResult(done=True, requeue_after=None)
 
         resource = ctx.resource
@@ -125,7 +137,7 @@ class ReconciliationController(Reconciler):
         # 步骤 1-3：获取资源 / 查询观测 / 比较差异
         diff = self._compute_diff(resource, observed)
         if not diff["needs_reconcile"]:
-            self._processed_keys.add(ctx.dedup_key)
+            await self._mark_processed(ctx.dedup_key)
             return ReconcileResult(done=True)
 
         # 步骤 4：生成候选（如果有 DecisionProvider，仅建议非授权）
@@ -153,7 +165,7 @@ class ReconciliationController(Reconciler):
         )
         policy_result = await self._policy.check(ctx, action)
         if policy_result.decision == "deny":
-            self._processed_keys.add(ctx.dedup_key)
+            await self._mark_processed(ctx.dedup_key)
             return ReconcileResult(
                 done=False,
                 requeue_after=30.0,
@@ -174,7 +186,7 @@ class ReconciliationController(Reconciler):
             # 工作流），requeue 等待人工审批后重新协调（对齐
             # development-plan 5.6 三态 / architecture 7.5——高风险操作
             # 不允许在审批前放行）
-            self._processed_keys.add(ctx.dedup_key)
+            await self._mark_processed(ctx.dedup_key)
             return ReconcileResult(
                 done=False,
                 requeue_after=30.0,
@@ -204,7 +216,7 @@ class ReconciliationController(Reconciler):
                 allocation_ref = await self._scheduler.allocate(sched_req)
             except Exception as exc:  # noqa: BLE001 - 分配失败需可重试
                 logger.warning("scheduler allocate failed: %s", exc)
-                self._processed_keys.add(ctx.dedup_key)
+                await self._mark_processed(ctx.dedup_key)
                 return ReconcileResult(
                     done=False,
                     requeue_after=10.0,
@@ -237,7 +249,7 @@ class ReconciliationController(Reconciler):
         # 步骤 8-9：重观察 + 更新 status
         # 走到这里 policy_result.decision 只能是 "allow"（deny /
         # require_approval 已提前返回），故直接标记 Reconciled
-        self._processed_keys.add(ctx.dedup_key)
+        await self._mark_processed(ctx.dedup_key)
         conditions = [
             {
                 "type": "Ready",
@@ -258,6 +270,21 @@ class ReconciliationController(Reconciler):
             requeue_after=None,
             status_patch={"conditions": conditions},
         )
+
+    # ------------------------------------------------------------------ #
+    # 去重键登记（持久化 store 优先，回退内存 set）
+    # ------------------------------------------------------------------ #
+
+    async def _mark_processed(self, key: str) -> None:
+        """登记已处理去重键。
+
+        注入 ``processed_store`` 时写入 SQLite（进程重启后仍可见，对齐
+        architecture §5.5）；否则回退内存 set（向后兼容既有行为）。
+        """
+        if self._processed_store is not None:
+            await self._processed_store.mark(key)
+        else:
+            self._processed_keys.add(key)
 
     # ------------------------------------------------------------------ #
     # 终止协调（受控释放 → 清空 finalizer → 物理删除）
@@ -331,7 +358,7 @@ class ReconciliationController(Reconciler):
             )
         except NotFoundError:
             # 已被并发删除：视为完成。
-            self._processed_keys.add(ctx.dedup_key)
+            await self._mark_processed(ctx.dedup_key)
             return ReconcileResult(done=True)
 
         current.finalizers = [f for f in current.finalizers if f != DEFAULT_RELEASE_FINALIZER]
@@ -380,7 +407,7 @@ class ReconciliationController(Reconciler):
                 actor="reconciler",
                 correlation_id=ctx.correlation_id,
             )
-        self._processed_keys.add(ctx.dedup_key)
+        await self._mark_processed(ctx.dedup_key)
         logger.info(
             "resource physically deleted after finalizers cleared: kind=%s name=%s "
             "tenant_id=%s correlation_id=%s",

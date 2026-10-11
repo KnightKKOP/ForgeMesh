@@ -5,13 +5,34 @@
 
 ## [1.0.1] - Unreleased
 
-### Fixed
-
-- 勘误：1.0.0 变更日志 P1 段中"PostgreSQL 权威存储（ADR-007）：Repository 模式、迁移脚本"的表述与实际不符——v1.0.0 实际交付为 SQLite 权威存储先行（`SQLiteRegistry` 实现 `ResourceRegistry` 抽象、CAS 乐观并发 `resource_version`），未引入 PostgreSQL 部署与迁移脚本。PostgreSQL 仍为权威存储目标态（ADR-007），过渡决策与迁移判据详见 [ADR-013](docs/design-decisions/adr-013.md)。
-
 ### Added
 
 - 新增 [ADR-013](docs/design-decisions/adr-013.md)：权威存储采用 SQLite 先行、PostgreSQL 为目标态的过渡决策。
+- finalizer 受控删除闭环：`request_delete` → `Terminating` → `ReleaseProvider` → 清空 finalizer（默认 `forgemesh.io/resource-release`）→ 物理删除；失败重入保持 `Terminating`，全流程幂等。
+- Allocation 持久化表：部分唯一索引 `idx_allocations_one_active_per_resource`（`ON allocations(resource_id) WHERE status = 'Active'`）保证同一资源至多一个 Active 分配。
+- `POST /api/v1/workflows` 与 `POST /api/v1/decisions` 端点正式实现（工作流启动返回 202、结构化决策请求）。
+- Go 网关推理服务路由 Resolver：`{svc}` → 实例 endpoint 解析（消费控制平面 `status.endpoints`）、TTL 缓存 5s、健康摘流（连续 3 次失败冷却 10s）、轮询负载均衡与 `X-Tenant-Id` 透传。
+- `tests/performance` 性能基准层（4 项：API P99、协调吞吐、重启恢复、冲突正确性；网关流式首字节基准属 Go 网关 CI 范围）。
+- 调和去重键 SQLite 持久化（`ProcessedKeyStore`）：控制平面重启后已处理事件不重复调和。
+
+### Changed
+
+- `PolicyDecisionType` 恢复 `allow` / `deny` / `require_approval` 三态：移除 `degraded` 取值，条件放行语义转入 obligations 表达。
+- `DecisionRouter` 路由结果新增 `status` 三态（`OK` / `FALLBACK_REQUIRED` / `FAILED`）：高风险请求的候选来自备用 Provider 时返回 `FALLBACK_REQUIRED` 且不自动采用，交由调用方决定；全部失败返回 `FAILED`，绝不解释为"允许执行默认操作"。
+- `DecisionRequest.risk_level` 恢复 `Literal["low", "medium", "high"]` 强类型（默认 `low`）、`deadline_ms` 恢复 `int` 强类型与默认值。
+- 推理服务状态转移表开放"任意非吸收态（含 `Failed` / `Unknown`）→ `Terminating`"，删除入口对所有现实状态可达。
+- `store.put` 接线状态机校验：非法状态转移在持久层被拒绝（`InvalidStateTransition`）。
+- DELETE 端点对存在副作用（finalizer 非空）的资源返回 `202 Terminating`，不再直接物理删除。
+
+### Fixed
+
+- 修复决策路由风险等级字典序比较 bug：`"low" >= "high"` 在字符串比较下为 `True`，导致低风险请求被误判为高风险；改为显式等级序（rank）比较。
+- 清理 OpenAPI 中已实现端点（workflows/decisions 等）的 `501 Not Implemented` 残留标记。
+- 勘误：1.0.0 变更日志 P1 段中"PostgreSQL 权威存储（ADR-007）：Repository 模式、迁移脚本"的表述与实际不符——v1.0.0 实际交付为 SQLite 权威存储先行（`SQLiteRegistry` 实现 `ResourceRegistry` 抽象、CAS 乐观并发 `resource_version`），未引入 PostgreSQL 部署与迁移脚本。PostgreSQL 仍为权威存储目标态（ADR-007），过渡决策与迁移判据详见 [ADR-013](docs/design-decisions/adr-013.md)。
+
+### Security
+
+- 决策高风险降级保护：高风险请求的候选来自备用 Provider 时不再自动采用（`FALLBACK_REQUIRED`），防止降级路径绕过审批与授权语义（对齐 ADR-004 / ADR-005）。
 
 ## [1.0.0] - 2026-10-11
 
@@ -130,4 +151,5 @@
 
 ## 版本对比链接
 
-[1.0.0]: https://github.com/forgemesh/forgemesh/releases/tag/v1.0.0
+[1.0.1]: https://github.com/Mekoforge/ForgeMesh/compare/v1.0.0...HEAD
+[1.0.0]: https://github.com/Mekoforge/ForgeMesh/releases/tag/v1.0.0

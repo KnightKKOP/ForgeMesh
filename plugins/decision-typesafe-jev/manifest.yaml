@@ -1,0 +1,24 @@
+apiVersion: forgemesh.io/v1alpha1
+kind: PluginManifest
+metadata:
+  id: forgemesh.decision.typesafe-jev
+  version: 0.1.0
+spec:
+  category: provider
+  compatibility:
+    coreApi: v1alpha1
+    minCoreVersion: "0.1.0"
+  provides:
+    - decision.provider.typesafe-jev
+  requires:
+    - decision.routing
+    - resource.registry
+  permissions:
+    - resource.read
+    - decision.evaluate
+    - network.egress
+  isolation: restricted-rpc
+  entrypoint: "python -m forgemesh_decision_typesafe_jev"
+  healthCheck:
+    mode: http
+    timeoutMs: 3000

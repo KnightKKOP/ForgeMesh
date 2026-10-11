@@ -74,6 +74,7 @@ def _load_plugin_package(package_name: str, plugin_dir: str) -> None:
 # 预加载插件 provider 模块，供测试文件直接 import。
 _load_plugin_module("decision_rules_provider", "decision-rules")
 _load_plugin_module("decision_jev_provider", "decision-jev")
+_load_plugin_module("decision_typesafe_jev_provider", "decision-typesafe-jev")
 _load_plugin_module("workflow_reference_provider", "workflow-reference")
 
 # 预加载 gpu-nvidia 插件包（含 discovery / preflight / health 子模块）。

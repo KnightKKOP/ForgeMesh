@@ -45,19 +45,27 @@ def client() -> TestClient:
     return TestClient(app)
 
 
+SPEC = {
+    "model": {"reference": "models/llama"},
+    "runtime": {"provider": "vllm", "version": "0.6.3"},
+    "resources": {"accelerator": {"type": "nvidia-gpu", "count": 1, "minMemoryGiB": 16}},
+}
+
+
 def _payload(name: str = "svc-1", namespace: str = "default") -> dict:
-    """构造推理服务创建请求体。"""
+    """构造推理服务创建请求体（OpenAPI 要求必须携带 spec）。"""
     return {
         "apiVersion": "forgemesh.io/v1alpha1",
         "kind": "InferenceService",
         "metadata": {"name": name, "namespace": namespace},
+        "spec": SPEC,
     }
 
 
 def test_create_and_get_inference_service(client: TestClient) -> None:
     """POST 创建 → GET 查询返回同一资源。"""
     resp = client.post("/api/v1/inference-services", json=_payload(), headers=TENANT_HEADERS)
-    assert resp.status_code == 200, resp.text
+    assert resp.status_code == 201, resp.text
     created = resp.json()
     assert created["kind"] == "InferenceService"
     assert created["metadata"]["name"] == "svc-1"
@@ -160,3 +168,55 @@ def test_missing_tenant_header(client: TestClient) -> None:
     """无 X-Tenant-Id 头返回 400。"""
     resp = client.post("/api/v1/inference-services", json=_payload())
     assert resp.status_code == 400, resp.text
+
+
+def test_create_preserves_spec_and_assigns_server_fields(client: TestClient) -> None:
+    """spec 原样持久化；uid 由服务端分配；status 由控制器维护，请求中的值被忽略。"""
+    body = _payload()
+    body["metadata"]["uid"] = "client-chosen"
+    body["status"] = {"phase": "Ready"}
+    resp = client.post("/api/v1/inference-services", json=body, headers=TENANT_HEADERS)
+    assert resp.status_code == 201, resp.text
+    created = resp.json()
+    assert created["spec"]["model"] == {"reference": "models/llama", "digest": None}
+    assert created["spec"]["runtime"] == {"provider": "vllm", "version": "0.6.3"}
+    assert created["metadata"]["uid"] not in (None, "client-chosen")
+    assert created["status"]["phase"] == "Pending"
+
+    fetched = client.get(
+        "/api/v1/inference-services/svc-1", headers=TENANT_HEADERS, params={"namespace": "default"}
+    ).json()
+    assert fetched["spec"] == created["spec"]
+    assert fetched["metadata"]["uid"] == created["metadata"]["uid"]
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        pytest.param(lambda b: b.pop("spec"), id="missing-spec"),
+        pytest.param(lambda b: b.update(kind="TotallyNotAnInferenceService"), id="wrong-kind"),
+        pytest.param(lambda b: b.update(metadata="svc-1"), id="metadata-not-object"),
+        pytest.param(lambda b: b["spec"].update(replicas=4), id="unknown-spec-field"),
+    ],
+)
+def test_create_rejects_invalid_body(client: TestClient, mutate) -> None:
+    """不合法请求体返回 400 错误信封，且不落库。"""
+    body = _payload()
+    body["spec"] = dict(SPEC)
+    mutate(body)
+    resp = client.post("/api/v1/inference-services", json=body, headers=TENANT_HEADERS)
+    assert resp.status_code == 400, resp.text
+    assert resp.json()["error"]["code"] == "BAD_REQUEST"
+    listed = client.get("/api/v1/inference-services", headers=TENANT_HEADERS).json()
+    assert listed["count"] == 0
+
+
+@pytest.mark.parametrize("path", ["/api/v1/inference-services", "/api/v1/resources"])
+@pytest.mark.parametrize("limit", [-1, 0, 1001])
+def test_list_rejects_out_of_range_limit(client: TestClient, path: str, limit: int) -> None:
+    """limit 超出 [1, 1000] 返回 400（SQLite 中 LIMIT -1 表示不限条数）。"""
+    resp = client.get(
+        path, headers=TENANT_HEADERS, params={"limit": limit, "kind": "InferenceService"}
+    )
+    assert resp.status_code == 400, resp.text
+    assert resp.json()["error"]["code"] == "BAD_REQUEST"

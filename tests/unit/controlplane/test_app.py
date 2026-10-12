@@ -8,7 +8,15 @@ from forgemesh.controlplane.api.dependencies import get_registry, reset_runtime_
 from forgemesh.controlplane.app import DB_PATH_ENV, create_app
 
 HEADERS = {"X-Tenant-Id": "acme"}
-BODY = {"kind": "InferenceService", "metadata": {"name": "llama", "namespace": "default"}}
+BODY = {
+    "kind": "InferenceService",
+    "metadata": {"name": "llama", "namespace": "default"},
+    "spec": {
+        "model": {"reference": "models/llama"},
+        "runtime": {"provider": "vllm"},
+        "resources": {"accelerator": {"type": "nvidia-gpu", "minMemoryGiB": 16}},
+    },
+}
 
 
 @pytest.fixture(autouse=True)
@@ -24,7 +32,7 @@ def test_api_routes_are_served_and_persisted_across_restarts(tmp_path) -> None:
 
     with TestClient(create_app(db_path=str(db_file))) as client:
         created = client.post("/api/v1/inference-services", json=BODY, headers=HEADERS)
-        assert created.status_code == 200
+        assert created.status_code == 201
 
     with TestClient(create_app(db_path=str(db_file))) as client:
         fetched = client.get(

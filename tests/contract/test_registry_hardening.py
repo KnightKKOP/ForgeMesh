@@ -12,9 +12,54 @@ import pytest
 from forgemesh.controlplane.registry import SQLiteRegistry
 from forgemesh.core.errors import ConflictError, PreconditionFailedError
 from forgemesh.core.objects import ObjectMeta, Resource
+from forgemesh.resource.allocation import Allocation
 
 KIND = "Node"
 TENANT = "tenant-a"
+
+
+class _InterleavedWriter:
+    """包装 sqlite3 连接：命中指定 SELECT 后立即插入一次已提交的写入。
+
+    模拟另一个连接（另一副本 / CLI / 运维脚本）恰好在「读」与「写」之间完成了写入。
+    """
+
+    def __init__(self, inner: sqlite3.Connection, trigger: str, statement: str) -> None:
+        self._inner = inner
+        self._trigger = trigger
+        self._statement = statement
+        self.fired = False
+
+    def _maybe_fire(self, sql: str) -> None:
+        if not self.fired and sql.lstrip().startswith(self._trigger):
+            self.fired = True
+            self._inner.execute(self._statement)
+            self._inner.commit()
+
+    def execute(self, sql: str, params: tuple = ()) -> sqlite3.Cursor:
+        result = self._inner.execute(sql, params)
+        self._maybe_fire(sql)
+        return result
+
+    def cursor(self) -> _InterleavedCursor:
+        return _InterleavedCursor(self, self._inner.cursor())
+
+    def __getattr__(self, item: str):
+        return getattr(self._inner, item)
+
+
+class _InterleavedCursor:
+    def __init__(self, writer: _InterleavedWriter, inner: sqlite3.Cursor) -> None:
+        self._writer = writer
+        self._inner = inner
+
+    def execute(self, sql: str, params: tuple = ()) -> sqlite3.Cursor:
+        result = self._inner.execute(sql, params)
+        self._writer._maybe_fire(sql)
+        return result
+
+    def __getattr__(self, item: str):
+        return getattr(self._inner, item)
 
 
 def _make_resource(
@@ -95,3 +140,101 @@ def test_open_refuses_legacy_db_with_duplicate_identities(tmp_path) -> None:
 
     with pytest.raises(PreconditionFailedError, match="name=dup"):
         SQLiteRegistry(str(db_file))
+
+
+@pytest.mark.contract
+def test_request_delete_does_not_overwrite_concurrent_update() -> None:
+    """受控删除的「置 Terminating」写入以读到的版本为条件，不覆盖并发更新。"""
+
+    async def scenario() -> None:
+        reg = SQLiteRegistry(":memory:")
+        try:
+            victim = _make_resource("victim")
+            victim.finalizers = ["forgemesh.io/resource-release"]
+            await reg.put(victim)
+            conn = reg._conn
+            reg._conn = _InterleavedWriter(
+                conn,
+                trigger="SELECT body, phase, finalizers, resource_version",
+                statement=(
+                    "UPDATE resources SET resource_version = resource_version + 1, "
+                    "body = json_set(body, '$.metadata.labels.writer', 'concurrent', "
+                    "'$.metadata.resourceVersion', '1') WHERE name = 'victim'"
+                ),
+            )
+            with pytest.raises(ConflictError):
+                await reg.request_delete(KIND, "ns-a", "victim", TENANT)
+            reg._conn = conn
+
+            current = await reg.get(KIND, "ns-a", "victim", TENANT)
+            assert current.metadata.labels == {"writer": "concurrent"}
+            assert current.metadata.resourceVersion == "1"
+
+            retried = await reg.request_delete(KIND, "ns-a", "victim", TENANT)
+            assert retried.deleted is False
+            after = await reg.get(KIND, "ns-a", "victim", TENANT)
+            assert after.metadata.labels == {"writer": "concurrent"}
+            assert after.metadata.resourceVersion == "2"
+        finally:
+            await reg.close()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.contract
+def test_request_delete_does_not_bypass_concurrently_added_finalizer() -> None:
+    """物理删除以读到的版本为条件：并发追加的 finalizer 不能被绕过。"""
+
+    async def scenario() -> None:
+        reg = SQLiteRegistry(":memory:")
+        try:
+            await reg.put(_make_resource("victim"))
+            conn = reg._conn
+            reg._conn = _InterleavedWriter(
+                conn,
+                trigger="SELECT body, phase, finalizers, resource_version",
+                statement=(
+                    "UPDATE resources SET resource_version = resource_version + 1, "
+                    "finalizers = '[\"guard\"]', "
+                    "body = json_set(body, '$.finalizers', json('[\"guard\"]'), "
+                    "'$.metadata.resourceVersion', '1') WHERE name = 'victim'"
+                ),
+            )
+            with pytest.raises(ConflictError):
+                await reg.request_delete(KIND, "ns-a", "victim", TENANT)
+            reg._conn = conn
+
+            survivor = await reg.get(KIND, "ns-a", "victim", TENANT)
+            assert survivor.finalizers == ["guard"]
+        finally:
+            await reg.close()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.contract
+def test_release_allocation_does_not_overwrite_terminal_state() -> None:
+    """释放分配以读到的状态为条件：并发过期后不得被改写为 Released。"""
+
+    async def scenario() -> None:
+        reg = SQLiteRegistry(":memory:")
+        try:
+            allocation_id = await reg.put_allocation(
+                Allocation(resource_id="gpu-0", tenant_id=TENANT, idempotency_key="alloc-1"),
+            )
+            conn = reg._conn
+            reg._conn = _InterleavedWriter(
+                conn,
+                trigger="SELECT status FROM allocations",
+                statement="UPDATE allocations SET status = 'Expired'",
+            )
+            with pytest.raises(ConflictError):
+                await reg.release_allocation(allocation_id, TENANT)
+            reg._conn = conn
+
+            [record] = await reg.list_allocations(TENANT)
+            assert record["status"] == "Expired"
+        finally:
+            await reg.close()
+
+    asyncio.run(scenario())

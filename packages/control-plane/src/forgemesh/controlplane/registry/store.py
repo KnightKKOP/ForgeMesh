@@ -547,6 +547,8 @@ class SQLiteRegistry(ResourceRegistry):
         Raises:
             NotFoundError: 目标资源不存在（或跨租户不可见）。
             InvalidStateTransition: 当前 phase 不允许转移到 ``Terminating``。
+            ConflictError: 读取后资源被并发修改（``resource_version`` 已变化），
+                调用方应重新读取后重试。
         """
         terminating = "Terminating"
 
@@ -563,6 +565,7 @@ class SQLiteRegistry(ResourceRegistry):
                     f"namespace={namespace!r} name={name} tenant_id={tenant_id}",
                 )
             phase = row["phase"]
+            read_version = row["resource_version"]
             current_finalizers = json.loads(row["finalizers"] or "[]")
             if phase == terminating:
                 # 幂等：删除请求已受理，仍在受控释放流程中。
@@ -572,22 +575,24 @@ class SQLiteRegistry(ResourceRegistry):
                 effective.append(DEFAULT_RELEASE_FINALIZER)
             if not effective:
                 # 无 finalizer 且无外部副作用 → 直接物理删除（向后兼容）。
+                # 以读到的版本为条件：并发写入可能刚追加了 finalizer。
                 cur.execute(
                     "DELETE FROM resources "
-                    "WHERE tenant_id=? AND kind=? AND namespace IS ? AND name=?",
-                    (tenant_id, kind, namespace, name),
+                    "WHERE tenant_id=? AND kind=? AND namespace IS ? AND name=? "
+                    " AND resource_version=?",
+                    (tenant_id, kind, namespace, name, read_version),
                 )
                 if cur.rowcount == 0:
                     self._conn.rollback()
-                    raise NotFoundError(
-                        f"resource not found: kind={kind} "
+                    raise ConflictError(
+                        f"request_delete raced with concurrent write: kind={kind} "
                         f"namespace={namespace!r} name={name} tenant_id={tenant_id}",
                     )
                 self._conn.commit()
                 return RequestDeleteResult(True, [])
             # finalizer 非空（或自动追加）→ 受控删除：置 Terminating。
             self._validate_phase_transition(kind, phase, terminating)
-            new_version = row["resource_version"] + 1
+            new_version = read_version + 1
             body = json.loads(row["body"])
             body["finalizers"] = effective
             # 仅当 payload 已携带 status 子树（强类型子类）时同步 phase；
@@ -602,7 +607,8 @@ class SQLiteRegistry(ResourceRegistry):
             cur.execute(
                 "UPDATE resources SET body=?, phase=?, finalizers=?, "
                 " resource_version=?, updated_at=datetime('now') "
-                "WHERE tenant_id=? AND kind=? AND namespace IS ? AND name=?",
+                "WHERE tenant_id=? AND kind=? AND namespace IS ? AND name=? "
+                " AND resource_version=?",
                 (
                     json.dumps(body, ensure_ascii=False),
                     terminating,
@@ -612,6 +618,7 @@ class SQLiteRegistry(ResourceRegistry):
                     kind,
                     namespace,
                     name,
+                    read_version,
                 ),
             )
             if cur.rowcount == 0:
@@ -725,6 +732,7 @@ class SQLiteRegistry(ResourceRegistry):
         Raises:
             NotFoundError: 分配不存在（或跨租户不可见）。
             InvalidStateTransition: 当前状态非 ``Active``（终态不可逆）。
+            ConflictError: 读取后状态被并发修改（如已被另一方释放或过期）。
         """
 
         def _release() -> None:
@@ -737,11 +745,16 @@ class SQLiteRegistry(ResourceRegistry):
                     f"allocation not found: id={allocation_id} tenant_id={tenant_id}",
                 )
             ALLOCATION_STATE_MACHINE.validate(row["status"], AllocationStatus.RELEASED.value)
-            self._conn.execute(
+            cur = self._conn.execute(
                 "UPDATE allocations SET status=?, released_at=datetime('now') "
-                "WHERE tenant_id=? AND id=?",
-                (AllocationStatus.RELEASED.value, tenant_id, allocation_id),
+                "WHERE tenant_id=? AND id=? AND status=?",
+                (AllocationStatus.RELEASED.value, tenant_id, allocation_id, row["status"]),
             )
+            if cur.rowcount == 0:
+                self._conn.rollback()
+                raise ConflictError(
+                    f"allocation changed concurrently: id={allocation_id} tenant_id={tenant_id}",
+                )
             self._conn.commit()
             if reason is not None:
                 logger.debug(

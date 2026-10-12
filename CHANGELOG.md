@@ -13,7 +13,7 @@
 - 新增契约 / 混沌 / 兼容测试 122 项（1115 vs 993）：Registry CAS 并发 / 租户过滤 / 重启恢复（19）、Workflow 恢复版本固定 / 取消补偿 + Outbox 事务 / 幂等 / 死信（12）、10 插件发布链路 conformance——manifest/isolation 一致性 + 四类 Provider 契约 + 卸载安全（91）。
 - 控制平面可运行入口：`control-plane` 包新增控制台脚本 `forgemesh-control-plane`（`forgemesh.controlplane.app:main`）；权威存储路径取自 `FORGEMESH_DB_PATH`（默认 `forgemesh.db`），监听地址取自 `FORGEMESH_HOST` / `FORGEMESH_PORT`（默认 `127.0.0.1:8080`），启动方式见 README「运行控制平面」。
 - 新增 `tests/contract/test_registry_hardening.py`：并发创建全部持久化、空 namespace 身份唯一、删除 / 释放 CAS、标签过滤与分页等 Registry 回归测试。
-- 新增 [ADR-014](docs/design-decisions/adr-014.md)（Proposed）：对外 API 采用绑定租户的 API Key 认证。
+- 新增 [ADR-014](docs/design-decisions/adr-014.md)（Accepted）：对外 API 采用绑定租户的 API Key 认证。
 - API Key 认证（ADR-014）：网关（`GATEWAY_AUTH_MODE` / `GATEWAY_API_KEYS_FILE`）与控制平面（`FORGEMESH_AUTH_MODE` / `FORGEMESH_API_KEYS_FILE`）各自校验 `Authorization: Bearer <key>`；key 文件只保存 SHA-256 摘要，每个 key 绑定租户、主体与 scope（`read` / `write` / `*`）；`python -m forgemesh.controlplane.keygen --tenant <租户> --subject <主体>` 生成 key 与对应的 key 文件条目。
 - 网关 `make run-dev`：以 `dev` 认证模式在 `127.0.0.1:8081` 启动，仅供本地开发。
 - OpenAPI：新增 `apiKey`（HTTP bearer）安全方案并设为全局 `security`（探针豁免），全部 `/api/v1` 端点声明 `401` / `403`。

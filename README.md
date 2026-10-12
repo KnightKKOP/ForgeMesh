@@ -173,6 +173,8 @@ GATEWAY_API_KEYS_FILE=../api-keys.json make run   # 默认 apikey 模式，监�
 make run-dev        # dev 模式：信任租户请求头，只监听 127.0.0.1:8081
 ```
 
+> 网关默认不连接回环、链路本地与云元数据地址上的推理实例。实例运行在本机时设置 `GATEWAY_INSTANCE_ALLOWED_CIDRS=127.0.0.0/8,::1/128`（`make run-dev` 已设置），见 [gateway/README.md](gateway/README.md)「实例地址限制」。
+
 ---
 
 ## 4. 功能概览（v1.0.0）

@@ -33,7 +33,7 @@ ForgeMesh 的**统一外部入口**与**高性能流式代理**。与 Python 控
 | 方法 | 路径 | 处理器 | 中间件 |
 | --- | --- | --- | --- |
 | GET | `/healthz` | 存活探针（始终 200） | 仅 Recovery |
-| GET | `/readyz` | 就绪探针（TCP 探测上游，不可达 503） | 仅 Recovery |
+| GET | `/readyz` | 就绪探针（请求控制平面 `/readyz`，非 200 或不可达时 503） | 仅 Recovery |
 | ANY | `/api/v1/resources[/...]` | 反代 → Python 控制平面 | 全链 |
 | ANY | `/api/v1/inference-services[/...]` | 反代 → Python 控制平面 | 全链 |
 | ANY | `/api/v1/workflows[/...]` | 反代 → Python 控制平面 | 全链 |
@@ -54,19 +54,35 @@ ForgeMesh 的**统一外部入口**与**高性能流式代理**。与 Python 控
 
 网关不转换请求体，客户端按服务实例的协议格式发送请求。
 
+同一服务的并发未命中只查询一次控制平面；"服务不存在 / 未就绪 / 无可用实例"缓存 1 秒
+（不超过 `GATEWAY_RESOLVER_TTL_SECONDS`），`403`、其他控制平面错误与网络错误不缓存。
+
+### 实例地址限制
+
+`status.endpoints` 中的地址由控制平面写入，网关在拨号时逐个检查解析出的 IP，主机名之后
+解析到别处同样生效：
+
+- 设置了 `GATEWAY_INSTANCE_ALLOWED_CIDRS` 时，只连接其中列出的网段；
+- 未设置时拒绝回环、链路本地（含 `169.254.169.254`）、未指定地址、组播，以及已知的云
+  元数据服务地址（`100.100.100.200`、`fd00:ec2::254`）。
+
+被拒绝的连接返回 `502 INSTANCE_ADDRESS_NOT_ALLOWED`，并计一次实例失败。实例运行在本机时
+需要显式允许回环网段，`make run-dev` 已设置 `GATEWAY_INSTANCE_ALLOWED_CIDRS=127.0.0.0/8,::1/128`。
+
 ### 中间件链
 
 执行顺序（外层 → 内层，与 `router.go` 实际组装一致，并由
 `internal/middleware/chain_test.go` 验证）：
 
 ```
-Recovery → Correlation → Authenticate → RateLimit → Route
+Recovery → Correlation → Authenticate → RateLimit → LimitRequestBody → Route
 ```
 
 - **Recovery**：兜底 panic → 500，记录堆栈，进程不退出（最外层，覆盖全量请求）。
 - **Correlation**：缺失则用 `crypto/rand` 生成 128-bit hex 关联 ID，注入 context 与响应头；已携带则透传。
 - **Authenticate**：按 `GATEWAY_AUTH_MODE` 校验凭证——`apikey`（默认）以 `Authorization: Bearer <key>` 的 SHA-256 摘要查 key 文件，`dev` 直接信任租户头。已验证的主体（subject / 租户 / scope）注入 context，并以已验证的租户**覆写**入站租户头。缺少或无效凭证返回 `401`（带 `WWW-Authenticate: Bearer realm="forgemesh"`），租户头与 key 绑定的租户不一致返回 `403`，响应体均为 JSON 错误信封。
 - **RateLimit**：按已验证租户的令牌桶限流，超限 `429 + Retry-After`；位于 Authenticate 之后，被拒请求不消耗令牌；不读取租户头或 `X-Forwarded-For`。
+- **LimitRequestBody**：请求体上限为 `GATEWAY_MAX_REQUEST_BODY_BYTES`（默认 10 MiB）。声明的 `Content-Length` 超限时直接返回 `413 REQUEST_TOO_LARGE`，不访问上游；分块传输的请求体读到上限时，反代与流式代理同样返回 `413`，不计实例失败。
 
 > 说明：探针刻意不经过认证/限流，保证负载均衡健康检查始终可用。
 
@@ -96,8 +112,9 @@ Recovery → Correlation → Authenticate → RateLimit → Route
 | `Host`、`Content-Length` | 剥离后重写 | 同方向一 |
 | hop-by-hop 头（双向） | 剥离 | 请求与响应两个方向均过滤 |
 
-**响应方向（上游/实例 → 客户端）**：非 hop-by-hop 头透传；流式响应强制
-`Content-Type: text/event-stream`、`Cache-Control: no-cache`、`X-Accel-Buffering: no`。
+**响应方向（上游/实例 → 客户端）**：非 hop-by-hop 头透传；流式代理的 2xx 响应强制
+`Content-Type: text/event-stream`，错误响应保留实例的 `Content-Type`（如 JSON 错误体）；
+流式代理的响应一律设置 `Cache-Control: no-cache`、`X-Accel-Buffering: no`。
 
 **安全缺陷记录（WP-D1，已修复）**：修复前 Authz 仅校验租户头存在性、不回写
 请求头，下游（反代/流式代理/限流 key）重新读取客户端**原始头**——多值头
@@ -128,6 +145,8 @@ Recovery → Correlation → Authenticate → RateLimit → Route
 | `GATEWAY_CORRELATION_HEADER` | `X-Correlation-ID` | 链路关联 ID 请求头 |
 | `GATEWAY_RESOLVER_TTL_SECONDS` | `5` | 推理服务→实例列表缓存 TTL（秒） |
 | `GATEWAY_UNHEALTHY_COOLDOWN_SECONDS` | `10` | 实例连续 3 次失败被摘流后的冷却时长（秒） |
+| `GATEWAY_INSTANCE_ALLOWED_CIDRS` | — | 推理实例允许所在的网段，逗号分隔（如 `10.0.0.0/8,fd00::/8`）；未设置时拒绝回环、链路本地与云元数据地址（见「实例地址限制」）；取值非法时拒绝启动 |
+| `GATEWAY_MAX_REQUEST_BODY_BYTES` | `10485760`（10 MiB） | 请求体上限（字节），超出返回 `413 REQUEST_TOO_LARGE`；必须为正整数 |
 
 ---
 
@@ -147,10 +166,12 @@ gateway/
     │   ├── ratelimit.go            # 按已验证租户的令牌桶（自实现）
     │   ├── authz.go                # Authenticate / RequireScope、Principal、dev 模式认证器
     │   ├── apikey.go               # key 文件解析与 API key 认证器
+    │   ├── bodylimit.go            # 请求体上限
     │   └── errors.go               # JSON 错误信封
     ├── upstream/client.go          # httputil.ReverseProxy 反代
-    ├── upstream/resolver.go        # 推理服务 → 实例 endpoint 解析（TTL 缓存、健康摘流）
+    ├── upstream/resolver.go        # 推理服务 → 实例 endpoint 解析（TTL 缓存、合并回源、健康摘流）
     ├── stream/proxy.go             # SSE 流式代理（逐块 Flush，断连取消上游）
+    ├── stream/addrpolicy.go        # 实例地址限制（拨号时检查）
     ├── health/health.go            # /healthz、/readyz
     └── router/router.go            # 路由表 + 中间件链
 ```
@@ -207,13 +228,15 @@ flowchart LR
     AZ -->|401 / 403| C
     AZ --> RL[RateLimit\n已验证租户令牌桶]
     RL -->|429| C
-    RL --> RT{Route}
+    RL --> BL[LimitRequestBody\n请求体上限]
+    BL -->|413| C
+    BL --> RT{Route}
     RT -->|/healthz /readyz| H[Probe]
     RT -->|/api/v1/resources 等| UP[ReverseProxy]
     RT -->|/api/v1/namespaces/{ns}/inference/{svc}/chat 等| SP[SSE StreamProxy]
     UP --> CP[(Python 控制平面)]
     SP -->|解析 status.endpoints| CP
-    SP -->|按 protocol 映射路径| INS[(推理实例)]
+    SP -->|按 protocol 映射路径，只连接允许的地址| INS[(推理实例)]
 ```
 
 ---

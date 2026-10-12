@@ -76,7 +76,7 @@
 |---|---|
 | 架构模块 | Data Plane Gateway（L1 推理流量入口，architecture.md 3.1 L1 / Dev-5） |
 | 当前代码路径 | `gateway/cmd/gateway/main.go`；`gateway/internal/{config,health,middleware,router,stream,upstream}/`（共 20 个 `.go` 文件，glob 核对）；`gateway/go.mod`（`github.com/Mekoforge/ForgeMesh/gateway`，go 1.22）；`gateway/Makefile`、`gateway/README.md` |
-| 核心契约 | `/api/v1/` REST + SSE 流式转发（见 openapi.yaml）；中间件链 `Recovery → Correlation → Authenticate → RateLimit → Route`；API key 认证（ADR-014，`middleware/{authz,apikey}.go`）；上游解析 `upstream/resolver.go`（按命名空间解析 ready 实例、`protocol` → 实例推理路径、健康摘流） |
+| 核心契约 | `/api/v1/` REST + SSE 流式转发（见 openapi.yaml）；中间件链 `Recovery → Correlation → Authenticate → RateLimit → LimitRequestBody → Route`；API key 认证（ADR-014，`middleware/{authz,apikey}.go`）；上游解析 `upstream/resolver.go`（按命名空间解析 ready 实例、`protocol` → 实例推理路径、合并回源、健康摘流）；实例地址限制 `stream/addrpolicy.go` |
 | 运行形态 | 独立进程（Go 二进制），经 `FORGEMESH_UPSTREAM` 转发至控制平面 |
 | 数据所有权 | 无权威数据（运行态转发；端点解析缓存为派生数据） |
 | 允许依赖 | 控制平面 HTTP API（上游）、Go 标准库 |

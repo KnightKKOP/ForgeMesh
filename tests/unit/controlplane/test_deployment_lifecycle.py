@@ -4,7 +4,7 @@
 * 创建的资源每轮推进一个 phase（``Pending`` → ``Scheduling`` → ``Preparing`` →
   ``Deploying`` → ``Verifying`` → ``Ready``），``status.endpoints`` 是启动器返回的实例；
 * 重启（``Ready`` 之后、启动部署的一轮被重放、启动实例的中途）不会启动第二个实例，也
-  不会再分配；
+  不会再分配；运行成功之后、写入 ``Ready`` 之前重启而实例已不在时，资源进入 ``Failed``；
 * 部署工作流没能启动时保留分配并重试；部署失败时实例被停止、分配释放，资源停在
   ``Failed``；补偿没能停止的实例在删除资源时停止；
 * 部署中途或 ``Ready`` 之后删除资源：取消运行、停止实例、释放分配、物理删除；
@@ -12,7 +12,7 @@
 
 测试以 ``asyncio.run`` 驱动异步方法，不依赖 pytest-asyncio。“重启”在同一个事件循环中
 关闭全部组件，再以同一数据库文件重新组装；启动器对象沿用，相当于实例在控制平面重启后
-仍在运行。
+仍在运行，换一个新的启动器对象则相当于实例随进程结束。
 """
 
 from __future__ import annotations
@@ -34,6 +34,7 @@ from forgemesh.controlplane.deployment import (
     LaunchRequest,
     RuntimeLauncher,
     deployment_run_key,
+    launched_instance,
 )
 from forgemesh.controlplane.reconciler import (
     ProcessedKeyStore,
@@ -175,10 +176,11 @@ class _ControlPlane:
     """一个控制平面进程的组件，组装方式与应用相同（在 ``async with`` 内使用）。
 
     进入时调用 ``recover()``（返回值存于 :attr:`recovered`）；退出时按应用的顺序关闭：
-    控制器 → 工作流运行时 → 工作流存储 → 去重键存储 → 注册表。
+    控制器 → 工作流运行时 → 启动器 → 工作流存储 → 去重键存储 → 注册表。
     """
 
     def __init__(self, db: str, launcher: RuntimeLauncher) -> None:
+        self.launcher = launcher
         self.registry = SQLiteRegistry(db)
         self.processed = ProcessedKeyStore(db)
         self.workflow_store = WorkflowStore(workflow_db_path(db))
@@ -192,6 +194,7 @@ class _ControlPlane:
             processed_store=self.processed,
             record_dedup_keys=False,
             workflow_poll_interval=POLL_SECONDS,
+            launcher=launcher,
         )
         self.manager = ControllerManager(self.registry, reconciler, poll_interval=POLL_SECONDS)
         self.recovered: list[str] = []
@@ -203,6 +206,7 @@ class _ControlPlane:
     async def __aexit__(self, *exc_info: object) -> None:
         await self.manager.stop()
         await self.runtime.aclose()
+        await self.launcher.aclose()
         await self.workflow_store.close()
         await self.processed.close()
         await self.registry.close()
@@ -490,6 +494,43 @@ def test_a_restart_in_the_middle_of_a_launch_resumes_the_run_with_the_same_insta
     asyncio.run(scenario())
     assert [request.instance_key for request in launcher.launches] == [RUN_KEY, RUN_KEY]
     assert launcher.stops == []
+
+
+@pytest.mark.unit
+def test_an_instance_lost_between_a_successful_run_and_ready_fails_the_service(tmp_path):
+    """运行已成功、写入 Ready 之前重启，实例没有活过重启（新启动器不认识它）：资源进入
+    Failed（InstanceLost）并释放分配，不把不存在的实例写进 ``status.endpoints``。"""
+    db = str(tmp_path / "cp.db")
+    fresh = _ScriptedLauncher()
+
+    async def scenario() -> None:
+        async with _ControlPlane(db, _ScriptedLauncher()) as plane:
+            await plane.registry.put(_service())
+            assert await plane.deploy(until={"Verifying"}) == [
+                "Scheduling",
+                "Preparing",
+                "Deploying",
+                "Verifying",
+            ]
+            run = await plane.runtime.find_run(RUN_KEY)
+            assert run.status is WorkflowStatus.SUCCEEDED
+            instance = launched_instance(run)
+
+        async with _ControlPlane(db, fresh) as plane:
+            assert await plane.deploy() == ["Failed"]
+            service = await plane.service()
+            assert service.status.endpoints == []
+            assert _ready(service) == (
+                "False",
+                "InstanceLost",
+                f"instance {instance.instance_id} at {instance.url} is not running any more; "
+                "delete and re-create the service to deploy it again",
+            )
+            assert await plane.registry.get_active_allocation(UID, TENANT) is None
+            assert await plane.registry.allocated_devices() == frozenset()
+
+    asyncio.run(scenario())
+    assert fresh.launches == []
 
 
 # ---------------------------------------------------------------------- #

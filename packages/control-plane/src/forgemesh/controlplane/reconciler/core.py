@@ -23,7 +23,8 @@
 ``Deploying → Verifying → Ready``
     按同一幂等键 find_run() 查询运行：实例启动后进入 ``Verifying``；运行成功后进入
     ``Ready``，写入 ``status.endpoints``（取自 ``launch-instance`` 的结果）与 ``Ready=True``。
-    运行未结束时每 ``workflow_poll_interval`` 秒查询一次。
+    运行未结束时每 ``workflow_poll_interval`` 秒查询一次。注入启动器时，写入 ``Ready``
+    之前先确认实例仍在运行。
 
 只有进入 ``Ready`` 或 ``Failed`` 的一轮返回 ``done=True``（登记去重键）；其余各轮返回
 ``done=False``，同一 generation 的去重键不会挡住下一轮。
@@ -39,6 +40,8 @@
   补偿没能停止实例时保留分配，删除资源时再停止实例、释放分配；找不到运行
   （``WorkflowRunNotFound``，如工作流数据库被重置）或运行成功却没有报告实例（运行时
   不返回步骤输出）时同样进入 ``Failed`` 并保留分配。
+* 运行成功、实例却已不在运行（如控制平面在运行成功之后、写入 ``Ready`` 之前重启，
+  实例随进程结束）：``phase=Failed``、``Ready=False``（``InstanceLost``），释放分配。
 * ``Failed`` 是终态：资源状态机只允许它转入 ``Terminating``，协调器不自动重试，删除后
   重新创建资源即可再次部署。
 
@@ -82,6 +85,7 @@ from ..deployment import (
     LAUNCH_INSTANCE,
     LaunchedInstance,
     LaunchRequest,
+    RuntimeLauncher,
     deployment_inputs,
     deployment_run_key,
     deployment_workflow,
@@ -218,6 +222,9 @@ class ReconciliationController(Reconciler):
             避免"已登记、状态却没写进去"（控制器管理器使用）。默认 ``True``。
         workflow_poll_interval: 部署运行进行中时两次查询之间的秒数，也是启动或查询失败
             后退避的起点（之后每次翻倍，最多 :data:`MAX_RETRY_DELAY_SECONDS`）。
+        launcher: 可选，部署工作流使用的启动器；注入时写入 ``Ready`` 之前以
+            :meth:`~forgemesh.controlplane.deployment.RuntimeLauncher.is_running` 确认实例
+            仍在运行，否则进入 ``Failed``（``InstanceLost``）。
 
     Raises:
         ValueError: 注入了工作流运行时却没有 ``release_provider``，或
@@ -235,6 +242,7 @@ class ReconciliationController(Reconciler):
         processed_store: ProcessedKeyStore | None = None,
         record_dedup_keys: bool = True,
         workflow_poll_interval: float = 2.0,
+        launcher: RuntimeLauncher | None = None,
     ) -> None:
         if workflow_runtime is not None and release_provider is None:
             raise ValueError(
@@ -252,6 +260,7 @@ class ReconciliationController(Reconciler):
         self._processed_store = processed_store
         self._record_dedup_keys = record_dedup_keys
         self._poll_interval = workflow_poll_interval
+        self._launcher = launcher
         # 已处理的去重键（内存级回退路径；processed_store 注入时以 SQLite
         # 持久化为准——architecture §5.5 不依赖单进程内存状态）。
         self._processed_keys: set[str] = set()
@@ -483,6 +492,16 @@ class ReconciliationController(Reconciler):
         if run.status is WorkflowStatus.SUCCEEDED and instance is not None:
             if phase == InferencePhase.DEPLOYING:
                 return self._verifying(instance, requeue_after=0.0)
+            if self._launcher is not None and not await self._launcher.is_running(
+                instance.instance_id
+            ):
+                return await self._fail(
+                    ctx,
+                    "InstanceLost",
+                    f"instance {instance.instance_id} at {instance.url} is not running any "
+                    "more; delete and re-create the service to deploy it again",
+                    release_allocation=True,
+                )
             return await self._ready(ctx, instance)
         if run.terminal:
             return await self._fail_run(ctx, run, instance)

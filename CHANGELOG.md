@@ -17,6 +17,9 @@
 - API Key 认证（ADR-014）：网关（`GATEWAY_AUTH_MODE` / `GATEWAY_API_KEYS_FILE`）与控制平面（`FORGEMESH_AUTH_MODE` / `FORGEMESH_API_KEYS_FILE`）各自校验 `Authorization: Bearer <key>`；key 文件只保存 SHA-256 摘要，每个 key 绑定租户、主体与 scope（`read` / `write` / `*`）；`python -m forgemesh.controlplane.keygen --tenant <租户> --subject <主体>` 生成 key 与对应的 key 文件条目。
 - 网关 `make run-dev`：以 `dev` 认证模式在 `127.0.0.1:8081` 启动，仅供本地开发。
 - OpenAPI：新增 `apiKey`（HTTP bearer）安全方案并设为全局 `security`（探针豁免），全部 `/api/v1` 端点声明 `401` / `403`。
+- 控制器：控制平面在应用启动（lifespan）时运行 `ControllerManager`，自动协调 `InferenceService` 并回写 `status`。Registry 每次写入时在同一事务中追加一条 `resource_changes` 变更记录，控制器按序号增量读取并清理已读记录；启动时全量重建工作队列，另每 10 分钟全量同步一次。工作队列按资源去重、支持延迟重试，失败时指数退避；`status` 以 `resource_version` 做 CAS 写入，去重键在写入成功之后才登记。控制器是单写者（ADR-013），应用只能以单进程运行。
+- Registry status 子资源写入 `update_status`：只修改 `conditions` / `phase` / `observedGeneration`，不递增 `generation`；条件按 `type` 合并，`status` 不变时保留 `lastTransitionTime`；支持以 `resource_version` 做 CAS，未建模的 payload 字段原样保留。另新增 `get_with_phase`、`list_resource_keys`、`changes_since`、`latest_change_seq`、`prune_changes`。
+- `ReconciliationController` 新增 `record_dedup_keys` 参数与 `mark_processed()`：调用方可以在持久化 `status` 之后再登记去重键。
 
 ### Changed
 
@@ -46,6 +49,8 @@
 - `namespace` 为空（NULL）的资源可以同名重复创建（SQLite 主键视 NULL 互不相等），一次 DELETE 会删除全部副本：新增唯一表达式索引 `(tenant_id, kind, COALESCE(namespace, ''), name)`；打开已含重复数据的旧库时抛出 `PreconditionFailedError`，不静默丢行。
 - `request_delete` 与 `release_allocation` 读后写不校验版本，期间提交的写入会丢失、期间追加的 finalizer 会被绕过：现以读取到的 `resource_version` / 状态为条件做 CAS，竞争失败抛出 `ConflictError`（DELETE 端点返回 `409`）。
 - 调和器在 deny / require_approval / 分配失败等无副作用路径上也记录去重键，重新入队后命中幂等短路，被阻塞的资源在 spec 变更或 24h 去重 TTL 过期前不会被重新评估：这些路径不再记录去重键。
+- 生产代码中没有任何地方驱动调和器，创建的资源永远停在 `Pending`、`status` 从不更新：现由控制器驱动（见 Added）。
+- 调和器在没有注入调度器或工作流运行时的情况下跳过分配与部署、登记去重键并报告 `Ready=True`（`Reconciled`），实际什么都没做：现在任何副作用之前检查，返回 `Ready=False`，原因为 `SchedulerUnavailable` 或 `WorkflowRuntimeUnavailable`，且不登记去重键。目前仓库没有调度器实现，默认部署中新建的服务会停在 `Pending` 并带有 `Ready=False`（`SchedulerUnavailable`）。
 
 ### Security
 

@@ -11,10 +11,10 @@
 4. **生成候选**：调用 DecisionProvider 产出候选动作（建议，非授权）。
 5. **Policy 校验**：PolicyEngine.check()，deny 则停止（不可绕过，INV-3）。
 6. **Scheduler 分配**：如需分配资源，Scheduler.allocate()（唯一授权分配点）。请求携带
-   资源身份（kind/namespace/name/uid）与幂等键（uid + generation，见
-   :func:`~forgemesh.controlplane.reconciler.dedup.allocation_idempotency_key`）：同一
-   generation 的重放得到同一分配；没有 ``metadata.uid`` 的资源报告 ``Ready=False``
-   （``MissingUid``），不分配。
+   资源身份（kind/namespace/name/uid）、幂等键（uid + generation，见
+   :func:`~forgemesh.controlplane.reconciler.dedup.allocation_idempotency_key`）与取自
+   ``spec.resources.accelerator`` 的调度需求：同一 generation 的重放得到同一分配；
+   没有 ``metadata.uid`` 的资源报告 ``Ready=False``（``MissingUid``），不分配。
 7. **WorkEngine 执行**：如需执行工作流，WorkflowRuntime.start()。
 8. **重观察**：收集执行后的新观测状态（P1 简化为标记完成）。
 9. **更新 status + 安排下次**：写回 status patch，返回 requeue_after。
@@ -46,11 +46,25 @@ from forgemesh.core.errors import ConflictError, NotFoundError
 from forgemesh.core.objects import Resource
 from forgemesh.core.reconciler import ReconcileContext, Reconciler, ReconcileResult
 from forgemesh.policy.api import PolicyAction, PolicyEngine
+from forgemesh.resource.inference import AcceleratorSpec
 
 from ..registry.store import DEFAULT_RELEASE_FINALIZER
 from .dedup import ProcessedKeyStore, allocation_idempotency_key
 
 logger = logging.getLogger(__name__)
+
+
+def _scheduling_requirements(resource: Resource) -> dict[str, Any]:
+    """提取资源的调度需求 ``{"accelerator": {"type", "count", "minMemoryGiB"}}``。
+
+    取自强类型 spec 的 ``spec.resources.accelerator``；没有加速器申请的资源（基类
+    ``Resource``、未登记的 kind）返回 ``{}``。
+    """
+    spec = getattr(resource, "spec", None)
+    accelerator = getattr(getattr(spec, "resources", None), "accelerator", None)
+    if not isinstance(accelerator, AcceleratorSpec):
+        return {}
+    return {"accelerator": accelerator.model_dump(mode="json")}
 
 
 class ReleaseProvider(Protocol):
@@ -502,7 +516,8 @@ class ReconciliationController(Reconciler):
         * 若 ``observed_generation >= desired_generation`` 且 phase 为 ``Ready``
           或 ``Degraded``，认为已收敛，无需协调。
         * 否则需要协调；根据 phase 判断是否需要分配（Pending/None）和
-          是否需要工作流（None/Pending/Scheduling）。
+          是否需要工作流（None/Pending/Scheduling）；``requirements`` 为传给
+          调度器的需求（见 :func:`_scheduling_requirements`）。
 
         Args:
             resource: 目标资源（含期望状态与元数据）。
@@ -510,7 +525,7 @@ class ReconciliationController(Reconciler):
 
         Returns:
             差异描述字典，含 ``needs_reconcile`` / ``operation`` /
-            ``needs_allocation`` / ``needs_workflow`` 等字段。
+            ``needs_allocation`` / ``needs_workflow`` / ``requirements`` 等字段。
         """
         observed_phase = observed.get("phase")
         desired_generation = resource.metadata.generation
@@ -531,7 +546,7 @@ class ReconciliationController(Reconciler):
             "operation": operation,
             "needs_allocation": needs_allocation,
             "needs_workflow": needs_workflow,
-            "requirements": {},
+            "requirements": _scheduling_requirements(resource),
             "desired_generation": desired_generation,
             "observed_generation": observed_generation,
             "observed_phase": observed_phase,

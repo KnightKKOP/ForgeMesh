@@ -3,6 +3,7 @@
 覆盖：幂等去重键、差异计算、Policy 三态
 （allow/deny/require_approval——degraded 已按 architecture 7.5 移除）、
 Scheduler 分配成功与失败、分配请求的资源身份与幂等键（uid + generation）、
+调度需求取自 ``spec.resources.accelerator``、
 缺少调度器/工作流运行时时如实报告 ``Ready=False``、
 幂等性，以及 Terminating 受控删除闭环
 （ReleaseProvider 释放 → 移除 finalizer → 释放 Allocation → 物理删除）。
@@ -173,6 +174,29 @@ def test_compute_diff_pending_needs_reconcile():
     assert diff["needs_reconcile"] is True
     assert diff["needs_allocation"] is True
     assert diff["needs_workflow"] is True
+
+
+@pytest.mark.unit
+def test_compute_diff_takes_requirements_from_the_accelerator_request():
+    """调度需求取自 spec.resources.accelerator（type / count / minMemoryGiB）。"""
+    service = make_inference_service(
+        phase=InferencePhase.PENDING,
+        accelerator=AcceleratorSpec(type="nvidia-gpu", count=2, minMemoryGiB=40),
+    )
+
+    diff = ReconciliationController._compute_diff(service, {"phase": "Pending"})
+
+    assert diff["requirements"] == {
+        "accelerator": {"type": "nvidia-gpu", "count": 2, "minMemoryGiB": 40}
+    }
+
+
+@pytest.mark.unit
+def test_compute_diff_without_an_accelerator_request_has_no_requirements():
+    """没有强类型 spec 的资源（基类 Resource）没有调度需求。"""
+    diff = ReconciliationController._compute_diff(make_resource(), {"phase": "Pending"})
+
+    assert diff["requirements"] == {}
 
 
 # ---------------------------------------------------------------------- #
@@ -398,6 +422,25 @@ def test_allocation_request_identifies_the_resource_and_its_generation():
 
 
 @pytest.mark.unit
+def test_allocation_request_carries_the_accelerator_request():
+    """调度器收到的需求即 InferenceService 的加速器申请。"""
+    service = make_inference_service(
+        phase=InferencePhase.PENDING,
+        accelerator=AcceleratorSpec(type="nvidia-gpu", count=1, minMemoryGiB=24),
+    )
+    scheduler = MockScheduler()
+
+    asyncio.run(
+        _allocating_controller(scheduler).reconcile(make_context(service, {"phase": "Pending"}))
+    )
+
+    [req] = scheduler.requests
+    assert req.requirements == {
+        "accelerator": {"type": "nvidia-gpu", "count": 1, "minMemoryGiB": 24}
+    }
+
+
+@pytest.mark.unit
 def test_replaying_a_generation_requests_the_same_allocation():
     """去重键丢失后（如未持久化的进程重启）重放同一 generation 使用同一幂等键；
     新 generation 与同名重建的资源（新 uid）得到新键。"""
@@ -567,15 +610,17 @@ def make_inference_service(
     name: str = "svc-1",
     tenant_id: str = "tenant-1",
     phase: InferencePhase = InferencePhase.READY,
+    accelerator: AcceleratorSpec | None = None,
 ) -> InferenceService:
     """构造带 spec/status 的 InferenceService（phase 由 status 携带）。"""
     return InferenceService(
-        metadata=ObjectMeta(name=name, tenant_id=tenant_id, generation=1),
+        metadata=ObjectMeta(name=name, uid="uid-1", tenant_id=tenant_id, generation=1),
         spec=InferenceServiceSpec(
             model=ModelRef(reference="models/llama"),
             runtime=RuntimeRef(provider="vllm"),
             resources=ResourcesSpec(
-                accelerator=AcceleratorSpec(type="nvidia-gpu", count=1, minMemoryGiB=16)
+                accelerator=accelerator
+                or AcceleratorSpec(type="nvidia-gpu", count=1, minMemoryGiB=16)
             ),
         ),
         status=InferenceServiceStatus(phase=phase),

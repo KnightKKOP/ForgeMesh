@@ -8,7 +8,7 @@
   启动中途重启后复用同一实例；
 * ``DeploymentReleaser``：没有部署时不做事、停止已部署的实例、取消进行中的部署、
   重试补偿时没能停止的实例、停止失败时抛出异常；
-* ``InMemoryLauncher`` 按实例幂等键复用实例。
+* ``InMemoryLauncher`` 按实例幂等键复用实例，只把仍在运行的实例报告为运行中。
 """
 
 from __future__ import annotations
@@ -207,8 +207,9 @@ def test_launched_instance_rejects_urls_that_endpoints_reject(url: str) -> None:
 
 
 @pytest.mark.unit
-def test_runtime_launcher_requires_launch_verify_and_stop() -> None:
-    assert RuntimeLauncher.__abstractmethods__ == {"launch", "verify", "stop"}
+def test_runtime_launcher_requires_launch_verify_stop_and_is_running() -> None:
+    """``prepare`` 与 ``aclose`` 可选，默认什么都不做。"""
+    assert RuntimeLauncher.__abstractmethods__ == {"launch", "verify", "stop", "is_running"}
 
     class _Minimal(RuntimeLauncher):
         async def launch(self, request: LaunchRequest) -> LaunchedInstance:
@@ -220,7 +221,12 @@ def test_runtime_launcher_requires_launch_verify_and_stop() -> None:
         async def stop(self, instance_id: str) -> None:
             return None
 
-    assert asyncio.run(_Minimal().prepare(_request())) is None
+        async def is_running(self, instance_id: str) -> bool:
+            return False
+
+    launcher = _Minimal()
+    assert asyncio.run(launcher.prepare(_request())) is None
+    assert asyncio.run(launcher.aclose()) is None
 
 
 # ---------------------------------------------------------------------- #
@@ -569,3 +575,17 @@ def test_in_memory_launcher_reuses_instances_per_key() -> None:
         instances["relaunched"].instance_id,
     }
     assert launcher.stops == [instances["first"].instance_id] * 2
+
+
+@pytest.mark.unit
+def test_in_memory_launcher_reports_only_running_instances() -> None:
+    launcher = InMemoryLauncher()
+
+    async def scenario() -> list[bool]:
+        instance = await launcher.launch(_request())
+        running = await launcher.is_running(instance.instance_id)
+        await launcher.stop(instance.instance_id)
+        return [running, await launcher.is_running(instance.instance_id)]
+
+    assert asyncio.run(scenario()) == [True, False]
+    assert asyncio.run(launcher.is_running("instance-unknown")) is False

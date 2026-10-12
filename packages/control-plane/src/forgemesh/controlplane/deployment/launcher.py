@@ -4,7 +4,8 @@
 工作流（:mod:`forgemesh.controlplane.deployment.workflow`）的三个步骤依次调用
 :meth:`~RuntimeLauncher.prepare`、:meth:`~RuntimeLauncher.launch` 与
 :meth:`~RuntimeLauncher.verify`；部署失败时的补偿与删除资源时调用
-:meth:`~RuntimeLauncher.stop`。
+:meth:`~RuntimeLauncher.stop`。控制平面用 :meth:`~RuntimeLauncher.is_running` 确认实例
+仍在运行（重启之后、写入 ``Ready`` 之前），关闭时调用 :meth:`~RuntimeLauncher.aclose`。
 
 契约放在控制平面而不是契约包中：启动器由控制平面按配置选择和组装，请求直接使用强类型
 的 :class:`~forgemesh.resource.inference.InferenceServiceSpec`。插件不能导入控制平面，
@@ -118,6 +119,22 @@ class RuntimeLauncher(ABC):
 
         Raises:
             Exception: 无法确认实例已停止；调用方稍后重试。
+        """
+
+    @abstractmethod
+    async def is_running(self, instance_id: str) -> bool:
+        """实例是否仍在运行：启动器知道这个实例，而且它没有退出。
+
+        只查看启动器自己的记录，不发请求、不等待；不认识的 id 返回 ``False``。实例不能
+        比控制平面进程活得更久的启动器，在重启之后对重启之前的实例一律返回 ``False``。
+        """
+
+    async def aclose(self) -> None:  # noqa: B027 - 可选，不持有资源的启动器无需关闭
+        """关闭启动器；默认什么都不做。
+
+        应用在工作流运行时关闭之后调用（运行时关闭时的补偿还会调用 :meth:`stop`），之后
+        不再调用其他方法。实例随控制平面进程结束的启动器（本进程内的服务器、子进程）在
+        这里停止全部实例。
         """
 
 

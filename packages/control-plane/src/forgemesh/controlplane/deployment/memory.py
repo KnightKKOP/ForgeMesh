@@ -68,5 +68,8 @@ class InMemoryLauncher(RuntimeLauncher):
             if instance.instance_id != instance_id
         }
 
+    async def is_running(self, instance_id: str) -> bool:
+        return instance_id in self.running
+
 
 __all__ = ["InMemoryLauncher"]

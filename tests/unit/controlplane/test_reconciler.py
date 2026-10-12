@@ -13,7 +13,11 @@ import json
 from typing import Any
 
 import pytest
-from forgemesh.controlplane.reconciler import ReconciliationController, compute_dedup_key
+from forgemesh.controlplane.reconciler import (
+    ProcessedKeyStore,
+    ReconciliationController,
+    compute_dedup_key,
+)
 from forgemesh.controlplane.registry import SQLiteRegistry
 from forgemesh.core.errors import NotFoundError
 from forgemesh.core.objects import ObjectMeta, Resource
@@ -273,6 +277,85 @@ def test_reconcile_allocation_failure():
     conditions = result.status_patch["conditions"]
     assert any(c["reason"] == "AllocationFailed" for c in conditions)
     assert any(c["status"] == "False" for c in conditions)
+
+
+class SequencePolicyEngine:
+    """按调用顺序依次返回预设决策（最后一个决策重复使用）。"""
+
+    def __init__(self, *decisions: str) -> None:
+        self._decisions = list(decisions)
+        self.calls = 0
+
+    async def check(self, ctx, action):  # noqa: ANN001
+        decision = self._decisions[min(self.calls, len(self._decisions) - 1)]
+        self.calls += 1
+        return PolicyDecision(decision=decision, reason=f"call-{self.calls}")
+
+
+class FlakyScheduler(MockScheduler):
+    """首次 allocate 失败，之后成功。"""
+
+    async def allocate(self, req):  # noqa: ANN001
+        self._fail = self.allocate_count == 0
+        return await super().allocate(req)
+
+
+def _processed_store_variants():
+    return [
+        pytest.param(lambda: None, id="in-memory-keys"),
+        pytest.param(lambda: ProcessedKeyStore(":memory:"), id="processed-store"),
+    ]
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("first_decision", ["deny", "require_approval"])
+@pytest.mark.parametrize("make_store", _processed_store_variants())
+def test_reconcile_requeue_after_policy_block_is_reevaluated(first_decision, make_store):
+    """deny / require_approval 未产生副作用：requeue 回来必须重新评估策略。"""
+    ctx = make_context(make_resource(generation=1, observed_generation=0), {"phase": "Pending"})
+    policy = SequencePolicyEngine(first_decision, "allow")
+    scheduler = MockScheduler()
+    controller = ReconciliationController(
+        registry=None,
+        policy_engine=policy,
+        scheduler=scheduler,
+        processed_store=make_store(),
+    )
+
+    blocked = asyncio.run(controller.reconcile(ctx))
+    assert blocked.done is False
+    assert scheduler.allocate_called is False
+
+    retried = asyncio.run(controller.reconcile(ctx))
+    assert policy.calls == 2
+    assert retried.done is True
+    assert any(c["reason"] == "Reconciled" for c in retried.status_patch["conditions"])
+    assert scheduler.allocate_count == 1
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("make_store", _processed_store_variants())
+def test_reconcile_requeue_after_allocation_failure_retries_allocation(make_store):
+    """分配失败未产生分配：requeue 回来必须重新尝试分配。"""
+    ctx = make_context(make_resource(generation=1, observed_generation=0), {"phase": "Pending"})
+    scheduler = FlakyScheduler()
+    controller = ReconciliationController(
+        registry=None,
+        policy_engine=MockPolicyEngine(PolicyDecision(decision="allow", reason="ok")),
+        scheduler=scheduler,
+        processed_store=make_store(),
+    )
+
+    failed = asyncio.run(controller.reconcile(ctx))
+    assert failed.done is False
+
+    retried = asyncio.run(controller.reconcile(ctx))
+    assert retried.done is True
+    assert scheduler.allocate_count == 2
+
+    again = asyncio.run(controller.reconcile(ctx))
+    assert again.status_patch == {}
+    assert scheduler.allocate_count == 2
 
 
 # ---------------------------------------------------------------------- #

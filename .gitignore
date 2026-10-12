@@ -56,3 +56,6 @@ diagnostics-*.zip
 
 # ---- Node (tooling only) ----
 node_modules/
+
+# ---- Local deployment ----
+/deploy/docker/api-keys.json

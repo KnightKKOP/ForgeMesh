@@ -11,7 +11,6 @@
 ### 1.1 环境要求
 
 - Python **3.12+**（CI 覆盖 3.12）
-- **uv**（Python 包与虚拟环境管理器，替代 pip/venv，安装见 <https://docs.astral.sh/uv/>）
 - GNU Make
 - Go **1.22+**（仅开发 `gateway/` 时需要）
 - Git
@@ -23,7 +22,7 @@
 ```bash
 git clone git@github.com:Mekoforge/ForgeMesh.git
 cd ForgeMesh
-uv sync               # 创建虚拟环境并安装全部子包（editable）+ 开发依赖
+make install          # 创建 .venv 并安装全部子包（editable）+ 开发依赖
 make test             # 运行全部测试，确认基线通过
 ```
 
@@ -38,7 +37,7 @@ cd ForgeMesh
 git remote add upstream git@github.com:Mekoforge/ForgeMesh.git
 git fetch upstream
 # 4. 安装依赖
-uv sync
+make install
 make test
 ```
 
@@ -48,8 +47,7 @@ make test
 
 | 命令 | 说明 |
 | --- | --- |
-| `uv sync` | 创建虚拟环境，安装全部子包（editable）+ 开发依赖 |
-| `make install` | 等价于 `uv sync`（Makefile 封装） |
+| `make install` | 创建 `.venv`，安装全部子包（editable）+ 开发依赖 |
 | `make test` | 运行全部测试（pytest） |
 | `make test-unit` | 仅单元测试 |
 | `make test-contract` | 仅契约测试 |
@@ -193,6 +191,6 @@ ADR 与上游架构基线冲突时，以 [`architecture.md`](docs/architecture/a
 ## 9. 代码风格
 
 - **Python**：ruff 配置见根 `pyproject.toml`（行宽 100，`py312` 目标）。统一类型注解，使用 `Optional[X]` / `List[X]` / `Dict[K, V]`（而非 PEP 604 `X | None`）；公共 API 使用 Pydantic 强类型模型，禁止以未校验的任意 dict 作为公共接口。
-- **Go**：`gateway/` 内遵循 `gofmt` / `go vet`；对外契约版本化。
+- **Go**：`gateway/` 内遵循 `gofmt` / `go vet`（CI 检查）；对外契约版本化。
 - **通用**：命名清晰、函数单一职责、为复杂逻辑写注释说明"为什么"，不留 TODO 占位（除非关联 Issue）。
 - 仓库文本统一使用 UTF-8，换行与缩进遵循 `.editorconfig`。

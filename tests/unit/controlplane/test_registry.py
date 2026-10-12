@@ -334,7 +334,7 @@ def test_allocation_released_allows_new_active() -> None:
     alloc_id = _run(reg.put_allocation(_make_allocation(idempotency_key="idem-1")))
     _run(reg.release_allocation(alloc_id, TENANT_A, reason="test"))
 
-    # 释放后可再次分配同一设备
+    # 释放后可再次为同一资源分配
     new_id = _run(reg.put_allocation(_make_allocation(idempotency_key="idem-2")))
     assert new_id != alloc_id
     active = _run(reg.get_active_allocation("gpu-0", TENANT_A))

@@ -36,9 +36,20 @@
 Allocation 持久化
 ------------------
 ``allocations`` 表持久化 :class:`~forgemesh.resource.allocation.Allocation`
-（``Active | Released | Expired``），以**部分唯一索引**
-``idx_allocations_one_active_per_resource`` 兜底「同一 ``resource_id`` 至多一个
-Active 分配」；``release_allocation`` 走 ``ALLOCATION_STATE_MACHINE`` 校验。
+（``Active | Released | Expired``），``resource_id`` 为归属资源（如
+``InferenceService``）的 uid；分配到的设备记录在 ``allocation_devices`` 表
+（``node_id`` / ``device_id``），设备行的状态由触发器
+``trg_allocation_devices_follow_status`` 与所属分配同步。数据库层兜底的约束：
+
+* 部分唯一索引 ``idx_allocations_one_active_per_tenant_resource``：同一租户的同一
+  资源至多一个 Active 分配（取代不分租户的旧索引
+  ``idx_allocations_one_active_per_resource``，打开存量库时删除旧索引）；
+* 部分唯一索引 ``idx_allocation_devices_one_active``：同一设备至多属于一个 Active
+  分配；
+* ``allocations.idempotency_key`` 唯一：一个幂等键只对应一个分配，释放后也不复用。
+
+:meth:`SQLiteRegistry.create_allocation` 在同一个 ``BEGIN IMMEDIATE`` 事务中写入
+分配行与设备行；``release_allocation`` 走 ``ALLOCATION_STATE_MACHINE`` 校验。
 
 变更记录
 --------
@@ -52,7 +63,9 @@ Active 分配」；``release_allocation`` 走 ``ALLOCATION_STATE_MACHINE`` 校�
 面向租户的查询均以 ``tenant_id`` 作为首要过滤条件；跨租户访问一律视为
 :class:`~forgemesh.core.errors.NotFoundError`，不泄露存在性。
 :meth:`SQLiteRegistry.list_resource_keys` 与 :meth:`SQLiteRegistry.changes_since`
-是例外：它们跨租户返回资源键，仅供控制平面内部的控制器使用，不得暴露给 API。
+是例外：它们跨租户返回资源键，仅供控制平面内部的控制器使用，不得暴露给 API；
+:meth:`SQLiteRegistry.get_allocation` 与 :meth:`SQLiteRegistry.allocated_devices`
+同样跨租户读取，仅供调度器使用（设备由全部租户共享）。
 """
 
 from __future__ import annotations
@@ -60,11 +73,12 @@ from __future__ import annotations
 import asyncio
 import base64
 import builtins
+import contextlib
 import json
 import logging
 import sqlite3
 import threading
-from collections.abc import Callable, Collection
+from collections.abc import Callable, Collection, Iterator, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -74,6 +88,7 @@ from uuid import uuid4
 from forgemesh.core.errors import ConflictError, NotFoundError, PreconditionFailedError
 from forgemesh.core.objects import Condition, Resource
 from forgemesh.core.registry import ResourceRegistry
+from forgemesh.core.scheduler import AllocatedDevice, ResourceRef
 from forgemesh.resource.allocation import Allocation, AllocationStatus
 from forgemesh.resource.inference import Endpoint, InferenceService
 from forgemesh.resource.states import ALLOCATION_STATE_MACHINE, INFERENCE_STATE_MACHINE
@@ -136,8 +151,22 @@ CREATE TABLE IF NOT EXISTS allocations (
     released_at TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_allocations_tenant ON allocations(tenant_id);
-CREATE UNIQUE INDEX IF NOT EXISTS idx_allocations_one_active_per_resource
-    ON allocations(resource_id) WHERE status = 'Active';
+CREATE UNIQUE INDEX IF NOT EXISTS idx_allocations_one_active_per_tenant_resource
+    ON allocations(tenant_id, resource_id) WHERE status = 'Active';
+CREATE TABLE IF NOT EXISTS allocation_devices (
+    allocation_id TEXT NOT NULL REFERENCES allocations(id),
+    node_id TEXT NOT NULL,
+    device_id TEXT NOT NULL,
+    status TEXT NOT NULL,
+    PRIMARY KEY (allocation_id, node_id, device_id)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_allocation_devices_one_active
+    ON allocation_devices(node_id, device_id) WHERE status = 'Active';
+CREATE TRIGGER IF NOT EXISTS trg_allocation_devices_follow_status
+    AFTER UPDATE OF status ON allocations
+BEGIN
+    UPDATE allocation_devices SET status = NEW.status WHERE allocation_id = NEW.id;
+END;
 CREATE TABLE IF NOT EXISTS resource_changes (
     seq INTEGER PRIMARY KEY AUTOINCREMENT,
     tenant_id TEXT NOT NULL,
@@ -267,12 +296,57 @@ class SQLiteRegistry(ResourceRegistry):
             (tenant_id, kind, namespace, name, change.value),
         )
 
+    @contextlib.contextmanager
+    def _immediate_transaction(self) -> Iterator[sqlite3.Cursor]:
+        """``BEGIN IMMEDIATE`` 事务：开始即持有写锁，事务内的检查不会被其他连接的
+        写入穿插；异常时回滚，正常退出时提交。"""
+        cur = self._conn.cursor()
+        cur.execute("BEGIN IMMEDIATE")
+        try:
+            yield cur
+        except BaseException:
+            self._conn.rollback()
+            raise
+        self._conn.commit()
+
+    def _allocation_record(self, row: sqlite3.Row) -> dict[str, Any]:
+        """分配行 → 记录字典：各列加 ``devices``（按分配时的顺序）。"""
+        record = dict(row)
+        record["devices"] = [
+            {"node_id": device["node_id"], "device_id": device["device_id"]}
+            for device in self._conn.execute(
+                "SELECT node_id, device_id FROM allocation_devices "
+                "WHERE allocation_id=? ORDER BY rowid",
+                (row["id"],),
+            )
+        ]
+        return record
+
     def _init_schema(self) -> None:
-        """创建表与索引（幂等），并对存量库做列迁移。"""
+        """创建表与索引（幂等），并对存量库做列与索引迁移。"""
         self._conn.executescript(_SCHEMA_SQL)
         self._migrate_legacy_resources()
+        self._migrate_legacy_allocations()
         self._ensure_identity_index()
         self._conn.commit()
+
+    def _migrate_legacy_allocations(self) -> None:
+        """删除存量库中不分租户的旧索引 ``idx_allocations_one_active_per_resource``。
+
+        取代它的 ``idx_allocations_one_active_per_tenant_resource`` 只在同一租户内约束
+        ``resource_id``，旧索引成立的数据必然满足新索引；存量分配记录原样保留。
+        """
+        legacy = self._conn.execute(
+            "SELECT 1 FROM sqlite_master "
+            "WHERE type='index' AND name='idx_allocations_one_active_per_resource'"
+        ).fetchone()
+        if legacy is not None:
+            self._conn.execute("DROP INDEX idx_allocations_one_active_per_resource")
+            logger.info(
+                "migrated legacy allocations table: replaced index "
+                "'idx_allocations_one_active_per_resource' with "
+                "'idx_allocations_one_active_per_tenant_resource'"
+            )
 
     def _ensure_identity_index(self) -> None:
         """建立把 NULL namespace 视为相等的身份唯一索引。
@@ -1005,10 +1079,11 @@ class SQLiteRegistry(ResourceRegistry):
     # ------------------------------------------------------------------ #
 
     async def put_allocation(self, allocation: Allocation) -> str:
-        """插入分配记录，返回新生成的分配 id。
+        """插入一条不持有设备的分配记录，返回新生成的分配 id。
 
-        同一 ``resource_id`` 已存在 ``Active`` 分配时，由部分唯一索引
-        ``idx_allocations_one_active_per_resource`` 兜底拒绝；重复
+        不校验归属资源是否存在；调度器经 :meth:`create_allocation` 写入分配。
+        同一租户的同一 ``resource_id`` 已存在 ``Active`` 分配时，由部分唯一索引
+        ``idx_allocations_one_active_per_tenant_resource`` 兜底拒绝；重复
         ``idempotency_key`` 由唯一约束拒绝；两者均转
         :class:`~forgemesh.core.errors.ConflictError`。
 
@@ -1055,14 +1130,160 @@ class SQLiteRegistry(ResourceRegistry):
 
         return await self._run(_put_allocation)
 
+    async def create_allocation(
+        self,
+        tenant_id: str,
+        resource: ResourceRef,
+        idempotency_key: str,
+        devices: Sequence[AllocatedDevice] = (),
+    ) -> dict[str, Any]:
+        """为 ``resource`` 创建持有 ``devices`` 的 Active 分配，返回分配记录。
+
+        检查与写入在同一个 ``BEGIN IMMEDIATE`` 事务中完成（另一连接的写入无法穿插），
+        分配行与设备行一起提交或一起回滚：
+
+        * ``idempotency_key`` 已属于该资源（同租户、同 uid）的 Active 分配 → 原样返回
+          该分配，不写库，忽略 ``devices``；
+        * ``idempotency_key`` 已被其他分配使用（含已释放 / 过期的分配）→ 冲突；
+        * 归属资源须存在、uid 一致且不处于 ``Terminating``；
+        * 该资源已有 Active 分配，或任一设备已属于某个 Active 分配 → 冲突，不写库。
+
+        Args:
+            tenant_id: 租户标识（多租户边界）。
+            resource: 归属资源；分配以其 ``uid`` 记为 ``resource_id``。
+            idempotency_key: 分配的幂等键。
+            devices: 分配的设备（可为空：没有加速器需求的资源）。
+
+        Returns:
+            分配记录：``allocations`` 各列加 ``devices``（``node_id`` / ``device_id``）。
+
+        Raises:
+            NotFoundError: 归属资源不存在，或同名资源的 uid 不同（原资源已被删除）。
+            ConflictError: 见上；以及归属资源处于 ``Terminating``。
+            ValueError: ``devices`` 含重复设备。
+        """
+        if len(set(devices)) != len(devices):
+            raise ValueError(f"duplicate devices in allocation request: {list(devices)}")
+        active = AllocationStatus.ACTIVE.value
+
+        def _create() -> dict[str, Any]:
+            with self._immediate_transaction() as cur:
+                existing = cur.execute(
+                    "SELECT * FROM allocations WHERE idempotency_key=?", (idempotency_key,)
+                ).fetchone()
+                if existing is not None:
+                    owner = (existing["tenant_id"], existing["resource_id"], existing["status"])
+                    if owner == (tenant_id, resource.uid, active):
+                        return self._allocation_record(existing)
+                    raise ConflictError(
+                        f"allocation idempotency_key already used: {idempotency_key!r}"
+                    )
+                row = cur.execute(
+                    "SELECT uid, phase FROM resources "
+                    "WHERE tenant_id=? AND kind=? AND namespace IS ? AND name=?",
+                    (tenant_id, resource.kind, resource.namespace, resource.name),
+                ).fetchone()
+                if row is None or row["uid"] != resource.uid:
+                    raise NotFoundError(
+                        f"resource not found: kind={resource.kind} "
+                        f"namespace={resource.namespace!r} name={resource.name} "
+                        f"uid={resource.uid} tenant_id={tenant_id}",
+                    )
+                if row["phase"] == "Terminating":
+                    raise ConflictError(
+                        f"resource is terminating: kind={resource.kind} "
+                        f"namespace={resource.namespace!r} name={resource.name}",
+                    )
+                held = cur.execute(
+                    "SELECT id FROM allocations WHERE tenant_id=? AND resource_id=? AND status=?",
+                    (tenant_id, resource.uid, active),
+                ).fetchone()
+                if held is not None:
+                    raise ConflictError(
+                        "resource already has an active allocation: "
+                        f"resource_id={resource.uid!r} allocation_id={held['id']}",
+                    )
+                for device in devices:
+                    taken = cur.execute(
+                        "SELECT 1 FROM allocation_devices "
+                        "WHERE node_id=? AND device_id=? AND status=?",
+                        (device.node_id, device.device_id, active),
+                    ).fetchone()
+                    if taken is not None:
+                        raise ConflictError(
+                            f"device already allocated: node_id={device.node_id} "
+                            f"device_id={device.device_id}",
+                        )
+                allocation_id = uuid4().hex
+                cur.execute(
+                    "INSERT INTO allocations (id, tenant_id, resource_id, status, idempotency_key) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (allocation_id, tenant_id, resource.uid, active, idempotency_key),
+                )
+                cur.executemany(
+                    "INSERT INTO allocation_devices (allocation_id, node_id, device_id, status) "
+                    "VALUES (?, ?, ?, ?)",
+                    [(allocation_id, d.node_id, d.device_id, active) for d in devices],
+                )
+                created = cur.execute(
+                    "SELECT * FROM allocations WHERE id=?", (allocation_id,)
+                ).fetchone()
+                return self._allocation_record(created)
+
+        try:
+            return await self._run(_create)
+        except sqlite3.IntegrityError as exc:
+            raise ConflictError(f"allocation rejected by a database constraint: {exc}") from exc
+
+    async def get_allocation(self, allocation_id: str) -> dict[str, Any] | None:
+        """按 id 读取分配记录（跨租户，仅供调度器释放分配）；不存在返回 ``None``。"""
+
+        def _get() -> dict[str, Any] | None:
+            row = self._conn.execute(
+                "SELECT * FROM allocations WHERE id=?", (allocation_id,)
+            ).fetchone()
+            return self._allocation_record(row) if row is not None else None
+
+        return await self._run(_get)
+
+    async def get_allocation_by_idempotency_key(
+        self,
+        idempotency_key: str,
+        tenant_id: str,
+    ) -> dict[str, Any] | None:
+        """读取以 ``idempotency_key`` 创建的分配（含终态）；本租户没有时返回 ``None``。"""
+
+        def _get_by_key() -> dict[str, Any] | None:
+            row = self._conn.execute(
+                "SELECT * FROM allocations WHERE tenant_id=? AND idempotency_key=?",
+                (tenant_id, idempotency_key),
+            ).fetchone()
+            return self._allocation_record(row) if row is not None else None
+
+        return await self._run(_get_by_key)
+
+    async def allocated_devices(self) -> frozenset[AllocatedDevice]:
+        """属于 Active 分配的全部设备（跨租户：设备由全部租户共享）。"""
+
+        def _allocated() -> frozenset[AllocatedDevice]:
+            rows = self._conn.execute(
+                "SELECT node_id, device_id FROM allocation_devices WHERE status=?",
+                (AllocationStatus.ACTIVE.value,),
+            ).fetchall()
+            return frozenset(
+                AllocatedDevice(node_id=row["node_id"], device_id=row["device_id"]) for row in rows
+            )
+
+        return await self._run(_allocated)
+
     async def get_active_allocation(
         self,
         resource_id: str,
         tenant_id: str,
     ) -> dict[str, Any] | None:
-        """读取 ``resource_id`` 当前唯一的 Active 分配；不存在返回 ``None``。
+        """读取 ``resource_id``（归属资源 uid）当前唯一的 Active 分配；不存在返回 ``None``。
 
-        强制以 ``tenant_id`` 过滤（与 resources 一致的多租户边界）。
+        强制以 ``tenant_id`` 过滤（与 resources 一致的多租户边界）。记录含 ``devices``。
         """
 
         def _get_active() -> dict[str, Any] | None:
@@ -1070,9 +1291,55 @@ class SQLiteRegistry(ResourceRegistry):
                 "SELECT * FROM allocations WHERE tenant_id=? AND resource_id=? AND status=?",
                 (tenant_id, resource_id, AllocationStatus.ACTIVE.value),
             ).fetchone()
-            return dict(row) if row is not None else None
+            return self._allocation_record(row) if row is not None else None
 
         return await self._run(_get_active)
+
+    async def release_active_allocation(
+        self,
+        resource_id: str,
+        tenant_id: str,
+        reason: str | None = None,
+    ) -> str | None:
+        """释放 ``resource_id``（归属资源 uid）当前的 Active 分配及其设备。
+
+        没有 Active 分配（含已被并发释放或过期）时返回 ``None``，可重复调用。
+
+        Args:
+            resource_id: 归属资源 uid。
+            tenant_id: 租户标识（多租户边界，强制过滤）。
+            reason: 释放原因（仅记录日志）。
+
+        Returns:
+            被释放的分配 id；没有可释放的分配时为 ``None``。
+        """
+        active = AllocationStatus.ACTIVE.value
+
+        def _release_active() -> str | None:
+            row = self._conn.execute(
+                "SELECT id FROM allocations WHERE tenant_id=? AND resource_id=? AND status=?",
+                (tenant_id, resource_id, active),
+            ).fetchone()
+            if row is None:
+                return None
+            cur = self._conn.execute(
+                "UPDATE allocations SET status=?, released_at=datetime('now') "
+                "WHERE id=? AND status=?",
+                (AllocationStatus.RELEASED.value, row["id"], active),
+            )
+            self._conn.commit()
+            if cur.rowcount == 0:
+                return None
+            logger.debug(
+                "allocation released: id=%s tenant_id=%s resource_id=%s reason=%s",
+                row["id"],
+                tenant_id,
+                resource_id,
+                reason,
+            )
+            return str(row["id"])
+
+        return await self._run(_release_active)
 
     async def release_allocation(
         self,
@@ -1081,6 +1348,8 @@ class SQLiteRegistry(ResourceRegistry):
         reason: str | None = None,
     ) -> None:
         """将分配 ``Active → Released``（走 ``ALLOCATION_STATE_MACHINE`` 校验）。
+
+        分配持有的设备随同一条 UPDATE 释放（触发器 ``trg_allocation_devices_follow_status``）。
 
         Args:
             allocation_id: 分配 id。
@@ -1128,14 +1397,14 @@ class SQLiteRegistry(ResourceRegistry):
         self,
         tenant_id: str,
     ) -> builtins.list[dict[str, Any]]:
-        """列出租户的全部分配记录（含终态），强制租户过滤。"""
+        """列出租户的全部分配记录（含终态与各自的 ``devices``），强制租户过滤。"""
 
         def _list_allocations() -> list[dict[str, Any]]:
             rows = self._conn.execute(
                 "SELECT * FROM allocations WHERE tenant_id=? ORDER BY created_at, id",
                 (tenant_id,),
             ).fetchall()
-            return [dict(row) for row in rows]
+            return [self._allocation_record(row) for row in rows]
 
         return await self._run(_list_allocations)
 

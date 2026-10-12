@@ -9,7 +9,8 @@
 关键语义：
 
 * ``AllocationStatus`` 只有 ``Active → {Released, Expired}`` 的单向转移；
-* 同一设备同一时刻**至多一个** ``Active`` 分配（由部分唯一索引兜底，此处以状态表达）；
+* 同一租户的同一归属资源、以及同一设备，同一时刻**至多一个** ``Active`` 分配
+  （由注册表的部分唯一索引兜底，此处以状态表达）；
 * ``idempotency_key`` 保证重复分配请求幂等（不产生重复副作用）。
 
 字段命名与 DDL 保持一致（snake_case），便于持久化层直接映射。
@@ -41,9 +42,10 @@ class Allocation(BaseModel):
     """资源分配记录。
 
     Attributes:
-        resource_id: 被分配的加速器 / 设备实例 id。
+        resource_id: 归属资源（如 ``InferenceService``）的 uid；分配到的设备由注册表
+            另行记录（``allocation_devices`` 表）。
         tenant_id: 归属租户（多租户隔离边界）。
-        owner_uid: 归属资源 uid（如 ``InferenceService`` 的 uid）；平台级分配可为空。
+        owner_uid: 注册表不持久化该字段（归属资源 uid 记在 ``resource_id``）。
         idempotency_key: 幂等键，唯一（重复请求不产生重复分配）。
         status: 分配状态，默认 ``Active``。
         lease_until: 租约到期时间；为空表示无期限（不推荐）。

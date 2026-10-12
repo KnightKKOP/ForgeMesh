@@ -1,8 +1,10 @@
-"""控制平面应用入口测试：真实路由已挂载、存储可配置、探针反映存储状态、控制器随应用运行。"""
+"""控制平面应用入口测试：真实路由已挂载、存储可配置、探针反映存储状态、控制器随应用运行、
+配置加速器清单时启用调度器。"""
 
 from __future__ import annotations
 
 import asyncio
+import json
 import sqlite3
 import time
 from pathlib import Path
@@ -20,6 +22,7 @@ from forgemesh.controlplane.app import DB_PATH_ENV, create_app
 from forgemesh.controlplane.auth import AUTH_MODE_DEV, AUTH_MODE_ENV
 from forgemesh.controlplane.controller import ControllerManager
 from forgemesh.controlplane.registry import SQLiteRegistry
+from forgemesh.controlplane.scheduler import INVENTORY_FILE_ENV, InventoryConfigError
 from forgemesh.resource.inference import InferenceService
 
 HEADERS = {"X-Tenant-Id": "acme"}
@@ -37,6 +40,7 @@ BODY = {
 @pytest.fixture(autouse=True)
 def _reset_components(monkeypatch):
     monkeypatch.setenv(AUTH_MODE_ENV, AUTH_MODE_DEV)
+    monkeypatch.delenv(INVENTORY_FILE_ENV, raising=False)
     reset_runtime_components()
     yield
     reset_runtime_components()
@@ -65,6 +69,14 @@ async def _store_service(db_file: Path) -> None:
                 {**BODY, "metadata": {**BODY["metadata"], "tenantId": "acme", "uid": "uid-llama"}}
             )
         )
+    finally:
+        await registry.close()
+
+
+async def _allocations(db_file: Path) -> list[dict[str, Any]]:
+    registry = SQLiteRegistry(str(db_file))
+    try:
+        return await registry.list_allocations("acme")
     finally:
         await registry.close()
 
@@ -187,6 +199,40 @@ def test_controller_picks_up_services_stored_while_it_was_not_running(tmp_path) 
         ready = _wait_for_ready_condition(client)
 
     assert ready["reason"] == "SchedulerUnavailable"
+
+
+@pytest.mark.unit
+def test_controller_schedules_when_an_inventory_is_configured(tmp_path, monkeypatch) -> None:
+    """配置清单后不再报告 SchedulerUnavailable；应用尚未注入工作流运行时，协调器在分配
+    之前停在 WorkflowRuntimeUnavailable，不留下分配。"""
+    db_file = tmp_path / "cp.db"
+    inventory = tmp_path / "inventory.json"
+    gpu = {"id": "gpu-0", "type": "nvidia-gpu", "memoryGiB": 80}
+    inventory.write_text(json.dumps({"nodes": [{"id": "node-a", "devices": [gpu]}]}))
+    monkeypatch.setenv(INVENTORY_FILE_ENV, str(inventory))
+
+    with TestClient(create_app(db_path=str(db_file))) as client:
+        created = client.post("/api/v1/inference-services", json=BODY, headers=HEADERS)
+        assert created.status_code == 201
+        ready = _wait_for_ready_condition(client)
+
+    assert (ready["status"], ready["reason"]) == ("False", "WorkflowRuntimeUnavailable")
+    assert asyncio.run(_allocations(db_file)) == []
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("content", [None, '{"nodes": []}'], ids=["missing-file", "invalid-file"])
+def test_app_refuses_to_start_with_an_unusable_inventory(tmp_path, monkeypatch, content) -> None:
+    db_file = tmp_path / "cp.db"
+    inventory = tmp_path / "inventory.json"
+    if content is not None:
+        inventory.write_text(content)
+    monkeypatch.setenv(INVENTORY_FILE_ENV, str(inventory))
+
+    with pytest.raises(InventoryConfigError), TestClient(create_app(db_path=str(db_file))):
+        pass
+
+    assert not db_file.exists()
 
 
 @pytest.mark.unit

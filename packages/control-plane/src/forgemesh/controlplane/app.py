@@ -16,6 +16,12 @@
   自动协调 ``InferenceService`` 并回写 status；去重键与资源存放在同一个数据库
   文件中。控制器是单写者（ADR-013），本应用只能以单进程运行（不要使用
   ``uvicorn --workers``）。
+* **调度器**：设置 ``FORGEMESH_INVENTORY_FILE``（静态加速器清单，格式见
+  :mod:`forgemesh.controlplane.scheduler.inventory`）时，控制器的协调器使用
+  :class:`~forgemesh.controlplane.scheduler.FirstFitScheduler`，清单不可读或非法时
+  拒绝启动；未设置时需要分配加速器的资源报告 ``Ready=False``
+  （``SchedulerUnavailable``）。应用尚未注入工作流运行时，协调器在分配之前即报告
+  ``WorkflowRuntimeUnavailable``。
 * **无导入副作用**：数据库在应用启动（lifespan）时才打开，导入本模块不会
   创建文件。
 * **探针**：``/healthz``（存活）恒为 ok；``/readyz``（就绪）探测权威存储可用。
@@ -49,10 +55,12 @@ from .auth import (
 )
 from .controller import ControllerManager
 from .reconciler import ProcessedKeyStore, ReconciliationController
+from .scheduler import INVENTORY_FILE_ENV, FirstFitScheduler, inventory_from_env
 
 if TYPE_CHECKING:  # pragma: no cover - 仅静态类型检查使用
     from .auth import Authenticator
     from .registry import SQLiteRegistry
+    from .scheduler import Inventory
 
 try:  # pragma: no cover - 取决于运行环境是否安装 FastAPI
     from fastapi import FastAPI
@@ -125,13 +133,20 @@ def resolve_db_path(db_path: str | None = None) -> str:
 
 
 def _build_controller(
-    registry: SQLiteRegistry, processed_store: ProcessedKeyStore
+    registry: SQLiteRegistry,
+    processed_store: ProcessedKeyStore,
+    inventory: Inventory | None,
 ) -> ControllerManager:
     # 没有授权规则的 DefaultPolicyEngine 拒绝一切操作。资源的创建和删除已经由 API 的
     # 认证与 scope 把关，协调只是推进这些已被接受的期望状态，因此放行 reconcile。
     policy = DefaultPolicyEngine(authz_rules=[AuthzRule(action="reconcile", effect="allow")])
+    scheduler = FirstFitScheduler(registry, inventory) if inventory is not None else None
     reconciler = ReconciliationController(
-        registry, policy, processed_store=processed_store, record_dedup_keys=False
+        registry,
+        policy,
+        scheduler=scheduler,
+        processed_store=processed_store,
+        record_dedup_keys=False,
     )
     return ControllerManager(registry, reconciler)
 
@@ -169,6 +184,14 @@ if _FASTAPI_AVAILABLE:
                     AUTH_MODE_ENV,
                     AUTH_MODE_DEV,
                 )
+            inventory = inventory_from_env()
+            if inventory is not None:
+                logger.info(
+                    "first-fit scheduler enabled from %s: %d node(s), %d device(s)",
+                    INVENTORY_FILE_ENV,
+                    len(inventory.nodes),
+                    sum(len(node.devices) for node in inventory.nodes),
+                )
             path = resolve_db_path(db_path)
             async with AsyncExitStack() as cleanup:
                 registry = init_registry(path)
@@ -178,7 +201,7 @@ if _FASTAPI_AVAILABLE:
                 cleanup.callback(reset_authenticator)
                 processed_store = ProcessedKeyStore(path)
                 cleanup.push_async_callback(processed_store.close)
-                controller = _build_controller(registry, processed_store)
+                controller = _build_controller(registry, processed_store, inventory)
                 cleanup.push_async_callback(controller.stop)
                 await controller.start()
                 yield

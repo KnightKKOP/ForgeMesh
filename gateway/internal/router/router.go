@@ -3,7 +3,7 @@
 // 路由表（对外统一入口，版本前缀 /api/v1/）：
 //
 //	GET  /healthz                              存活探针（无中间件）
-//	GET  /readyz                               就绪探针（探测上游可达，无中间件）
+//	GET  /readyz                               就绪探针（请求控制平面 /readyz，无中间件）
 //	ANY  /api/v1/resources[/...]               反代到 Python 控制平面
 //	ANY  /api/v1/inference-services[/...]      反代到 Python 控制平面
 //	ANY  /api/v1/workflows[/...]               反代到 Python 控制平面
@@ -14,7 +14,8 @@
 //	                                          路径；要求 read 作用域）
 //	ANY  /api/v1/inference/{svc}/chat          同上，用于不带命名空间的服务
 //
-// 中间件链（执行顺序）：Recovery → Correlation → Authenticate → RateLimit → Route。
+// 中间件链（执行顺序）：Recovery → Correlation → Authenticate → RateLimit →
+// LimitRequestBody → Route。
 // Recovery 作为最外层兜底全量请求；探针刻意不经过认证/限流，保证健康检查可用。
 // 认证模式见 config.AuthModeAPIKey / config.AuthModeDev 与 ADR-014。
 package router
@@ -87,7 +88,7 @@ func New(cfg config.Config, logger *log.Logger) (*Router, error) {
 		unhealthyCooldown = upstream.DefaultUnhealthyCooldown
 	}
 	resolver := upstream.NewResolver(cfg.UpstreamURL, nil, resolverTTL, unhealthyCooldown, logger)
-	streamProxy := stream.New(resolver, cfg.TenantHeader, logger)
+	streamProxy := stream.New(resolver, cfg.TenantHeader, stream.NewAddressPolicy(cfg.InstanceAllowedCIDRs), logger)
 
 	// 精细路由仅在 API 前缀内匹配（顶层已按 /api/v1/ 分流）。
 	apiMux := http.NewServeMux()
@@ -101,12 +102,18 @@ func New(cfg config.Config, logger *log.Logger) (*Router, error) {
 	apiMux.Handle(streamRoutePattern, streamHandler)
 	apiMux.Handle(streamWithoutNamespacePattern, streamHandler)
 
-	// API 中间件链：Correlation → Authenticate → RateLimit。
+	maxBody := cfg.MaxRequestBodyBytes
+	if maxBody <= 0 {
+		maxBody = config.DefaultMaxRequestBodyBytes
+	}
+
+	// API 中间件链：Correlation → Authenticate → RateLimit → LimitRequestBody。
 	limiter := middleware.NewRateLimiter(cfg.RateLimitRPS, cfg.RateLimitBurst)
 	apiHandler := middleware.Chain(apiMux,
 		middleware.Correlation(cfg.CorrelationHeader),
 		middleware.Authenticate(authn, cfg.TenantHeader),
 		middleware.RateLimit(limiter),
+		middleware.LimitRequestBody(maxBody),
 	)
 
 	// 顶层路由：探针不经过鉴权/限流。

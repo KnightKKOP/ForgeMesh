@@ -22,11 +22,15 @@ func TestLoad_Defaults(t *testing.T) {
 	t.Setenv(envRateLimitBurst, "")
 	t.Setenv(envResolverTTLSeconds, "")
 	t.Setenv(envUnhealthyCooldownSeconds, "")
+	t.Setenv(envMaxRequestBodyBytes, "")
 	setAPIKeyAuthEnv(t)
 
 	cfg, err := Load()
 	if err != nil {
 		t.Fatalf("Load 默认应成功: %v", err)
+	}
+	if cfg.MaxRequestBodyBytes != DefaultMaxRequestBodyBytes {
+		t.Fatalf("MaxRequestBodyBytes 默认应为 %d，实际 %d", DefaultMaxRequestBodyBytes, cfg.MaxRequestBodyBytes)
 	}
 	if cfg.ResolverTTLSeconds != defaultResolverTTLSeconds {
 		t.Fatalf("ResolverTTLSeconds 默认应为 %d，实际 %d", defaultResolverTTLSeconds, cfg.ResolverTTLSeconds)
@@ -99,6 +103,20 @@ func TestLoad_ResolverOverrides(t *testing.T) {
 	}
 }
 
+// TestLoad_MaxRequestBodyBytesOverride 验证环境变量可覆盖请求体上限。
+func TestLoad_MaxRequestBodyBytesOverride(t *testing.T) {
+	setAPIKeyAuthEnv(t)
+	t.Setenv(envMaxRequestBodyBytes, "1048576")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load 应成功: %v", err)
+	}
+	if cfg.MaxRequestBodyBytes != 1<<20 {
+		t.Fatalf("MaxRequestBodyBytes 应为 1048576，实际 %d", cfg.MaxRequestBodyBytes)
+	}
+}
+
 // TestLoad_InvalidResolverValues 验证非正数取值被拒绝。
 func TestLoad_InvalidResolverValues(t *testing.T) {
 	cases := []struct {
@@ -113,6 +131,8 @@ func TestLoad_InvalidResolverValues(t *testing.T) {
 		{"冷却零", envUnhealthyCooldownSeconds, "0", envUnhealthyCooldownSeconds},
 		{"冷却负数", envUnhealthyCooldownSeconds, "-1", envUnhealthyCooldownSeconds},
 		{"冷却非数字", envUnhealthyCooldownSeconds, "x", envUnhealthyCooldownSeconds},
+		{"请求体上限零", envMaxRequestBodyBytes, "0", envMaxRequestBodyBytes},
+		{"请求体上限非数字", envMaxRequestBodyBytes, "10MiB", envMaxRequestBodyBytes},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -126,5 +146,36 @@ func TestLoad_InvalidResolverValues(t *testing.T) {
 				t.Fatalf("错误信息应提及 %s，实际: %v", tc.want, err)
 			}
 		})
+	}
+}
+
+// TestLoad_InstanceAllowedCIDRs 验证实例允许网段的解析：未设置为空，逗号分隔、忽略空白与空项，
+// 网段按掩码归一化；非 CIDR 取值被拒绝。
+func TestLoad_InstanceAllowedCIDRs(t *testing.T) {
+	setAPIKeyAuthEnv(t)
+	t.Setenv(envInstanceAllowedCIDRs, "")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load 应成功: %v", err)
+	}
+	if len(cfg.InstanceAllowedCIDRs) != 0 {
+		t.Fatalf("未设置时应为空，实际 %v", cfg.InstanceAllowedCIDRs)
+	}
+
+	t.Setenv(envInstanceAllowedCIDRs, " 10.20.0.0/16, 127.0.0.1/8 ,,fd00::/8")
+	if cfg, err = Load(); err != nil {
+		t.Fatalf("Load 应成功: %v", err)
+	}
+	got := make([]string, 0, len(cfg.InstanceAllowedCIDRs))
+	for _, prefix := range cfg.InstanceAllowedCIDRs {
+		got = append(got, prefix.String())
+	}
+	if want := "10.20.0.0/16 127.0.0.0/8 fd00::/8"; strings.Join(got, " ") != want {
+		t.Fatalf("网段应为 %s，实际 %v", want, got)
+	}
+
+	t.Setenv(envInstanceAllowedCIDRs, "10.0.0.5")
+	if _, err = Load(); err == nil || !strings.Contains(err.Error(), envInstanceAllowedCIDRs) {
+		t.Fatalf("非 CIDR 取值应被拒绝并提及 %s，实际 %v", envInstanceAllowedCIDRs, err)
 	}
 }

@@ -1,7 +1,8 @@
 // Package stream 实现 SSE / 流式分块的透明代理。
 //
 // 与普通反代的区别：
-//   - 设置 text/event-stream 并禁用各级缓冲（含 nginx 的 X-Accel-Buffering）。
+//   - 成功响应设置 text/event-stream（错误响应保留实例的 Content-Type），并禁用各级
+//     缓冲（含 nginx 的 X-Accel-Buffering）。
 //   - 逐块读取上游响应并立即 Flush，保证 token 实时到达客户端。
 //   - 通过继承客户端请求的 context，客户端断开会自动取消上游请求，避免资源泄漏。
 //
@@ -12,13 +13,15 @@
 // （如 openai-chat 为 /v1/chat/completions），查询串原样保留。
 //
 // 安全约束（见开发计划 §14.1）：仅做转发，不缓存、不落盘任何响应内容；
-// 调用方的平台凭证（Authorization、Cookie）不会转发给实例。
+// 调用方的平台凭证（Authorization、Cookie）不会转发给实例；只连接 AddressPolicy
+// 允许的实例地址，status.endpoints 被写成内网或元数据服务地址时不会成为跳板。
 package stream
 
 import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"net"
@@ -33,6 +36,14 @@ import (
 
 // readBufferSize 是单次读取上游响应体的缓冲区大小。
 const readBufferSize = 32 * 1024
+
+// 实例连接池：Go 默认每个主机只保留 2 个空闲连接，一波并发流式请求结束后多数连接
+// 会被关闭，下一波请求只能重新建连。
+const (
+	maxIdleConns        = 512
+	maxIdleConnsPerHost = 64
+	idleConnTimeout     = 90 * time.Second
+)
 
 // Resolver 抽象「推理服务 → 实例 endpoint 列表」的解析与健康上报，
 // 由 upstream.Resolver 实现；以接口注入便于测试替换。
@@ -57,11 +68,11 @@ type Proxy struct {
 // New 构造流式代理。
 //
 // resolver 提供按服务名的实例解析；tenantHeader 为提取租户身份的请求头名
-// （与认证中间件一致）；logger 为 nil 时使用 log.Default()。
+// （与认证中间件一致）；policy 限定可以连接的实例地址；logger 为 nil 时使用 log.Default()。
 //
 // 客户端不设置整体超时（流式连接可能长时间保持），仅对响应头到达设置超时，
 // 防止上游僵死连接长期占用资源。
-func New(resolver Resolver, tenantHeader string, logger *log.Logger) *Proxy {
+func New(resolver Resolver, tenantHeader string, policy AddressPolicy, logger *log.Logger) *Proxy {
 	if logger == nil {
 		logger = log.Default()
 	}
@@ -81,7 +92,12 @@ func New(resolver Resolver, tenantHeader string, logger *log.Logger) *Proxy {
 				DialContext: (&net.Dialer{
 					Timeout:   10 * time.Second,
 					KeepAlive: 30 * time.Second,
+					Control:   policy.control,
 				}).DialContext,
+				MaxIdleConns:        maxIdleConns,
+				MaxIdleConnsPerHost: maxIdleConnsPerHost,
+				IdleConnTimeout:     idleConnTimeout,
+				TLSHandshakeTimeout: 10 * time.Second,
 				// 关闭响应压缩，避免代理层引入额外缓冲/转换。
 				DisableCompression: true,
 			},
@@ -148,9 +164,20 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, upstreamURL, end
 
 	resp, err := p.client.Do(req)
 	if err != nil {
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			writeJSONError(w, http.StatusRequestEntityTooLarge, "REQUEST_TOO_LARGE",
+				fmt.Sprintf("请求体超过 %d 字节", tooLarge.Limit))
+			return
+		}
 		p.logger.Printf("stream upstream error: corr=%s path=%s endpoint=%s err=%v",
 			r.Header.Get("X-Correlation-ID"), r.URL.Path, endpoint, err)
 		p.resolver.ReportFailure(endpoint)
+		if errors.Is(err, ErrAddressNotAllowed) {
+			writeJSONError(w, http.StatusBadGateway, "INSTANCE_ADDRESS_NOT_ALLOWED",
+				"实例地址不在允许连接的范围内: "+endpoint)
+			return
+		}
 		http.Error(w, http.StatusText(http.StatusBadGateway), http.StatusBadGateway)
 		return
 	}
@@ -172,8 +199,10 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, upstreamURL, end
 		}
 		dst[k] = append([]string(nil), vs...)
 	}
-	// 强制流式语义。
-	dst.Set("Content-Type", "text/event-stream")
+	// 成功响应强制流式语义；错误响应保留实例的 Content-Type，客户端才能按格式解析错误体。
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		dst.Set("Content-Type", "text/event-stream")
+	}
 	dst.Set("Cache-Control", "no-cache")
 	dst.Set("Connection", "keep-alive")
 	// 关闭 nginx 等中间层对响应的缓冲。

@@ -22,6 +22,7 @@
 - `ReconciliationController` 新增 `record_dedup_keys` 参数与 `mark_processed()`：调用方可以在持久化 `status` 之后再登记去重键。
 - `InferenceServiceStatus.endpoints`：每个实例包含 `url`（http/https 基地址，不含凭证、查询串与片段）、`ready`（默认 `true`）、可选的 `instanceId` 与 `protocol`（`openai-chat` / `tgi-generate`），资源模型、JSON Schema 与 OpenAPI 一致；`update_status` 可以整体替换 `endpoints`，写入前逐项校验。
 - 网关新增带命名空间的推理路由 `/api/v1/namespaces/{ns}/inference/{svc}/chat`：Resolver 以 `?namespace=` 查询控制平面，缓存按租户与命名空间隔离；`/api/v1/inference/{svc}/chat` 继续解析不带命名空间的服务。
+- 网关请求体上限 `GATEWAY_MAX_REQUEST_BODY_BYTES`（默认 10 MiB）：声明的 `Content-Length` 超限时直接返回 `413 REQUEST_TOO_LARGE`，不访问上游；分块传输的请求体读到上限时同样返回 `413`，不计实例失败。
 
 ### Changed
 
@@ -36,6 +37,9 @@
 - 控制平面全部错误响应统一为错误信封：框架层 404 / 405 不再返回 `{"detail": ...}`，请求校验失败由 `422` 改为 `400`，未捕获异常返回不含内部细节的 `500 INTERNAL_ERROR`（细节写入日志）。
 - 网关接受任意大小写的 `Bearer` scheme（如 `bearer`）。
 - **破坏性**：网关消费的 `status.endpoints` 由字符串数组改为对象数组（见 Added），只使用 `ready` 且协议已知的实例；JSON Schema 中资源模型从未实现的单数 `status.endpoint` 一并移除。
+- **破坏性**：网关默认不连接回环、链路本地、未指定、组播地址与已知云元数据服务地址上的推理实例（见 Security）；实例运行在本机时需设置 `GATEWAY_INSTANCE_ALLOWED_CIDRS`（`make run-dev` 已允许 `127.0.0.0/8,::1/128`）。
+- 网关连接池：流式代理与控制平面客户端每个主机最多保留 64 个空闲连接（此前为 `net/http` 默认的 2 个，一波并发请求之后大部分连接被关闭，下一波重新建连）；资源反代等待控制平面响应头最多 30 秒。
+- 网关 Resolver 合并同一服务的并发未命中，只查询一次控制平面，查询不随发起它的请求取消；"服务不存在 / 未就绪 / 无可用实例"缓存 1 秒（不超过 `GATEWAY_RESOLVER_TTL_SECONDS`），`403`、其他控制平面错误与网络错误仍不缓存。
 
 ### Deprecated
 
@@ -56,13 +60,17 @@
 - 调和器在没有注入调度器或工作流运行时的情况下跳过分配与部署、登记去重键并报告 `Ready=True`（`Reconciled`），实际什么都没做：现在任何副作用之前检查，返回 `Ready=False`，原因为 `SchedulerUnavailable` 或 `WorkflowRuntimeUnavailable`，且不登记去重键。目前仓库没有调度器实现，默认部署中新建的服务会停在 `Pending` 并带有 `Ready=False`（`SchedulerUnavailable`）。
 - 网关把入站路径原样拼接到实例地址，请求以 `/api/v1/inference/{svc}/chat` 到达推理运行时，而 vLLM 与 TGI 都不提供这个路径：现按实例的 `protocol` 转发到 `/v1/chat/completions`（`openai-chat`）或 `/generate_stream`（`tgi-generate`），查询串保留。
 - 网关解析推理服务时不带命名空间，控制平面因此只查找不带命名空间的服务，带命名空间的服务无法经网关调用：现由带命名空间的路由解析（见 Added）。
+- 网关 `/readyz` 只对上游做 TCP 拨号，控制平面的权威存储不可用（其 `/readyz` 返回 `503`）或端口被其他进程占用时仍报告就绪：现请求控制平面的 `/readyz`，返回 `200` 才就绪，否则返回 `503`（`upstream not ready` / `upstream unreachable`）。
+- 推理实例返回错误（如 vLLM 对非法参数返回 `400` JSON）时，网关把响应的 `Content-Type` 改成 `text/event-stream`：现只对 2xx 响应这样设置，错误响应保留实例的 `Content-Type`。
 
 ### Security
 
-- Go 网关多租户安全验证：跨租户拒绝、伪造 `X-Tenant-Id` 不得提权、SSE 客户端取消 / 上游断开连接释放、中间件链序（Recovery→Correlation→Authenticate→RateLimit→Route）测试；网关 README 新增 header 转发 / 剥离策略表。
+- Go 网关多租户安全验证：跨租户拒绝、伪造 `X-Tenant-Id` 不得提权、SSE 客户端取消 / 上游断开连接释放、中间件链序（Recovery→Correlation→Authenticate→RateLimit→LimitRequestBody→Route）测试；网关 README 新增 header 转发 / 剥离策略表。
 - 租户身份改由凭证绑定（ADR-014）：此前网关只检查 `X-Tenant-ID` 是否存在，控制平面直接信任该请求头且可被直连，任何调用方都能读写任意租户的资源。控制平面现自行校验凭证，不依赖请求必经网关；网关对推理路由检查 `read` scope，命中 Resolver 缓存的请求同样受约束。
 - 网关不再把调用方的 `Authorization` / `Cookie` 转发给推理实例（此前原样透传，凭证会泄露给实例）；资源反代与 Resolver 查询仍向控制平面转发 `Authorization`，由控制平面复核。
 - 网关限流改按已验证的租户计数，不再读取客户端可控的租户头或 `X-Forwarded-For`（此前更换头值即可获得新的令牌桶）。
+- 网关只连接允许网段内的推理实例：此前流式代理会连接 `status.endpoints` 中的任意地址，实例地址被写成 `169.254.169.254` 或内网服务时，网关就成了访问它们的跳板。现在拨号时逐个检查解析出的 IP（主机名之后解析到别处同样生效）；`GATEWAY_INSTANCE_ALLOWED_CIDRS` 列出允许的网段，未设置时拒绝回环、链路本地、未指定、组播地址与已知云元数据服务地址；被拒绝的连接返回 `502 INSTANCE_ADDRESS_NOT_ALLOWED`，并计一次实例失败。
+- 网关请求体此前不设上限，原样转发给控制平面与推理实例：现限制为 `GATEWAY_MAX_REQUEST_BODY_BYTES`（见 Added）。
 
 ## [1.0.1] - 2026-10-11
 

@@ -25,7 +25,7 @@ import (
 // newGatewayServer 将 proxy 挂载到与线上一致的路由模式，返回完整网关 server。
 func newGatewayServer(t *testing.T, res Resolver) *httptest.Server {
 	t.Helper()
-	proxy := New(res, "X-Tenant-ID", nil)
+	proxy := New(res, "X-Tenant-ID", allowLoopback, nil)
 	mux := http.NewServeMux()
 	mux.Handle("/api/v1/inference/{svc}/chat", proxy)
 	srv := httptest.NewServer(mux)

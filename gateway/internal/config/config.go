@@ -9,6 +9,7 @@ package config
 import (
 	"fmt"
 	"net"
+	"net/netip"
 	"os"
 	"strconv"
 	"strings"
@@ -26,7 +27,12 @@ const (
 	envUnhealthyCooldownSeconds = "GATEWAY_UNHEALTHY_COOLDOWN_SECONDS"
 	envAuthMode                 = "GATEWAY_AUTH_MODE"
 	envAPIKeysFile              = "GATEWAY_API_KEYS_FILE"
+	envInstanceAllowedCIDRs     = "GATEWAY_INSTANCE_ALLOWED_CIDRS"
+	envMaxRequestBodyBytes      = "GATEWAY_MAX_REQUEST_BODY_BYTES"
 )
+
+// DefaultMaxRequestBodyBytes 是请求体大小上限的默认值（10 MiB）。
+const DefaultMaxRequestBodyBytes int64 = 10 << 20
 
 // 认证模式（GATEWAY_AUTH_MODE）。
 const (
@@ -71,6 +77,11 @@ type Config struct {
 	AuthMode string
 	// APIKeysFile AuthModeAPIKey 下的 key 文件路径（与控制平面 FORGEMESH_API_KEYS_FILE 格式相同）。
 	APIKeysFile string
+	// InstanceAllowedCIDRs 流式代理允许连接的推理实例网段；为空时拒绝回环、链路本地与
+	// 元数据服务地址，允许其余地址（见 stream.AddressPolicy）。
+	InstanceAllowedCIDRs []netip.Prefix
+	// MaxRequestBodyBytes 单个请求体的大小上限（字节），超出返回 413。
+	MaxRequestBodyBytes int64
 }
 
 // Load 从环境变量读取配置；未设置项使用默认值。
@@ -119,6 +130,15 @@ func Load() (Config, error) {
 	}
 	cfg.UnhealthyCooldownSeconds = cooldownSec
 
+	maxBody, err := getIntEnv(envMaxRequestBodyBytes, int(DefaultMaxRequestBodyBytes))
+	if err != nil {
+		return Config{}, err
+	}
+	if maxBody <= 0 {
+		return Config{}, fmt.Errorf("config: %s 必须为正整数，当前为 %d", envMaxRequestBodyBytes, maxBody)
+	}
+	cfg.MaxRequestBodyBytes = int64(maxBody)
+
 	// 归一化上游地址：去掉结尾斜杠，避免与请求路径拼接时出现双斜杠。
 	cfg.UpstreamURL = strings.TrimRight(strings.TrimSpace(cfg.UpstreamURL), "/")
 	if cfg.UpstreamURL == "" {
@@ -146,7 +166,27 @@ func Load() (Config, error) {
 			envAuthMode, cfg.AuthMode, AuthModeAPIKey, AuthModeDev)
 	}
 
+	if cfg.InstanceAllowedCIDRs, err = parseCIDRs(os.Getenv(envInstanceAllowedCIDRs)); err != nil {
+		return Config{}, fmt.Errorf("config: %s %w", envInstanceAllowedCIDRs, err)
+	}
+
 	return cfg, nil
+}
+
+// parseCIDRs 解析逗号分隔的网段列表（如 "10.0.0.0/8, fd00::/8"）；空串返回 nil。
+func parseCIDRs(raw string) ([]netip.Prefix, error) {
+	var prefixes []netip.Prefix
+	for _, item := range strings.Split(raw, ",") {
+		if item = strings.TrimSpace(item); item == "" {
+			continue
+		}
+		prefix, err := netip.ParsePrefix(item)
+		if err != nil {
+			return nil, fmt.Errorf("取值非法 %q（需要 CIDR，如 10.0.0.0/8）: %w", item, err)
+		}
+		prefixes = append(prefixes, prefix.Masked())
+	}
+	return prefixes, nil
 }
 
 // isLoopbackAddr 报告监听地址是否只绑定回环接口；未指定主机（如 ":8081"）表示绑定全部接口。

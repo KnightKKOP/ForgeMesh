@@ -6,23 +6,29 @@ import (
 	"log"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/Mekoforge/ForgeMesh/gateway/internal/config"
 )
 
+// loopbackOnly 只允许连接回环地址：测试中的推理实例都运行在 127.0.0.1。
+var loopbackOnly = []netip.Prefix{netip.MustParsePrefix("127.0.0.0/8")}
+
 // newTestRouter 构造 dev 认证模式的测试用网关处理器；upstreamURL 指向被测的模拟上游。
 func newTestRouter(t *testing.T, upstreamURL string) *Router {
 	t.Helper()
 	cfg := config.Config{
-		ListenAddr:        ":0",
-		UpstreamURL:       upstreamURL,
-		RateLimitRPS:      1000,
-		RateLimitBurst:    1000,
-		TenantHeader:      "X-Tenant-ID",
-		CorrelationHeader: "X-Correlation-ID",
-		AuthMode:          config.AuthModeDev,
+		ListenAddr:           ":0",
+		UpstreamURL:          upstreamURL,
+		RateLimitRPS:         1000,
+		RateLimitBurst:       1000,
+		TenantHeader:         "X-Tenant-ID",
+		CorrelationHeader:    "X-Correlation-ID",
+		AuthMode:             config.AuthModeDev,
+		InstanceAllowedCIDRs: loopbackOnly,
 	}
 	r, err := New(cfg, log.New(io.Discard, "", 0))
 	if err != nil {
@@ -125,6 +131,59 @@ func TestApi_UnknownRouteAllowedThroughChain(t *testing.T) {
 	}
 }
 
+// TestApi_RequestBodyLimit 验证请求体上限：声明长度超限直接 413、不触达控制平面；
+// 分块上传超限同样 413；恰好等于上限的请求体正常转发。
+func TestApi_RequestBodyLimit(t *testing.T) {
+	var cpHits atomic.Int64
+	controlPlane := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		cpHits.Add(1)
+		_, _ = io.Copy(io.Discard, req.Body)
+		w.WriteHeader(http.StatusCreated)
+	}))
+	defer controlPlane.Close()
+
+	r, err := New(config.Config{
+		ListenAddr:          ":0",
+		UpstreamURL:         controlPlane.URL,
+		RateLimitRPS:        1000,
+		RateLimitBurst:      1000,
+		TenantHeader:        "X-Tenant-ID",
+		CorrelationHeader:   "X-Correlation-ID",
+		AuthMode:            config.AuthModeDev,
+		MaxRequestBodyBytes: 16,
+	}, log.New(io.Discard, "", 0))
+	if err != nil {
+		t.Fatalf("New 失败: %v", err)
+	}
+	post := func(body string, chunked bool) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/resources", strings.NewReader(body))
+		if chunked {
+			req.ContentLength = -1
+		}
+		req.Header.Set("X-Tenant-ID", "tenant-a")
+		rec := httptest.NewRecorder()
+		r.ServeHTTP(rec, req)
+		return rec
+	}
+
+	if rec := post(strings.Repeat("x", 17), false); rec.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("声明长度超限应 413，实际 %d（body=%s）", rec.Code, rec.Body.String())
+	}
+	if got := cpHits.Load(); got != 0 {
+		t.Fatalf("声明长度超限的请求不应触达控制平面，实际 %d 次", got)
+	}
+	rec := post(strings.Repeat("x", 64), true)
+	if rec.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("分块上传超限应 413，实际 %d（body=%s）", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), `"code":"REQUEST_TOO_LARGE"`) {
+		t.Fatalf("错误体应含 REQUEST_TOO_LARGE，实际: %s", rec.Body.String())
+	}
+	if rec := post(strings.Repeat("x", 16), false); rec.Code != http.StatusCreated {
+		t.Fatalf("等于上限的请求体应正常转发，实际 %d（body=%s）", rec.Code, rec.Body.String())
+	}
+}
+
 // TestInferenceChat_ResolvesEndpoint 端到端验证推理路由：
 // 控制平面返回 Ready + 实例 endpoint，SSE 请求应被转发到该实例并透传流式响应。
 func TestInferenceChat_ResolvesEndpoint(t *testing.T) {
@@ -215,6 +274,51 @@ func TestInferenceChat_NamespacedRoute(t *testing.T) {
 	}
 	if instanceGotPath != "/generate_stream" {
 		t.Fatalf("实例收到的路径应为 tgi-generate 的推理路径，实际 %q", instanceGotPath)
+	}
+}
+
+// TestInferenceChat_DefaultPolicyRefusesLoopbackInstance 验证未配置实例允许网段时，
+// 网关不连接 status.endpoints 中的回环地址，返回 502 INSTANCE_ADDRESS_NOT_ALLOWED。
+func TestInferenceChat_DefaultPolicyRefusesLoopbackInstance(t *testing.T) {
+	var instanceHits atomic.Int64
+	instance := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		instanceHits.Add(1)
+	}))
+	defer instance.Close()
+	controlPlane := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, fmt.Sprintf(
+			`{"status":{"phase":"Ready","endpoints":[{"url":%q,"protocol":"openai-chat"}]}}`,
+			instance.URL))
+	}))
+	defer controlPlane.Close()
+
+	r, err := New(config.Config{
+		ListenAddr:        ":0",
+		UpstreamURL:       controlPlane.URL,
+		RateLimitRPS:      1000,
+		RateLimitBurst:    1000,
+		TenantHeader:      "X-Tenant-ID",
+		CorrelationHeader: "X-Correlation-ID",
+		AuthMode:          config.AuthModeDev,
+	}, log.New(io.Discard, "", 0))
+	if err != nil {
+		t.Fatalf("New 失败: %v", err)
+	}
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/inference/svc-a/chat", nil)
+	req.Header.Set("X-Tenant-ID", "tenant-a")
+	r.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("回环实例应被拒绝（502），实际 %d（body=%s）", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), `"code":"INSTANCE_ADDRESS_NOT_ALLOWED"`) {
+		t.Fatalf("错误体应含 INSTANCE_ADDRESS_NOT_ALLOWED，实际: %s", rec.Body.String())
+	}
+	if got := instanceHits.Load(); got != 0 {
+		t.Fatalf("回环实例不应收到请求，实际 %d 次", got)
 	}
 }
 

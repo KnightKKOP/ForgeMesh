@@ -3,8 +3,12 @@ package stream
 import (
 	"context"
 	"errors"
+	"fmt"
+	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"net/url"
 	"strings"
 	"sync"
@@ -14,6 +18,9 @@ import (
 
 	"github.com/Mekoforge/ForgeMesh/gateway/internal/upstream"
 )
+
+// allowLoopback 允许回环地址：测试中的推理实例都运行在 127.0.0.1。
+var allowLoopback = NewAddressPolicy([]netip.Prefix{netip.MustParsePrefix("127.0.0.0/8")})
 
 // fakeResolver 是测试用的解析器替身：返回固定 endpoint 列表并记录上报调用。
 type fakeResolver struct {
@@ -222,7 +229,7 @@ func TestProxy_SSEForwarding(t *testing.T) {
 	defer upstreamSrv.Close()
 
 	res := newFakeResolver([]string{upstreamSrv.URL}, nil)
-	proxy := New(res, "X-Tenant-ID", nil)
+	proxy := New(res, "X-Tenant-ID", allowLoopback, nil)
 
 	rec := httptest.NewRecorder()
 	proxy.ServeHTTP(rec, newChatRequest("svc-a"))
@@ -272,7 +279,7 @@ func TestProxy_RoundRobin(t *testing.T) {
 	}))
 	defer srvB.Close()
 
-	proxy := New(newFakeResolver([]string{srvA.URL, srvB.URL}, nil), "X-Tenant-ID", nil)
+	proxy := New(newFakeResolver([]string{srvA.URL, srvB.URL}, nil), "X-Tenant-ID", allowLoopback, nil)
 
 	for i := 0; i < 4; i++ {
 		rec := httptest.NewRecorder()
@@ -317,7 +324,7 @@ func TestProxy_MapsProtocolToInstancePath(t *testing.T) {
 			req := newChatRequest("svc-a")
 			req.URL.RawQuery = "stream=true"
 			rec := httptest.NewRecorder()
-			New(res, "X-Tenant-ID", nil).ServeHTTP(rec, req)
+			New(res, "X-Tenant-ID", allowLoopback, nil).ServeHTTP(rec, req)
 
 			if rec.Code != http.StatusOK {
 				t.Fatalf("转发应返回 200，实际 %d（body=%s）", rec.Code, rec.Body.String())
@@ -344,7 +351,7 @@ func TestProxy_UnknownProtocol(t *testing.T) {
 
 	res := newFakeResolverWithEndpoints([]upstream.Endpoint{{URL: srv.URL, Protocol: "grpc"}}, nil)
 	rec := httptest.NewRecorder()
-	New(res, "X-Tenant-ID", nil).ServeHTTP(rec, newChatRequest("svc-a"))
+	New(res, "X-Tenant-ID", allowLoopback, nil).ServeHTTP(rec, newChatRequest("svc-a"))
 
 	if rec.Code != http.StatusBadGateway {
 		t.Fatalf("未知协议应 502，实际 %d", rec.Code)
@@ -367,11 +374,69 @@ func TestProxy_PassesNamespaceToResolver(t *testing.T) {
 	req.SetPathValue("ns", "team-a")
 	req.SetPathValue("svc", "svc-a")
 	req.Header.Set("X-Tenant-ID", "tenant-a")
-	New(res, "X-Tenant-ID", nil).ServeHTTP(httptest.NewRecorder(), req)
+	New(res, "X-Tenant-ID", allowLoopback, nil).ServeHTTP(httptest.NewRecorder(), req)
 
 	want := upstream.ServiceRef{Namespace: "team-a", Name: "svc-a"}
 	if res.lastSvc != want {
 		t.Fatalf("Resolver 应收到 %+v，实际 %+v", want, res.lastSvc)
+	}
+}
+
+// TestProxy_ReusesConnectionsAcrossConcurrentStreams 验证一波并发流式请求结束后连接留在池中，
+// 下一波同样并发度的请求不再新建连接（Go 默认每个主机只保留 2 个空闲连接）。
+func TestProxy_ReusesConnectionsAcrossConcurrentStreams(t *testing.T) {
+	const concurrency = 8
+	var newConns atomic.Int64
+	var mu sync.Mutex
+	var gate chan struct{}
+	var arrived sync.WaitGroup
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		g := gate
+		mu.Unlock()
+		arrived.Done()
+		<-g // 整波请求同时在途，每个请求各占一个连接
+		_, _ = w.Write([]byte("data: ok\n\n"))
+	}))
+	srv.Config.ConnState = func(_ net.Conn, state http.ConnState) {
+		if state == http.StateNew {
+			newConns.Add(1)
+		}
+	}
+	srv.Start()
+	defer srv.Close()
+
+	proxy := New(newFakeResolver([]string{srv.URL}, nil), "X-Tenant-ID", allowLoopback, nil)
+	wave := func() {
+		mu.Lock()
+		gate = make(chan struct{})
+		g := gate
+		mu.Unlock()
+		arrived.Add(concurrency)
+		var done sync.WaitGroup
+		for i := 0; i < concurrency; i++ {
+			done.Add(1)
+			go func() {
+				defer done.Done()
+				rec := httptest.NewRecorder()
+				proxy.ServeHTTP(rec, newChatRequest("svc-a"))
+				if rec.Code != http.StatusOK {
+					t.Errorf("请求应 200，实际 %d", rec.Code)
+				}
+			}()
+		}
+		arrived.Wait()
+		close(g)
+		done.Wait()
+	}
+
+	wave()
+	if got := newConns.Load(); got != concurrency {
+		t.Fatalf("第一波应建立 %d 个连接，实际 %d", concurrency, got)
+	}
+	wave()
+	if got := newConns.Load(); got != concurrency {
+		t.Fatalf("第二波应复用空闲连接，实际新建了 %d 个", got-concurrency)
 	}
 }
 
@@ -393,7 +458,7 @@ func TestProxy_HopByHopHeadersFiltered(t *testing.T) {
 	}))
 	defer upstreamSrv.Close()
 
-	proxy := New(newFakeResolver([]string{upstreamSrv.URL}, nil), "X-Tenant-ID", nil)
+	proxy := New(newFakeResolver([]string{upstreamSrv.URL}, nil), "X-Tenant-ID", allowLoopback, nil)
 
 	rec := httptest.NewRecorder()
 	proxy.ServeHTTP(rec, newChatRequest("svc-a"))
@@ -414,7 +479,7 @@ func TestProxy_HopByHopHeadersFiltered(t *testing.T) {
 func TestProxy_UpstreamError(t *testing.T) {
 	endpoint := "http://127.0.0.1:1" // 不可达端口。
 	res := newFakeResolver([]string{endpoint}, nil)
-	proxy := New(res, "X-Tenant-ID", nil)
+	proxy := New(res, "X-Tenant-ID", allowLoopback, nil)
 	// 缩短超时以加速测试。
 	proxy.client.Timeout = 200 * time.Millisecond
 
@@ -446,7 +511,7 @@ func TestProxy_ForwardsClientHeaders(t *testing.T) {
 	defer upstreamSrv.Close()
 
 	res := newFakeResolver([]string{upstreamSrv.URL}, nil)
-	proxy := New(res, "X-Tenant-ID", nil)
+	proxy := New(res, "X-Tenant-ID", allowLoopback, nil)
 
 	rec := httptest.NewRecorder()
 	req := newChatRequest("svc-a")
@@ -469,7 +534,7 @@ func TestProxy_ForwardsClientHeaders(t *testing.T) {
 
 // TestProxy_NoHealthyUpstream 验证无可用实例时返回 503 与 NO_HEALTHY_UPSTREAM 错误信封。
 func TestProxy_NoHealthyUpstream(t *testing.T) {
-	proxy := New(newFakeResolver(nil, nil), "X-Tenant-ID", nil)
+	proxy := New(newFakeResolver(nil, nil), "X-Tenant-ID", allowLoopback, nil)
 
 	rec := httptest.NewRecorder()
 	proxy.ServeHTTP(rec, newChatRequest("svc-a"))
@@ -497,7 +562,7 @@ func TestProxy_ResolveSentinelErrors(t *testing.T) {
 		upstream.ErrNoHealthyEndpoints,
 	}
 	for _, sentinel := range sentinels {
-		proxy := New(newFakeResolver(nil, sentinel), "X-Tenant-ID", nil)
+		proxy := New(newFakeResolver(nil, sentinel), "X-Tenant-ID", allowLoopback, nil)
 		rec := httptest.NewRecorder()
 		proxy.ServeHTTP(rec, newChatRequest("svc-a"))
 		if rec.Code != http.StatusServiceUnavailable {
@@ -511,7 +576,7 @@ func TestProxy_ResolveSentinelErrors(t *testing.T) {
 
 // TestProxy_ResolveTransientError 验证解析的网络/控制平面错误映射为 502。
 func TestProxy_ResolveTransientError(t *testing.T) {
-	proxy := New(newFakeResolver(nil, errors.New("connection refused")), "X-Tenant-ID", nil)
+	proxy := New(newFakeResolver(nil, errors.New("connection refused")), "X-Tenant-ID", allowLoopback, nil)
 
 	rec := httptest.NewRecorder()
 	proxy.ServeHTTP(rec, newChatRequest("svc-a"))
@@ -526,7 +591,7 @@ func TestProxy_ResolveTransientError(t *testing.T) {
 
 // TestProxy_MissingSvc 验证路径缺少 {svc} 值时返回 400。
 func TestProxy_MissingSvc(t *testing.T) {
-	proxy := New(newFakeResolver([]string{"http://127.0.0.1:1"}, nil), "X-Tenant-ID", nil)
+	proxy := New(newFakeResolver([]string{"http://127.0.0.1:1"}, nil), "X-Tenant-ID", allowLoopback, nil)
 
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/inference//chat", nil)
@@ -541,7 +606,7 @@ func TestProxy_MissingSvc(t *testing.T) {
 func TestProxy_InvalidEndpoint(t *testing.T) {
 	endpoint := "://bad-endpoint"
 	res := newFakeResolver([]string{endpoint}, nil)
-	proxy := New(res, "X-Tenant-ID", nil)
+	proxy := New(res, "X-Tenant-ID", allowLoopback, nil)
 
 	rec := httptest.NewRecorder()
 	proxy.ServeHTTP(rec, newChatRequest("svc-a"))
@@ -554,6 +619,67 @@ func TestProxy_InvalidEndpoint(t *testing.T) {
 	}
 }
 
+// TestProxy_RefusesDisallowedInstanceAddress 验证默认策略下不连接回环与元数据服务地址
+// （包括解析到回环地址的主机名）：返回 502 INSTANCE_ADDRESS_NOT_ALLOWED 并计一次失败。
+func TestProxy_RefusesDisallowedInstanceAddress(t *testing.T) {
+	var hits atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+	}))
+	defer srv.Close()
+	port := srv.Listener.Addr().(*net.TCPAddr).Port
+
+	for _, endpoint := range []string{
+		srv.URL,
+		fmt.Sprintf("http://localhost:%d", port),
+		"http://169.254.169.254",
+	} {
+		res := newFakeResolver([]string{endpoint}, nil)
+		rec := httptest.NewRecorder()
+		New(res, "X-Tenant-ID", AddressPolicy{}, nil).ServeHTTP(rec, newChatRequest("svc-a"))
+
+		if rec.Code != http.StatusBadGateway {
+			t.Fatalf("%s 应返回 502，实际 %d", endpoint, rec.Code)
+		}
+		if !strings.Contains(rec.Body.String(), `"code":"INSTANCE_ADDRESS_NOT_ALLOWED"`) {
+			t.Fatalf("%s 的错误体应含 INSTANCE_ADDRESS_NOT_ALLOWED，实际: %s", endpoint, rec.Body.String())
+		}
+		if got := res.failureCount(endpoint); got != 1 {
+			t.Fatalf("%s 应上报 1 次失败，实际 %d", endpoint, got)
+		}
+	}
+	if got := hits.Load(); got != 0 {
+		t.Fatalf("被拒绝的实例不应收到请求，实际 %d 次", got)
+	}
+}
+
+// TestProxy_RequestBodyTooLarge 验证分块请求体超过上限（由 LimitRequestBody 包装）时
+// 返回 413，且不计实例失败。
+func TestProxy_RequestBodyTooLarge(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+	}))
+	defer srv.Close()
+
+	res := newFakeResolver([]string{srv.URL}, nil)
+	rec := httptest.NewRecorder()
+	req := newChatRequest("svc-a")
+	req.Method = http.MethodPost
+	req.Body = http.MaxBytesReader(rec, io.NopCloser(strings.NewReader(strings.Repeat("x", 64))), 16)
+	req.ContentLength = -1
+	New(res, "X-Tenant-ID", allowLoopback, nil).ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("请求体超限应 413，实际 %d（body=%s）", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), `"code":"REQUEST_TOO_LARGE"`) {
+		t.Fatalf("错误体应含 REQUEST_TOO_LARGE，实际: %s", rec.Body.String())
+	}
+	if got := res.failureCount(srv.URL); got != 0 {
+		t.Fatalf("请求体超限属客户端问题，不应计实例失败，实际 %d", got)
+	}
+}
+
 // TestProxy_Upstream5xxCountsFailure 验证实例返回 5xx 时计一次失败（响应仍透传）。
 func TestProxy_Upstream5xxCountsFailure(t *testing.T) {
 	upstreamSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -563,7 +689,7 @@ func TestProxy_Upstream5xxCountsFailure(t *testing.T) {
 	defer upstreamSrv.Close()
 
 	res := newFakeResolver([]string{upstreamSrv.URL}, nil)
-	proxy := New(res, "X-Tenant-ID", nil)
+	proxy := New(res, "X-Tenant-ID", allowLoopback, nil)
 
 	rec := httptest.NewRecorder()
 	proxy.ServeHTTP(rec, newChatRequest("svc-a"))
@@ -576,6 +702,37 @@ func TestProxy_Upstream5xxCountsFailure(t *testing.T) {
 	}
 	if got := res.successCount(upstreamSrv.URL); got != 0 {
 		t.Fatalf("5xx 不应上报成功，实际 %d", got)
+	}
+}
+
+// TestProxy_ErrorResponseKeepsContentType 验证实例的错误响应保留原 Content-Type 与响应体，
+// 不被改成 text/event-stream。
+func TestProxy_ErrorResponseKeepsContentType(t *testing.T) {
+	const errBody = `{"object":"error","message":"max_tokens is too large","code":400}`
+	upstreamSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(errBody))
+	}))
+	defer upstreamSrv.Close()
+
+	res := newFakeResolver([]string{upstreamSrv.URL}, nil)
+	proxy := New(res, "X-Tenant-ID", allowLoopback, nil)
+
+	rec := httptest.NewRecorder()
+	proxy.ServeHTTP(rec, newChatRequest("svc-a"))
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("4xx 应透传，实际 %d", rec.Code)
+	}
+	if ct := rec.Header().Get("Content-Type"); ct != "application/json" {
+		t.Fatalf("错误响应应保留实例的 Content-Type application/json，实际 %q", ct)
+	}
+	if got := rec.Body.String(); got != errBody {
+		t.Fatalf("错误响应体应原样透传，\nwant %q\ngot  %q", errBody, got)
+	}
+	if got := res.failureCount(upstreamSrv.URL); got != 0 {
+		t.Fatalf("4xx 不应计实例失败，实际 %d", got)
 	}
 }
 

@@ -370,6 +370,12 @@ func TestNewResolver_Defaults(t *testing.T) {
 	if r.cooldown != DefaultUnhealthyCooldown {
 		t.Fatalf("cooldown 应回退默认 %v，实际 %v", DefaultUnhealthyCooldown, r.cooldown)
 	}
+	if r.negativeTTL != negativeCacheTTL {
+		t.Fatalf("负缓存时长应为 %v，实际 %v", negativeCacheTTL, r.negativeTTL)
+	}
+	if short := NewResolver("http://cp:8080", nil, 100*time.Millisecond, 0, nil); short.negativeTTL != 100*time.Millisecond {
+		t.Fatalf("负缓存时长不应超过 ttl，实际 %v", short.negativeTTL)
+	}
 	if r.client == nil || r.client.Timeout != resolveHTTPTimeout {
 		t.Fatalf("client 为 nil 时应构造默认超时客户端")
 	}
@@ -394,6 +400,185 @@ func TestResolve_Concurrent(t *testing.T) {
 		}(i)
 	}
 	wg.Wait()
+}
+
+// blockingControlPlane 启动在 release 调用之前挂起全部查询的模拟控制平面。
+func blockingControlPlane(t *testing.T) (*httptest.Server, *atomic.Int64, func()) {
+	t.Helper()
+	gate := make(chan struct{})
+	var once sync.Once
+	release := func() { once.Do(func() { close(gate) }) }
+	srv, calls := newControlPlane(t, func(w http.ResponseWriter, r *http.Request) {
+		<-gate
+		_, _ = io.WriteString(w, readyBody("Ready", "http://10.0.0.1:8000"))
+	})
+	// Cleanup 后进先出：先放行挂起的请求，srv.Close 才不会一直等待。
+	t.Cleanup(release)
+	return srv, calls, release
+}
+
+// waitForCalls 等待控制平面收到 n 次查询。
+func waitForCalls(t *testing.T, calls *atomic.Int64, n int64) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for calls.Load() < n {
+		if time.Now().After(deadline) {
+			t.Fatalf("控制平面应收到 %d 次查询，实际 %d", n, calls.Load())
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+// TestResolve_CoalescesConcurrentMisses 验证同一服务的并发未命中只查询一次控制平面，
+// 全部调用方拿到这次查询的结果。
+func TestResolve_CoalescesConcurrentMisses(t *testing.T) {
+	srv, calls, release := blockingControlPlane(t)
+	r := newTestResolver(srv.URL, time.Minute, time.Second)
+
+	const callers = 20
+	var started sync.WaitGroup
+	results := make(chan error, callers)
+	for i := 0; i < callers; i++ {
+		started.Add(1)
+		go func() {
+			started.Done()
+			eps, err := r.Resolve(context.Background(), svcA, "tenant-a")
+			if err == nil && (len(eps) != 1 || eps[0].URL != "http://10.0.0.1:8000") {
+				err = fmt.Errorf("endpoints 不符: %v", eps)
+			}
+			results <- err
+		}()
+	}
+	started.Wait()
+	waitForCalls(t, calls, 1)
+	time.Sleep(20 * time.Millisecond) // 留出时间让其余调用方进入等待，否则测不出重复查询。
+	release()
+
+	for i := 0; i < callers; i++ {
+		if err := <-results; err != nil {
+			t.Fatalf("共用查询的调用方应成功: %v", err)
+		}
+	}
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("并发未命中应只查询 1 次控制平面，实际 %d", got)
+	}
+}
+
+// TestResolve_CallerCancellationDoesNotAbortSharedLookup 验证发起查询的调用方取消后查询继续：
+// 该调用方返回 context.Canceled，等待同一查询的调用方仍拿到结果。
+func TestResolve_CallerCancellationDoesNotAbortSharedLookup(t *testing.T) {
+	srv, calls, release := blockingControlPlane(t)
+	r := newTestResolver(srv.URL, time.Minute, time.Second)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	first := make(chan error, 1)
+	go func() {
+		_, err := r.Resolve(ctx, svcA, "tenant-a")
+		first <- err
+	}()
+	waitForCalls(t, calls, 1)
+
+	second := make(chan error, 1)
+	go func() {
+		_, err := r.Resolve(context.Background(), svcA, "tenant-a")
+		second <- err
+	}()
+
+	cancel()
+	if err := <-first; !errors.Is(err, context.Canceled) {
+		t.Fatalf("取消的调用方应返回 context.Canceled，实际 %v", err)
+	}
+	release()
+	if err := <-second; err != nil {
+		t.Fatalf("等待同一查询的调用方应成功: %v", err)
+	}
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("取消不应中断共用的查询（应只查询 1 次），实际 %d", got)
+	}
+}
+
+// TestResolve_CachesMisses 验证"服务不存在 / 未就绪 / 无可用实例"在负缓存期内不再查询控制平面。
+func TestResolve_CachesMisses(t *testing.T) {
+	for name, tc := range map[string]struct {
+		status int
+		body   string
+		want   error
+	}{
+		"not found":    {http.StatusNotFound, `{"detail":"not found"}`, ErrServiceNotFound},
+		"not ready":    {http.StatusOK, readyBody("Pending", "http://10.0.0.1:8000"), ErrNotReady},
+		"no endpoints": {http.StatusOK, readyBody("Ready"), ErrNoEndpoints},
+	} {
+		t.Run(name, func(t *testing.T) {
+			srv, calls := newControlPlane(t, func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(tc.status)
+				_, _ = io.WriteString(w, tc.body)
+			})
+			r := newTestResolver(srv.URL, time.Minute, time.Second)
+
+			for i := 0; i < 3; i++ {
+				if _, err := r.Resolve(context.Background(), svcA, "tenant-a"); !errors.Is(err, tc.want) {
+					t.Fatalf("第 %d 次 Resolve 应返回 %v，实际 %v", i+1, tc.want, err)
+				}
+			}
+			if got := calls.Load(); got != 1 {
+				t.Fatalf("负缓存期内应只查询 1 次控制平面，实际 %d", got)
+			}
+		})
+	}
+}
+
+// TestResolve_MissCacheExpires 验证否定结果按 negativeTTL（而不是 ttl）过期：服务就绪后
+// 很快就能解析成功。
+func TestResolve_MissCacheExpires(t *testing.T) {
+	var ready atomic.Bool
+	srv, calls := newControlPlane(t, func(w http.ResponseWriter, r *http.Request) {
+		phase := "Pending"
+		if ready.Load() {
+			phase = "Ready"
+		}
+		_, _ = io.WriteString(w, readyBody(phase, "http://10.0.0.1:8000"))
+	})
+	r := newTestResolver(srv.URL, time.Minute, time.Second)
+	r.negativeTTL = 50 * time.Millisecond
+
+	if _, err := r.Resolve(context.Background(), svcA, "tenant-a"); !errors.Is(err, ErrNotReady) {
+		t.Fatalf("应返回 ErrNotReady，实际 %v", err)
+	}
+	ready.Store(true)
+	time.Sleep(70 * time.Millisecond)
+	if _, err := r.Resolve(context.Background(), svcA, "tenant-a"); err != nil {
+		t.Fatalf("负缓存过期后应重新查询并成功: %v", err)
+	}
+	if got := calls.Load(); got != 2 {
+		t.Fatalf("应查询 2 次控制平面，实际 %d", got)
+	}
+}
+
+// TestResolve_DoesNotCacheOtherFailures 验证 403 / 401 / 5xx 不缓存：它们取决于凭证或属于
+// 暂时故障，下一个请求立即重新查询。
+func TestResolve_DoesNotCacheOtherFailures(t *testing.T) {
+	for name, status := range map[string]int{
+		"forbidden":    http.StatusForbidden,
+		"unauthorized": http.StatusUnauthorized,
+		"server error": http.StatusInternalServerError,
+	} {
+		t.Run(name, func(t *testing.T) {
+			srv, calls := newControlPlane(t, func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(status)
+			})
+			r := newTestResolver(srv.URL, time.Minute, time.Second)
+
+			for i := 0; i < 2; i++ {
+				if _, err := r.Resolve(context.Background(), svcA, "tenant-a"); err == nil {
+					t.Fatalf("控制平面返回 %d 时 Resolve 应失败", status)
+				}
+			}
+			if got := calls.Load(); got != 2 {
+				t.Fatalf("失败不应缓存（应查询 2 次），实际 %d", got)
+			}
+		})
+	}
 }
 
 // TestResolve_QueriesTheServiceNamespace 验证带命名空间的服务以 namespace 参数查询，

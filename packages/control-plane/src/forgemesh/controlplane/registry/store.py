@@ -14,6 +14,9 @@
   成功后 ``resource_version`` 递增 1。
 * ``resource_version`` 在 DB 中为 ``INTEGER``，对外的
   ``metadata.resourceVersion`` 为字符串（对齐契约 ``Optional[str]``）。
+* :meth:`SQLiteRegistry.update_status` → **status 子资源**：只修改状态条件、
+  phase 与 ``observedGeneration``，不递增 ``generation``，可选 CAS；合并后
+  没有变化时不写库。
 
 受控删除（finalizer 语义，对齐 architecture.md §5.3/§12.4 与 development-plan
 第 7 章）
@@ -65,12 +68,13 @@ import sqlite3
 import threading
 from collections.abc import Callable, Collection
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Any, TypeVar
 from uuid import uuid4
 
 from forgemesh.core.errors import ConflictError, NotFoundError, PreconditionFailedError
-from forgemesh.core.objects import Resource
+from forgemesh.core.objects import Condition, Resource
 from forgemesh.core.registry import ResourceRegistry
 from forgemesh.resource.allocation import Allocation, AllocationStatus
 from forgemesh.resource.inference import InferenceService
@@ -194,6 +198,30 @@ class RequestDeleteResult:
 
     deleted: bool
     finalizers: builtins.list[str] = field(default_factory=list)
+
+
+def _merge_conditions(
+    existing: builtins.list[dict[str, Any]],
+    updates: builtins.list[Condition],
+    now: datetime,
+) -> builtins.list[dict[str, Any]]:
+    """按 ``type`` 合并条件；``lastTransitionTime`` 只在条件的 ``status`` 变化时刷新。"""
+    merged = [dict(item) for item in existing]
+    for update in updates:
+        index = next(
+            (i for i, item in enumerate(merged) if item.get("type") == update.type),
+            None,
+        )
+        if index is not None and merged[index].get("status") == update.status:
+            entry = update.model_dump(mode="json", exclude={"lastTransitionTime"})
+            entry["lastTransitionTime"] = merged[index].get("lastTransitionTime")
+        else:
+            entry = update.model_copy(update={"lastTransitionTime": now}).model_dump(mode="json")
+        if index is None:
+            merged.append(entry)
+        else:
+            merged[index] = entry
+    return merged
 
 
 class SQLiteRegistry(ResourceRegistry):
@@ -354,7 +382,11 @@ class SQLiteRegistry(ResourceRegistry):
         投影到基类已知字段（丢弃未知扩展字段），保证旧 payload / 第三方 kind
         的读回兼容。
         """
-        body = row["body"]
+        return SQLiteRegistry._body_to_resource(row["body"])
+
+    @staticmethod
+    def _body_to_resource(body: str) -> Resource:
+        """按 :meth:`_row_to_resource` 的规则反序列化 payload。"""
         data = json.loads(body)
         if isinstance(data, dict):
             model = _KIND_MODELS.get(data.get("kind", ""))
@@ -729,6 +761,126 @@ class SQLiteRegistry(ResourceRegistry):
             return RequestDeleteResult(False, effective)
 
         return await self._run(_request_delete)
+
+    async def update_status(
+        self,
+        kind: str,
+        namespace: str | None,
+        name: str,
+        tenant_id: str,
+        status_patch: dict[str, Any],
+        *,
+        observed_generation: int | None = None,
+        expected_version: str | None = None,
+    ) -> Resource:
+        """status 子资源写入：只修改状态条件、phase 与 observedGeneration。
+
+        不触碰 spec 与其余元数据，不递增 ``generation``。规则：
+
+        * ``status_patch["conditions"]`` 按 ``type`` 合并到已有条件：payload 带
+          ``status`` 子树（强类型资源）时写入 ``status.conditions``，否则写入
+          顶层 ``conditions``；``lastTransitionTime`` 由注册中心维护，只在条件的
+          ``status`` 变化时刷新；
+        * ``status_patch["phase"]`` 经权威状态机校验，只适用于带 ``status`` 子树
+          的资源；
+        * ``observed_generation`` 写入元数据列与 ``metadata.observedGeneration``，
+          payload 已有 ``status.observedGeneration`` 时一并更新；
+        * ``expected_version`` 非空时做 CAS，冲突语义与 :meth:`put` 相同；
+        * 合并后没有任何变化时不写库，``resource_version`` 不变，也不追加变更记录。
+
+        Returns:
+            写入后的资源；没有变化时为当前资源。
+
+        Raises:
+            NotFoundError: 资源不存在（或跨租户不可见）。
+            ConflictError: ``expected_version`` 与当前版本不一致。
+            InvalidStateTransition: phase 转移非法。
+            ValueError: 补丁含 ``conditions`` / ``phase`` 以外的字段或非法条件，
+                或为没有 ``status`` 子树的资源设置 phase。
+        """
+        unknown = sorted(set(status_patch) - {"conditions", "phase"})
+        if unknown:
+            raise ValueError(f"unsupported status fields: {unknown}")
+        updates = [Condition.model_validate(item) for item in status_patch.get("conditions", [])]
+        raw_phase = status_patch.get("phase")
+        target_phase = str(raw_phase) if raw_phase is not None else None
+
+        def _update_status() -> Resource:
+            cur = self._conn.cursor()
+            row = cur.execute(
+                "SELECT body, phase, observed_generation, resource_version FROM resources "
+                "WHERE tenant_id=? AND kind=? AND namespace IS ? AND name=?",
+                (tenant_id, kind, namespace, name),
+            ).fetchone()
+            if row is None:
+                raise NotFoundError(
+                    f"resource not found: kind={kind} "
+                    f"namespace={namespace!r} name={name} tenant_id={tenant_id}",
+                )
+            read_version = row["resource_version"]
+            if expected_version is not None and int(expected_version) != read_version:
+                raise ConflictError(
+                    f"status update failed: expected_version={expected_version!r} "
+                    f"does not match current {read_version} "
+                    f"(kind={kind} namespace={namespace!r} name={name})",
+                )
+            original = json.loads(row["body"])
+            body = json.loads(row["body"])
+            status = body.get("status")
+            has_status = isinstance(status, dict)
+            phase = row["phase"]
+            if target_phase is not None:
+                if not has_status:
+                    raise ValueError(f"{kind} payload has no status subtree to hold a phase")
+                self._validate_phase_transition(kind, phase, target_phase)
+                status["phase"] = target_phase
+                phase = target_phase
+            if updates:
+                holder = status if has_status else body
+                holder["conditions"] = _merge_conditions(
+                    holder.get("conditions") or [], updates, datetime.now(UTC)
+                )
+            observed = row["observed_generation"]
+            if observed_generation is not None:
+                observed = observed_generation
+                body["metadata"]["observedGeneration"] = observed_generation
+                if has_status and "observedGeneration" in status:
+                    status["observedGeneration"] = observed_generation
+            if body == original:
+                return self._body_to_resource(row["body"])
+
+            new_version = read_version + 1
+            body["metadata"]["resourceVersion"] = str(new_version)
+            new_body = json.dumps(body, ensure_ascii=False)
+            updated = self._body_to_resource(new_body)
+            cur.execute(
+                "UPDATE resources SET body=?, phase=?, observed_generation=?, "
+                " resource_version=?, updated_at=datetime('now') "
+                "WHERE tenant_id=? AND kind=? AND namespace IS ? AND name=? "
+                " AND resource_version=?",
+                (
+                    new_body,
+                    phase,
+                    observed,
+                    new_version,
+                    tenant_id,
+                    kind,
+                    namespace,
+                    name,
+                    read_version,
+                ),
+            )
+            if cur.rowcount == 0:
+                self._conn.rollback()
+                raise ConflictError(
+                    f"status update raced with concurrent write: kind={kind} "
+                    f"namespace={namespace!r} name={name} tenant_id={tenant_id}",
+                )
+            self._record_change(cur, tenant_id, kind, namespace, name, ChangeType.STATUS)
+            self._conn.commit()
+            return updated
+
+        return await self._run(_update_status)
 
     # ------------------------------------------------------------------ #
     # 控制器读取（跨租户，仅供控制平面内部使用）

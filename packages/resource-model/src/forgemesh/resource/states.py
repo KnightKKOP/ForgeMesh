@@ -27,8 +27,6 @@
 
     Active → {Released, Expired}
     Released / Expired → ∅（终态）
-
-兼容 Python 3.9+。
 """
 
 from __future__ import annotations

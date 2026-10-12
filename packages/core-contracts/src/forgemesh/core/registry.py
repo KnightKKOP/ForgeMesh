@@ -19,8 +19,6 @@ PostgreSQL 存储）在控制平面子包中提供。
 
 * ``list`` 按 kind/namespace/labels 过滤返回集合（强制注入租户边界）。
 * ``delete`` 删除资源；不存在时抛 :class:`~forgemesh.core.errors.NotFoundError`。
-
-兼容 Python 3.9+。
 """
 
 from __future__ import annotations

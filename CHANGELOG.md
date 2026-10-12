@@ -51,6 +51,7 @@
 - pytest 把 `RuntimeWarning` 与 `PytestUnraisableExceptionWarning` 视为错误：协程未被 await 时被调用的代码实际没有执行，测试现在会失败，而不是只打印一条警告。
 - README 与 CONTRIBUTING 的安装命令改为 `make install`：在仓库根目录执行 `uv sync` 只会创建一个空的虚拟环境，随后 `make test` 找不到 pytest。README 目录树列出全部 10 个插件，并补充容器部署说明。
 - [docs/architecture/module-mapping.md](docs/architecture/module-mapping.md)：更正网关文件与测试数量（33 / 17）和上游变量名（`GATEWAY_UPSTREAM_URL`），部署小节与 CI 小节按当前工件更新，偏差 D2 处置后移除。
+- 删除源码与测试 docstring 中「兼容 Python 3.9+」/「兼容 3.9–3.12」的说法（各子包 `requires-python` 已是 `>=3.12`，代码使用 `X | None` 与 `enum.StrEnum`，在 3.9 上无法导入）；CONTRIBUTING 的类型注解约定改为与 ruff `UP` 规则一致的 `list[X]` / `X | None`。
 
 ### Deprecated
 

@@ -9,8 +9,6 @@
   ``measure_error_rate`` / ``verify``（延迟超限/错误率超限/全部通过）。
 * **release** — ``stop_instance`` / ``release_lease`` / ``verify_allocation`` /
   ``release`` 完整流程。
-
-兼容 Python 3.9+。
 """
 
 from __future__ import annotations
@@ -36,7 +34,7 @@ from runtime_vllm_plugin.verify import (
 
 @pytest.fixture(autouse=True)
 def _fresh_event_loop():
-    """为每个测试提供干净的 current event loop（兼容 3.9–3.12）。"""
+    """为每个测试提供干净的 current event loop。"""
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     try:

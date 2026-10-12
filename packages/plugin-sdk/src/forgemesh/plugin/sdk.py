@@ -16,8 +16,6 @@
 * **发布可模拟**：``publish`` 支持 ``memory://`` 协议用于本地/测试环境；
   ``http(s)://`` 走真实上传，失败时返回 ``success=False`` 而非抛异常，
   便于 CI 重试。
-
-兼容 Python 3.9+。
 """
 
 from __future__ import annotations

@@ -8,8 +8,6 @@
 
 降级策略仅回答「是否应尝试备用 Provider」，**不**执行降级、**不**授权、
 **不**改写资源终态。最终是否放行仍由 Policy 与 Scheduler 决定。
-
-兼容 Python 3.9+。
 """
 
 from __future__ import annotations

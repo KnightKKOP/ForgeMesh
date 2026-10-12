@@ -7,8 +7,6 @@
 * 超过最大尝试次数 → 不再降级。
 * 主 Provider 成功 → 不降级。
 * 无备用 Provider → fail。
-
-兼容 Python 3.9+。
 """
 
 from __future__ import annotations

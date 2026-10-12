@@ -10,8 +10,6 @@
 
 ``SigningError`` 复用 :class:`forgemesh.core.errors.ForgeMeshError` 统一异常体系；
 若核心包未就绪，则回退到本地兜底基类。
-
-兼容 Python 3.9+。
 """
 
 from __future__ import annotations

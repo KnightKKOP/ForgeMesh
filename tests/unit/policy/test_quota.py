@@ -6,8 +6,6 @@
 * release 回收；
 * set_limit / get_usage；
 * 多租户隔离（不同租户独立配额）。
-
-兼容 Python 3.9+。
 """
 from __future__ import annotations
 
@@ -20,7 +18,7 @@ from forgemesh.policy.quota import QuotaDecision, QuotaLimit, QuotaPolicy
 
 @pytest.fixture(autouse=True)
 def _fresh_event_loop():
-    """为每个测试提供干净的 current event loop（兼容 3.9–3.12）。"""
+    """为每个测试提供干净的 current event loop。"""
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     try:

@@ -22,8 +22,6 @@
 * **合法标识符**：插件名只允许 ``[a-z][a-z0-9-]*``；目录名保留连字符，
   Python 模块名用下划线形式，测试骨架用 ``importlib`` 按文件路径加载
   ``provider.py``，兼容连字符目录。
-
-兼容 Python 3.9+。
 """
 
 from __future__ import annotations

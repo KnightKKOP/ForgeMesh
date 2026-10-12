@@ -2,8 +2,6 @@
 
 从 dict 解析工作流定义，校验步骤 DAG 无环、id 唯一、needs 引用合法。
 对齐 development-plan 5.4。
-
-兼容 Python 3.9+。
 """
 
 from __future__ import annotations

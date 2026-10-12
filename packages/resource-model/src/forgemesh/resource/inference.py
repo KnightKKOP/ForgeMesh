@@ -9,7 +9,7 @@
 * ADR-011（运行时版本固定）。
 
 字段命名与资源 API/JSON 表示保持一致（camelCase），便于网关 / CLI / OpenAPI 直接互通。
-兼容 Python 3.9+ / Pydantic v2。
+基于 Pydantic v2。
 """
 
 from __future__ import annotations

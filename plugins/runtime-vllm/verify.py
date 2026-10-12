@@ -8,7 +8,7 @@
 * **验收标准可配**：延迟超阈值或错误率超阈值 → ``passed=False``。
 * **测试友好**：HTTP 客户端可注入，无真实服务时用 mock 即可测试。
 
-兼容 Python 3.9+ / Pydantic v2。
+基于 Pydantic v2。
 """
 
 from __future__ import annotations

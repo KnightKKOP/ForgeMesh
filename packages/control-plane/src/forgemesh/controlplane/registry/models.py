@@ -3,8 +3,6 @@
 提供资源准入校验（``apiVersion`` / ``kind`` / ``metadata.name`` 非空）与
 spec 变更时的 generation 自增（委托 :meth:`Resource.with_generation_bump`，
 保持不可变派生语义）。
-
-兼容 Python 3.9+。
 """
 
 from __future__ import annotations

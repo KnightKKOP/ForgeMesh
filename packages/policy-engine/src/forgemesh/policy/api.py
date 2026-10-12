@@ -5,8 +5,6 @@ Policy 负责授权、准入、配额规则与审批要求，**最终授权在 P
 * JEV（DecisionProvider）的高置信推荐**不等于**授权（INV-3）。
 * Policy 只回答「是否允许」，不负责具体资源分配（分配由 Scheduler 唯一负责）。
 * 任何分配必须先 Policy 后 Scheduler；跳过即抛治理绕过错误（编排层强制）。
-
-兼容 Python 3.9+。
 """
 
 from __future__ import annotations

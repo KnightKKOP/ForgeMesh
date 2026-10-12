@@ -9,8 +9,6 @@
 * :class:`StructuredLogger` —— 结构化日志（JSON），自动对敏感字段脱敏。
 * :class:`TraceSpan` / :class:`TraceRecorder` —— 分布式追踪 span，
   correlation_id 累计贯穿所有 span，parent span 通过 contextvars 传播。
-
-兼容 Python 3.9+（运行环境 3.12）。
 """
 
 from __future__ import annotations

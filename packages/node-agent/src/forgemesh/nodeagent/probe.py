@@ -8,7 +8,7 @@ Accelerators + DeviceInstances 的资源快照（JSON 兼容 dict），供
 :class:`SnapshotReporter` 上报控制平面。
 
 对齐 architecture 5.1（核心资源模型）与 ADR-010（能力驱动异构资源模型）。
-兼容 Python 3.9+ / Pydantic v2。
+基于 Pydantic v2。
 """
 
 from __future__ import annotations

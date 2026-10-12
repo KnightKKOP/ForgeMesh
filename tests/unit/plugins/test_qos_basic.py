@@ -8,8 +8,6 @@
 * ``QoSProviderResult`` 字段正确性。
 * 优先级解析（字符串 / int / 默认 / 无法识别回退）。
 * 与 :class:`QoSManager` 集成（``release_slot`` 后恢复准入）。
-
-兼容 Python 3.9+。
 """
 
 from __future__ import annotations
@@ -23,7 +21,7 @@ from qos_basic_plugin import QoSProvider, QoSProviderResult
 
 @pytest.fixture(autouse=True)
 def _fresh_event_loop():
-    """为每个测试提供干净的 current event loop（兼容 3.9–3.12）。"""
+    """为每个测试提供干净的 current event loop。"""
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     try:

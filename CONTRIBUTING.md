@@ -190,7 +190,7 @@ ADR 与上游架构基线冲突时，以 [`architecture.md`](docs/architecture/a
 
 ## 9. 代码风格
 
-- **Python**：ruff 配置见根 `pyproject.toml`（行宽 100，`py312` 目标）。统一类型注解，使用 `Optional[X]` / `List[X]` / `Dict[K, V]`（而非 PEP 604 `X | None`）；公共 API 使用 Pydantic 强类型模型，禁止以未校验的任意 dict 作为公共接口。
+- **Python**：ruff 配置见根 `pyproject.toml`（行宽 100，`py312` 目标）。统一类型注解，使用内置泛型与 PEP 604 写法 `list[X]` / `dict[K, V]` / `X | None`（ruff `UP` 规则会拒绝 `Optional[X]` / `List[X]`）；公共 API 使用 Pydantic 强类型模型，禁止以未校验的任意 dict 作为公共接口。
 - **Go**：`gateway/` 内遵循 `gofmt` / `go vet`（CI 检查）；对外契约版本化。
 - **通用**：命名清晰、函数单一职责、为复杂逻辑写注释说明"为什么"，不留 TODO 占位（除非关联 Issue）。
 - 仓库文本统一使用 UTF-8，换行与缩进遵循 `.editorconfig`。

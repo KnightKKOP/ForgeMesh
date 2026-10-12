@@ -9,8 +9,6 @@
 * **无补偿跳过**：未注册补偿 handler 的步骤标记为 ``SKIPPED``。
 * **补偿失败不中断**：某步补偿失败标记为 ``COMPENSATION_FAILED``，仍继续补偿其余步骤，
   以最大化清理效果。
-
-兼容 Python 3.9+。
 """
 
 from __future__ import annotations

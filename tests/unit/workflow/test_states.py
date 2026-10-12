@@ -4,8 +4,6 @@
 * 合法转移通过；
 * 非法转移（如 ``SUCCEEDED -> RUNNING``）抛 ``InvalidStateTransition``；
 * :class:`StepStatus` 恰好 10 态、:class:`WorkflowStatus` 恰好 8 态。
-
-兼容 Python 3.9+。
 """
 
 from __future__ import annotations

@@ -7,8 +7,6 @@
 * ``"pending"`` —— 待审批；
 * ``"approved"`` —— 已通过；
 * ``"rejected"`` —— 已拒绝。
-
-兼容 Python 3.9+。
 """
 
 from __future__ import annotations

@@ -9,8 +9,6 @@
 * ``correct`` 计量修正（原记录保留 + 新增 ``correction_of`` 记录，IVT-10）。
 * 追加式不可修改（重复 ``record_id`` 抛 ``ConflictError``）。
 * 多租户隔离。
-
-兼容 Python 3.9+。
 """
 
 from __future__ import annotations
@@ -24,7 +22,7 @@ from metering_basic_plugin import UsageRecord, UsageStore, UsageSummary
 
 @pytest.fixture(autouse=True)
 def _fresh_event_loop():
-    """为每个测试提供干净的 current event loop（兼容 3.9–3.12）。"""
+    """为每个测试提供干净的 current event loop。"""
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     try:

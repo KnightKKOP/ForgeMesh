@@ -7,8 +7,6 @@
 评估流水线：**授权 → 配额 → 高风险审批**，任一 deny 即 deny；
 全部通过返回 allow；条件授权/配额接近上限等降级类信息合并进
 obligations（不改变 allow 语义），高风险操作返回 require_approval。
-
-兼容 Python 3.9+。
 """
 from __future__ import annotations
 

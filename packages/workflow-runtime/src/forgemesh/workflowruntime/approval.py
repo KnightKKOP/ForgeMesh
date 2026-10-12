@@ -8,8 +8,6 @@
 * **ApprovalGate**：用 :class:`asyncio.Event` 管理审批等待，支持通过/拒绝/超时。
 * **CommitRevalidator**：审批通过后重校验输入/状态一致性，防止审批期间状态漂移
   导致盲目 commit（对齐 runtime.py docstring「commit 步骤重新校验」语义）。
-
-兼容 Python 3.9+。
 """
 
 from __future__ import annotations

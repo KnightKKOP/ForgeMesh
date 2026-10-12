@@ -3,8 +3,6 @@
 P1 简化：每个命令使用独立的内存 SQLite 库（``:memory:``），
 不跨命令持久化。后续阶段将切换为 HTTP 客户端模式，通过 ``--api-url``
 连接控制平面。
-
-兼容 Python 3.9+。
 """
 
 from __future__ import annotations

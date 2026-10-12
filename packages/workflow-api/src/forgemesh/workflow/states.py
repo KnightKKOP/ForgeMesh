@@ -9,8 +9,6 @@
 
 非法转移统一抛出 :class:`forgemesh.core.errors.InvalidStateTransition`。
 若核心包尚未安装，则回退到本模块内定义的同名兜底异常类，保证契约可独立加载。
-
-兼容 Python 3.9+。
 """
 
 from __future__ import annotations

@@ -14,8 +14,6 @@ Temporal/Cadence 等）都必须满足同一语义，业务模型不与之耦合
 * **审批**：等待人工或外部事件的运行进入 ``WAITING``，由外部信号唤醒。
 * **版本固定**：运行实例固定其 ``definition_version``，升级定义不影响既有实例。
 * **结果查询**：不确定状态下应先查询真实状态，不得盲目重试不可幂等操作。
-
-兼容 Python 3.9+。
 """
 
 from __future__ import annotations

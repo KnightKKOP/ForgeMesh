@@ -13,8 +13,6 @@ development-plan 5.9 / INV-4。
   :meth:`HeartbeatManager.list_online_agents` 仅返回 ``ONLINE`` 状态的 Agent，
   ``DEGRADED`` / ``OFFLINE`` 均不视为可用，避免将失联 Agent 的资源回收到
   调度池。
-
-兼容 Python 3.9+（运行环境 3.12，使用 :class:`enum.StrEnum`）。
 """
 
 from __future__ import annotations

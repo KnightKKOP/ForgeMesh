@@ -8,8 +8,6 @@ development-plan 5.6 与 architecture 7.5（degraded 降级放行已移除，
   （条件记入 obligations，不改变 allow 语义）。
 * :class:`QuotaRule` —— 配额规则，超限 deny、接近上限 allow + 告警约束。
 * :class:`RuleSet` —— 规则集合，组合授权与配额检查。
-
-兼容 Python 3.9+。
 """
 from __future__ import annotations
 

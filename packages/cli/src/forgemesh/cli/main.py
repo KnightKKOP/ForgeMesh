@@ -16,8 +16,6 @@
 
 P1 简化：CLI 直接调用 :class:`SQLiteRegistry`（内存库），不走 HTTP。
 后续阶段将切换为 HTTP 客户端模式。
-
-兼容 Python 3.9+。
 """
 
 from __future__ import annotations

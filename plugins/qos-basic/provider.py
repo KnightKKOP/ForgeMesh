@@ -11,8 +11,6 @@
   与 ``priority``；缺失字段使用合理默认，降低调用方耦合。
 * **优先级可移植**：:class:`QoSProviderResult.priority` 以字符串形式返回
   优先级名称（如 ``"NORMAL"``），避免跨进程传递枚举序列化问题。
-
-兼容 Python 3.9+。
 """
 
 from __future__ import annotations

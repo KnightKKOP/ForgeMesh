@@ -4,8 +4,6 @@
 同一 SQLite 事务中写入业务状态和事件记录，Dispatcher 异步发布。
 
 幂等保证：消费者按 event_id 去重，重复投递不产生重复副作用。
-
-兼容 Python 3.9+。
 """
 
 from __future__ import annotations

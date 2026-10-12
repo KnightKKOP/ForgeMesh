@@ -30,8 +30,6 @@
 2. 移除默认 release finalizer（``forgemesh.io/resource-release``）并 CAS 写回；
 3. finalizers 全部清空后：释放关联 Allocation（若存在 Active）→ 物理 DELETE
    → 记审计日志。
-
-兼容 Python 3.9+。
 """
 
 from __future__ import annotations

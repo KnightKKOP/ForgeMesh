@@ -15,8 +15,6 @@
 * **恢复**：``list_pending_runs`` 列出所有非终态运行，供进程重启后恢复。
 * **线程安全**：SQLite 以 ``check_same_thread=False`` 打开，所有异步方法通过
   :func:`asyncio.to_thread` 在独立线程执行同步 sqlite3 调用。
-
-兼容 Python 3.9+。
 """
 
 from __future__ import annotations

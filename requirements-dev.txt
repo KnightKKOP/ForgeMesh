@@ -7,6 +7,7 @@ pytest>=7
 pytest-cov
 ruff
 pydantic>=2,<3
+cryptography>=42
 jsonschema
 pyyaml
 fastapi

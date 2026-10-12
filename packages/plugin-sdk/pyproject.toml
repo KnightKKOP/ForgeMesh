@@ -10,6 +10,7 @@ requires-python = ">=3.12"
 dependencies = [
     "pydantic>=2,<3",
     "pyyaml>=6.0.1",
+    "cryptography>=42",
     "forgemesh-core",
 ]
 

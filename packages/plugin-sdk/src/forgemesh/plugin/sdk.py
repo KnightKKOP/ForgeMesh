@@ -8,9 +8,8 @@
 设计要点：
 
 * **数据类分离**：:class:`ValidationResult` / :class:`PluginArtifact` /
-  :class:`PublishResult` 为纯数据载体，与 :mod:`forgemesh.plugin.signing` 中
-  的同名签名制品类职责不同（本模块的 ``PluginArtifact`` 携带打包产物路径，
-  签名模块的携带内容字节与签名对象）。
+  :class:`PublishResult` 为纯数据载体；制品签名由 :mod:`forgemesh.plugin.signing`
+  负责，签名对象是打包产物的内容与清单。
 * **校验分层**：``validate_manifest`` 先做 Schema 校验（pydantic），再做语义
   检查（未声明权限/隔离等告警），``valid`` 仅在无 error 时为真。
 * **发布可模拟**：``publish`` 支持 ``memory://`` 协议用于本地/测试环境；
@@ -58,7 +57,7 @@ class ValidationResult:
 
 @dataclass
 class PluginArtifact:
-    """打包制品（携带产物路径，区别于签名模块的内容制品）。
+    """打包制品（携带产物路径）。
 
     Attributes:
         name: 制品名称（来自 manifest metadata.id）。

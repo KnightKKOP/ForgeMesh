@@ -3,7 +3,7 @@
 覆盖：
 
 * **核心 API 版本兼容**：PluginManifest apiVersion、PluginVersionCompat 语义版本兼容。
-* **签名验证（安全认证）**：PluginSigner 三重拒绝（未签名/摘要不符/签名不符）。
+* **签名验证（安全认证）**：PluginSigner 拒绝未签名、摘要不符、签名公钥不受信任的制品。
 * **隔离边界（安全认证）**：RESTRICTED_RPC 资源访问边界、UNTRUSTED 权限边界。
 * **升级安全（IVT-8）**：升级不静默改变既有工作流实例的执行定义。
 * **SDK 打包/发布兼容**：PluginSdk.pack/publish 端到端兼容性。
@@ -28,11 +28,22 @@ from forgemesh.plugin.isolation import (
 from forgemesh.plugin.manifest import PluginManifest, PluginMeta, PluginSpec
 from forgemesh.plugin.sdk import PluginArtifact as SdkArtifact
 from forgemesh.plugin.sdk import PluginSdk, PublishResult, ValidationResult
-from forgemesh.plugin.signing import PluginArtifact as SignedArtifact
-from forgemesh.plugin.signing import PluginSigner, SigningError
+from forgemesh.plugin.signing import (
+    PluginSigner,
+    SigningError,
+    generate_private_key,
+    load_trusted_keys,
+    public_key_pem,
+)
 
 #: 兼容性测试统一标记。
 _compat = pytest.mark.contract
+
+#: 签名测试使用的清单。
+_SIGNED_MANIFEST = PluginManifest(
+    metadata=PluginMeta(id="p", version="0.1.0"),
+    spec=PluginSpec(category="policy"),
+)
 
 
 # ===========================================================================
@@ -153,7 +164,7 @@ class TestPluginVersionCompat:
 
 
 class TestSigningSecurity:
-    """PluginSigner 安全认证：三重拒绝 + 正常验证通过。"""
+    """PluginSigner 安全认证：拒绝未签名、篡改与非受信任签名 + 正常验证通过。"""
 
     @_compat
     def test_compute_digest_format(self) -> None:
@@ -164,49 +175,41 @@ class TestSigningSecurity:
 
     @_compat
     def test_sign_and_verify_success(self) -> None:
-        """签名后用相同密钥验证应通过。"""
+        """签名后用对应的受信任公钥验证应通过。"""
         signer = PluginSigner()
-        key = b"secret-key"
+        key = generate_private_key()
         content = b"plugin content"
-        digest = PluginSigner.compute_digest(content)
-        artifact = SignedArtifact(name="p", version="0.1.0", digest=digest, content=content)
-        artifact.signature = signer.sign(artifact, key)
-        assert signer.verify(artifact, key) is True
+        signature = signer.sign(content, _SIGNED_MANIFEST, key)
+        trusted = load_trusted_keys([public_key_pem(key)])
+        assert signer.verify(content, _SIGNED_MANIFEST, signature, trusted) == signature.key_id
 
     @_compat
     def test_unsigned_rejected(self) -> None:
         """未签名制品应被拒绝。"""
         signer = PluginSigner()
-        artifact = SignedArtifact(name="p", version="0.1.0", digest="sha256:x")
         with pytest.raises(SigningError, match="unsigned"):
-            signer.verify(artifact, b"key")
+            signer.verify(b"plugin content", _SIGNED_MANIFEST, None, {})
 
     @_compat
     def test_digest_mismatch_rejected(self) -> None:
         """摘要不符应被拒绝。"""
         signer = PluginSigner()
-        key = b"secret-key"
-        content = b"plugin content"
-        digest = PluginSigner.compute_digest(content)
-        artifact = SignedArtifact(name="p", version="0.1.0", digest=digest, content=content)
-        artifact.signature = signer.sign(artifact, key)
+        key = generate_private_key()
+        signature = signer.sign(b"plugin content", _SIGNED_MANIFEST, key)
+        trusted = load_trusted_keys([public_key_pem(key)])
         # 篡改内容使摘要不匹配
-        artifact.content = b"tampered"
         with pytest.raises(SigningError, match="digest"):
-            signer.verify(artifact, key)
+            signer.verify(b"tampered", _SIGNED_MANIFEST, signature, trusted)
 
     @_compat
     def test_signature_mismatch_rejected(self) -> None:
-        """签名不符（密钥不同）应被拒绝。"""
+        """签名公钥不受信任（密钥不同）应被拒绝。"""
         signer = PluginSigner()
-        sign_key = b"sign-key"
-        verify_key = b"different-key"
         content = b"plugin content"
-        digest = PluginSigner.compute_digest(content)
-        artifact = SignedArtifact(name="p", version="0.1.0", digest=digest, content=content)
-        artifact.signature = signer.sign(artifact, sign_key)
-        with pytest.raises(SigningError, match="signature"):
-            signer.verify(artifact, verify_key)
+        signature = signer.sign(content, _SIGNED_MANIFEST, generate_private_key())
+        trusted = load_trusted_keys([public_key_pem(generate_private_key())])
+        with pytest.raises(SigningError, match="not trusted"):
+            signer.verify(content, _SIGNED_MANIFEST, signature, trusted)
 
     @_compat
     def test_digest_deterministic(self) -> None:
@@ -217,15 +220,12 @@ class TestSigningSecurity:
 
     @_compat
     def test_signer_fingerprint_stable(self) -> None:
-        """相同密钥应产生相同 signer 指纹。"""
+        """相同密钥应产生相同 key id。"""
         signer = PluginSigner()
-        key = b"secret-key"
-        digest = PluginSigner.compute_digest(b"content")
-        art1 = SignedArtifact(name="p", version="0.1.0", digest=digest)
-        art2 = SignedArtifact(name="p", version="0.1.0", digest=digest)
-        sig1 = signer.sign(art1, key)
-        sig2 = signer.sign(art2, key)
-        assert sig1.signer == sig2.signer
+        key = generate_private_key()
+        sig1 = signer.sign(b"content", _SIGNED_MANIFEST, key)
+        sig2 = signer.sign(b"other content", _SIGNED_MANIFEST, key)
+        assert sig1.key_id == sig2.key_id
 
 
 # ===========================================================================

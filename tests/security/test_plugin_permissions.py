@@ -22,30 +22,22 @@ from forgemesh.plugin.isolation import (
     PluginVersionCompat,
     TrustLevel,
 )
+from forgemesh.plugin.manifest import PluginManifest, PluginMeta, PluginSpec
 from forgemesh.plugin.signing import (
-    PluginArtifact,
-    PluginSignature,
     PluginSigner,
     SigningError,
+    generate_private_key,
+    load_trusted_keys,
+    public_key_pem,
 )
 
 _SIGNER = PluginSigner()
-_KEY = b"test-secret-key-for-security-tests"
-
-
-def _make_artifact(
-    content: bytes = b"plugin payload",
-    digest: str | None = None,
-    signature: PluginSignature | None = None,
-) -> PluginArtifact:
-    """构造测试用制品。"""
-    return PluginArtifact(
-        name="forgemesh.plugin.example",
-        version="1.0.0",
-        digest=digest if digest is not None else PluginSigner.compute_digest(content),
-        signature=signature,
-        content=content,
-    )
+_PRIVATE_KEY = generate_private_key()
+_TRUSTED = load_trusted_keys([public_key_pem(_PRIVATE_KEY)])
+_MANIFEST = PluginManifest(
+    metadata=PluginMeta(id="forgemesh.plugin.example", version="1.0.0"),
+    spec=PluginSpec(category="policy"),
+)
 
 
 # --------------------------------------------------------------------------- #
@@ -126,10 +118,8 @@ def test_restricted_rpc_no_direct_db() -> None:
 @pytest.mark.unit
 def test_unsigned_plugin_rejected() -> None:
     """未签名插件被拒绝加载：verify 抛 SigningError("unsigned plugin rejected")。"""
-    artifact = _make_artifact(signature=None)
-
     with pytest.raises(SigningError, match="unsigned plugin rejected"):
-        _SIGNER.verify(artifact, _KEY)
+        _SIGNER.verify(b"plugin payload", _MANIFEST, None, _TRUSTED)
 
 
 # --------------------------------------------------------------------------- #
@@ -139,13 +129,11 @@ def test_unsigned_plugin_rejected() -> None:
 
 @pytest.mark.unit
 def test_digest_mismatch_rejected() -> None:
-    """摘要不符的插件被拒绝加载：verify 抛 SigningError("digest mismatch")。"""
-    # 构造一个摘要与内容不符的制品
-    artifact = _make_artifact(digest="sha256:deadbeef00000000")
-    artifact.signature = _SIGNER.sign(artifact, _KEY)
+    """签名后被篡改的制品被拒绝加载：verify 从内容重算摘要，抛 SigningError。"""
+    signature = _SIGNER.sign(b"plugin payload", _MANIFEST, _PRIVATE_KEY)
 
-    with pytest.raises(SigningError, match="digest mismatch"):
-        _SIGNER.verify(artifact, _KEY)
+    with pytest.raises(SigningError, match="artifact digest mismatch"):
+        _SIGNER.verify(b"tampered payload", _MANIFEST, signature, _TRUSTED)
 
 
 # --------------------------------------------------------------------------- #

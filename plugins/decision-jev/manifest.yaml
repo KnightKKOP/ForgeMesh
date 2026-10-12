@@ -16,7 +16,7 @@ spec:
   permissions:
     - resource.read
     - decision.evaluate
-  isolation: restricted-rpc
+  isolation: in-process
   entrypoint: "provider:JEVProvider"
   healthCheck:
     mode: rpc

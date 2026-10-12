@@ -17,7 +17,7 @@ spec:
   permissions:
     - device.read
     - device.partition
-  isolation: restricted-rpc
+  isolation: in-process
   entrypoint: "discovery:GPUDiscoverer"
   healthCheck:
     mode: rpc

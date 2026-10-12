@@ -17,7 +17,7 @@ spec:
     - resource.read
     - decision.evaluate
     - network.egress
-  isolation: restricted-rpc
+  isolation: in-process
   entrypoint: "provider:TypeSafeJevProvider"
   healthCheck:
     mode: http

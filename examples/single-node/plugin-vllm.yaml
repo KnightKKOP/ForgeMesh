@@ -20,7 +20,7 @@ spec:
     - resource.read
     - inference.deploy
     - inference.inspect
-  isolation: restricted-rpc        # 按信任级别隔离（ADR-006）
+  isolation: in-process            # 插件在宿主进程内运行，目前没有进程隔离
   entrypoint: "deploy:VLLMDeployer"
   artifactDigest: sha256:ab12...
   signature: cosign:...

@@ -88,8 +88,8 @@
         },
         "isolation": {
           "type": "string",
-          "enum": ["in-process", "restricted-rpc", "sandbox"],
-          "description": "隔离级别（ADR-006）。"
+          "enum": ["in-process"],
+          "description": "隔离级别。插件都在宿主进程内运行，目前只能声明 in-process；restricted-rpc / sandbox 需要真实的进程边界（ADR-006），实现之前不得声明。"
         },
         "entrypoint": {
           "type": "string",

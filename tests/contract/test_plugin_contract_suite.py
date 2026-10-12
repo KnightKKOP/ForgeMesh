@@ -67,7 +67,7 @@ def _make_manifest(**spec_overrides: Any) -> PluginManifest:
         "compatibility": {"coreApi": "v1alpha1"},
         "provides": ["test-plugin"],
         "permissions": ["metering.read"],
-        "isolation": "restricted-rpc",
+        "isolation": "in-process",
         "entrypoint": "provider:TestPlugin",
     }
     spec_fields.update(spec_overrides)
@@ -136,6 +136,13 @@ class TestPluginManifestSchema:
         manifest = PluginManifest.model_validate(raw)
         assert manifest.metadata.version == "1.0.0"
         assert manifest.spec.isolation == "in-process"
+
+    @pytest.mark.contract
+    @pytest.mark.parametrize("isolation", ["restricted-rpc", "sandbox"])
+    def test_unimplemented_isolation_rejected(self, isolation: str) -> None:
+        """宿主没有进程边界，清单不得声明 restricted-rpc / sandbox。"""
+        with pytest.raises(ValidationError, match="declare 'in-process'"):
+            _make_manifest(isolation=isolation)
 
 
 # ===========================================================================

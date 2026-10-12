@@ -17,7 +17,7 @@ spec:
     - resource.read
     - inference.deploy
     - inference.inspect
-  isolation: restricted-rpc
+  isolation: in-process
   entrypoint: "deploy:VLLMDeployer"
   healthCheck:
     mode: rpc

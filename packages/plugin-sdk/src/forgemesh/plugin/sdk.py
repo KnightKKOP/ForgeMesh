@@ -177,7 +177,7 @@ class PluginSdk:
         if not spec.permissions:
             warnings.append("spec.permissions is empty; plugin will run with no capabilities")
         if spec.isolation is None:
-            warnings.append("spec.isolation is unset; installer will default to restricted-rpc")
+            warnings.append("spec.isolation is unset; the plugin runs in-process")
         if spec.entrypoint is None:
             warnings.append("spec.entrypoint is unset; the plugin cannot be loaded")
         if not spec.compatibility:

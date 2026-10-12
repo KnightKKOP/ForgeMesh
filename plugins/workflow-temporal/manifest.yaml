@@ -21,7 +21,7 @@ spec:
   permissions:
     - resource.read
     - workflow.execute
-  isolation: restricted-rpc
+  isolation: in-process
   entrypoint: "provider:TemporalWorkflowProvider"
   healthCheck:
     mode: rpc

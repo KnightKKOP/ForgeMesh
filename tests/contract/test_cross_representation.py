@@ -25,7 +25,7 @@ import yaml
 from forgemesh.core.errors import ForgeMeshError, GovernanceBypassError
 from forgemesh.core.objects import ObjectMeta
 from forgemesh.decision.provider import DecisionRequest
-from forgemesh.plugin.manifest import ENTRYPOINT_PATTERN, PluginSpec
+from forgemesh.plugin.manifest import ENTRYPOINT_PATTERN, SUPPORTED_ISOLATION, PluginSpec
 from forgemesh.plugin.permissions import Permission
 from forgemesh.policy.api import PolicyDecision
 from forgemesh.resource.inference import (
@@ -146,13 +146,13 @@ def test_plugin_spec_supply_chain_fields() -> None:
     """PluginSpec：供应链安全字段（isolation/entrypoint/artifactDigest/signature）一致。"""
     spec = PluginSpec(
         category="provider",
-        isolation="sandbox",
+        isolation="in-process",
         entrypoint="provider:Main",
         artifactDigest="sha256:abc",
         signature="cosign:xyz",
     )
     dumped = spec.model_dump(by_alias=True)
-    assert dumped["isolation"] == "sandbox"
+    assert dumped["isolation"] == "in-process"
     assert dumped["entrypoint"] == "provider:Main"
     assert dumped["artifactDigest"] == "sha256:abc"
     assert dumped["signature"] == "cosign:xyz"
@@ -219,6 +219,22 @@ def test_plugin_permissions_rejected_by_model_and_schema(permissions: list[str])
     assert all("permissions" in error.absolute_path for error in errors)
     with pytest.raises(ValidationError, match="permissions"):
         PluginSpec.model_validate(manifest["spec"])
+
+
+@pytest.mark.contract
+def test_plugin_isolation_schema_matches_model() -> None:
+    """Schema 的隔离级别枚举与模型一致：只允许 in-process。"""
+    schema = _load_json(SCHEMAS_DIR / "plugin-manifest.schema.json")
+    isolation = schema["properties"]["spec"]["properties"]["isolation"]
+    assert isolation["enum"] == list(SUPPORTED_ISOLATION) == ["in-process"]
+
+    validator = Draft202012Validator(schema)
+    for value in ("restricted-rpc", "sandbox"):
+        manifest = _plugin_manifest_with_permissions(["resource.read"])
+        manifest["spec"]["isolation"] = value
+        assert list(validator.iter_errors(manifest))
+        with pytest.raises(ValidationError, match="isolation"):
+            PluginSpec.model_validate(manifest["spec"])
 
 
 @pytest.mark.contract

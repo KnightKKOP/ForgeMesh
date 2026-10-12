@@ -97,7 +97,7 @@ spec:
     - {{ name }}
   requires: []
   permissions: []
-  isolation: restricted-rpc
+  isolation: in-process
   entrypoint: "provider:{{ class_name }}"
 """
 

@@ -7,6 +7,7 @@
   network.egress/filesystem.access/database.access）；
 * validate_manifest（UNTRUSTED 不允许 database.access/platform.admin）；
 * 权限名与清单共用 Permission 词表，未知名称报错；
+* 清单 isolation 只能声明 in-process（没有进程边界），仓库内清单均如实声明；
 * PluginVersionCompat.is_compatible（兼容/不兼容）；
 * check_upgrade（非破坏性/破坏性升级）；
 * IVT-8：升级后既有实例按原版本执行。
@@ -14,7 +15,10 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
+import yaml
 from forgemesh.plugin.isolation import (
     IsolationError,
     IsolationGuard,
@@ -24,7 +28,15 @@ from forgemesh.plugin.isolation import (
     TrustLevel,
     UpgradeCheck,
 )
+from forgemesh.plugin.manifest import PluginSpec
 from forgemesh.plugin.permissions import Permission
+from pydantic import ValidationError
+
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+_SHIPPED_MANIFESTS = [
+    *sorted(_REPO_ROOT.glob("plugins/*/manifest.yaml")),
+    _REPO_ROOT / "examples" / "single-node" / "plugin-vllm.yaml",
+]
 
 
 class TestEnums:
@@ -157,6 +169,36 @@ class TestValidateManifest:
 
         with pytest.raises(IsolationError, match="unknown permission 'admin'"):
             guard.validate_manifest(TrustLevel.TRUSTED, ["resource.read", "admin"])
+
+
+class TestManifestIsolationDeclaration:
+    """清单 ``spec.isolation``：没有进程边界，只能如实声明 in-process。"""
+
+    @pytest.mark.parametrize("isolation", ["in-process", None])
+    def test_in_process_or_unset_accepted(self, isolation: str | None) -> None:
+        assert PluginSpec(category="policy", isolation=isolation).isolation == isolation
+
+    @pytest.mark.parametrize("isolation", ["restricted-rpc", "sandbox", "RESTRICTED_RPC", ""])
+    def test_other_isolation_rejected(self, isolation: str) -> None:
+        with pytest.raises(ValidationError, match="without a process boundary"):
+            PluginSpec(category="policy", isolation=isolation)
+
+    @pytest.mark.parametrize(
+        "path", _SHIPPED_MANIFESTS, ids=lambda p: str(p.relative_to(_REPO_ROOT))
+    )
+    def test_shipped_manifests_declare_in_process(self, path: Path) -> None:
+        spec = yaml.safe_load(path.read_text(encoding="utf-8"))["spec"]
+
+        assert spec["isolation"] == "in-process"
+
+    def test_typesafe_jev_declares_direct_network_egress(self) -> None:
+        """typesafe-jev 在进程内直接用 urllib 访问外部 API，须如实申请 network.egress。"""
+        plugin = _REPO_ROOT / "plugins" / "decision-typesafe-jev"
+        spec = yaml.safe_load((plugin / "manifest.yaml").read_text(encoding="utf-8"))["spec"]
+
+        assert "urllib.request.urlopen" in (plugin / "provider.py").read_text(encoding="utf-8")
+        assert spec["isolation"] == "in-process"
+        assert "network.egress" in spec["permissions"]
 
 
 class TestIsCompatible:

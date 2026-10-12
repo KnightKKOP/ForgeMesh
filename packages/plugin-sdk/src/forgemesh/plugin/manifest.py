@@ -8,7 +8,9 @@
 * **权限申请**：``permissions`` 是插件申请的权限，取值限于
   :class:`~forgemesh.plugin.permissions.Permission` 词表且不得重复；清单不能给自己授权，
   实际授予由管理员决定。
-* **隔离分级**：隔离模式按信任级别由安装器裁决（ADR-006），Manifest 可声明。
+* **隔离**：插件都在宿主进程内运行，``isolation`` 只能声明 ``in-process``（未设置同样按
+  进程内运行）；``restricted-rpc`` / ``sandbox`` 需要真实的进程边界（ADR-006），实现之前
+  清单不得声明。
 * **入口点**：``entrypoint`` 形如 ``<模块>:<类>``，模块路径相对于插件包（插件目录须含
   ``__init__.py``），由 :func:`forgemesh.plugin.loader.load_entrypoint` 加载。
 * **供应链**：``artifact_digest`` / ``signature`` 支持制品摘要与签名校验。
@@ -94,6 +96,9 @@ PLUGIN_TRANSITIONS: dict[PluginLifecycleState, set[PluginLifecycleState]] = {
 #: ``api/schemas/plugin-manifest.schema.json`` 使用同一正则。
 ENTRYPOINT_PATTERN = r"^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)*:[A-Za-z_][A-Za-z0-9_]*$"
 
+#: 清单可声明的隔离级别。宿主没有为插件建立任何进程边界，所以只有 ``in-process`` 名副其实。
+SUPPORTED_ISOLATION: tuple[str, ...] = ("in-process",)
+
 
 class PluginMeta(BaseModel):
     """插件元数据。
@@ -116,7 +121,7 @@ class PluginSpec(BaseModel):
         provides: 提供的能力标识。
         requires: 依赖的能力标识。
         permissions: 申请的权限（:class:`Permission` 词表，不得重复）；实际授予由管理员决定。
-        isolation: 隔离级别（in-process/restricted-rpc/sandbox，ADR-006）。
+        isolation: 隔离级别，目前只能是 ``in-process``（未设置同样按进程内运行）。
         entrypoint: 入口点 ``<模块>:<类>``（如 ``provider:RulesProvider``），模块路径相对于
             插件包。
         artifactDigest: 制品摘要（如 sha256:...），供应链安全。
@@ -133,7 +138,7 @@ class PluginSpec(BaseModel):
     provides: list[str] = Field(default_factory=list)
     requires: list[str] = Field(default_factory=list)
     permissions: list[Permission] = Field(default_factory=list)
-    isolation: str | None = Field(default=None, description="隔离级别（in-process/restricted-rpc/sandbox，ADR-006）")
+    isolation: str | None = Field(default=None, description="隔离级别，目前只能是 in-process")
     entrypoint: str | None = Field(
         default=None, description="入口点 <模块>:<类>，模块路径相对于插件包"
     )
@@ -148,6 +153,16 @@ class PluginSpec(BaseModel):
         duplicates = sorted({p.value for p in value if value.count(p) > 1})
         if duplicates:
             raise ValueError(f"duplicate permissions: {duplicates}")
+        return value
+
+    @field_validator("isolation")
+    @classmethod
+    def _supported_isolation(cls, value: str | None) -> str | None:
+        if value is not None and value not in SUPPORTED_ISOLATION:
+            raise ValueError(
+                f"isolation {value!r} is not supported: plugins run inside the host process "
+                "without a process boundary, declare 'in-process'"
+            )
         return value
 
     @field_validator("entrypoint")
@@ -217,5 +232,6 @@ __all__ = [
     "PluginManifest",
     "PluginLifecycleState",
     "PLUGIN_TRANSITIONS",
+    "SUPPORTED_ISOLATION",
     "validate_plugin_transition",
 ]

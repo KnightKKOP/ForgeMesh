@@ -43,6 +43,7 @@ from forgemesh.core.errors import (
     InvalidStateTransition,
     NotFoundError,
 )
+from forgemesh.plugin.loader import load_entrypoint
 from forgemesh.plugin.manifest import (
     PluginLifecycleState,
     PluginManifest,
@@ -74,8 +75,8 @@ ALL_PLUGIN_DIRS: list[str] = [
     "metering-basic",
 ]
 
-#: manifest 允许的隔离级别枚举（对齐 schema enum 与 ADR-006）。
-_ALLOWED_ISOLATION = {"in-process", "restricted-rpc", "sandbox"}
+#: manifest 允许的隔离级别（对齐 schema enum）：插件都在宿主进程内运行，没有进程边界。
+_ALLOWED_ISOLATION = {"in-process"}
 
 #: 插件可申请的权限词表。
 _PERMISSION_VOCABULARY = {p.value for p in Permission}
@@ -192,7 +193,7 @@ class TestManifestAndIsolationConformance:
     def test_isolation_declaration_within_allowed_enum(
         self, plugin_dir: str
     ) -> None:
-        """isolation 声明值须落在允许枚举 {in-process, restricted-rpc, sandbox} 内。"""
+        """isolation 只能声明 in-process（restricted-rpc / sandbox 尚无进程边界实现）。"""
         isolation = _load_manifest_dict(plugin_dir)["spec"]["isolation"]
         assert isolation in _ALLOWED_ISOLATION, (
             f"{plugin_dir}: 非法 isolation 声明 {isolation!r}"
@@ -204,35 +205,12 @@ class TestManifestAndIsolationConformance:
         [pytest.param(p, id=p) for p in ALL_PLUGIN_DIRS],
     )
     def test_isolation_matches_directory_shape(self, plugin_dir: str) -> None:
-        """isolation 声明须与目录形态一致。
+        """声明 ``in-process`` 的插件须能在进程内按清单入口点加载。"""
+        spec = _load_manifest_dict(plugin_dir)["spec"]
+        assert spec["isolation"] == "in-process"
 
-        * 声明 ``in-process``：目录须有可加载入口（provider.py 或
-          ``__init__.py``），且进程内实际加载成功；
-        * 声明 ``restricted-rpc`` / ``sandbox``：允许仅有清单（不强求沙箱
-          运行时存在），枚举合法性由前一用例保证。
-        """
-        manifest = _load_manifest_dict(plugin_dir)
-        isolation = manifest["spec"]["isolation"]
-        plugin_path = _PLUGINS_ROOT / plugin_dir
-
-        if isolation == "in-process":
-            has_entry = (plugin_path / "provider.py").is_file() or (
-                plugin_path / "__init__.py"
-            ).is_file()
-            assert has_entry, (
-                f"{plugin_dir} 声明 in-process 但缺少可加载入口"
-                "（provider.py 或 __init__.py）"
-            )
-            # 进程内加载须成功（幂等注册到 sys.modules）。
-            if (plugin_path / "provider.py").is_file():
-                _ensure_plugin_module(
-                    f"_conformance_{plugin_dir.replace('-', '_')}", plugin_dir
-                )
-            else:
-                _ensure_plugin_package(
-                    f"_conformance_{plugin_dir.replace('-', '_')}", plugin_dir
-                )
-        # restricted-rpc / sandbox：不强制沙箱运行时存在，无需目录形态断言。
+        entry = load_entrypoint(_PLUGINS_ROOT / plugin_dir, spec["entrypoint"])
+        assert entry.__name__ == spec["entrypoint"].split(":")[1]
 
     @_compat
     @pytest.mark.parametrize(

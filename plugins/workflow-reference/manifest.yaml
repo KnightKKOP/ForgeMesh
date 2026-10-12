@@ -17,7 +17,7 @@ spec:
     - resource.read
     - resource.write
     - workflow.execute
-  isolation: restricted-rpc
+  isolation: in-process
   entrypoint: "provider:ReferenceWorkflowRuntime"
   healthCheck:
     mode: rpc

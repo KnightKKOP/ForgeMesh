@@ -16,7 +16,7 @@ spec:
   permissions:
     - metering.read
     - event.subscribe
-  isolation: restricted-rpc
+  isolation: in-process
   entrypoint: "provider:MeteringProvider"
   healthCheck:
     mode: rpc

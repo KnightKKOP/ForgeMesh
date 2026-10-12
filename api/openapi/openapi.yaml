@@ -170,7 +170,7 @@ paths:
         "202":
           description: >
             已受理删除（异步）——资源持有 finalizer（有外部副作用或持有加速器
-            分配时自动追加），置为 Terminating，由协调器驱动「受控释放 GPU →
+            分配时自动追加），置为 Terminating，由协调器驱动「取消部署、停止推理实例 →
             清空 finalizer → 释放分配 → 物理删除」闭环（development-plan 第 7 章）。
           content:
             application/json:

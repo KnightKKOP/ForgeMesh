@@ -3,6 +3,8 @@
 * :mod:`.launcher` —— 启动器契约 :class:`RuntimeLauncher` 及其请求 / 结果模型；
 * :mod:`.workflow` —— 部署工作流定义、幂等键与步骤 handler :class:`DeploymentSteps`；
 * :mod:`.release` —— 删除资源时取消部署、停止实例的 :class:`DeploymentReleaser`；
+* :mod:`.recovery` —— 重启之后把实例已不在运行的 ``Ready`` 服务转为 ``Degraded`` 的
+  :func:`mark_lost_instances`；
 * :mod:`.memory` —— 测试替身 :class:`InMemoryLauncher`。
 
 本包只依赖工作流契约（``forgemesh-workflow-api``），不依赖具体的工作流运行时。
@@ -12,6 +14,7 @@ from __future__ import annotations
 
 from .launcher import LaunchedInstance, LaunchRequest, RuntimeLauncher
 from .memory import InMemoryLauncher
+from .recovery import INSTANCE_LOST_REASON, mark_lost_instances
 from .release import DeploymentReleaser
 from .workflow import (
     DEPLOYMENT_WORKFLOW,
@@ -28,6 +31,7 @@ from .workflow import (
 
 __all__ = [
     "DEPLOYMENT_WORKFLOW",
+    "INSTANCE_LOST_REASON",
     "LAUNCH_INSTANCE",
     "PREPARE_MODEL",
     "VERIFY_INSTANCE",
@@ -42,4 +46,5 @@ __all__ = [
     "deployment_run_key",
     "deployment_workflow",
     "launched_instance",
+    "mark_lost_instances",
 ]

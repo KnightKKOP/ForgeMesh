@@ -1,6 +1,7 @@
 # ForgeMesh PluginManifest 示例（vLLM 运行时）
 # 契约：api/schemas/plugin-manifest.schema.json
 # 对齐 docs/architecture/development-plan.md 6.3 与 architecture 8.2。
+# 签名不写进清单：python -m forgemesh.plugin.signtool sign 生成随制品分发的签名文档。
 apiVersion: forgemesh.io/v1alpha1
 kind: PluginManifest
 metadata:
@@ -22,8 +23,6 @@ spec:
     - inference.inspect
   isolation: in-process            # 插件在宿主进程内运行，目前没有进程隔离
   entrypoint: "deploy:VLLMDeployer"
-  artifactDigest: sha256:ab12...
-  signature: cosign:...
   configuration:
     schema: ./config.schema.json
   healthCheck:

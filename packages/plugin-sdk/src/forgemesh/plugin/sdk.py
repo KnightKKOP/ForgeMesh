@@ -180,6 +180,12 @@ class PluginSdk:
             warnings.append("spec.isolation is unset; the plugin runs in-process")
         if spec.entrypoint is None:
             warnings.append("spec.entrypoint is unset; the plugin cannot be loaded")
+        if spec.artifactDigest is not None or spec.signature is not None:
+            warnings.append(
+                "spec.artifactDigest / spec.signature are deprecated, never verified and will "
+                "be removed in 2.0.0; sign the artifact with python -m forgemesh.plugin.signtool "
+                "instead (see docs/plugin-development/guide.md)"
+            )
         if not spec.compatibility:
             warnings.append("spec.compatibility is empty; core API version pinning recommended")
 

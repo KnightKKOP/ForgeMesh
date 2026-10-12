@@ -198,6 +198,20 @@ def test_default_policy_trusts_no_key() -> None:
 
 
 @pytest.mark.unit
+def test_inline_manifest_signature_fields_are_ignored() -> None:
+    """清单内已弃用的 artifactDigest / signature 代替不了签名文档，注册时也不比对。"""
+    mgr = _manager()
+    manifest = _make_manifest()
+    manifest.spec.artifactDigest = PluginSigner.compute_digest(_artifact(manifest))
+    manifest.spec.signature = "cosign:xyz"
+    with pytest.raises(PluginRejectedError, match="unsigned"):
+        mgr.register(manifest, artifact=_artifact(manifest))
+    manifest.spec.artifactDigest = "sha256:" + "0" * 64
+    record = mgr.get(_register(mgr, manifest))
+    assert record.artifact_digest == PluginSigner.compute_digest(_artifact(manifest))
+
+
+@pytest.mark.unit
 def test_dev_mode_registers_unsigned_plugins(caplog: pytest.LogCaptureFixture) -> None:
     """开发模式下未签名的插件可以注册，开启开发模式和每次注册都会记录告警。"""
     with caplog.at_level(logging.WARNING, logger="forgemesh.controlplane.plugin_manager"):

@@ -186,6 +186,22 @@ def test_plugin_manifest_schema_has_supply_chain_fields() -> None:
 
 
 @pytest.mark.contract
+@pytest.mark.parametrize("field", ["artifactDigest", "signature"])
+def test_plugin_inline_signature_fields_deprecated(field: str) -> None:
+    """清单内的 artifactDigest / signature 不参与校验。
+
+    Schema 标为弃用，Schema 与模型的描述都写明计划移除版本。
+    """
+    schema = _load_json(SCHEMAS_DIR / "plugin-manifest.schema.json")
+    prop = schema["properties"]["spec"]["properties"][field]
+    assert prop["deprecated"] is True
+    assert "2.0.0" in prop["description"]
+    description = PluginSpec.model_fields[field].description
+    assert description.startswith("已弃用")
+    assert "2.0.0" in description
+
+
+@pytest.mark.contract
 def test_plugin_permissions_schema_matches_vocabulary() -> None:
     """Schema 的权限枚举与 Permission 词表逐项一致，且不允许重复。"""
     schema = _load_json(SCHEMAS_DIR / "plugin-manifest.schema.json")

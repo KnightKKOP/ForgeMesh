@@ -98,11 +98,13 @@
         },
         "artifactDigest": {
           "type": "string",
-          "description": "制品摘要，如 sha256:...（供应链安全）。"
+          "deprecated": true,
+          "description": "已弃用，不参与任何校验，计划在 2.0.0 移除。制品摘要记录在随制品分发的独立签名文档中（python -m forgemesh.plugin.signtool sign），注册时由插件管理器校验。"
         },
         "signature": {
           "type": "string",
-          "description": "制品签名，如 cosign:...（供应链安全）。"
+          "deprecated": true,
+          "description": "已弃用，不参与任何校验，计划在 2.0.0 移除。签名是随制品分发的独立签名文档（python -m forgemesh.plugin.signtool sign），注册时由插件管理器校验。"
         },
         "configuration": {
           "type": "object",

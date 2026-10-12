@@ -13,7 +13,9 @@
   清单不得声明。
 * **入口点**：``entrypoint`` 形如 ``<模块>:<类>``，模块路径相对于插件包（插件目录须含
   ``__init__.py``），由 :func:`forgemesh.plugin.loader.load_entrypoint` 加载。
-* **供应链**：``artifact_digest`` / ``signature`` 支持制品摘要与签名校验。
+* **供应链**：签名是随制品分发的独立文档（:mod:`forgemesh.plugin.signing`），由插件管理器
+  在注册时校验；清单中的 ``artifactDigest`` / ``signature`` 字段已弃用，不参与任何校验，
+  计划在 2.0.0 移除。
 
 非法生命周期转移抛出 :class:`forgemesh.core.errors.InvalidStateTransition`；
 若核心包未就绪，则回退到本地同名兜底异常类。
@@ -124,11 +126,16 @@ class PluginSpec(BaseModel):
         isolation: 隔离级别，目前只能是 ``in-process``（未设置同样按进程内运行）。
         entrypoint: 入口点 ``<模块>:<类>``（如 ``provider:RulesProvider``），模块路径相对于
             插件包。
-        artifactDigest: 制品摘要（如 sha256:...），供应链安全。
-        signature: 制品签名（如 cosign:...），供应链安全。
+        artifactDigest: 已弃用，不参与任何校验（见下方弃用说明）。
+        signature: 已弃用，不参与任何校验（见下方弃用说明）。
         configuration: 配置 schema 引用/默认值。
         healthCheck: 健康检查配置（如 ``{"mode": "rpc", "timeoutMs": 2000}``，
             值可为字符串或整数等混合类型）。
+
+    .. deprecated:: 1.1.0
+       ``artifactDigest`` / ``signature`` 不参与任何校验，计划在 2.0.0 移除。制品摘要与签名
+       记录在随制品分发的独立签名文档中（:mod:`forgemesh.plugin.signing`），用
+       ``python -m forgemesh.plugin.signtool sign`` 生成。
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -142,8 +149,12 @@ class PluginSpec(BaseModel):
     entrypoint: str | None = Field(
         default=None, description="入口点 <模块>:<类>，模块路径相对于插件包"
     )
-    artifactDigest: str | None = Field(default=None, description="制品摘要（如 sha256:...），供应链安全")
-    signature: str | None = Field(default=None, description="制品签名（如 cosign:...），供应链安全")
+    artifactDigest: str | None = Field(
+        default=None, description="已弃用，不参与任何校验，计划在 2.0.0 移除"
+    )
+    signature: str | None = Field(
+        default=None, description="已弃用，不参与任何校验，计划在 2.0.0 移除"
+    )
     configuration: dict[str, Any] = Field(default_factory=dict)
     healthCheck: dict[str, Any] = Field(default_factory=dict)
 

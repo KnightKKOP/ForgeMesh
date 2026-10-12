@@ -17,6 +17,7 @@ import hashlib
 from pathlib import Path
 
 import pytest
+import yaml
 from forgemesh.plugin.isolation import (
     IsolationError,
     IsolationGuard,
@@ -362,6 +363,24 @@ class TestSdkPackPublishCompat:
         assert isinstance(result, ValidationResult)
         assert result.valid is True
         assert result.errors == []
+
+    @_compat
+    def test_validate_manifest_warns_about_inline_signature(self, tmp_path: Path) -> None:
+        """清单仍写 artifactDigest / signature 时给出弃用告警：两个字段都不参与任何校验。"""
+        sdk = PluginSdk()
+        plugin_dir = sdk.generate_scaffold("legacy-plugin", "decision", tmp_path)
+        manifest_path = plugin_dir / "manifest.yaml"
+        assert not [w for w in sdk.validate_manifest(manifest_path).warnings if "deprecated" in w]
+
+        data = yaml.safe_load(manifest_path.read_text(encoding="utf-8"))
+        data["spec"].update(artifactDigest="sha256:ab12", signature="cosign:xyz")
+        manifest_path.write_text(yaml.safe_dump(data), encoding="utf-8")
+        result = sdk.validate_manifest(manifest_path)
+        assert result.valid is True
+        deprecated = [w for w in result.warnings if "deprecated" in w]
+        assert len(deprecated) == 1
+        assert "forgemesh.plugin.signtool" in deprecated[0]
+        assert "2.0.0" in deprecated[0]
 
     @_compat
     def test_validate_manifest_missing_file(self, tmp_path: Path) -> None:

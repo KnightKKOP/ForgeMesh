@@ -8,6 +8,8 @@
 // 设计要点：
 //   - 内存缓存：service→(endpoints, expiry)，TTL 内复用，减少控制平面压力；
 //     缓存 key 含租户 ID 与命名空间，保证多租户、多命名空间的同名服务互相隔离。
+//   - 合并回源：同一个 key 的并发未命中共用一次控制平面查询，缓存过期的瞬间
+//     突发请求不会同时打到控制平面；"服务不存在 / 未就绪 / 无可用实例"缓存 1 秒。
 //   - 只返回 ready 且协议已知的实例；协议决定实例上的推理路径（见 Protocol.Path）。
 //   - 健康摘流：每个 endpoint 维护连续失败计数，达到阈值（3 次）即标记
 //     unhealthy 进入冷却期；冷却结束后按 half-open 语义重新放行（计数清零，
@@ -57,6 +59,9 @@ const (
 	defaultFailureThreshold = 3
 	// resolveHTTPTimeout 是查询控制平面的单次 HTTP 超时。
 	resolveHTTPTimeout = 5 * time.Second
+	// negativeCacheTTL 是否定结果的缓存时长：吸收同一时刻的重试，又不让刚就绪的
+	// 服务长时间不可用。
+	negativeCacheTTL = time.Second
 	// maxResolveBodySize 限制控制平面响应体读取量，防御异常大响应。
 	maxResolveBodySize = 1 << 20 // 1 MiB
 )
@@ -131,10 +136,20 @@ func WithAuthorization(ctx context.Context, value string) context.Context {
 	return context.WithValue(ctx, authorizationKey{}, value)
 }
 
-// cacheEntry 是服务级缓存条目。
+// cacheEntry 是服务级缓存条目；err 非空时缓存的是否定结果（见 isCacheableMiss）。
 type cacheEntry struct {
 	endpoints []Endpoint
+	err       error
 	expiry    time.Time
+}
+
+// lookup 是一次进行中的控制平面查询，同一个缓存 key 的并发未命中共用它；
+// done 关闭之后 endpoints / err 只读。查询使用发起者的凭证，等待者共用结果与共用
+// 缓存的语义相同：网关已对每个调用方校验过凭证、租户与 read scope。
+type lookup struct {
+	done      chan struct{}
+	endpoints []Endpoint
+	err       error
 }
 
 // endpointHealth 是实例级健康状态（受 Resolver.mu 保护）。
@@ -148,13 +163,15 @@ type Resolver struct {
 	controlPlaneURL  string
 	client           *http.Client
 	ttl              time.Duration
+	negativeTTL      time.Duration
 	cooldown         time.Duration
 	failureThreshold int
 	logger           *log.Logger
 
-	mu     sync.Mutex
-	cache  map[string]cacheEntry      // key: 见 cacheKey
-	health map[string]*endpointHealth // key: endpoint URL 字符串
+	mu       sync.Mutex
+	cache    map[string]cacheEntry      // key: 见 cacheKey
+	inflight map[string]*lookup         // key: 见 cacheKey
+	health   map[string]*endpointHealth // key: endpoint URL 字符串
 }
 
 // NewResolver 构造解析器。
@@ -179,10 +196,12 @@ func NewResolver(controlPlaneURL string, client *http.Client, ttl, cooldown time
 		controlPlaneURL:  strings.TrimRight(controlPlaneURL, "/"),
 		client:           client,
 		ttl:              ttl,
+		negativeTTL:      min(ttl, negativeCacheTTL),
 		cooldown:         cooldown,
 		failureThreshold: defaultFailureThreshold,
 		logger:           logger,
 		cache:            make(map[string]cacheEntry),
+		inflight:         make(map[string]*lookup),
 		health:           make(map[string]*endpointHealth),
 	}
 }
@@ -190,38 +209,72 @@ func NewResolver(controlPlaneURL string, client *http.Client, ttl, cooldown time
 // Resolve 返回服务的健康实例 endpoint 列表（已过滤冷却期内的实例）。
 //
 // 返回哨兵错误：ErrServiceNotFound / ErrNotReady / ErrNoEndpoints /
-// ErrNoHealthyEndpoints；网络错误与控制平面异常返回包装后的普通错误。
+// ErrNoHealthyEndpoints；网络错误与控制平面异常返回包装后的普通错误；
+// ctx 在查询完成前结束时返回 ctx.Err()。
 func (r *Resolver) Resolve(ctx context.Context, svc ServiceRef, tenantID string) ([]Endpoint, error) {
 	key := cacheKey(tenantID, svc)
 
-	// 先查缓存（TTL 内直接命中，不发请求）。
 	r.mu.Lock()
 	if entry, ok := r.cache[key]; ok && time.Now().Before(entry.expiry) {
-		endpoints := r.filterHealthyLocked(entry.endpoints)
-		r.mu.Unlock()
-		if len(endpoints) == 0 {
-			return nil, fmt.Errorf("%w: service=%s tenant=%s", ErrNoHealthyEndpoints, svc, tenantID)
-		}
-		return endpoints, nil
+		defer r.mu.Unlock()
+		return r.healthyLocked(entry.endpoints, entry.err, svc, tenantID)
+	}
+	l, running := r.inflight[key]
+	if !running {
+		l = &lookup{done: make(chan struct{})}
+		r.inflight[key] = l
+		// 查询不随发起它的调用方取消：其他等待者与缓存还需要结果。
+		go r.runLookup(context.WithoutCancel(ctx), key, svc, tenantID, l)
 	}
 	r.mu.Unlock()
 
-	// 缓存未命中：查询控制平面（锁外执行，避免 HTTP 阻塞其他 Resolve）。
-	endpoints, err := r.fetch(ctx, svc, tenantID)
-	if err != nil {
-		// 失败不写缓存：让下一个请求立即重试，缩短故障恢复时间。
-		return nil, err
+	select {
+	case <-l.done:
+	case <-ctx.Done():
+		return nil, ctx.Err()
 	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.healthyLocked(l.endpoints, l.err, svc, tenantID)
+}
+
+// runLookup 查询控制平面，写入缓存后唤醒全部等待者。成功结果缓存 ttl；与凭证无关的
+// 否定结果缓存 negativeTTL；其余失败不缓存，下一个请求立即重试。
+func (r *Resolver) runLookup(ctx context.Context, key string, svc ServiceRef, tenantID string, l *lookup) {
+	ctx, cancel := context.WithTimeout(ctx, resolveHTTPTimeout)
+	defer cancel()
+	endpoints, err := r.fetch(ctx, svc, tenantID)
 
 	r.mu.Lock()
-	r.cache[key] = cacheEntry{endpoints: endpoints, expiry: time.Now().Add(r.ttl)}
-	healthy := r.filterHealthyLocked(endpoints)
+	switch {
+	case err == nil:
+		r.cache[key] = cacheEntry{endpoints: endpoints, expiry: time.Now().Add(r.ttl)}
+	case isCacheableMiss(err):
+		r.cache[key] = cacheEntry{err: err, expiry: time.Now().Add(r.negativeTTL)}
+	}
+	delete(r.inflight, key)
+	l.endpoints, l.err = endpoints, err
 	r.mu.Unlock()
+	close(l.done)
+}
 
+// healthyLocked 返回解析结果中不在冷却期的实例（调用方须持有 r.mu）。
+func (r *Resolver) healthyLocked(endpoints []Endpoint, err error, svc ServiceRef, tenantID string) ([]Endpoint, error) {
+	if err != nil {
+		return nil, err
+	}
+	healthy := r.filterHealthyLocked(endpoints)
 	if len(healthy) == 0 {
 		return nil, fmt.Errorf("%w: service=%s tenant=%s", ErrNoHealthyEndpoints, svc, tenantID)
 	}
 	return healthy, nil
+}
+
+// isCacheableMiss 报告 err 是否为可以短暂缓存的否定结果。它们只取决于租户与服务，
+// 与调用方凭证无关；ErrForbidden 取决于凭证，网络错误与控制平面异常是暂时的，都不缓存。
+func isCacheableMiss(err error) bool {
+	return errors.Is(err, ErrServiceNotFound) || errors.Is(err, ErrNotReady) ||
+		errors.Is(err, ErrNoEndpoints)
 }
 
 // fetch 调用控制平面 GET /api/v1/inference-services/{svc}[?namespace={ns}] 并提取 endpoints。

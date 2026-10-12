@@ -49,7 +49,7 @@
 | 17 | 开发与 CI | `Makefile`、根 `pyproject.toml`、`.github/workflows/ci.yml` | 开发工具链 | 已实现（细节见小节） |
 | 18 | 部署与运维 | `deploy/`、`docs/operations/` | 部署工件 + 运维文档 | compose 已实现且有测试覆盖；k8s 清单实现待核验（见 2.18） |
 
-> 插件共 **10 个**（含 `decision-typesafe-jev`，PR #3 已合入 main），全部在 `plugins/` 平铺目录（`provider.py` + `manifest.yaml`），由 `api/schemas/plugin-manifest.schema.json` 约束。
+> 插件共 **10 个**（含 `decision-typesafe-jev`，PR #3 已合入 main），全部在 `plugins/` 平铺目录，每个目录都是 Python 包（`__init__.py` + `manifest.yaml` + 实现模块），由 `api/schemas/plugin-manifest.schema.json` 约束。清单 `spec.entrypoint`（`<模块>:<类>`，如 `provider:RulesProvider`、`deploy:VLLMDeployer`）由 `forgemesh.plugin.loader` 在当前进程内加载；插件都在宿主进程内运行，没有进程隔离（`isolation` 只能声明 `in-process`，见偏差 D3）。
 
 ---
 
@@ -121,7 +121,7 @@
 |---|---|
 | 架构模块 | L2 Core Control Plane（权威状态、协调、插件管理、审计） |
 | 当前代码路径 | `packages/control-plane/src/forgemesh/controlplane/`：`registry/{models,store}.py`、`reconciler/{core,dedup}.py`、`controller/{manager,queue}.py`、`scheduler/{inventory,first_fit}.py`、`deployment/{launcher,workflow,release,recovery,config,network,fake,vllm_process,memory}.py`、`api/{routes,dependencies,errors}.py`、`plugin_manager.py`、`outbox.py`、`audit.py`、`tasks.py`、`heartbeat.py`、`observability.py`、`diagnostics.py`、`app.py`、`auth.py`、`keygen.py`、`sqlite.py`（共 38 个 `.py`；其中 `auth.py` / `keygen.py` / `api/errors.py` 为 API 认证与错误信封，见 ADR-014；`controller/` 驱动协调器并回写 status；`scheduler/` 按静态加速器清单首次适配分配；`deployment/` 为部署工作流（准备模型 → 启动实例 → 验证实例）、启动器契约 `RuntimeLauncher` 与两个启动器（`fake.py`：控制平面进程内的 OpenAI 兼容桩服务 `FakeLauncher`；`vllm_process.py`：本机 vLLM 子进程 `VLLMProcessLauncher`；由 `config.py` 按 `FORGEMESH_RUNTIME_LAUNCHER` 选择，`network.py` 为两者共用的地址校验与健康检查）、删除时的清理 `DeploymentReleaser`、重启之后把实例已不在运行的 `Ready` 服务转为 `Degraded` 的 `mark_lost_instances`（`recovery.py`）与测试替身 `InMemoryLauncher`；`sqlite.py` 统一 SQLite 连接设置（WAL、外键），并由 `workflow_db_path` 给出工作流存储文件；其余与任务书的 9 个子模块一一对应） |
-| 核心契约 | 实现 `core-contracts` 的 `ResourceRegistry` / `Reconciler` / `Scheduler`（`FirstFitScheduler`：清单来自 `FORGEMESH_INVENTORY_FILE`，设置时才注入控制器；分配与设备占用经 `SQLiteRegistry.create_allocation` 在同一事务中写入，设备独占由 `allocation_devices` 部分唯一索引保证）；协调器按 phase 逐轮推进 `InferenceService`（`Pending` → `Scheduling` → `Preparing` → `Deploying` → `Verifying` → `Ready`），以 `deployment:{uid}` 为幂等键启动并查询部署工作流，成功后写入 `status.endpoints`，删除时经 `DeploymentReleaser` 取消部署、停止实例（部署包只依赖工作流契约，运行时与启动器由组装方注入：`app.py` 在设置了 `FORGEMESH_RUNTIME_LAUNCHER` 时以 `workflow-runtime` 的 `LocalWorkflowRuntime` 与所选启动器组装，未设置时不注入，协调器在分配之前报告 `WorkflowRuntimeUnavailable`）；`app.py` 提供 HTTP 服务（FastAPI，未安装时回退纯标准库占位——生产必须 FastAPI/ASGI），并在 lifespan 中运行控制器（设置了启动器时，先恢复未结束的部署运行、把实例已不在运行的 `Ready` 服务转为 `Degraded`，再启动控制器）；控制器按序号增量读取 `resource_changes` 变更记录，经 `update_status`（status 子资源，CAS）回写协调结果；Outbox 事务性事件（architecture.md 3.3 规则 7）；`ProcessedKeyStore` 去重（reconciler/dedup.py） |
+| 核心契约 | 实现 `core-contracts` 的 `ResourceRegistry` / `Reconciler` / `Scheduler`（`FirstFitScheduler`：清单来自 `FORGEMESH_INVENTORY_FILE`，设置时才注入控制器；分配与设备占用经 `SQLiteRegistry.create_allocation` 在同一事务中写入，设备独占由 `allocation_devices` 部分唯一索引保证）；协调器按 phase 逐轮推进 `InferenceService`（`Pending` → `Scheduling` → `Preparing` → `Deploying` → `Verifying` → `Ready`），以 `deployment:{uid}` 为幂等键启动并查询部署工作流，成功后写入 `status.endpoints`，删除时经 `DeploymentReleaser` 取消部署、停止实例（部署包只依赖工作流契约，运行时与启动器由组装方注入：`app.py` 在设置了 `FORGEMESH_RUNTIME_LAUNCHER` 时以 `workflow-runtime` 的 `LocalWorkflowRuntime` 与所选启动器组装，未设置时不注入，协调器在分配之前报告 `WorkflowRuntimeUnavailable`）；`app.py` 提供 HTTP 服务（FastAPI，未安装时回退纯标准库占位——生产必须 FastAPI/ASGI），并在 lifespan 中运行控制器（设置了启动器时，先恢复未结束的部署运行、把实例已不在运行的 `Ready` 服务转为 `Degraded`，再启动控制器）；控制器按序号增量读取 `resource_changes` 变更记录，经 `update_status`（status 子资源，CAS）回写协调结果；Outbox 事务性事件（architecture.md 3.3 规则 7）；`ProcessedKeyStore` 去重（reconciler/dedup.py）；`PluginManager`（plugin_manager.py）注册时校验插件清单与 Ed25519 签名（受信任公钥来自插件策略文件），插件实际权限为清单申请与管理员授予的交集，控制平面应用尚未接入 |
 | 运行形态 | 单实例控制平面进程（模块化单体，architecture.md 3.3 规则 8）；ADR-013 约束：仅允许单写方写同一 SQLite 权威库；控制器与 API 同进程运行，不得以多个 worker 进程启动 |
 | 数据所有权 | **全部业务资源权威状态**（registry/store.py）、审计事件（audit.py，默认内存库，控制平面应用尚未接入）、Outbox 事件、任务与心跳状态 |
 | 允许依赖 | `forgemesh.core` / `forgemesh.resource` / `forgemesh.policy` / `forgemesh.decision` / `forgemesh.workflow*` / `forgemesh.plugin`（plugin-sdk）、标准库 `sqlite3`、FastAPI |
@@ -167,11 +167,11 @@
 | 架构模块 | L3/L4 决策能力插件：规则、JEV、类型安全 JEV |
 | 当前代码路径 | `plugins/decision-rules/{provider.py,manifest.yaml}`；`plugins/decision-jev/{provider.py,manifest.yaml}`；`plugins/decision-typesafe-jev/{provider.py,manifest.yaml}`（PR #3 合入） |
 | 核心契约 | 实现 `forgemesh.decision.provider.DecisionProvider`（Protocol）；manifest 受 `api/schemas/plugin-manifest.schema.json` 约束 |
-| 运行形态 | 插件（manifest entrypoint 由 plugin_manager 加载，进程内隔离） |
+| 运行形态 | 插件（进程内运行，无进程隔离，见 D3；manifest `entrypoint` 由 `forgemesh.plugin.loader` 加载） |
 | 数据所有权 | 无（候选产出到 DecisionRouter；记录归 DecisionRecordStore） |
 | 允许依赖 | `forgemesh.decision`（API 包）、plugin-sdk |
 | 禁止依赖 | 控制平面内部实现（扫描五验证 ✅，见 3.5）、其他插件私有数据（architecture.md 3.3 规则 4） |
-| 测试路径 | `tests/unit/plugins/test_decision_rules.py`、`test_decision_jev.py`、`test_decision_typesafe_jev.py`；隔离与签名见 `test_isolation.py`、`test_signing.py` |
+| 测试路径 | `tests/unit/plugins/test_decision_rules.py`、`test_decision_jev.py`、`test_decision_typesafe_jev.py`；插件 SDK 的签名、签名工具、权限词表、入口加载与信任级别检查见同目录 `test_signing.py`、`test_signtool.py`、`test_permissions.py`、`test_loader.py`、`test_isolation.py`；全部插件的入口加载另由 CI `scripts/plugin_entrypoint_smoke.py` 冒烟 |
 | 状态 | 已实现且有测试覆盖 |
 | 演进动作 | 保留；WP-E1 conformance（超时/无效输出/降级路径） |
 
@@ -242,7 +242,7 @@
 | 架构模块 | L4 硬件能力插件：发现 / 预检 / 健康 / MIG / 异构（architecture.md 9.2 / 9.4） |
 | 当前代码路径 | `plugins/gpu-nvidia/{discovery,preflight,health,mig,hetero}.py` + `manifest.yaml`（5 个子模块文件，glob 核对） |
 | 核心契约 | GPU 发现与能力上报（discovery）、驱动/运行时预检（preflight）、健康监测（health）、MIG 切分（mig）、异构设备（hetero）；manifest 同 2.8 |
-| 运行形态 | 插件（由控制平面经 Node Agent/Provider 接口调用，进程内隔离） |
+| 运行形态 | 插件（由控制平面经 Node Agent/Provider 接口调用，进程内运行，无进程隔离） |
 | 数据所有权 | 无（上报数据归 Registry；设备实际状态归节点） |
 | 允许依赖 | plugin-sdk、`forgemesh.resource`（设备模型） |
 | 禁止依赖 | 控制平面内部实现、其他插件私有数据 |
@@ -255,8 +255,8 @@
 | 字段 | 内容 |
 |---|---|
 | 架构模块 | L4 推理运行时插件：vLLM、TGI |
-| 当前代码路径 | `plugins/runtime-vllm/{provider,deploy,model,release,verify}.py` + `manifest.yaml`；`plugins/runtime-tgi/{provider.py,manifest.yaml,__init__.py}` |
-| 核心契约 | Runtime Provider 接口（部署 deploy、模型加载 model、发布 release、验证 verify——vllm 完整五段；tgi 精简 provider）；manifest 同 2.8 |
+| 当前代码路径 | `plugins/runtime-vllm/{deploy,model,release,verify}.py` + `manifest.yaml`（入口 `deploy:VLLMDeployer`）；`plugins/runtime-tgi/{provider.py,manifest.yaml,__init__.py}` |
+| 核心契约 | Runtime Provider 接口（部署 deploy、模型加载 model、发布 release、验证 verify——vllm 分四个模块；tgi 精简 provider）；manifest 同 2.8 |
 | 运行形态 | 插件（产出/操作推理服务实例；实际推理流量不经此，经 Go 网关直达）；控制平面部署推理服务不经这两个插件：启动器（含 `vllm-process`）是控制平面 `deployment/` 中的代码（见 2.5；控制平面不导入插件，见扫描二） |
 | 数据所有权 | 无（InferenceService 权威状态归 Registry） |
 | 允许依赖 | plugin-sdk、`forgemesh.resource` |
@@ -356,7 +356,7 @@ grep -rn "decision_rules\|decision_jev\|gpu_nvidia\|runtime_vllm\|workflow_refer
 
 **输出：未命中（EXIT=1）**
 
-**结论：✅ 符合** —— 控制平面与策略引擎对 10 个插件零私有耦合；插件接入仅经 manifest/entrypoint 的公共契约（`DecisionProvider` 等 Protocol/ABC）。
+**结论：✅ 符合** —— 控制平面与策略引擎对 10 个插件零私有耦合；插件接入仅经 manifest/entrypoint 的公共契约（入口类由 `forgemesh.plugin.loader` 按插件目录加载，不经 import 插件模块名；`DecisionProvider` 等 Protocol/ABC）。
 
 ### 3.3 扫描三：Node Agent 不得导入控制平面内部实现
 
@@ -423,6 +423,7 @@ grep -rn "decision_rules\|gpu_nvidia\|runtime_vllm\|workflow_temporal" \
 | 编号 | 偏差 | 证据 | 影响 | 建议处置 |
 |---|---|---|---|---|
 | **D1** | 决策记录的契约与 SQLite 存储实现共存于 API 包：`decision-api` 导入 `sqlite3`，违反"契约包不依赖 DB 驱动"的边界规则 | 扫描一命中：`packages/decision-api/src/forgemesh/decision/records.py:16`（`DecisionRecord` + `DecisionRecordStore` 同文件） | 边界纯度受损；存储演进（如 PostgreSQL 迁移）将波及 API 包；属标准库依赖，无外部供应链风险 | **有证据后重构**：将 `DecisionRecordStore` 迁至控制平面实现层（与 `SQLiteRegistry` 同域），API 包仅保留 `DecisionRecord` 模型与存储接口；需 ADR 评审与迁移测试，不属 v1.1 强制项 |
+| **D3** | ADR-006 的受限 RPC 宿主未实现：插件（包括第三方插件）都在宿主进程内运行，没有进程隔离 | `packages/plugin-sdk/src/forgemesh/plugin/manifest.py` 的 `SUPPORTED_ISOLATION` 只有 `in-process`（Schema 的 `isolation` 枚举相同）；同目录 `loader.py` 的 `load_entrypoint` 在当前进程内导入插件包；`IsolationMode.RESTRICTED_RPC` 只用于 `IsolationGuard` 的权限检查，没有对应的宿主实现 | 插件代码拥有宿主进程的全部能力（网络、文件系统、数据库连接），权限授予与 `check_permissions` 约束不了进程内的插件代码，只能靠注册时的签名校验限定插件来源 | **实现进程边界或修订 ADR-006**：受限 RPC 宿主实现之前，清单不得声明 `restricted-rpc` / `sandbox`，只注册可信来源的签名插件 |
 
 > 备注（不计入偏差）：`agent.proto` 为 `v1alpha1` 草案（timestamp 用 RFC 3339 字符串），正式化时机由演进决定。
 

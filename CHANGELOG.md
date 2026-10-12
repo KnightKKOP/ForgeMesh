@@ -72,6 +72,7 @@
 - 调和器在没有注入调度器或工作流运行时的情况下跳过分配与部署、登记去重键并报告 `Ready=True`（`Reconciled`），实际什么都没做：现在任何副作用之前检查，返回 `Ready=False`，原因为 `SchedulerUnavailable` 或 `WorkflowRuntimeUnavailable`，且不登记去重键。目前仓库没有调度器实现，默认部署中新建的服务会停在 `Pending` 并带有 `Ready=False`（`SchedulerUnavailable`）。
 - 网关把入站路径原样拼接到实例地址，请求以 `/api/v1/inference/{svc}/chat` 到达推理运行时，而 vLLM 与 TGI 都不提供这个路径：现按实例的 `protocol` 转发到 `/v1/chat/completions`（`openai-chat`）或 `/generate_stream`（`tgi-generate`），查询串保留。
 - 网关解析推理服务时不带命名空间，控制平面因此只查找不带命名空间的服务，带命名空间的服务无法经网关调用：现由带命名空间的路由解析（见 Added）。
+- OpenAPI 没有描述 `GET` / `DELETE /api/v1/inference-services/{name}` 的 `namespace` 查询参数，而实现一直支持它，网关解析带命名空间的服务时也依赖它：现已补上，并写明省略时指不带命名空间的资源（列表接口省略时则不按命名空间过滤）。
 - 网关 `/readyz` 只对上游做 TCP 拨号，控制平面的权威存储不可用（其 `/readyz` 返回 `503`）或端口被其他进程占用时仍报告就绪：现请求控制平面的 `/readyz`，返回 `200` 才就绪，否则返回 `503`（`upstream not ready` / `upstream unreachable`）。
 - 推理实例返回错误（如 vLLM 对非法参数返回 `400` JSON）时，网关把响应的 `Content-Type` 改成 `text/event-stream`：现只对 2xx 响应这样设置，错误响应保留实例的 `Content-Type`。
 - [docs/operations/backup-restore.md](docs/operations/backup-restore.md) 的热备份方法「`PRAGMA wal_checkpoint(TRUNCATE)` 后 `cp` 主库文件」在控制平面写入期间不安全：复制途中的自动 checkpoint 会改写主库文件，备份可能不一致甚至损坏；脚本只看 `PRAGMA integrity_check` 的退出码，而 `sqlite3` 检查出损坏时同样返回 `0`。现改为 `VACUUM INTO`（脚本）/ `Connection.backup`（Python）在线快照，校验输出必须为 `ok`，数据库路径不存在时报错，而不是备份一个新建的空库。

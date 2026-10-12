@@ -186,11 +186,58 @@ def test_payload_fields_unknown_to_the_registry_are_preserved() -> None:
 
 
 @pytest.mark.unit
+def test_endpoints_are_validated_and_replaced_as_a_whole() -> None:
+    reg = SQLiteRegistry()
+    _run(reg.put(_service()))
+    first = {"url": "http://10.0.0.1:8000", "protocol": "openai-chat", "instanceId": "i-1"}
+    second = {"url": "http://10.0.0.2:8000", "protocol": "openai-chat", "ready": False}
+
+    _run(reg.update_status(KIND, NAMESPACE, "svc", TENANT, {"endpoints": [first]}))
+    replaced = _run(reg.update_status(KIND, NAMESPACE, "svc", TENANT, {"endpoints": [second]}))
+
+    assert [(e.url, e.ready, e.instanceId) for e in replaced.status.endpoints] == [
+        ("http://10.0.0.2:8000", False, None)
+    ]
+    stored = json.loads(_stored_row(reg)["body"])["status"]["endpoints"]
+    assert stored == [
+        {
+            "url": "http://10.0.0.2:8000",
+            "ready": False,
+            "instanceId": None,
+            "protocol": "openai-chat",
+        }
+    ]
+    assert _run(reg.get(KIND, NAMESPACE, "svc", TENANT)) == replaced
+
+
+@pytest.mark.unit
+def test_endpoints_need_a_status_subtree() -> None:
+    reg = SQLiteRegistry()
+    widget = Resource(
+        kind="Widget", metadata=ObjectMeta(name="w", namespace=NAMESPACE, tenant_id=TENANT)
+    )
+    _run(reg.put(widget))
+
+    with pytest.raises(ValueError):
+        _run(
+            reg.update_status(
+                "Widget",
+                NAMESPACE,
+                "w",
+                TENANT,
+                {"endpoints": [{"url": "http://10.0.0.1:8000", "protocol": "openai-chat"}]},
+            )
+        )
+
+
+@pytest.mark.unit
 @pytest.mark.parametrize(
     "patch",
     [
         {"spec": {"replicas": 3}},
         {"conditions": [{"type": "Ready", "status": "Maybe"}]},
+        {"endpoints": [{"url": "http://10.0.0.1:8000", "protocol": "grpc"}]},
+        {"endpoints": [{"url": "file:///etc/passwd", "protocol": "openai-chat"}]},
     ],
 )
 def test_invalid_patches_are_rejected(patch) -> None:

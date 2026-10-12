@@ -51,9 +51,9 @@ forgemesh/
 ├── Makefile                    # install / test / lint / fmt / clean
 ├── requirements-dev.txt        # 开发依赖
 │
-├── api/                        # 对外契约（v1.0 稳定）
+├── api/                        # 对外契约（预览版，x-stability: beta）
 │   ├── schemas/                # JSON Schema（4 个核心模型）
-│   ├── openapi/                # OpenAPI 规范（v1.0.0，x-stability: stable）
+│   ├── openapi/                # OpenAPI 规范（1.1.0，x-stability: beta）
 │   └── protobuf/               # Agent / gRPC 协议
 │
 ├── packages/                   # Python 命名空间包（PEP 420，monorepo）
@@ -194,7 +194,9 @@ scripts/compose_smoke.sh   # 端到端冒烟（CI 同样执行）
 
 ## 4. 功能概览（v1.0.0）
 
-ForgeMesh v1.0.0 是首个稳定版本，涵盖以下核心能力：
+ForgeMesh 目前处于预览阶段，API 稳定性标注为 `beta`：minor 版本可能包含破坏性变更，均在 [CHANGELOG](CHANGELOG.md) 中标注（规则见[弃用政策](docs/governance/deprecation-policy.md) 1.4 节）。v1.0.0 发布时曾标注为稳定版本，这一标注已经更正；改回 `stable` 之前，应当满足[架构验收标准](docs/architecture/architecture.md)（第 20 节）。
+
+以下是 v1.0.0 发布时列出的核心能力：
 
 ### 核心控制平面（M2）
 - **资源注册中心**：SQLite 持久化，乐观并发 CAS，租户隔离，分页游标
@@ -234,7 +236,7 @@ ForgeMesh v1.0.0 是首个稳定版本，涵盖以下核心能力：
 - **TGI Runtime**：HuggingFace TGI 推理 Runtime Provider（deploy→verify→release 闭环）
 - **插件 SDK**：脚手架生成，Manifest 校验，打包发布，开放契约测试套件
 - **治理文档**：GOVERNANCE / SECURITY / CONTRIBUTING / CODE_OF_CONDUCT 完善，弃用政策
-- **稳定 API**：OpenAPI v1.0.0 标记，CHANGELOG，发布记录，CI 架构文档检查
+- **API 版本管理**：OpenAPI 版本号与稳定性标注（当前为 1.1.0、`beta`），CHANGELOG，发布记录，CI 架构文档检查
 
 ### 测试统计
 

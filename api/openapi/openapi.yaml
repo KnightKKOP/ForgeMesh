@@ -1,16 +1,17 @@
 openapi: 3.1.0
 info:
   title: ForgeMesh Control Plane API
-  version: 1.0.0
+  version: 1.1.0
   description: >-
-    ForgeMesh v1.0.0 稳定版对外 API。外部入口统一经 Go 网关
+    ForgeMesh 控制平面对外 API，当前为预览版（x-stability: beta）。外部入口统一经 Go 网关
     （/api/v1/ 版本前缀）；本文件描述控制平面资源/运行 API 与探针。
     统一响应信封与错误码见 components。资源权威 Schema 见 api/schemas/。
-    v1.0 为首个稳定版本，major 版本内保证 API 兼容性（见 docs/releases/v1.0.md）。
+    beta 阶段的 minor 版本可能包含破坏性变更，均在 CHANGELOG 中以「破坏性」标注；
+    x-stability 改为 stable 之后，按 docs/governance/deprecation-policy.md 保证 major 版本内兼容。
     认证（ADR-014）：除探针外的全部端点要求 Authorization: Bearer <API key>，
     租户取自 key 绑定的租户；X-Tenant-Id 请求头可以省略，携带时必须与之一致，
     否则返回 403。读接口要求 read scope，写接口要求 write scope。
-  x-stability: stable
+  x-stability: beta
   x-deprecation-policy: >-
     端点或字段弃用时使用 x-deprecated: true 扩展字段标记，并附带 x-deprecated-since
     记录弃用版本、x-deprecated-removal 记录计划移除版本。弃用端点至少保留 2 个

@@ -32,6 +32,7 @@
 
 - README 策略引擎描述修正：`allow/deny/degraded` 三态改为 `allow/deny/require_approval` 三态（对齐 v1.0.1 已交付语义），并补充说明 Decision Router 的 `OK/FALLBACK_REQUIRED/FAILED` 为决策路由层状态、与 Policy 三态不混用。
 - [docs/releases/v1.0.md](docs/releases/v1.0.md) 插入"勘误与现状（2026-10-11）"节：澄清 v1.0.0 发布记录中 PostgreSQL 相关表述与 ADR-013 不一致，当前权威存储为 SQLite、PostgreSQL 为目标态，文档中 PostgreSQL 备份/迁移命令不可用。
+- API 稳定性标注由 `stable` 更正为 `beta`：OpenAPI `info.x-stability` 改为 `beta`，`info.version` 改为 `1.1.0`；README、SECURITY.md 与 v1.0 发布记录同步更正。v1.0.0 宣称的「首个稳定版本、major 版本内保证兼容」与实际不符：1.0.x 可运行入口的业务端点仍返回 `501`、没有认证，1.1.0 也包含多项破坏性变更。[弃用政策](docs/governance/deprecation-policy.md)新增 1.4 节：beta 阶段的 minor 版本可以包含破坏性变更，但必须以「**破坏性**」标注；改回 `stable` 之前应满足架构验收标准（architecture.md 第 20 节）。
 - 包元数据事实统一：全部 10 个子包 `requires-python` 从 `>=3.9` 校准为 `>=3.12`（对齐 README/CI/Ruff 的 Python 3.12 基线）；`control-plane` 与 `workflow-runtime` 包描述去除过时的 skeleton/placeholder 表述，`cli` 与 `node-agent` 包描述同步移除 skeleton 字样。
 - [.github/workflows/ci.yml](.github/workflows/ci.yml)：ADR 检查由硬编码 001–012 改为索引驱动动态校验；architecture-docs job 新增 manifest / OpenAPI 语义 / 元数据一致 / 插件冒烟四道步骤。
 - 修正 `plugins/runtime-tgi`（移除 schema 未定义的 spec.capabilities）与 `plugins/workflow-temporal`（category 改为 provider 并移除 capabilities）manifest 至 schema 合规。

@@ -61,7 +61,7 @@
 |---|---|
 | 架构模块 | 外部 API 契约（OpenAPI / JSON Schema / Protobuf） |
 | 当前代码路径 | `api/openapi/openapi.yaml`；`api/schemas/inference-service.schema.json`、`device-profile.schema.json`、`event.schema.json`、`plugin-manifest.schema.json`；`api/protobuf/agent.proto` |
-| 核心契约 | OpenAPI **3.1.0**（`ForgeMesh Control Plane API` version **1.0.0**，`x-stability: stable`，`/api/v1/` 前缀经 Go 网关）；4 份 JSON Schema（资源权威 Schema）；Protobuf **proto3** `forgemesh.agent.v1alpha1`（草案：ADR-009 无 shell 任务、`idempotency_key`、`correlation_id`） |
+| 核心契约 | OpenAPI **3.1.0**（`ForgeMesh Control Plane API` version **1.1.0**，`x-stability: beta`，`/api/v1/` 前缀经 Go 网关）；4 份 JSON Schema（资源权威 Schema）；Protobuf **proto3** `forgemesh.agent.v1alpha1`（草案：ADR-009 无 shell 任务、`idempotency_key`、`correlation_id`） |
 | 运行形态 | 静态契约工件：被 CI `architecture-docs` job 校验、被控制平面/网关/Agent 实现引用 |
 | 数据所有权 | 无（仅定义协议，不持有数据） |
 | 允许依赖 | 无（纯声明文件，可引用彼此的语义） |

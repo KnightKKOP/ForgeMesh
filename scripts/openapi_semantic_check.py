@@ -10,8 +10,8 @@
 
 设计说明（探针豁免）：``/healthz``、``/readyz`` 等 liveness/readiness 探针由
 基础设施直连调用、无认证与错误响应语义（本规格中 /healthz 仅 200，/readyz
-未就绪为 503），且 openapi.yaml 为 v1.0 稳定契约、不在 CI 补强任务的修改
-范围，故对 tags 含 ``probes`` 的 operation 豁免 4xx 要求（2xx 要求不豁免）。
+未就绪为 503），且 openapi.yaml 不在 CI 补强任务的修改范围，故对 tags 含
+``probes`` 的 operation 豁免 4xx 要求（2xx 要求不豁免）。
 """
 
 from __future__ import annotations

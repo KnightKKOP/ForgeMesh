@@ -1,6 +1,9 @@
 package middleware
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -10,6 +13,45 @@ import (
 var okHandler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 })
+
+const (
+	keyTenantA  = "fmk_key-for-tenant-a"
+	keyReadOnly = "fmk_read-only-key-for-tenant-a"
+)
+
+func digestOf(key string) string {
+	sum := sha256.Sum256([]byte(key))
+	return hex.EncodeToString(sum[:])
+}
+
+func newTestAPIKeyAuthenticator(t *testing.T) *APIKeyAuthenticator {
+	t.Helper()
+	authn, err := NewAPIKeyAuthenticator([]APIKey{
+		{ID: "a", SHA256: digestOf(keyTenantA), TenantID: "tenant-a", Subject: "alice", Scopes: []string{ScopeRead, ScopeWrite}},
+		{ID: "ro", SHA256: digestOf(keyReadOnly), TenantID: "tenant-a", Subject: "viewer", Scopes: []string{ScopeRead}},
+	}, DefaultTenantHeader)
+	if err != nil {
+		t.Fatalf("NewAPIKeyAuthenticator 失败: %v", err)
+	}
+	return authn
+}
+
+// decodeError 解析错误信封，返回 error.code。
+func decodeError(t *testing.T, rec *httptest.ResponseRecorder) string {
+	t.Helper()
+	if ct := rec.Header().Get("Content-Type"); ct != "application/json" {
+		t.Fatalf("错误响应 Content-Type 应为 application/json，实际 %q", ct)
+	}
+	var body struct {
+		Error struct {
+			Code string `json:"code"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("错误响应不是错误信封: %v（body=%s）", err, rec.Body.String())
+	}
+	return body.Error.Code
+}
 
 // TestAuthz_MissingTenantHeader 验证缺失租户头时返回 401。
 func TestAuthz_MissingTenantHeader(t *testing.T) {
@@ -74,121 +116,157 @@ func TestAuthz_BlankTenantHeader(t *testing.T) {
 	}
 }
 
-// TestAuthzWithToken_ValidToken 验证有效 Bearer Token + 租户头放行。
-func TestAuthzWithToken_ValidToken(t *testing.T) {
-	tokens := map[string]bool{"secret-token-123": true}
-	h := AuthzWithToken(DefaultTenantHeader, tokens)(okHandler)
+// TestAuthenticate_APIKeyBindsTenant 验证有效 key 放行：主体注入 context，
+// 租户头被覆写为 key 绑定的租户（客户端可以不发租户头）。
+func TestAuthenticate_APIKeyBindsTenant(t *testing.T) {
+	var got Principal
+	var forwardedTenant string
+	next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got, _ = PrincipalFromContext(r.Context())
+		forwardedTenant = r.Header.Get(DefaultTenantHeader)
+		w.WriteHeader(http.StatusOK)
+	})
+	h := Authenticate(newTestAPIKeyAuthenticator(t), DefaultTenantHeader)(next)
 
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/resources", nil)
-	req.Header.Set("Authorization", "Bearer secret-token-123")
-	req.Header.Set(DefaultTenantHeader, "tenant-a")
+	req.Header.Set("Authorization", "Bearer "+keyTenantA)
 	h.ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusOK {
-		t.Fatalf("有效 token 应放行(200)，实际 %d", rec.Code)
+		t.Fatalf("有效 key 应放行(200)，实际 %d", rec.Code)
+	}
+	if got.TenantID != "tenant-a" || got.Subject != "alice" || !got.HasScope(ScopeWrite) {
+		t.Fatalf("context 主体不符: %+v", got)
+	}
+	if forwardedTenant != "tenant-a" {
+		t.Fatalf("租户头应被覆写为 key 绑定的 tenant-a，实际 %q", forwardedTenant)
 	}
 }
 
-// TestAuthzWithToken_InvalidToken 验证无效 token 返回 401。
-func TestAuthzWithToken_InvalidToken(t *testing.T) {
-	tokens := map[string]bool{"secret-token-123": true}
-	h := AuthzWithToken(DefaultTenantHeader, tokens)(okHandler)
+// TestAuthenticate_APIKeyRejectsInvalidCredentials 验证缺失、非 Bearer、空白与未知 key
+// 均返回 401 错误信封并附 WWW-Authenticate，且不触达下游。
+func TestAuthenticate_APIKeyRejectsInvalidCredentials(t *testing.T) {
+	cases := map[string]string{
+		"缺失 Authorization": "",
+		"非 Bearer 方案":      "Basic " + keyTenantA,
+		"空白凭证":             "Bearer   ",
+		"未知 key":           "Bearer fmk_unknown",
+	}
+	for name, auth := range cases {
+		t.Run(name, func(t *testing.T) {
+			reached := false
+			next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { reached = true })
+			h := Authenticate(newTestAPIKeyAuthenticator(t), DefaultTenantHeader)(next)
 
-	rec := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodGet, "/api/v1/resources", nil)
-	req.Header.Set("Authorization", "Bearer wrong-token")
-	req.Header.Set(DefaultTenantHeader, "tenant-a")
-	h.ServeHTTP(rec, req)
+			rec := httptest.NewRecorder()
+			req := httptest.NewRequest(http.MethodGet, "/api/v1/resources", nil)
+			req.Header.Set(DefaultTenantHeader, "tenant-a")
+			if auth != "" {
+				req.Header.Set("Authorization", auth)
+			}
+			h.ServeHTTP(rec, req)
 
-	if rec.Code != http.StatusUnauthorized {
-		t.Fatalf("无效 token 应返回 401，实际 %d", rec.Code)
+			if rec.Code != http.StatusUnauthorized {
+				t.Fatalf("应返回 401，实际 %d", rec.Code)
+			}
+			if rec.Header().Get("WWW-Authenticate") != bearerChallenge {
+				t.Fatalf("401 应携带 WWW-Authenticate=%q，实际 %q", bearerChallenge, rec.Header().Get("WWW-Authenticate"))
+			}
+			if code := decodeError(t, rec); code != "UNAUTHENTICATED" {
+				t.Fatalf("错误码应为 UNAUTHENTICATED，实际 %q", code)
+			}
+			if reached {
+				t.Fatal("认证失败的请求不应触达下游")
+			}
+		})
 	}
 }
 
-// TestAuthzWithToken_MissingToken 验证缺失 Authorization 头返回 401。
-func TestAuthzWithToken_MissingToken(t *testing.T) {
-	tokens := map[string]bool{"secret-token-123": true}
-	h := AuthzWithToken(DefaultTenantHeader, tokens)(okHandler)
+// TestAuthenticate_APIKeyRejectsForeignTenantHeader 验证租户头与 key 绑定的租户不符时
+// 返回 403（含多值头中夹带他租户的情形），而不是被静默改写。
+func TestAuthenticate_APIKeyRejectsForeignTenantHeader(t *testing.T) {
+	for name, values := range map[string][]string{
+		"他租户":     {"tenant-b"},
+		"多值夹带他租户": {"tenant-a", "tenant-b"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			h := Authenticate(newTestAPIKeyAuthenticator(t), DefaultTenantHeader)(okHandler)
 
-	rec := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodGet, "/api/v1/resources", nil)
-	req.Header.Set(DefaultTenantHeader, "tenant-a")
-	h.ServeHTTP(rec, req)
+			rec := httptest.NewRecorder()
+			req := httptest.NewRequest(http.MethodGet, "/api/v1/resources", nil)
+			req.Header.Set("Authorization", "Bearer "+keyTenantA)
+			for _, v := range values {
+				req.Header.Add(DefaultTenantHeader, v)
+			}
+			h.ServeHTTP(rec, req)
 
-	if rec.Code != http.StatusUnauthorized {
-		t.Fatalf("缺失 token 应返回 401，实际 %d", rec.Code)
+			if rec.Code != http.StatusForbidden {
+				t.Fatalf("租户头与凭证不符应 403，实际 %d", rec.Code)
+			}
+			if code := decodeError(t, rec); code != "FORBIDDEN" {
+				t.Fatalf("错误码应为 FORBIDDEN，实际 %q", code)
+			}
+		})
 	}
 }
 
-// TestAuthzWithToken_EmptyTokenMap_Degraded 验证 validTokens 为空时退化为仅检查租户头。
-func TestAuthzWithToken_EmptyTokenMap_Degraded(t *testing.T) {
-	h := AuthzWithToken(DefaultTenantHeader, nil)(okHandler)
+// TestAuthenticate_APIKeyAcceptsMatchingTenantHeader 验证与凭证一致（含空白填充）的租户头放行。
+func TestAuthenticate_APIKeyAcceptsMatchingTenantHeader(t *testing.T) {
+	h := Authenticate(newTestAPIKeyAuthenticator(t), DefaultTenantHeader)(okHandler)
 
-	// 无 Authorization 头但有租户头 → 应放行（降级模式）。
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/resources", nil)
-	req.Header.Set(DefaultTenantHeader, "tenant-a")
+	req.Header.Set("Authorization", "bearer "+keyTenantA)
+	req.Header.Set(DefaultTenantHeader, " tenant-a ")
 	h.ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusOK {
-		t.Fatalf("空 token map 降级模式下应放行(200)，实际 %d", rec.Code)
-	}
-
-	// 无租户头 → 仍应 401。
-	rec2 := httptest.NewRecorder()
-	req2 := httptest.NewRequest(http.MethodGet, "/api/v1/resources", nil)
-	h.ServeHTTP(rec2, req2)
-
-	if rec2.Code != http.StatusUnauthorized {
-		t.Fatalf("降级模式下缺失租户头应 401，实际 %d", rec2.Code)
+		t.Fatalf("与凭证一致的租户头应放行，实际 %d", rec.Code)
 	}
 }
 
-// TestAuthzWithToken_NonBearerScheme 验证非 Bearer 方案（如 Basic）被拒绝。
-func TestAuthzWithToken_NonBearerScheme(t *testing.T) {
-	tokens := map[string]bool{"secret-token-123": true}
-	h := AuthzWithToken(DefaultTenantHeader, tokens)(okHandler)
+// TestAuthenticate_ErrorEnvelopeCarriesCorrelationID 验证认证失败的错误信封带关联 ID。
+func TestAuthenticate_ErrorEnvelopeCarriesCorrelationID(t *testing.T) {
+	h := Chain(okHandler,
+		Correlation(DefaultCorrelationHeader),
+		Authenticate(newTestAPIKeyAuthenticator(t), DefaultTenantHeader),
+	)
 
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/resources", nil)
-	req.Header.Set("Authorization", "Basic dXNlcjpwYXNz")
-	req.Header.Set(DefaultTenantHeader, "tenant-a")
+	req.Header.Set(DefaultCorrelationHeader, "corr-401")
 	h.ServeHTTP(rec, req)
 
-	if rec.Code != http.StatusUnauthorized {
-		t.Fatalf("非 Bearer 方案应返回 401，实际 %d", rec.Code)
+	var body struct {
+		Error struct {
+			CorrelationID string `json:"correlationId"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil || body.Error.CorrelationID != "corr-401" {
+		t.Fatalf("错误信封应带 correlationId=corr-401，实际 body=%s", rec.Body.String())
 	}
 }
 
-// TestAuthzWithToken_BlankToken 验证 Bearer 后空白 token 被拒绝。
-func TestAuthzWithToken_BlankToken(t *testing.T) {
-	tokens := map[string]bool{"secret-token-123": true}
-	h := AuthzWithToken(DefaultTenantHeader, tokens)(okHandler)
+// TestRequireScope 验证作用域检查：持有所需作用域放行，否则 403；缺少主体同样拒绝。
+func TestRequireScope(t *testing.T) {
+	authn := newTestAPIKeyAuthenticator(t)
+	h := Authenticate(authn, DefaultTenantHeader)(RequireScope(ScopeWrite)(okHandler))
 
-	rec := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodGet, "/api/v1/resources", nil)
-	req.Header.Set("Authorization", "Bearer   ")
-	req.Header.Set(DefaultTenantHeader, "tenant-a")
-	h.ServeHTTP(rec, req)
-
-	if rec.Code != http.StatusUnauthorized {
-		t.Fatalf("空白 token 应返回 401，实际 %d", rec.Code)
+	for key, want := range map[string]int{keyTenantA: http.StatusOK, keyReadOnly: http.StatusForbidden} {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/resources", nil)
+		req.Header.Set("Authorization", "Bearer "+key)
+		h.ServeHTTP(rec, req)
+		if rec.Code != want {
+			t.Fatalf("key %s 期望 %d，实际 %d", key, want, rec.Code)
+		}
 	}
-}
-
-// TestAuthzWithToken_ValidTokenMissingTenant 验证 token 有效但缺失租户头仍返回 401。
-func TestAuthzWithToken_ValidTokenMissingTenant(t *testing.T) {
-	tokens := map[string]bool{"secret-token-123": true}
-	h := AuthzWithToken(DefaultTenantHeader, tokens)(okHandler)
 
 	rec := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodGet, "/api/v1/resources", nil)
-	req.Header.Set("Authorization", "Bearer secret-token-123")
-	h.ServeHTTP(rec, req)
-
-	if rec.Code != http.StatusUnauthorized {
-		t.Fatalf("有效 token 但缺失租户头应 401，实际 %d", rec.Code)
+	RequireScope(ScopeRead)(okHandler).ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/", nil))
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("context 中没有主体时应 403，实际 %d", rec.Code)
 	}
 }
 
@@ -203,7 +281,7 @@ func TestExtractBearerToken_Table(t *testing.T) {
 		{"带前后空白", "Bearer   abc123  ", "abc123"},
 		{"缺失 Authorization", "", ""},
 		{"非 Bearer 方案", "Basic abc123", ""},
-		{"小写 bearer 不识别", "bearer abc123", ""},
+		{"方案名大小写不敏感", "bearer abc123", "abc123"},
 		{"仅前缀无 token", "Bearer ", ""},
 		{"Bearer 后多空格", "Bearer    xyz", "xyz"},
 	}

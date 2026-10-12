@@ -85,6 +85,7 @@ func newResolverEnv(t *testing.T, ttlSec, cooldownSec int, eps ...string) *resol
 		CorrelationHeader:        "X-Correlation-ID",
 		ResolverTTLSeconds:       ttlSec,
 		UnhealthyCooldownSeconds: cooldownSec,
+		AuthMode:                 config.AuthModeDev,
 	}
 	r, err := New(cfg, log.New(io.Discard, "", 0))
 	if err != nil {
@@ -313,6 +314,7 @@ func TestResolver_ErrorResponseMapping(t *testing.T) {
 				CorrelationHeader:        "X-Correlation-ID",
 				ResolverTTLSeconds:       60,
 				UnhealthyCooldownSeconds: 600,
+				AuthMode:                 config.AuthModeDev,
 			}
 			r, err := New(cfg, log.New(io.Discard, "", 0))
 			if err != nil {

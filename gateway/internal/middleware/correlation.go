@@ -19,6 +19,7 @@ type contextKey int
 const (
 	correlationIDKey contextKey = iota
 	tenantIDKey
+	principalKey
 )
 
 // CorrelationIDFromContext 返回请求上下文中携带的关联 ID，缺失时返回空字符串。
@@ -39,7 +40,7 @@ func TenantFromContext(ctx context.Context) string {
 	return v
 }
 
-// WithTenant 将租户 ID 写入上下文，供 Authz 中间件向下游处理链传播。
+// WithTenant 将租户 ID 写入上下文，供认证中间件向下游处理链传播。
 func WithTenant(ctx context.Context, tenantID string) context.Context {
 	return context.WithValue(ctx, tenantIDKey, tenantID)
 }

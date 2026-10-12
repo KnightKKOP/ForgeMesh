@@ -9,7 +9,8 @@
 // 解析为推理服务实例 endpoint，按简单轮询选择一个实例转发（实例级负载均衡），
 // 并依据转发成败向 Resolver 上报，驱动健康摘流与冷却恢复。
 //
-// 安全约束（见开发计划 §14.1）：仅做转发，不缓存、不落盘任何响应内容。
+// 安全约束（见开发计划 §14.1）：仅做转发，不缓存、不落盘任何响应内容；
+// 调用方的平台凭证（Authorization、Cookie）不会转发给实例。
 package stream
 
 import (
@@ -54,7 +55,7 @@ type Proxy struct {
 // New 构造流式代理。
 //
 // resolver 提供按服务名的实例解析；tenantHeader 为提取租户身份的请求头名
-// （与 Authz 中间件一致）；logger 为 nil 时使用 log.Default()。
+// （与认证中间件一致）；logger 为 nil 时使用 log.Default()。
 //
 // 客户端不设置整体超时（流式连接可能长时间保持），仅对响应头到达设置超时，
 // 防止上游僵死连接长期占用资源。
@@ -95,7 +96,8 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	tenantID := r.Header.Get(p.tenantHeader)
 
-	endpoints, err := p.resolver.Resolve(r.Context(), svc, tenantID)
+	resolveCtx := upstream.WithAuthorization(r.Context(), r.Header.Get("Authorization"))
+	endpoints, err := p.resolver.Resolve(resolveCtx, svc, tenantID)
 	if err != nil {
 		p.logger.Printf("stream resolve error: corr=%s svc=%s tenant=%s err=%v",
 			r.Header.Get("X-Correlation-ID"), svc, tenantID, err)
@@ -220,9 +222,11 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, target *url.URL,
 }
 
 // classifyResolveError 将解析错误映射为 (HTTP 状态码, 错误码)。
-// 服务缺失/未就绪/无实例 → 503；控制平面自身故障 → 502。
+// 凭证无权读取服务 → 403；服务缺失/未就绪/无实例 → 503；控制平面自身故障 → 502。
 func classifyResolveError(err error) (int, string) {
 	switch {
+	case errors.Is(err, upstream.ErrForbidden):
+		return http.StatusForbidden, "FORBIDDEN"
 	case errors.Is(err, upstream.ErrServiceNotFound),
 		errors.Is(err, upstream.ErrNotReady),
 		errors.Is(err, upstream.ErrNoEndpoints),
@@ -294,12 +298,22 @@ func isHopByHop(key string) bool {
 	return ok
 }
 
-// copyForwardHeaders 复制需要转发的入站头，剔除逐跳头、Host 与 Content-Length
+// credentialHeaders 是调用方访问平台的凭证，不得转发给推理实例：实例可能运行第三方
+// 模型服务代码，拿到平台 key 即可冒充调用方访问控制平面。
+var credentialHeaders = map[string]struct{}{
+	"Authorization": {},
+	"Cookie":        {},
+}
+
+// copyForwardHeaders 复制需要转发的入站头，剔除逐跳头、调用方凭证、Host 与 Content-Length
 // （后者由 Transport 依据 ContentLength 字段自动生成，避免长度不一致）。
 func copyForwardHeaders(src http.Header) http.Header {
 	dst := make(http.Header, len(src))
 	for k, vs := range src {
 		ck := http.CanonicalHeaderKey(k)
+		if _, credential := credentialHeaders[ck]; credential {
+			continue
+		}
 		if isHopByHop(k) || ck == "Host" || ck == "Content-Length" {
 			continue
 		}

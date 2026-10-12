@@ -10,8 +10,7 @@
 //	  - 探针式直连路径（模仿 router.go 顶层 /healthz）不经过链、不泄漏受信头；
 //	  - 各类拒绝响应为固定文案，不含内部细节。
 //
-// 注：middleware.go 包注释中的链序描述（RateLimit 在 Authz 之前）与
-// router.go 实际组装不符，本测试以实际行为为准（详见任务 WP-D1 报告）。
+// 链中的 Authz 是 dev 模式的 Authenticate（信任租户头），链序语义与 apikey 模式相同。
 package middleware
 
 import (
@@ -32,7 +31,7 @@ func newAPIChain(l *Limiter, route http.Handler) http.Handler {
 	api := Chain(route,
 		Correlation(DefaultCorrelationHeader),
 		Authz(DefaultTenantHeader),
-		RateLimit(l, DefaultTenantHeader),
+		RateLimit(l),
 	)
 	return Recovery(log.New(io.Discard, "", 0))(api)
 }
@@ -163,11 +162,12 @@ func TestChain_ProbeBypassesChainNoLeak(t *testing.T) {
 func TestChain_RejectResponsesOpaque(t *testing.T) {
 	h := newAPIChain(NewRateLimiter(0.001, 1), nil)
 
-	// 401：缺失租户身份。
+	// 401：缺失租户身份，返回固定文案的错误信封。
 	rec401 := httptest.NewRecorder()
 	h.ServeHTTP(rec401, httptest.NewRequest(http.MethodGet, "/api/v1/resources", nil))
-	if want := "401 Unauthorized: missing tenant identity\n"; rec401.Body.String() != want {
-		t.Fatalf("401 响应体应为 %q，实际 %q", want, rec401.Body.String())
+	if code := decodeError(t, rec401); code != "UNAUTHENTICATED" ||
+		!strings.Contains(rec401.Body.String(), `"message":"missing tenant identity"`) {
+		t.Fatalf("401 响应体应为 UNAUTHENTICATED 错误信封，实际 %q", rec401.Body.String())
 	}
 
 	// 429：同租户超限（首请求已消耗 burst=1 的唯一令牌）。

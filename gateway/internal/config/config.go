@@ -8,6 +8,7 @@ package config
 
 import (
 	"fmt"
+	"net"
 	"os"
 	"strconv"
 	"strings"
@@ -23,6 +24,16 @@ const (
 	envCorrelationHeader        = "GATEWAY_CORRELATION_HEADER"
 	envResolverTTLSeconds       = "GATEWAY_RESOLVER_TTL_SECONDS"
 	envUnhealthyCooldownSeconds = "GATEWAY_UNHEALTHY_COOLDOWN_SECONDS"
+	envAuthMode                 = "GATEWAY_AUTH_MODE"
+	envAPIKeysFile              = "GATEWAY_API_KEYS_FILE"
+)
+
+// 认证模式（GATEWAY_AUTH_MODE）。
+const (
+	// AuthModeAPIKey 校验 `Authorization: Bearer <key>`，key 绑定租户（默认）。
+	AuthModeAPIKey = "apikey"
+	// AuthModeDev 直接信任租户请求头，只允许监听回环地址，仅供本地开发。
+	AuthModeDev = "dev"
 )
 
 // 默认值。
@@ -35,6 +46,7 @@ const (
 	defaultCorrelationHeader        = "X-Correlation-ID"
 	defaultResolverTTLSeconds       = 5
 	defaultUnhealthyCooldownSeconds = 10
+	defaultAuthMode                 = AuthModeAPIKey
 )
 
 // Config 描述网关运行所需的全部配置项。
@@ -55,6 +67,10 @@ type Config struct {
 	ResolverTTLSeconds int
 	// UnhealthyCooldownSeconds 实例被摘流后的冷却时长（秒），正整数。
 	UnhealthyCooldownSeconds int
+	// AuthMode 入口认证模式：AuthModeAPIKey 或 AuthModeDev。
+	AuthMode string
+	// APIKeysFile AuthModeAPIKey 下的 key 文件路径（与控制平面 FORGEMESH_API_KEYS_FILE 格式相同）。
+	APIKeysFile string
 }
 
 // Load 从环境变量读取配置；未设置项使用默认值。
@@ -112,7 +128,38 @@ func Load() (Config, error) {
 		return Config{}, fmt.Errorf("config: %s 不能为空", envListenAddr)
 	}
 
+	cfg.AuthMode = strings.ToLower(strings.TrimSpace(getEnv(envAuthMode, defaultAuthMode)))
+	cfg.APIKeysFile = strings.TrimSpace(os.Getenv(envAPIKeysFile))
+	switch cfg.AuthMode {
+	case AuthModeAPIKey:
+		if cfg.APIKeysFile == "" {
+			return Config{}, fmt.Errorf("config: %s=%s（默认）时必须通过 %s 指定 API key 文件；"+
+				"%s=%s 仅供本地开发", envAuthMode, AuthModeAPIKey, envAPIKeysFile, envAuthMode, AuthModeDev)
+		}
+	case AuthModeDev:
+		if !isLoopbackAddr(cfg.ListenAddr) {
+			return Config{}, fmt.Errorf("config: %s=%s 信任租户请求头，只允许监听回环地址（如 127.0.0.1:8081），"+
+				"当前 %s=%q", envAuthMode, AuthModeDev, envListenAddr, cfg.ListenAddr)
+		}
+	default:
+		return Config{}, fmt.Errorf("config: %s 取值非法 %q（可选 %s、%s）",
+			envAuthMode, cfg.AuthMode, AuthModeAPIKey, AuthModeDev)
+	}
+
 	return cfg, nil
+}
+
+// isLoopbackAddr 报告监听地址是否只绑定回环接口；未指定主机（如 ":8081"）表示绑定全部接口。
+func isLoopbackAddr(addr string) bool {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return false
+	}
+	if host == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 func getEnv(key, fallback string) string {

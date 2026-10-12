@@ -6,9 +6,8 @@
 //     被规范化为受信单值，无法造成“鉴权身份 ≠ 转发身份”的横向越权；
 //   - 无认证请求访问推理路径被 authz 拒绝，且不触达上游。
 //
-// 已知骨架限制（非本测试可消除）：Authz 尚未接入 JWT/OIDC 签名校验，
-// 租户身份本质仍是“客户端声明 + 控制平面二次校验”（零信任，见 authz.go）；
-// 本文件针对的是其中可立即利用的“头部变体歧义”攻击面。
+// 本文件的用例运行在 dev 认证模式（信任租户头），针对“头部变体歧义”攻击面；
+// apikey 模式下租户取自凭证、与凭证不符的租户头被拒绝，见 auth_test.go。
 package router
 
 import (
@@ -191,8 +190,8 @@ func TestTenantSecurity_UnauthorizedResponseOpaque(t *testing.T) {
 	r.ServeHTTP(rec, req)
 
 	body := rec.Body.String()
-	if want := "401 Unauthorized: missing tenant identity\n"; body != want {
-		t.Fatalf("401 响应体应为固定文案 %q，实际 %q", want, body)
+	if !strings.HasPrefix(body, `{"error":{"code":"UNAUTHENTICATED","message":"missing tenant identity"`) {
+		t.Fatalf("401 响应体应为固定文案的错误信封，实际 %q", body)
 	}
 	for _, leak := range []string{"goroutine", "panic", ".go:", "runtime", "stack"} {
 		if strings.Contains(strings.ToLower(body), strings.ToLower(leak)) {
@@ -218,6 +217,7 @@ func TestTenantSecurity_ConfigTenantHeaderEndToEnd(t *testing.T) {
 		RateLimitBurst:    1000,
 		TenantHeader:      "X-Org-Scope",
 		CorrelationHeader: "X-Correlation-ID",
+		AuthMode:          config.AuthModeDev,
 	}
 	r, err := New(cfg, nil)
 	if err != nil {

@@ -1,6 +1,6 @@
 # 架构决策记录（Architecture Decision Records, ADR）
 
-本目录保存 ForgeMesh 的架构决策记录。**ADR-001 ~ ADR-013 已被采纳（Accepted）**，构成架构约束；其中 ADR-001 ~ ADR-012 源自上游架构基线 [`../architecture/architecture.md`](../architecture/architecture.md) 第 2 章与开发计划 [`../architecture/development-plan.md`](../architecture/development-plan.md) 第 1.2 节，ADR-013 为实施期新增决策。
+本目录保存 ForgeMesh 的架构决策记录。**ADR-001 ~ ADR-013 已被采纳（Accepted）**，构成架构约束；其中 ADR-001 ~ ADR-012 源自上游架构基线 [`../architecture/architecture.md`](../architecture/architecture.md) 第 2 章与开发计划 [`../architecture/development-plan.md`](../architecture/development-plan.md) 第 1.2 节，ADR-013 为实施期新增决策。ADR-014 为待评审（Proposed）的实施期决策。
 
 > 参与流程见 [`../../CONTRIBUTING.md`](../../CONTRIBUTING.md) 第 7 节；决策机制见 [`../../GOVERNANCE.md`](../../GOVERNANCE.md) 第 3.2 节。ADR 与上游架构基线冲突时，**以 architecture.md 为准**。
 
@@ -23,6 +23,7 @@
 | [ADR-011](adr-011.md) | 插件与工作流版本固定 | Accepted | 升级不能破坏正在运行的任务 | WP-2.1、WP-4.6 |
 | [ADR-012](adr-012.md) | 所有公共契约版本化 | Accepted | 通过 Schema、兼容性测试与弃用周期管理 | WP-0.5、第 8 章 |
 | [ADR-013](adr-013.md) | 权威存储 SQLite 先行、PostgreSQL 为目标态 | Accepted | SQL 方言限定两者兼容子集；PG 独有特性不得进入核心路径 | WP-1.2、ADR-007 |
+| [ADR-014](adr-014.md) | 对外 API 采用绑定租户的 API Key 认证 | Proposed | 租户只来自已验证凭证；网关与控制平面各自校验；默认拒绝 | 11.1、14.1、D1.1 |
 
 ---
 

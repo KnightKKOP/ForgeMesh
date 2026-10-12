@@ -6,6 +6,7 @@ import pytest
 from fastapi.testclient import TestClient
 from forgemesh.controlplane.api.dependencies import get_registry, reset_runtime_components
 from forgemesh.controlplane.app import DB_PATH_ENV, create_app
+from forgemesh.controlplane.auth import AUTH_MODE_DEV, AUTH_MODE_ENV
 
 HEADERS = {"X-Tenant-Id": "acme"}
 BODY = {
@@ -20,7 +21,8 @@ BODY = {
 
 
 @pytest.fixture(autouse=True)
-def _reset_components():
+def _reset_components(monkeypatch):
+    monkeypatch.setenv(AUTH_MODE_ENV, AUTH_MODE_DEV)
     reset_runtime_components()
     yield
     reset_runtime_components()
@@ -71,6 +73,48 @@ def test_readyz_reports_unavailable_registry(tmp_path) -> None:
         not_ready = client.get("/readyz")
         assert not_ready.status_code == 503
         assert not_ready.json()["error"]["code"] == "NOT_READY"
+
+
+@pytest.mark.unit
+def test_framework_errors_use_the_error_envelope(tmp_path) -> None:
+    with TestClient(create_app(db_path=str(tmp_path / "cp.db"))) as client:
+        missing = client.get(
+            "/api/v1/inference-services/nope",
+            headers={**HEADERS, "X-Correlation-Id": "corr-1"},
+        )
+        not_object = client.post("/api/v1/inference-services", json=[1, 2], headers=HEADERS)
+        bad_limit = client.get(
+            "/api/v1/inference-services", params={"limit": "many"}, headers=HEADERS
+        )
+        wrong_method = client.put("/healthz")
+
+    assert missing.status_code == 404
+    assert missing.json()["error"]["code"] == "NOT_FOUND"
+    assert missing.json()["error"]["correlationId"] == "corr-1"
+    assert not_object.status_code == 400
+    assert not_object.json()["error"]["code"] == "BAD_REQUEST"
+    assert not_object.json()["error"]["details"]["errors"]
+    assert bad_limit.status_code == 400
+    assert bad_limit.json()["error"]["code"] == "BAD_REQUEST"
+    assert wrong_method.status_code == 405
+    assert wrong_method.json()["error"]["code"] == "METHOD_NOT_ALLOWED"
+
+
+@pytest.mark.unit
+def test_unhandled_errors_return_an_opaque_500_envelope(tmp_path, monkeypatch) -> None:
+    async def failing_list(*args, **kwargs):
+        raise RuntimeError("secret internal detail")
+
+    app = create_app(db_path=str(tmp_path / "cp.db"))
+    with TestClient(app, raise_server_exceptions=False) as client:
+        monkeypatch.setattr(get_registry(), "list", failing_list)
+        response = client.get("/api/v1/inference-services", headers=HEADERS)
+
+    assert response.status_code == 500
+    error = response.json()["error"]
+    assert error["code"] == "INTERNAL_ERROR"
+    assert "secret" not in error["message"]
+    assert error["correlationId"]
 
 
 @pytest.mark.unit

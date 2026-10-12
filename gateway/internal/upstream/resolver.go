@@ -1,6 +1,7 @@
 // resolver.go 实现推理服务名 → 实例 endpoint 列表的解析。
 //
-// 数据源：控制平面 GET /api/v1/inference-services/{svc}（携带 X-Tenant-Id），
+// 数据源：控制平面 GET /api/v1/inference-services/{svc}（携带 X-Tenant-Id 与调用方的
+// Authorization，控制平面据此独立校验调用方，见 WithAuthorization），
 // 从响应 status.endpoints[] 取实例地址（如 "http://10.0.0.1:8000"）。
 //
 // 设计要点：
@@ -10,7 +11,8 @@
 //     unhealthy 进入冷却期；冷却结束后按 half-open 语义重新放行（计数清零，
 //     给实例一次探测机会，避免"一次失败即永久摘除"或"反复抖动"）。
 //   - 解析失败（控制平面 404 / 网络错误 / status.endpoints 为空 /
-//     phase 非 Ready）返回哨兵错误，调用方据此生成 502/503。
+//     phase 非 Ready）返回哨兵错误，调用方据此生成 502/503；控制平面 403
+//     返回 ErrForbidden，调用方据此生成 403。
 //
 // 依赖约束：仅使用标准库（encoding/json 等），与 config 包约束一致。
 package upstream
@@ -33,6 +35,8 @@ import (
 var (
 	// ErrServiceNotFound 控制平面返回 404：推理服务不存在。
 	ErrServiceNotFound = errors.New("inference service not found")
+	// ErrForbidden 控制平面返回 403：调用方凭证无权读取该推理服务。
+	ErrForbidden = errors.New("credentials may not read the inference service")
 	// ErrNotReady 资源 status.phase 不为 Ready：服务尚未就绪。
 	ErrNotReady = errors.New("inference service not Ready")
 	// ErrNoEndpoints status.endpoints 为空（或全部无法解析）：没有可用实例地址。
@@ -63,6 +67,17 @@ type inferenceServicePayload struct {
 		Phase     string   `json:"phase"`
 		Endpoints []string `json:"endpoints"`
 	} `json:"status"`
+}
+
+type authorizationKey struct{}
+
+// WithAuthorization 返回携带调用方 Authorization 请求头的 context。Resolver 查询控制平面
+// 时原样附带，控制平面用同一份凭证独立校验调用方与租户；value 为空时原样返回 ctx。
+func WithAuthorization(ctx context.Context, value string) context.Context {
+	if value == "" {
+		return ctx
+	}
+	return context.WithValue(ctx, authorizationKey{}, value)
 }
 
 // cacheEntry 是服务级缓存条目。
@@ -165,9 +180,12 @@ func (r *Resolver) fetch(ctx context.Context, svc, tenantID string) ([]string, e
 	if err != nil {
 		return nil, fmt.Errorf("resolver: 构造请求失败: %w", err)
 	}
-	// 控制平面 get_tenant_id 依赖 X-Tenant-Id（HTTP 头大小写不敏感）。
+	// 租户已由网关认证中间件取自凭证；控制平面会核对它与凭证绑定的租户一致。
 	req.Header.Set("X-Tenant-Id", tenantID)
 	req.Header.Set("Accept", "application/json")
+	if auth, _ := ctx.Value(authorizationKey{}).(string); auth != "" {
+		req.Header.Set("Authorization", auth)
+	}
 
 	resp, err := r.client.Do(req)
 	if err != nil {
@@ -178,6 +196,8 @@ func (r *Resolver) fetch(ctx context.Context, svc, tenantID string) ([]string, e
 	switch {
 	case resp.StatusCode == http.StatusNotFound:
 		return nil, fmt.Errorf("%w: svc=%s tenant=%s", ErrServiceNotFound, svc, tenantID)
+	case resp.StatusCode == http.StatusForbidden:
+		return nil, fmt.Errorf("%w: svc=%s tenant=%s", ErrForbidden, svc, tenantID)
 	case resp.StatusCode < 200 || resp.StatusCode >= 300:
 		return nil, fmt.Errorf("resolver: 控制平面返回异常状态 %d (svc=%s)", resp.StatusCode, svc)
 	}

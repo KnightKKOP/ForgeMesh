@@ -9,10 +9,12 @@
 //	ANY  /api/v1/workflows[/...]               反代到 Python 控制平面
 //	ANY  /api/v1/decisions[/...]               反代到 Python 控制平面
 //	ANY  /api/v1/inference/{svc}/chat          SSE 流式代理（{svc} 经 Resolver
-//	                                          解析为实例 endpoint，轮询分发）
+//	                                          解析为实例 endpoint，轮询分发；
+//	                                          要求 read 作用域）
 //
-// 中间件链（执行顺序）：Recovery → Correlation → Authz → RateLimit → Route。
-// Recovery 作为最外层兜底全量请求；探针刻意不经过鉴权/限流，保证健康检查可用。
+// 中间件链（执行顺序）：Recovery → Correlation → Authenticate → RateLimit → Route。
+// Recovery 作为最外层兜底全量请求；探针刻意不经过认证/限流，保证健康检查可用。
+// 认证模式见 config.AuthModeAPIKey / config.AuthModeDev 与 ADR-014。
 package router
 
 import (
@@ -61,6 +63,10 @@ func New(cfg config.Config, logger *log.Logger) (*Router, error) {
 	if target.Scheme == "" || target.Host == "" {
 		return nil, fmt.Errorf("router: 上游地址必须包含 scheme 与 host: %q", cfg.UpstreamURL)
 	}
+	authn, err := newAuthenticator(cfg)
+	if err != nil {
+		return nil, err
+	}
 
 	hc := health.New(cfg.UpstreamURL)
 	proxy := upstream.New(target, cfg.CorrelationHeader, cfg.TenantHeader, logger)
@@ -84,14 +90,16 @@ func New(cfg config.Config, logger *log.Logger) (*Router, error) {
 		apiMux.Handle(p, proxy)     // 精确匹配集合端点
 		apiMux.Handle(p+"/", proxy) // 匹配子资源
 	}
-	apiMux.Handle(streamRoutePattern, streamProxy)
+	// 推理调用读取服务的 status.endpoints 并调用实例，不修改资源，故要求 read 作用域；
+	// 在网关侧检查，使命中 Resolver 缓存的请求同样受作用域约束。
+	apiMux.Handle(streamRoutePattern, middleware.RequireScope(middleware.ScopeRead)(streamProxy))
 
-	// API 中间件链：Correlation → Authz → RateLimit。
+	// API 中间件链：Correlation → Authenticate → RateLimit。
 	limiter := middleware.NewRateLimiter(cfg.RateLimitRPS, cfg.RateLimitBurst)
 	apiHandler := middleware.Chain(apiMux,
 		middleware.Correlation(cfg.CorrelationHeader),
-		middleware.Authz(cfg.TenantHeader),
-		middleware.RateLimit(limiter, cfg.TenantHeader),
+		middleware.Authenticate(authn, cfg.TenantHeader),
+		middleware.RateLimit(limiter),
 	)
 
 	// 顶层路由：探针不经过鉴权/限流。
@@ -102,6 +110,27 @@ func New(cfg config.Config, logger *log.Logger) (*Router, error) {
 
 	// Recovery 作为最外层，兜底全量请求的 panic。
 	return &Router{handler: middleware.Recovery(logger)(root)}, nil
+}
+
+// newAuthenticator 按配置构造入口认证器；未知模式视为配置错误，绝不退化为信任请求头。
+func newAuthenticator(cfg config.Config) (middleware.Authenticator, error) {
+	switch cfg.AuthMode {
+	case config.AuthModeAPIKey:
+		keys, err := middleware.LoadAPIKeys(cfg.APIKeysFile)
+		if err != nil {
+			return nil, fmt.Errorf("router: %w", err)
+		}
+		authn, err := middleware.NewAPIKeyAuthenticator(keys, cfg.TenantHeader)
+		if err != nil {
+			return nil, fmt.Errorf("router: %w", err)
+		}
+		return authn, nil
+	case config.AuthModeDev:
+		return middleware.HeaderAuthenticator{TenantHeader: cfg.TenantHeader}, nil
+	default:
+		return nil, fmt.Errorf("router: 未知认证模式 %q（可选 %q、%q）",
+			cfg.AuthMode, config.AuthModeAPIKey, config.AuthModeDev)
+	}
 }
 
 // ServeHTTP 实现 http.Handler。

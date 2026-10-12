@@ -12,8 +12,9 @@
 * ``POST   /decisions``                   —— 结构化决策（决策≠授权，development-plan 5.5）
 * ``GET    /resources``                   —— 通用资源列表（可选 kind 过滤）
 
-租户上下文通过 ``X-Tenant-Id`` 请求头注入（见 :mod:`.dependencies`），
-作为多租户隔离的权威来源，覆盖请求体中的租户字段。
+租户取自已验证的凭证（见 :func:`.dependencies.get_principal` 与
+:mod:`forgemesh.controlplane.auth`），作为多租户隔离的权威来源，覆盖请求体中的
+租户字段；读接口要求 ``read`` scope，写接口要求 ``write`` scope。
 
 运行时端点（workflows / decisions）依赖注入的 ``WorkflowRuntime`` /
 ``DecisionRouter``（见 :func:`.dependencies.init_workflow_runtime` 等）；
@@ -43,7 +44,10 @@ from .dependencies import (
     get_registry,
     get_tenant_id,
     get_workflow_runtime,
+    require_read,
+    require_write,
 )
+from .errors import validation_details
 
 router = APIRouter(prefix="/api/v1")
 
@@ -55,8 +59,8 @@ class ResourceListResponse(BaseModel):
     count: int
 
 
-#: 由服务端维护、创建请求中一律忽略的元数据字段。请求头 ``X-Tenant-Id`` 为租户
-#: 权威来源，覆盖请求体中的租户字段，防止跨租户伪造。
+#: 由服务端维护、创建请求中一律忽略的元数据字段。已验证凭证中的租户是权威来源，
+#: 覆盖请求体中的租户字段，防止跨租户伪造。
 _SERVER_OWNED_METADATA = ("tenant_id", "tenantId", "uid", "resourceVersion")
 
 #: 列表接口单页条数上限。
@@ -108,7 +112,7 @@ def _invalid_limit(limit: int) -> JSONResponse | None:
 # ------------------------------------------------------------------ #
 
 
-@router.post("/inference-services", status_code=201)
+@router.post("/inference-services", status_code=201, dependencies=[Depends(require_write)])
 async def create_inference_service(
     body: dict[str, Any],
     tenant_id: str = Depends(get_tenant_id),
@@ -127,7 +131,7 @@ async def create_inference_service(
             "BAD_REQUEST",
             "推理服务创建请求校验失败",
             correlation_id,
-            {"errors": _validation_details(exc)},
+            {"errors": validation_details(exc)},
         )
     except ValueError as exc:
         return _error_response(400, "BAD_REQUEST", str(exc), correlation_id)
@@ -138,7 +142,7 @@ async def create_inference_service(
     return JSONResponse(status_code=201, content=created.model_dump(by_alias=True, mode="json"))
 
 
-@router.get("/inference-services")
+@router.get("/inference-services", dependencies=[Depends(require_read)])
 async def list_inference_services(
     tenant_id: str = Depends(get_tenant_id),
     namespace: str | None = None,
@@ -152,7 +156,7 @@ async def list_inference_services(
     return {"items": [r.model_dump(by_alias=True) for r in items], "count": len(items)}
 
 
-@router.get("/inference-services/{name}")
+@router.get("/inference-services/{name}", dependencies=[Depends(require_read)])
 async def get_inference_service(
     name: str,
     tenant_id: str = Depends(get_tenant_id),
@@ -167,7 +171,7 @@ async def get_inference_service(
     return resource.model_dump(by_alias=True)
 
 
-@router.delete("/inference-services/{name}")
+@router.delete("/inference-services/{name}", dependencies=[Depends(require_write)])
 async def delete_inference_service(
     name: str,
     tenant_id: str = Depends(get_tenant_id),
@@ -199,7 +203,7 @@ async def delete_inference_service(
 # ------------------------------------------------------------------ #
 
 
-@router.get("/resources")
+@router.get("/resources", dependencies=[Depends(require_read)])
 async def list_resources(
     tenant_id: str = Depends(get_tenant_id),
     kind: str | None = None,
@@ -256,14 +260,6 @@ class WorkflowRunResponse(BaseModel):
     definition_version: int = Field(alias="definitionVersion")
 
 
-def _validation_details(exc: ValidationError) -> list[dict[str, Any]]:
-    """提取校验错误摘要（loc/msg/type），剥离不可 JSON 序列化的 ``ctx``。"""
-    return [
-        {"loc": [str(x) for x in err["loc"]], "msg": err["msg"], "type": err["type"]}
-        for err in exc.errors()
-    ]
-
-
 def _error_response(
     status_code: int,
     code: str,
@@ -278,7 +274,7 @@ def _error_response(
     )
 
 
-@router.post("/workflows", status_code=202)
+@router.post("/workflows", status_code=202, dependencies=[Depends(require_write)])
 async def start_workflow(
     body: dict[str, Any],
     tenant_id: str = Depends(get_tenant_id),
@@ -307,7 +303,7 @@ async def start_workflow(
             "BAD_REQUEST",
             "工作流启动请求校验失败",
             correlation_id,
-            {"errors": _validation_details(exc)},
+            {"errors": validation_details(exc)},
         )
 
     try:
@@ -344,7 +340,7 @@ async def start_workflow(
 class DecisionCallRequest(BaseModel):
     """决策请求体（对齐 OpenAPI ``DecisionRequest``）。
 
-    OpenAPI 契约未含租户字段，租户一律由 ``X-Tenant-Id`` 请求头注入。
+    OpenAPI 契约未含租户字段，租户一律取自已验证的凭证。
 
     Attributes:
         question: 决策问题；API 层映射为内部模型的 ``operation`` 语义标识。
@@ -360,7 +356,7 @@ class DecisionCallRequest(BaseModel):
     required_capabilities: list[str] | None = Field(default=None, alias="requiredCapabilities")
 
 
-@router.post("/decisions")
+@router.post("/decisions", dependencies=[Depends(require_write)])
 async def request_decision(
     body: dict[str, Any],
     tenant_id: str = Depends(get_tenant_id),
@@ -390,7 +386,7 @@ async def request_decision(
             "BAD_REQUEST",
             "决策请求校验失败",
             correlation_id,
-            {"errors": _validation_details(exc)},
+            {"errors": validation_details(exc)},
         )
 
     try:

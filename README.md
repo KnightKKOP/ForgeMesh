@@ -288,7 +288,7 @@ ForgeMesh 目前处于预览阶段，API 稳定性标注为 `beta`：minor 版�
 
 ### 核心控制平面（M2）
 - **资源注册中心**：SQLite 持久化，乐观并发 CAS，租户隔离，分页游标（现状：API 尚未返回分页游标）
-- **协调控制器**：9 步声明式闭环（获取→查询→比较→生成候选→策略校验→调度分配→执行→重观察→更新状态）（现状：自 1.1.0 起由控制器自动驱动；设置 `FORGEMESH_INVENTORY_FILE` 后启用 first-fit 调度器，但应用还没有接入工作流运行时，新建的推理服务停在 `Pending`，并报告 `Ready=False`：未设置清单时为 `SchedulerUnavailable`，设置后为 `WorkflowRuntimeUnavailable`）
+- **协调控制器**：9 步声明式闭环（获取→查询→比较→生成候选→策略校验→调度分配→执行→重观察→更新状态）（现状：自 1.1.0 起由控制器自动驱动；同时设置 `FORGEMESH_INVENTORY_FILE` 与 `FORGEMESH_RUNTIME_LAUNCHER` 后，调度、部署、写入 `status.endpoints` 与受控删除形成完整闭环，见[部署推理服务](#部署推理服务)；未设置启动器时，新建的推理服务停在 `Pending`，并报告 `Ready=False`（`SchedulerUnavailable` 或 `WorkflowRuntimeUnavailable`）。控制平面重启后实例不会自动重新启动）
 - **策略引擎**：allow/deny/require_approval 三态决策，配额规则，高风险审批触发
   - 说明：Decision Router 的 `OK/FALLBACK_REQUIRED/FAILED` 是决策路由层的另一组状态，与 Policy 三态不混用
 - **插件管理器**：Manifest 解析校验，生命周期状态机，能力发现，权限授予（现状：授予的权限直接取自插件清单自己的声明）
@@ -305,7 +305,7 @@ ForgeMesh 目前处于预览阶段，API 稳定性标注为 `beta`：minor 版�
 - **Node Agent**：注册认证，设备/驱动探测，本地运行时管理，断线重连，任务恢复（现状：与控制平面之间只有进程内调用，没有网络传输）
 - **gRPC 任务协议**：6 类任务枚举，心跳与离线检测，幂等键去重（现状：协议定义在 `api/protobuf/agent.proto`，尚未生成代码）
 - **gpu-nvidia 插件**：GPU 枚举，能力采集，驱动/CUDA 预检，周期性健康检查
-- **runtime-vllm 插件**：模型拉取，实例部署，冒烟验证，租约释放（现状：默认 launcher 抛出 `NotImplementedError`，部署实例需要注入 launcher）
+- **runtime-vllm 插件**：模型拉取，实例部署，冒烟验证，租约释放（现状：插件中的默认 launcher 仍抛出 `NotImplementedError`；控制平面部署推理服务时不使用这个插件，而是使用自带的 vLLM 进程启动器 `FORGEMESH_RUNTIME_LAUNCHER=vllm-process`）
 - **GPU 上线 E2E**：发现→验证→准备→部署→验收→提交 完整闭环（现状：工作流级测试，各步骤为模拟实现）
 - **故障恢复**：节点离线不误判、控制平面重启恢复、重复事件不盲目重试
 
@@ -321,7 +321,7 @@ ForgeMesh 目前处于预览阶段，API 稳定性标注为 `beta`：minor 版�
 - **MIG 支持**：NVIDIA MIG 实例管理（创建/销毁/发现/健康检查/能力报告），并发安全，资源不超分
 - **异构 GPU**：非 NVIDIA 能力差异显式报告（差异不隐藏）
 - **Temporal Provider**：WorkflowRuntime 契约适配，补偿注册，信号投递（现状：只有内存客户端，没有接入 temporalio）
-- **TGI Runtime**：HuggingFace TGI 推理 Runtime Provider（deploy→verify→release 闭环）（现状：默认 launcher 抛出 `NotImplementedError`）
+- **TGI Runtime**：HuggingFace TGI 推理 Runtime Provider（deploy→verify→release 闭环）（现状：默认 launcher 抛出 `NotImplementedError`，控制平面也还没有 TGI 启动器）
 - **插件 SDK**：脚手架生成，Manifest 校验，打包发布，开放契约测试套件
 - **治理文档**：GOVERNANCE / SECURITY / CONTRIBUTING / CODE_OF_CONDUCT 完善，弃用政策
 - **API 版本管理**：OpenAPI 版本号与稳定性标注（当前为 1.1.0、`beta`），CHANGELOG，发布记录，CI 架构文档检查
@@ -330,7 +330,7 @@ ForgeMesh 目前处于预览阶段，API 稳定性标注为 `beta`：minor 版�
 
 | 类型 | 数量 |
 |------|------|
-| Python 测试 | **1479** |
+| Python 测试 | **1623** |
 | Go 测试 | 134 个测试函数，全部通过 |
 | ruff 检查 | All checks passed |
 

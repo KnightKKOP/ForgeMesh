@@ -22,11 +22,15 @@ func TestLoad_Defaults(t *testing.T) {
 	t.Setenv(envRateLimitBurst, "")
 	t.Setenv(envResolverTTLSeconds, "")
 	t.Setenv(envUnhealthyCooldownSeconds, "")
+	t.Setenv(envMaxRequestBodyBytes, "")
 	setAPIKeyAuthEnv(t)
 
 	cfg, err := Load()
 	if err != nil {
 		t.Fatalf("Load 默认应成功: %v", err)
+	}
+	if cfg.MaxRequestBodyBytes != DefaultMaxRequestBodyBytes {
+		t.Fatalf("MaxRequestBodyBytes 默认应为 %d，实际 %d", DefaultMaxRequestBodyBytes, cfg.MaxRequestBodyBytes)
 	}
 	if cfg.ResolverTTLSeconds != defaultResolverTTLSeconds {
 		t.Fatalf("ResolverTTLSeconds 默认应为 %d，实际 %d", defaultResolverTTLSeconds, cfg.ResolverTTLSeconds)
@@ -99,6 +103,20 @@ func TestLoad_ResolverOverrides(t *testing.T) {
 	}
 }
 
+// TestLoad_MaxRequestBodyBytesOverride 验证环境变量可覆盖请求体上限。
+func TestLoad_MaxRequestBodyBytesOverride(t *testing.T) {
+	setAPIKeyAuthEnv(t)
+	t.Setenv(envMaxRequestBodyBytes, "1048576")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load 应成功: %v", err)
+	}
+	if cfg.MaxRequestBodyBytes != 1<<20 {
+		t.Fatalf("MaxRequestBodyBytes 应为 1048576，实际 %d", cfg.MaxRequestBodyBytes)
+	}
+}
+
 // TestLoad_InvalidResolverValues 验证非正数取值被拒绝。
 func TestLoad_InvalidResolverValues(t *testing.T) {
 	cases := []struct {
@@ -113,6 +131,8 @@ func TestLoad_InvalidResolverValues(t *testing.T) {
 		{"冷却零", envUnhealthyCooldownSeconds, "0", envUnhealthyCooldownSeconds},
 		{"冷却负数", envUnhealthyCooldownSeconds, "-1", envUnhealthyCooldownSeconds},
 		{"冷却非数字", envUnhealthyCooldownSeconds, "x", envUnhealthyCooldownSeconds},
+		{"请求体上限零", envMaxRequestBodyBytes, "0", envMaxRequestBodyBytes},
+		{"请求体上限非数字", envMaxRequestBodyBytes, "10MiB", envMaxRequestBodyBytes},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

@@ -131,6 +131,59 @@ func TestApi_UnknownRouteAllowedThroughChain(t *testing.T) {
 	}
 }
 
+// TestApi_RequestBodyLimit 验证请求体上限：声明长度超限直接 413、不触达控制平面；
+// 分块上传超限同样 413；恰好等于上限的请求体正常转发。
+func TestApi_RequestBodyLimit(t *testing.T) {
+	var cpHits atomic.Int64
+	controlPlane := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		cpHits.Add(1)
+		_, _ = io.Copy(io.Discard, req.Body)
+		w.WriteHeader(http.StatusCreated)
+	}))
+	defer controlPlane.Close()
+
+	r, err := New(config.Config{
+		ListenAddr:          ":0",
+		UpstreamURL:         controlPlane.URL,
+		RateLimitRPS:        1000,
+		RateLimitBurst:      1000,
+		TenantHeader:        "X-Tenant-ID",
+		CorrelationHeader:   "X-Correlation-ID",
+		AuthMode:            config.AuthModeDev,
+		MaxRequestBodyBytes: 16,
+	}, log.New(io.Discard, "", 0))
+	if err != nil {
+		t.Fatalf("New 失败: %v", err)
+	}
+	post := func(body string, chunked bool) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/resources", strings.NewReader(body))
+		if chunked {
+			req.ContentLength = -1
+		}
+		req.Header.Set("X-Tenant-ID", "tenant-a")
+		rec := httptest.NewRecorder()
+		r.ServeHTTP(rec, req)
+		return rec
+	}
+
+	if rec := post(strings.Repeat("x", 17), false); rec.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("声明长度超限应 413，实际 %d（body=%s）", rec.Code, rec.Body.String())
+	}
+	if got := cpHits.Load(); got != 0 {
+		t.Fatalf("声明长度超限的请求不应触达控制平面，实际 %d 次", got)
+	}
+	rec := post(strings.Repeat("x", 64), true)
+	if rec.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("分块上传超限应 413，实际 %d（body=%s）", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), `"code":"REQUEST_TOO_LARGE"`) {
+		t.Fatalf("错误体应含 REQUEST_TOO_LARGE，实际: %s", rec.Body.String())
+	}
+	if rec := post(strings.Repeat("x", 16), false); rec.Code != http.StatusCreated {
+		t.Fatalf("等于上限的请求体应正常转发，实际 %d（body=%s）", rec.Code, rec.Body.String())
+	}
+}
+
 // TestInferenceChat_ResolvesEndpoint 端到端验证推理路由：
 // 控制平面返回 Ready + 实例 endpoint，SSE 请求应被转发到该实例并透传流式响应。
 func TestInferenceChat_ResolvesEndpoint(t *testing.T) {

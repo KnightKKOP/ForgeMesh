@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -591,6 +592,33 @@ func TestProxy_RefusesDisallowedInstanceAddress(t *testing.T) {
 	}
 	if got := hits.Load(); got != 0 {
 		t.Fatalf("被拒绝的实例不应收到请求，实际 %d 次", got)
+	}
+}
+
+// TestProxy_RequestBodyTooLarge 验证分块请求体超过上限（由 LimitRequestBody 包装）时
+// 返回 413，且不计实例失败。
+func TestProxy_RequestBodyTooLarge(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+	}))
+	defer srv.Close()
+
+	res := newFakeResolver([]string{srv.URL}, nil)
+	rec := httptest.NewRecorder()
+	req := newChatRequest("svc-a")
+	req.Method = http.MethodPost
+	req.Body = http.MaxBytesReader(rec, io.NopCloser(strings.NewReader(strings.Repeat("x", 64))), 16)
+	req.ContentLength = -1
+	New(res, "X-Tenant-ID", allowLoopback, nil).ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("请求体超限应 413，实际 %d（body=%s）", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), `"code":"REQUEST_TOO_LARGE"`) {
+		t.Fatalf("错误体应含 REQUEST_TOO_LARGE，实际: %s", rec.Body.String())
+	}
+	if got := res.failureCount(srv.URL); got != 0 {
+		t.Fatalf("请求体超限属客户端问题，不应计实例失败，实际 %d", got)
 	}
 }
 

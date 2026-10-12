@@ -20,6 +20,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"net"
@@ -150,6 +151,12 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, upstreamURL, end
 
 	resp, err := p.client.Do(req)
 	if err != nil {
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			writeJSONError(w, http.StatusRequestEntityTooLarge, "REQUEST_TOO_LARGE",
+				fmt.Sprintf("请求体超过 %d 字节", tooLarge.Limit))
+			return
+		}
 		p.logger.Printf("stream upstream error: corr=%s path=%s endpoint=%s err=%v",
 			r.Header.Get("X-Correlation-ID"), r.URL.Path, endpoint, err)
 		p.resolver.ReportFailure(endpoint)

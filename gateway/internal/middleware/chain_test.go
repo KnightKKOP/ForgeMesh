@@ -2,7 +2,7 @@
 //
 // 链序（与 router.go 实际组装一致，外层 → 内层）：
 //
-//		Recovery → Correlation → Authz → RateLimit → Route
+//		Recovery → Correlation → Authz → RateLimit → LimitRequestBody → Route
 //
 //	  - Correlation 先于 Authz：认证失败的响应也携带关联 ID；
 //	  - Authz 先于 RateLimit：被拒请求不产生限流副作用（不耗令牌、不误伤）；
@@ -32,6 +32,7 @@ func newAPIChain(l *Limiter, route http.Handler) http.Handler {
 		Correlation(DefaultCorrelationHeader),
 		Authz(DefaultTenantHeader),
 		RateLimit(l),
+		LimitRequestBody(1<<20),
 	)
 	return Recovery(log.New(io.Discard, "", 0))(api)
 }

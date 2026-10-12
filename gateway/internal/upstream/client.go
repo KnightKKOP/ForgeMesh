@@ -5,10 +5,14 @@
 package upstream
 
 import (
+	"errors"
+	"fmt"
 	"log"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+
+	"github.com/Mekoforge/ForgeMesh/gateway/internal/middleware"
 )
 
 // Client 是对 httputil.ReverseProxy 的薄封装，实现 http.Handler。
@@ -57,6 +61,12 @@ func New(target *url.URL, correlationHeader, tenantHeader string, logger *log.Lo
 			}
 		},
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
+			var tooLarge *http.MaxBytesError
+			if errors.As(err, &tooLarge) {
+				middleware.WriteError(w, r, http.StatusRequestEntityTooLarge, "REQUEST_TOO_LARGE",
+					fmt.Sprintf("request body exceeds %d bytes", tooLarge.Limit))
+				return
+			}
 			logger.Printf("upstream proxy error: corr=%s path=%s err=%v", r.Header.Get(c.correlationHeader), r.URL.Path, err)
 			http.Error(w, http.StatusText(http.StatusBadGateway), http.StatusBadGateway)
 		},

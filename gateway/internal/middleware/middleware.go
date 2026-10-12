@@ -2,11 +2,12 @@
 //
 // 链的执行顺序（外层 → 内层）：
 //
-//	Recovery → Correlation → Authenticate → RateLimit → Route
+//	Recovery → Correlation → Authenticate → RateLimit → LimitRequestBody → Route
 //
 // Recovery 位于最外层，保证任何下游 panic 都能被兜底；
 // Correlation 尽早生成关联 ID，认证失败的响应也能携带；
-// Authenticate 先于 RateLimit，被拒请求不消耗令牌。
+// Authenticate 先于 RateLimit，被拒请求不消耗令牌；
+// LimitRequestBody 紧挨路由，请求体只在转发时才被读取。
 package middleware
 
 import "net/http"

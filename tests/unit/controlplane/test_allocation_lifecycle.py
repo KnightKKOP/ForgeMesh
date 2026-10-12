@@ -1,8 +1,9 @@
 """分配生命周期测试：控制器 + 协调器 + 首次适配调度器 + 注册表。
 
 * 同一 generation 的重放（含分配后、status 写入前崩溃，再以文件库重启）始终只有
-  一个分配，且分配的设备满足 ``spec.resources.accelerator``；
-* 处于 Scheduling 的资源被删除后不留下 Active 分配，同名资源重建后能再次分到同一设备。
+  一个分配，分配的设备满足 ``spec.resources.accelerator``，部署工作流拿到的就是它；
+* 持有分配、还没有实例的资源（Preparing）被删除后不留下 Active 分配，同名资源重建后
+  能再次分到同一设备。
 
 测试以 ``asyncio.run`` 驱动异步方法，不依赖 pytest-asyncio。
 """
@@ -15,11 +16,13 @@ from typing import Any
 
 import pytest
 from forgemesh.controlplane.controller import ControllerManager
+from forgemesh.controlplane.deployment import LaunchRequest
 from forgemesh.controlplane.reconciler import ProcessedKeyStore, ReconciliationController
 from forgemesh.controlplane.registry import ResourceKey, SQLiteRegistry
 from forgemesh.controlplane.scheduler import FirstFitScheduler, Inventory
 from forgemesh.core.errors import NotFoundError
-from forgemesh.core.objects import ObjectMeta
+from forgemesh.core.objects import ObjectMeta, Resource
+from forgemesh.core.scheduler import AllocatedDevice
 from forgemesh.policy.engine import DefaultPolicyEngine
 from forgemesh.policy.rules import AuthzRule
 from forgemesh.resource.inference import (
@@ -66,18 +69,33 @@ def _service(uid: str, min_memory: int = 16) -> InferenceService:
 
 
 class _Workflow:
-    async def start(self, defn: Any, inputs: Any, idempotency_key: str) -> RunRef:
+    """只记录启动请求的部署工作流替身：本模块的部署停在 Deploying 之前。"""
+
+    def __init__(self) -> None:
+        self.requests: list[LaunchRequest] = []
+
+    async def start(self, defn: Any, inputs: dict[str, Any], idempotency_key: str) -> RunRef:
+        self.requests.append(LaunchRequest.model_validate(inputs["request"]))
         return RunRef(run_id=idempotency_key, definition_version=1)
 
 
+class _Release:
+    async def release(self, resource: Resource) -> None:
+        return None
+
+
 def _manager(
-    registry: SQLiteRegistry, inventory: Inventory, store: ProcessedKeyStore | None = None
+    registry: SQLiteRegistry,
+    inventory: Inventory,
+    store: ProcessedKeyStore | None = None,
+    workflow: _Workflow | None = None,
 ) -> ControllerManager:
     reconciler = ReconciliationController(
         registry,
         DefaultPolicyEngine(authz_rules=[AuthzRule(action="reconcile", effect="allow")]),
         scheduler=FirstFitScheduler(registry, inventory),
-        workflow_runtime=_Workflow(),
+        workflow_runtime=workflow or _Workflow(),
+        release_provider=_Release(),
         processed_store=store,
         record_dedup_keys=False,
     )
@@ -88,10 +106,11 @@ def _manager(
 def test_replaying_a_generation_after_a_crash_and_restart_keeps_one_allocation(
     tmp_path, monkeypatch
 ):
-    """分配之后、status 写入之前进程退出：去重键没有登记，重启后同一 generation 再次
-    协调，拿到的仍是原来的分配。"""
+    """Scheduling 一轮分配之后、status 写入之前进程退出：重启后同一 generation 再次分配，
+    拿到的仍是原来的分配，部署工作流收到的也是它的设备。"""
     db = str(tmp_path / "cp.db")
     inventory = _inventory(("gpu-0", 24), ("gpu-1", 80))
+    workflow = _Workflow()
 
     async def killed(*args: Any, **kwargs: Any) -> Any:
         raise RuntimeError("process killed")
@@ -101,9 +120,11 @@ def test_replaying_a_generation_after_a_crash_and_restart_keeps_one_allocation(
         store = ProcessedKeyStore(db)
         try:
             await registry.put(_service("uid-1", min_memory=40))
+            manager = _manager(registry, inventory, store)
+            await manager.process(KEY)
             monkeypatch.setattr(registry, "update_status", killed)
             with pytest.raises(RuntimeError, match="process killed"):
-                await _manager(registry, inventory, store).process(KEY)
+                await manager.process(KEY)
             return await registry.list_allocations(TENANT)
         finally:
             await store.close()
@@ -113,7 +134,7 @@ def test_replaying_a_generation_after_a_crash_and_restart_keeps_one_allocation(
         registry = SQLiteRegistry(db)
         store = ProcessedKeyStore(db)
         try:
-            manager = _manager(registry, inventory, store)
+            manager = _manager(registry, inventory, store, workflow)
             await manager.process(KEY)
             await manager.process(KEY)
             service = await registry.get(KIND, NAMESPACE, "svc", TENANT)
@@ -128,13 +149,16 @@ def test_replaying_a_generation_after_a_crash_and_restart_keeps_one_allocation(
     assert allocations == [allocation]
     assert (allocation["resource_id"], allocation["idempotency_key"]) == ("uid-1", "uid-1:1")
     assert allocation["devices"] == [{"node_id": "node-a", "device_id": "gpu-1"}]
-    assert [condition.reason for condition in service.status.conditions] == ["Reconciled"]
+    assert service.status.phase == "Deploying"
+    [request] = workflow.requests
+    assert request.allocation_id == allocation["id"]
+    assert request.devices == (AllocatedDevice(node_id="node-a", device_id="gpu-1"),)
 
 
 @pytest.mark.unit
-def test_deleting_a_scheduling_resource_frees_its_device_for_a_re_created_one():
-    """单卡清单：Scheduling 不是有外部副作用的 phase，但资源持有分配，删除仍先进入
-    Terminating；协调器释放分配并物理删除后，同名资源以新 uid 重建能分到这张卡。"""
+def test_deleting_an_allocated_resource_frees_its_device_for_a_re_created_one():
+    """单卡清单：Preparing 不是有外部副作用的 phase（还没有实例），但资源持有分配，删除
+    仍先进入 Terminating；协调器释放分配并物理删除后，同名资源以新 uid 重建能分到这张卡。"""
     inventory = _inventory(("gpu-0", 80))
 
     async def scenario() -> None:
@@ -143,8 +167,9 @@ def test_deleting_a_scheduling_resource_frees_its_device_for_a_re_created_one():
             manager = _manager(registry, inventory)
             await registry.put(_service("uid-1"))
             await manager.process(KEY)
+            await manager.process(KEY)
+            assert (await registry.get(KIND, NAMESPACE, "svc", TENANT)).status.phase == "Preparing"
             [first] = await registry.list_allocations(TENANT)
-            await registry.update_status(KIND, NAMESPACE, "svc", TENANT, {"phase": "Scheduling"})
 
             deletion = await registry.request_delete(KIND, NAMESPACE, "svc", TENANT)
             assert deletion.deleted is False
@@ -157,6 +182,7 @@ def test_deleting_a_scheduling_resource_frees_its_device_for_a_re_created_one():
             assert (await registry.get_allocation(first["id"]))["status"] == "Released"
 
             await registry.put(_service("uid-2"))
+            await manager.process(KEY)
             await manager.process(KEY)
 
             second = await registry.get_active_allocation("uid-2", TENANT)

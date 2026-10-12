@@ -133,15 +133,16 @@ func TestIsHopByHop(t *testing.T) {
 	}
 }
 
-// TestCopyForwardHeaders 验证转发头复制：剔除逐跳头、Host、Content-Length，保留其余。
+// TestCopyForwardHeaders 验证转发头复制：剔除逐跳头、调用方凭证、Host、Content-Length，保留其余。
 func TestCopyForwardHeaders(t *testing.T) {
 	src := http.Header{}
 	src.Set("Content-Type", "application/json")
-	src.Set("Authorization", "Bearer token")
 	src.Set("X-Tenant-ID", "tenant-a")
 	src.Set("X-Correlation-ID", "corr-123")
 	src.Set("Accept", "text/event-stream")
 	// 应被剔除的头。
+	src.Set("Authorization", "Bearer token")
+	src.Set("Cookie", "session=abc")
 	src.Set("Connection", "keep-alive")
 	src.Set("Proxy-Connection", "keep-alive")
 	src.Set("Keep-Alive", "timeout=30")
@@ -153,15 +154,16 @@ func TestCopyForwardHeaders(t *testing.T) {
 	dst := copyForwardHeaders(src)
 
 	// 验证保留的头。
-	mustKeep := []string{"Content-Type", "Authorization", "X-Tenant-ID", "X-Correlation-ID", "Accept"}
+	mustKeep := []string{"Content-Type", "X-Tenant-ID", "X-Correlation-ID", "Accept"}
 	for _, h := range mustKeep {
 		if dst.Get(h) == "" {
 			t.Errorf("头 %q 应被保留，但缺失", h)
 		}
 	}
 
-	// 验证剔除的头（逐跳头 + Host + Content-Length）。
+	// 验证剔除的头（调用方凭证 + 逐跳头 + Host + Content-Length）。
 	mustDrop := []string{
+		"Authorization", "Cookie",
 		"Connection", "Proxy-Connection", "Keep-Alive",
 		"Transfer-Encoding", "Upgrade", "Host", "Content-Length",
 	}
@@ -335,7 +337,7 @@ func TestProxy_UpstreamError(t *testing.T) {
 	}
 }
 
-// TestProxy_ForwardsClientHeaders 验证客户端有效头被转发到实例（剔除 hop-by-hop），
+// TestProxy_ForwardsClientHeaders 验证客户端有效头被转发到实例、平台凭证不会转发，
 // 且 {svc} 与租户 ID 正确传给 Resolver。
 func TestProxy_ForwardsClientHeaders(t *testing.T) {
 	var receivedAuth, receivedTenant string
@@ -359,8 +361,8 @@ func TestProxy_ForwardsClientHeaders(t *testing.T) {
 	req.Header.Set("Authorization", "Bearer my-token")
 	proxy.ServeHTTP(rec, req)
 
-	if receivedAuth != "Bearer my-token" {
-		t.Fatalf("Authorization 头应转发，实际 %q", receivedAuth)
+	if receivedAuth != "" {
+		t.Fatalf("Authorization（平台凭证）不应转发给实例，实际 %q", receivedAuth)
 	}
 	if receivedTenant != "tenant-a" {
 		t.Fatalf("X-Tenant-ID 头应转发，实际 %q", receivedTenant)

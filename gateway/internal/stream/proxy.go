@@ -9,7 +9,8 @@
 // 解析为推理服务实例 endpoint，按简单轮询选择一个实例转发（实例级负载均衡），
 // 并依据转发成败向 Resolver 上报，驱动健康摘流与冷却恢复。
 //
-// 安全约束（见开发计划 §14.1）：仅做转发，不缓存、不落盘任何响应内容。
+// 安全约束（见开发计划 §14.1）：仅做转发，不缓存、不落盘任何响应内容；
+// 调用方的平台凭证（Authorization、Cookie）不会转发给实例。
 package stream
 
 import (
@@ -297,12 +298,22 @@ func isHopByHop(key string) bool {
 	return ok
 }
 
-// copyForwardHeaders 复制需要转发的入站头，剔除逐跳头、Host 与 Content-Length
+// credentialHeaders 是调用方访问平台的凭证，不得转发给推理实例：实例可能运行第三方
+// 模型服务代码，拿到平台 key 即可冒充调用方访问控制平面。
+var credentialHeaders = map[string]struct{}{
+	"Authorization": {},
+	"Cookie":        {},
+}
+
+// copyForwardHeaders 复制需要转发的入站头，剔除逐跳头、调用方凭证、Host 与 Content-Length
 // （后者由 Transport 依据 ContentLength 字段自动生成，避免长度不一致）。
 func copyForwardHeaders(src http.Header) http.Header {
 	dst := make(http.Header, len(src))
 	for k, vs := range src {
 		ck := http.CanonicalHeaderKey(k)
+		if _, credential := credentialHeaders[ck]; credential {
+			continue
+		}
 		if isHopByHop(k) || ck == "Host" || ck == "Content-Length" {
 			continue
 		}

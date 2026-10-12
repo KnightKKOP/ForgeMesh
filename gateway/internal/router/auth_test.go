@@ -2,7 +2,7 @@
 //
 //   - 无凭证或凭证无效 → 401，不触达上游；
 //   - 租户取自 key 绑定的租户，与凭证不符的租户头 → 403；
-//   - 控制平面收到调用方凭证，可独立校验（含 Resolver 查询）；
+//   - 控制平面收到调用方凭证，可独立校验（含 Resolver 查询）；推理实例收不到；
 //   - 推理调用要求 read 作用域。
 package router
 
@@ -168,13 +168,14 @@ func TestAPIKeyMode_RejectsForeignTenantHeader(t *testing.T) {
 	}
 }
 
-// inferenceEnv 是假控制平面 + 假推理实例；控制平面记录 Resolver 查询带来的凭证。
+// inferenceEnv 是假控制平面 + 假推理实例；两者都记录收到的 Authorization。
 type inferenceEnv struct {
-	router     *Router
-	cpStatus   int
-	cpHits     atomic.Int64
-	cpAuth     atomic.Value
-	instanceOK atomic.Int64
+	router       *Router
+	cpStatus     int
+	cpHits       atomic.Int64
+	cpAuth       atomic.Value
+	instanceOK   atomic.Int64
+	instanceAuth atomic.Value
 }
 
 func newInferenceEnv(t *testing.T, cpStatus int) *inferenceEnv {
@@ -182,6 +183,7 @@ func newInferenceEnv(t *testing.T, cpStatus int) *inferenceEnv {
 	env := &inferenceEnv{cpStatus: cpStatus}
 	instance := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		env.instanceOK.Add(1)
+		env.instanceAuth.Store(r.Header.Get("Authorization") + r.Header.Get("Cookie"))
 		w.Header().Set("Content-Type", "text/event-stream")
 		_, _ = io.WriteString(w, "data: ok\n\n")
 	}))
@@ -205,11 +207,13 @@ func (e *inferenceEnv) chat(key string) *httptest.ResponseRecorder {
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/inference/svc-a/chat", nil)
 	req.Header.Set("Authorization", "Bearer "+key)
+	req.Header.Set("Cookie", "session=abc")
 	e.router.ServeHTTP(rec, req)
 	return rec
 }
 
-// TestAPIKeyMode_InferenceResolvesWithCallerCredentials 验证 Resolver 以调用方凭证查询控制平面。
+// TestAPIKeyMode_InferenceResolvesWithCallerCredentials 验证 Resolver 以调用方凭证查询控制平面，
+// 而推理实例收不到调用方凭证。
 func TestAPIKeyMode_InferenceResolvesWithCallerCredentials(t *testing.T) {
 	env := newInferenceEnv(t, http.StatusOK)
 
@@ -221,6 +225,9 @@ func TestAPIKeyMode_InferenceResolvesWithCallerCredentials(t *testing.T) {
 	}
 	if env.instanceOK.Load() != 1 {
 		t.Fatalf("请求应转发到推理实例 1 次，实际 %d", env.instanceOK.Load())
+	}
+	if got, _ := env.instanceAuth.Load().(string); got != "" {
+		t.Fatalf("推理实例不应收到调用方凭证，实际 %q", got)
 	}
 }
 

@@ -30,6 +30,9 @@
 - 调度器 `forgemesh.controlplane.scheduler.FirstFitScheduler`：按静态加速器清单首次适配分配。清单是 JSON 文件，路径取自 `FORGEMESH_INVENTORY_FILE`（未设置时不启用调度器），列出节点及其设备（`id` / `type` / `memoryGiB`），严格校验（未知字段、隐式类型转换、空列表、重复 id 都是错误），文件不可读或非法时控制平面拒绝启动，格式见 README「运行控制平面」。调度器按清单顺序取第一个能凑齐数量的节点（类型精确匹配、单卡显存不低于 `minMemoryGiB`，不跨节点）；同一幂等键返回同一分配（重启后亦然）；资源已持有仍满足需求的分配时直接复用，不满足时报冲突，须先释放；`feasible()` 只读，`release()` 幂等。分配不设租约，资源删除时由协调器释放。应用尚未接入工作流运行时，因此协调器在分配之前即报告 `Ready=False`（`WorkflowRuntimeUnavailable`）。
 - 设备级独占：新表 `allocation_devices` 记录每个分配占用的 `(node_id, device_id)`，部分唯一索引 `idx_allocation_devices_one_active` 保证一个设备至多属于一个 Active 分配，触发器 `trg_allocation_devices_follow_status` 让设备随分配状态一起释放。`SQLiteRegistry.create_allocation` 在同一个 `BEGIN IMMEDIATE` 事务中检查归属资源（存在、uid 一致、不在 `Terminating`）、幂等键（重放返回原分配，用过的键不再复用）、资源与设备是否已被占用，再一起写入分配与设备行；另新增 `get_allocation`、`get_allocation_by_idempotency_key`、`allocated_devices`、`release_active_allocation`，分配记录包含 `devices`。
 - 调度契约：`ScheduleRequest` 新增 `resource_ref`（`ResourceRef`：`kind` / `namespace` / `name` / `uid`）与 `idempotency_key`，`AllocationRef` 新增 `devices`（`AllocatedDevice`：`node_id` / `device_id`）。协调器以 `{uid}:{generation}`（`allocation_idempotency_key`）为幂等键，`requirements` 取自 `spec.resources.accelerator`（`{"accelerator": {"type", "count", "minMemoryGiB"}}`）；没有 `metadata.uid` 的资源报告 `Ready=False`（`MissingUid`），不分配。
+- 工作流契约：运行快照 `RunInfo`（`status`、按定义顺序的步骤状态 `steps`、已成功步骤的输出 `outputs`（步骤之后被补偿也保留）、失败原因 `error`、属性 `terminal`）；`WorkflowRuntime` 新增两个非抽象方法：`get_run(run_id)`（默认只填 `status`）与 `find_run(idempotency_key)`（按幂等键查找运行、不创建，默认抛 `NotImplementedError`），既有实现（如 `workflow-temporal`）无需修改。
+- 工作流运行时 `forgemesh.workflowruntime.runtime.LocalWorkflowRuntime`：`start()` 创建（或按幂等键复用）运行后立即返回，步骤由运行时持有的后台任务按定义顺序执行（重试、步骤超时与工作流超时沿用 `WorkflowExecutor`），每一步的状态与结果都落盘。全部成功 → `Succeeded`；某一步用尽重试或工作流超时 → `Compensating`，反向补偿已成功且注册了补偿的步骤，未执行的步骤置为 `Skipped`，然后 `Failed`（`error` 记录失败的步骤与错误）。`cancel()` 中断正在执行的步骤并等待运行进入 `Cancelled`（`cleanup=True` 时先补偿）；`recover()`（进程启动时调用一次）让未结束的运行从第一个未成功的步骤继续，或完成中断的补偿；`wait()` 等待后台执行结束；`aclose()` 取消或等待全部后台任务，之后才能关闭存储。审批结果只保存在内存中，重启后需要重新审批。`workflow-reference` 插件的 `ReferenceWorkflowRuntime` 即是它的子类。`WorkflowStore` 记录运行失败原因（打开旧库时自动补上 `error` 列）、补偿后保留步骤结果、记录步骤尝试次数，新增 `get_run_by_idempotency_key`；连接以锁串行化，文件库以 WAL 模式打开。
+- 推理服务部署 `forgemesh.controlplane.deployment`：启动器契约 `RuntimeLauncher`（`prepare`（可选）/ `launch` / `verify` / `stop`，均须幂等，`stop` 须在有限时间内返回）及其请求 `LaunchRequest`（实例幂等键、租户、资源身份、`spec`、分配 id 与设备）与结果 `LaunchedInstance`（实例 id、地址、协议，按 `status.endpoints` 的规则校验）；部署工作流 `inference-service-deployment`：`prepare-model`（单次时限 3600 秒）→ `launch-instance`（600 秒，补偿为 `stop`）→ `verify-instance`（1800 秒），步骤 handler 为 `DeploymentSteps`；每个资源 uid 一次部署运行，幂等键 `deployment:{uid}`（`deployment_run_key`）同时是实例幂等键；`DeploymentReleaser`（协调器的 `ReleaseProvider`）在资源删除时取消进行中的部署运行（补偿停止已启动的实例）并停止可能仍在运行的实例。仓库只提供测试替身 `InMemoryLauncher`，还没有真实的启动器；控制平面应用也尚未注入工作流运行时与启动器。`forgemesh.controlplane.sqlite.workflow_db_path()` 给出工作流存储的文件：控制平面数据库旁的独立文件（`forgemesh.db` → `forgemesh.workflows.db`），步骤写入不必等待 Registry 的写锁。
 
 ### Changed
 
@@ -59,6 +62,11 @@
 - **破坏性**：`ScheduleRequest` 必须提供 `resource_ref` 与 `idempotency_key`（见 Added）；`resource_kind` 改为只读属性（等同 `resource_ref.kind`），构造时传入会被拒绝。`AllocationRef.resource_id` 改为归属资源的 `uid`。
 - **破坏性**：`allocations.resource_id` 改为归属资源的 `uid`（此前协调器按 `{kind}/{name}` 查找），同一租户内同一 uid 至多一个 Active 分配：部分唯一索引 `idx_allocations_one_active_per_tenant_resource`（`ON allocations(tenant_id, resource_id) WHERE status = 'Active'`）取代 `idx_allocations_one_active_per_resource`，打开旧库时自动替换，已有行保留。旧库中以 `{kind}/{name}` 记录的分配不做迁移，也不再随资源删除释放（此前仓库没有调度器实现，正常部署不会产生这类分配）。
 - **破坏性**：持有 Active 分配的资源无论处于哪个 phase，`DELETE` 都返回 `202` 并先进入 `Terminating`（此前 `Pending` / `Scheduling` / `Preparing` / `Failed` / `Unknown` 直接物理删除并返回 `204`），由协调器释放分配后再物理删除；检查之后才提交的分配使这次删除失败（`409`），而不是遗留一个没有归属的分配。OpenAPI 已同步。
+- **破坏性**：协调器按 phase 逐轮部署 `InferenceService`，每一轮只做一个合法的 phase 转移并写回 `status.phase`：`Pending` → `Scheduling`（策略放行；策略只在离开 `Pending` 时评估）→ `Preparing`（分配加速器）→ `Deploying`（以同一幂等键取回分配，启动部署工作流，输入携带分配的设备）→ `Verifying`（`launch-instance` 已成功）→ `Ready`（运行成功：写入 `status.endpoints` 与 `Ready=True`，原因 `Reconciled`）。部署过程中 `Ready=False`，原因即当前 phase；运行未结束时按幂等键 `find_run()`，每 `workflow_poll_interval` 秒查询一次。只有进入 `Ready` 或 `Failed` 的一轮登记去重键。
+- **破坏性**：部署失败时资源进入终态 `Failed`（`Ready=False`）：运行失败、被取消或超时 → `WorkflowFailed`（消息为运行记录的失败原因，如 `step 'verify-instance' failed: …`），释放分配；补偿没能停止实例时保留分配（消息说明实例可能仍在运行），删除资源时经 `Terminating` 停止实例后再释放；找不到运行（`WorkflowRunNotFound`，如工作流数据库被重置）或运行成功却没有报告实例时同样进入 `Failed` 并保留分配。协调器不自动重试，删除后重新创建资源即可再次部署。
+- **破坏性**：处于 `Ready` / `Degraded` / `Updating` / `Failed` / `Unknown` 的资源不再被协调（不评估策略、不写 `status`）：还没有更新已部署服务的流程，修改 `spec`（新 `generation`）不会重新部署。此前协调器对 `Updating` / `Failed` / `Unknown` 的资源（`Ready` / `Degraded` 在 generation 变化时）重新评估策略后写入 `Ready=True`。
+- **破坏性**：`ReconciliationController` 注入 `workflow_runtime` 时必须同时注入 `release_provider`（否则抛 `ValueError`：删除资源会留下运行中的实例），运行时须实现 `find_run` 并在快照中返回步骤输出；新增参数 `workflow_poll_interval`（默认 `2.0` 秒，须为正数）。不是 `InferenceService` 的资源报告 `Ready=False`（`NotDeployable`），不分配、不启动工作流。
+- **破坏性**：`ReferenceWorkflowRuntime` 在后台执行运行（见 Added）：`start()` 返回时运行可能仍在执行，步骤失败时补偿并以 `Failed` 结束，`cancel()` 等待运行进入终态；使用方须在启动时调用 `recover()`、关闭时调用 `aclose()`。
 
 ### Deprecated
 
@@ -99,6 +107,8 @@
 - 协调器传给调度器的 `requirements` 恒为空，调度器无从得知资源申请了几张什么卡：现取自 `spec.resources.accelerator`。
 - 删除处于 `Pending` / `Scheduling` 等无副作用 phase、但已持有分配的资源时直接物理删除，分配及其设备永远不会被释放：现先进入 `Terminating`（见 Changed）。
 - `Terminating` 协调按 `{kind}/{name}` 释放分配，忽略命名空间，删除一个服务可能释放另一个命名空间中同名服务的分配：现按资源 uid（限本租户）释放。资源已被删除、或同名资源已以新 uid 重建时，只释放原资源的分配，不再移除新资源的 finalizer 并把它删除。
+- 协调器启动一个没有步骤的工作流后立即登记去重键并写入 `Ready=True`（`Reconciled`），启动失败时只记一条警告、同样报告 `Ready=True`；`phase` 停在 `Pending`，`status.endpoints` 从不写入（改进计划 4.10 遗留问题、5.3）：现按 phase 逐轮部署，运行成功之后才 `Ready=True`（见 Changed）。部署工作流没能启动时停在 `Preparing`、`Ready=False`（`WorkflowStartFailed`），保留分配，不登记去重键，退避重试（从 `workflow_poll_interval` 起每次翻倍，最多 60 秒）；查询运行失败同样处理（`WorkflowLookupFailed`）。
+- 参考工作流运行时的 `start()` 只创建运行记录并推进到 `Running`，从不执行步骤，运行永远停在 `Running`，`cancel(cleanup=True)` 补偿的是从未执行过的步骤：现由 `LocalWorkflowRuntime` 在后台执行（见 Added）。
 
 ### Security
 

@@ -174,7 +174,7 @@ curl -s -H "Authorization: Bearer fmk_…" http://127.0.0.1:8080/api/v1/inferenc
 
 节点 `id` 在清单内唯一，设备 `id` 在所属节点内唯一，节点与设备都至少一个，不允许其他字段；`type` 与 `spec.resources.accelerator.type` 按字符串精确匹配，`memoryGiB` 是单卡显存（正整数，不接受 `"80"` 或 `80.0`）。调度器按清单顺序取第一个能凑齐 `count` 张卡的节点，在该节点内按顺序取类型匹配、显存不低于 `minMemoryGiB` 且未被占用的设备，不跨节点凑数。分配按资源 `uid` 记录在权威存储中（`allocations` / `allocation_devices`），同一设备同时至多属于一个生效的分配；分配不设租约，在资源删除时释放：持有分配的资源无论处于哪个 phase，`DELETE` 都返回 `202` 并先进入 `Terminating`。
 
-控制平面启动后会自动协调 `InferenceService`：新建、修改或请求删除的资源在 0.5 秒内被处理，协调结果写入 `status.conditions`（例如 `Ready=False` 及其原因）。未设置 `FORGEMESH_INVENTORY_FILE` 时，新建的服务会停在 `Pending`，并带有 `Ready=False`（`SchedulerUnavailable`）条件；设置后，由于应用尚未接入工作流运行时，条件为 `Ready=False`（`WorkflowRuntimeUnavailable`），协调器在分配之前停下，暂不占用设备。控制器与 API 运行在同一个进程中，是权威存储的唯一写者（ADR-013）：请以单进程运行，不要使用 `uvicorn --workers` 或多副本。
+控制平面启动后会自动协调 `InferenceService`：新建、修改或请求删除的资源在 0.5 秒内被处理，协调结果写入 `status.conditions`（例如 `Ready=False` 及其原因）。未设置 `FORGEMESH_INVENTORY_FILE` 时，新建的服务会停在 `Pending`，并带有 `Ready=False`（`SchedulerUnavailable`）条件；设置后，由于应用尚未接入工作流运行时，条件为 `Ready=False`（`WorkflowRuntimeUnavailable`），协调器在分配之前停下，暂不占用设备。协调器本身已能完成部署：注入工作流运行时与推理实例启动器（`forgemesh.controlplane.deployment.RuntimeLauncher`）后，资源每轮推进一个 phase（`Pending` → `Scheduling` → `Preparing` → `Deploying` → `Verifying` → `Ready`），部署工作流（准备模型 → 启动实例 → 验证实例）成功后写入 `status.endpoints` 与 `Ready=True`；部署失败时资源进入 `Failed`，不自动重试，删除后重新创建即可再次部署；删除时先取消部署、停止实例，再释放分配。仓库目前只有测试用的内存启动器。控制器与 API 运行在同一个进程中，是权威存储的唯一写者（ADR-013）：请以单进程运行，不要使用 `uvicorn --workers` 或多副本。
 
 ### Go 网关
 

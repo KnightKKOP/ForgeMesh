@@ -1,9 +1,10 @@
 """幂等去重键生成与持久化。
 
 对齐 development-plan 5.4：dedup_key 由 kind/namespace/name/uid/generation/operation 派生，
-同一键的协调不得重复产生副作用。资源分配另有自己的幂等键
-（:func:`allocation_idempotency_key`，由 uid + generation 派生；``allocations.idempotency_key``
-唯一，一个键只对应一个分配）。
+同一键的协调不得重复产生副作用。资源分配与部署运行另有自己的幂等键：分配为
+:func:`allocation_idempotency_key`（由 uid + generation 派生；``allocations.idempotency_key``
+唯一，一个键只对应一个分配），部署运行为
+:func:`~forgemesh.controlplane.deployment.workflow.deployment_run_key`（由 uid 派生）。
 
 :class:`ProcessedKeyStore` 将已处理去重键持久化到 SQLite（对齐 architecture
 §5.5「不能依赖单进程内存状态保证全局正确性」）：进程重启后已处理键仍然

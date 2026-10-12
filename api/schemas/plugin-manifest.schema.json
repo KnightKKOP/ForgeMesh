@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://forgemesh.io/schemas/plugin-manifest.schema.json",
   "title": "PluginManifest",
-  "description": "ForgeMesh 插件清单。对齐 architecture 8.2 与 development-plan 5.7 / 6.3。声明能力(provides)与依赖(requires)及最小权限集合；声明能力≠实际具备，运行时须经探测与验证（ADR-006 隔离）。",
+  "description": "ForgeMesh 插件清单。对齐 architecture 8.2 与 development-plan 5.7 / 6.3。声明能力(provides)、依赖(requires)与权限申请(permissions，实际授予由管理员决定)；声明能力≠实际具备，运行时须经探测与验证（ADR-006 隔离）。",
   "type": "object",
   "required": ["apiVersion", "kind", "metadata", "spec"],
   "additionalProperties": false,
@@ -55,8 +55,27 @@
         },
         "permissions": {
           "type": "array",
-          "description": "最小权限集合（按信任级别授予，ADR-006）。",
-          "items": {"type": "string", "minLength": 1},
+          "description": "插件申请的权限，取值与 forgemesh.plugin.permissions.Permission 词表一致；清单不能给自己授权，实际授予由管理员的授予记录决定。",
+          "items": {
+            "type": "string",
+            "enum": [
+              "resource.read",
+              "resource.write",
+              "decision.evaluate",
+              "policy.evaluate",
+              "workflow.execute",
+              "inference.deploy",
+              "inference.inspect",
+              "device.read",
+              "device.partition",
+              "metering.read",
+              "event.subscribe",
+              "network.egress",
+              "filesystem.access",
+              "database.access",
+              "platform.admin"
+            ]
+          },
           "uniqueItems": true
         },
         "compatibility": {

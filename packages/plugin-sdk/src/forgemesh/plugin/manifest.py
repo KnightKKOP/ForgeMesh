@@ -5,7 +5,9 @@
 * **安装状态与健康状态分离**：:class:`PluginLifecycleState` 只描述治理生命周期
   （发现→校验→安装→启用/禁用→卸载）；运行健康（Healthy/Degraded/Unhealthy）
   由独立健康检查表达，二者不得复用同一字段。
-* **最小权限**：``permissions`` 声明插件所需的最小权限集合，供安装时校验与运行时限制。
+* **权限申请**：``permissions`` 是插件申请的权限，取值限于
+  :class:`~forgemesh.plugin.permissions.Permission` 词表且不得重复；清单不能给自己授权，
+  实际授予由管理员决定。
 * **隔离分级**：隔离模式按信任级别由安装器裁决（ADR-006），Manifest 可声明。
 * **供应链**：``artifact_digest`` / ``signature`` 支持制品摘要与签名校验。
 
@@ -18,7 +20,8 @@ from __future__ import annotations
 from enum import StrEnum
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field
+from forgemesh.plugin.permissions import Permission
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 try:  # 优先复用核心包统一异常体系
     from forgemesh.core.errors import InvalidStateTransition
@@ -105,7 +108,7 @@ class PluginSpec(BaseModel):
         compatibility: 兼容性声明（如 ``{"coreApi": "v1alpha1"}``）。
         provides: 提供的能力标识。
         requires: 依赖的能力标识。
-        permissions: 所需最小权限集合。
+        permissions: 申请的权限（:class:`Permission` 词表，不得重复）；实际授予由管理员决定。
         isolation: 隔离级别（in-process/restricted-rpc/sandbox，ADR-006）。
         entrypoint: 入口点标识。
         artifactDigest: 制品摘要（如 sha256:...），供应链安全。
@@ -121,13 +124,21 @@ class PluginSpec(BaseModel):
     compatibility: dict[str, str] = Field(default_factory=dict)
     provides: list[str] = Field(default_factory=list)
     requires: list[str] = Field(default_factory=list)
-    permissions: list[str] = Field(default_factory=list)
+    permissions: list[Permission] = Field(default_factory=list)
     isolation: str | None = Field(default=None, description="隔离级别（in-process/restricted-rpc/sandbox，ADR-006）")
     entrypoint: str | None = Field(default=None, description="入口点标识")
     artifactDigest: str | None = Field(default=None, description="制品摘要（如 sha256:...），供应链安全")
     signature: str | None = Field(default=None, description="制品签名（如 cosign:...），供应链安全")
     configuration: dict[str, Any] = Field(default_factory=dict)
     healthCheck: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("permissions")
+    @classmethod
+    def _unique_permissions(cls, value: list[Permission]) -> list[Permission]:
+        duplicates = sorted({p.value for p in value if value.count(p) > 1})
+        if duplicates:
+            raise ValueError(f"duplicate permissions: {duplicates}")
+        return value
 
 
 class PluginManifest(BaseModel):

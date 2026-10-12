@@ -234,44 +234,46 @@ class TestSigningSecurity:
 
 
 class TestIsolationBoundary:
-    """隔离边界安全认证：资源访问边界 + 权限声明边界。"""
+    """隔离边界安全认证：权限使用边界 + 权限申请边界。"""
 
     @_compat
     def test_trusted_in_process_allows_database(self) -> None:
-        """TRUSTED（IN_PROCESS）允许访问 database。"""
+        """TRUSTED（IN_PROCESS）允许使用 database.access。"""
         guard = IsolationGuard()
-        guard.check_access(TrustLevel.TRUSTED, "database")  # 不抛异常
+        guard.check_access(TrustLevel.TRUSTED, "database.access")  # 不抛异常
 
     @_compat
     @pytest.mark.parametrize("trust", [TrustLevel.VERIFIED, TrustLevel.UNTRUSTED])
     def test_non_trusted_blocks_database(self, trust: TrustLevel) -> None:
         """VERIFIED/UNTRUSTED 应禁止直连 database。"""
         guard = IsolationGuard()
-        with pytest.raises(IsolationError):
-            guard.check_access(trust, "database")
+        with pytest.raises(IsolationError, match="'database.access' not available"):
+            guard.check_access(trust, "database.access")
 
     @_compat
     @pytest.mark.parametrize("trust", [TrustLevel.VERIFIED, TrustLevel.UNTRUSTED])
     def test_non_trusted_blocks_filesystem(self, trust: TrustLevel) -> None:
         """VERIFIED/UNTRUSTED 应禁止直连 filesystem。"""
         guard = IsolationGuard()
-        with pytest.raises(IsolationError):
-            guard.check_access(trust, "filesystem")
+        with pytest.raises(IsolationError, match="'filesystem.access' not available"):
+            guard.check_access(trust, "filesystem.access")
 
     @_compat
     @pytest.mark.parametrize("trust", [TrustLevel.VERIFIED, TrustLevel.UNTRUSTED])
     def test_non_trusted_blocks_network(self, trust: TrustLevel) -> None:
-        """VERIFIED/UNTRUSTED 应禁止直连 network。"""
+        """VERIFIED/UNTRUSTED 应禁止直接对外发起网络连接。"""
         guard = IsolationGuard()
-        with pytest.raises(IsolationError):
-            guard.check_access(trust, "network")
+        with pytest.raises(IsolationError, match="'network.egress' not available"):
+            guard.check_access(trust, "network.egress")
 
     @_compat
     def test_untrusted_combined_forbidden_permissions_rejected(self) -> None:
-        """UNTRUSTED 同时声明 database + admin 应被拒绝。"""
+        """UNTRUSTED 同时申请 database.access + platform.admin 应被拒绝。"""
         guard = IsolationGuard()
-        with pytest.raises(IsolationError):
-            guard.validate_manifest(TrustLevel.UNTRUSTED, ["metrics:read", "database", "admin"])
+        with pytest.raises(IsolationError, match=r"\['database\.access', 'platform\.admin'\]"):
+            guard.validate_manifest(
+                TrustLevel.UNTRUSTED, ["metering.read", "database.access", "platform.admin"]
+            )
 
     @_compat
     def test_custom_isolation_policy(self) -> None:
@@ -285,8 +287,8 @@ class TestIsolationBoundary:
         )
         guard = IsolationGuard(policy=custom_policy)
         # 自定义策略下 TRUSTED 也走 RESTRICTED_RPC
-        with pytest.raises(IsolationError):
-            guard.check_access(TrustLevel.TRUSTED, "database")
+        with pytest.raises(IsolationError, match="not available in RESTRICTED_RPC mode"):
+            guard.check_access(TrustLevel.TRUSTED, "database.access")
 
 
 # ===========================================================================

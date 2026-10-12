@@ -4,6 +4,7 @@
 
 * :class:`PluginManifest`        —— 声明式插件清单（类别/兼容性/能力/权限/隔离）。
 * :class:`PluginLifecycleState`  —— 插件生命周期状态机。
+* :class:`Permission`            —— 权限词表（清单申请、管理员授予与隔离检查共用）。
 
 核心原则：**安装状态与健康状态分离**。``Installed/Enabled`` 描述的是治理
 生命周期，不代表运行健康；运行健康由独立健康检查（Healthy/Degraded/Unhealthy）
@@ -21,8 +22,10 @@ from .manifest import (
     PluginSpec,
     validate_plugin_transition,
 )
+from .permissions import Permission
 
 __all__ = [
+    "Permission",
     "PluginCategory",
     "PluginMeta",
     "PluginSpec",

@@ -8,6 +8,8 @@
    未声明时缺省 Draft 2020-12。
 2. 实例校验：用 ``api/schemas/plugin-manifest.schema.json`` 逐个校验
    ``plugins/*/manifest.yaml``（yaml.safe_load 后经 jsonschema 校验）。
+   ``spec.permissions`` 由 schema 的枚举限定在权限词表内；该枚举与
+   ``forgemesh.plugin.permissions.Permission`` 一致（契约测试保证）。
 
 schema 之外追加两条平台约定检查（manifest 必须满足而 schema 未强制）：
 

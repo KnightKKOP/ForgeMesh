@@ -31,7 +31,6 @@ from __future__ import annotations
 import asyncio
 import importlib.util
 import json
-import re
 import sys
 from collections.abc import Awaitable, Callable
 from pathlib import Path
@@ -48,6 +47,7 @@ from forgemesh.plugin.manifest import (
     PluginLifecycleState,
     PluginManifest,
 )
+from forgemesh.plugin.permissions import Permission
 from forgemesh.workflow.runtime import Step, WorkflowDefinition, WorkflowRuntime
 from forgemesh.workflow.states import WorkflowStatus
 from jsonschema import Draft202012Validator
@@ -77,8 +77,8 @@ ALL_PLUGIN_DIRS: list[str] = [
 #: manifest 允许的隔离级别枚举（对齐 schema enum 与 ADR-006）。
 _ALLOWED_ISOLATION = {"in-process", "restricted-rpc", "sandbox"}
 
-#: 最小权限形式：至少两段点分的小写标识（如 ``resource.read``）。
-_PERMISSION_RE = re.compile(r"^[a-z0-9-]+(\.[a-z0-9-]+)+$")
+#: 插件可申请的权限词表。
+_PERMISSION_VOCABULARY = {p.value for p in Permission}
 
 #: 10 插件 manifest schema（模块级加载一次，供第 1 节复用）。
 _MANIFEST_SCHEMA: dict[str, Any] = json.loads(
@@ -240,15 +240,12 @@ class TestManifestAndIsolationConformance:
         [pytest.param(p, id=p) for p in ALL_PLUGIN_DIRS],
     )
     def test_permissions_nonempty_and_parseable(self, plugin_dir: str) -> None:
-        """spec.permissions 非空，且每项均为可解析的最小权限点分形式。"""
+        """spec.permissions 非空，且每项都在 Permission 词表中。"""
         permissions = _load_manifest_dict(plugin_dir)["spec"]["permissions"]
         assert permissions, f"{plugin_dir}: permissions 不得为空"
         for perm in permissions:
-            assert isinstance(perm, str) and perm, (
-                f"{plugin_dir}: 权限项须为非空字符串: {perm!r}"
-            )
-            assert _PERMISSION_RE.fullmatch(perm), (
-                f"{plugin_dir}: 权限项 {perm!r} 不符合 '域.动作' 最小权限形式"
+            assert perm in _PERMISSION_VOCABULARY, (
+                f"{plugin_dir}: 权限项 {perm!r} 不在 Permission 词表中"
             )
 
 

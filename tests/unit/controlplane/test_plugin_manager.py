@@ -45,7 +45,7 @@ def _make_manifest(
         spec=PluginSpec(
             category=category,
             provides=provides if provides is not None else ["gpu.discovery"],
-            permissions=permissions if permissions is not None else ["device:read"],
+            permissions=permissions if permissions is not None else ["device.read"],
             compatibility=compatibility if compatibility is not None else {},
         ),
     )
@@ -308,13 +308,13 @@ def test_check_permissions_granted() -> None:
     """拥有所需权限返回 True。"""
     mgr = PluginManager()
     pid = mgr.register(
-        _make_manifest(permissions=["device:read", "device:write", "metrics:scrape"])
+        _make_manifest(permissions=["device.read", "device.partition", "metering.read"])
     )
-    assert mgr.check_permissions(pid, {"device:read"}) is True
-    assert mgr.check_permissions(pid, {"device:read", "device:write"}) is True
+    assert mgr.check_permissions(pid, {"device.read"}) is True
+    assert mgr.check_permissions(pid, {"device.read", "device.partition"}) is True
     # 全部权限
     assert mgr.check_permissions(
-        pid, {"device:read", "device:write", "metrics:scrape"}
+        pid, {"device.read", "device.partition", "metering.read"}
     ) is True
 
 
@@ -322,9 +322,9 @@ def test_check_permissions_granted() -> None:
 def test_check_permissions_denied() -> None:
     """缺少所需权限返回 False。"""
     mgr = PluginManager()
-    pid = mgr.register(_make_manifest(permissions=["device:read"]))
-    assert mgr.check_permissions(pid, {"device:write"}) is False
-    assert mgr.check_permissions(pid, {"device:read", "device:write"}) is False
+    pid = mgr.register(_make_manifest(permissions=["device.read"]))
+    assert mgr.check_permissions(pid, {"device.partition"}) is False
+    assert mgr.check_permissions(pid, {"device.read", "device.partition"}) is False
 
 
 @pytest.mark.unit
@@ -340,7 +340,7 @@ def test_check_permissions_not_found() -> None:
     """对未注册插件校验权限抛 NotFoundError。"""
     mgr = PluginManager()
     with pytest.raises(NotFoundError):
-        mgr.check_permissions("ghost:0.0.0", {"device:read"})
+        mgr.check_permissions("ghost:0.0.0", {"device.read"})
 
 
 # ---------------------------------------------------------------------- #

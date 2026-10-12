@@ -5,7 +5,7 @@
 
 * :class:`InferenceService` —— 资源包裹层 ``spec.resources.accelerator`` 结构；
 * :class:`ObjectMeta` —— 多租户字段 snake_case / camelCase alias 双向一致；
-* :class:`PluginManifest` / :class:`PluginSpec` —— 供应链安全字段与健康检查类型；
+* :class:`PluginManifest` / :class:`PluginSpec` —— 供应链安全字段、健康检查类型与权限词表；
 * :class:`PolicyDecision` —— 三态（allow / deny / degraded）枚举；
 * :class:`DecisionRequest` —— 风险等级与决策时限字段；
 * :class:`Step` —— 补偿、审批与 ``with`` alias 字段；
@@ -26,6 +26,7 @@ from forgemesh.core.errors import ForgeMeshError, GovernanceBypassError
 from forgemesh.core.objects import ObjectMeta
 from forgemesh.decision.provider import DecisionRequest
 from forgemesh.plugin.manifest import PluginSpec
+from forgemesh.plugin.permissions import Permission
 from forgemesh.policy.api import PolicyDecision
 from forgemesh.resource.inference import (
     InferenceService,
@@ -182,6 +183,42 @@ def test_plugin_manifest_schema_has_supply_chain_fields() -> None:
     # healthCheck.timeoutMs 应为 integer
     hc = spec_props["healthCheck"]["properties"]
     assert hc["timeoutMs"]["type"] == "integer", "Schema 中 timeoutMs 应为 integer"
+
+
+@pytest.mark.contract
+def test_plugin_permissions_schema_matches_vocabulary() -> None:
+    """Schema 的权限枚举与 Permission 词表逐项一致，且不允许重复。"""
+    schema = _load_json(SCHEMAS_DIR / "plugin-manifest.schema.json")
+    permissions = schema["properties"]["spec"]["properties"]["permissions"]
+    assert permissions["items"]["enum"] == [p.value for p in Permission]
+    assert permissions["uniqueItems"] is True
+
+
+def _plugin_manifest_with_permissions(permissions: list[str]) -> dict[str, Any]:
+    return {
+        "apiVersion": "forgemesh.io/v1alpha1",
+        "kind": "PluginManifest",
+        "metadata": {"id": "forgemesh.policy.example", "version": "0.1.0"},
+        "spec": {"category": "policy", "provides": [], "requires": [], "permissions": permissions},
+    }
+
+
+@pytest.mark.contract
+@pytest.mark.parametrize(
+    "permissions",
+    [["admin"], ["metrics:read"], ["Resource.Read"], ["resource.read", "resource.read"]],
+)
+def test_plugin_permissions_rejected_by_model_and_schema(permissions: list[str]) -> None:
+    """词表外或重复的权限，Python 模型与 Schema 都拒绝。"""
+    validator = Draft202012Validator(_load_json(SCHEMAS_DIR / "plugin-manifest.schema.json"))
+    assert not list(validator.iter_errors(_plugin_manifest_with_permissions(["resource.read"])))
+
+    manifest = _plugin_manifest_with_permissions(permissions)
+    errors = list(validator.iter_errors(manifest))
+    assert errors
+    assert all("permissions" in error.absolute_path for error in errors)
+    with pytest.raises(ValidationError, match="permissions"):
+        PluginSpec.model_validate(manifest["spec"])
 
 
 # ---------------------------------------------------------------------------

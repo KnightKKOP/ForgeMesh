@@ -13,6 +13,8 @@ dependencies = [
     "forgemesh-resource-model",
     "forgemesh-workflow-api",
     "forgemesh-decision-api",
+    "forgemesh-policy-engine",
+    "forgemesh-plugin-sdk",
 ]
 
 [project.optional-dependencies]
@@ -20,6 +22,9 @@ api = [
     "fastapi>=0.110",
     "uvicorn>=0.29",
 ]
+
+[project.scripts]
+forgemesh-control-plane = "forgemesh.controlplane.app:main"
 
 [tool.setuptools]
 package-dir = { "" = "src" }

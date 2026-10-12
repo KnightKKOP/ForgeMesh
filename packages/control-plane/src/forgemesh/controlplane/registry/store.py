@@ -251,6 +251,13 @@ class SQLiteRegistry(ResourceRegistry):
         machine.validate(current, target)
 
     @staticmethod
+    def _label_path(key: str) -> str:
+        """把标签键转换为 SQLite JSON 路径（键整体加双引号，兼容 ``.`` 与 ``/``）。"""
+        if '"' in key or "\\" in key:
+            raise ValueError(f"invalid label key: {key!r}")
+        return f'$.metadata.labels."{key}"'
+
+    @staticmethod
     def _encode_token(namespace: str | None, name: str) -> str:
         """将分页游标 ``(namespace, name)`` 编码为 opaque base64 字符串。"""
         payload = json.dumps({"ns": namespace, "name": name}, ensure_ascii=False)
@@ -443,10 +450,19 @@ class SQLiteRegistry(ResourceRegistry):
     ) -> builtins.list[Resource]:
         """按 ``kind`` + 可选 ``namespace`` / ``labels`` 过滤列出资源（分页）。
 
+        标签过滤在 SQL 中先于 ``LIMIT`` 执行，保证每页返回的都是匹配项。
         ``watch=True`` 在阶段 P1 暂未实现，抛 :class:`NotImplementedError`。
+
+        Raises:
+            ValueError: ``limit`` 小于 1，或标签键包含双引号 / 反斜杠。
         """
         if watch:
             raise NotImplementedError("watch stream is not implemented in phase P1")
+        if limit < 1:
+            raise ValueError(f"limit must be >= 1, got {limit}")
+        label_paths = [
+            (self._label_path(key), value) for key, value in sorted((labels or {}).items())
+        ]
 
         def _list() -> list[Resource]:
             sql = "SELECT body FROM resources WHERE tenant_id=? AND kind=?"
@@ -454,6 +470,9 @@ class SQLiteRegistry(ResourceRegistry):
             if namespace is not None:
                 sql += " AND namespace IS ?"
                 params.append(namespace)
+            for path, value in label_paths:
+                sql += " AND json_extract(body, ?) = ?"
+                params.extend([path, value])
             if continue_token is not None:
                 cursor_ns, cursor_name = self._decode_token(continue_token)
                 cursor_ns_key = cursor_ns if cursor_ns is not None else ""
@@ -466,14 +485,7 @@ class SQLiteRegistry(ResourceRegistry):
             sql += " ORDER BY COALESCE(namespace, ''), name LIMIT ?"
             params.append(limit)
             rows = self._conn.execute(sql, tuple(params)).fetchall()
-            results = [self._row_to_resource(r) for r in rows]
-            if labels:
-                results = [
-                    res
-                    for res in results
-                    if all(res.metadata.labels.get(k) == v for k, v in labels.items())
-                ]
-            return results
+            return [self._row_to_resource(r) for r in rows]
 
         return await self._run(_list)
 

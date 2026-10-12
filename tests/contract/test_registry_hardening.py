@@ -238,3 +238,45 @@ def test_release_allocation_does_not_overwrite_terminal_state() -> None:
             await reg.close()
 
     asyncio.run(scenario())
+
+
+@pytest.mark.contract
+def test_label_selector_is_applied_before_limit() -> None:
+    """标签过滤先于 LIMIT：匹配项排在第一页之外时也必须被返回且可分页遍历。"""
+
+    async def scenario() -> None:
+        reg = SQLiteRegistry(":memory:")
+        try:
+            for i in range(150):
+                labels = {"app.kubernetes.io/name": "target"} if i >= 140 else {}
+                await reg.put(_make_resource(f"res-{i:03d}", labels=labels))
+            selector = {"app.kubernetes.io/name": "target"}
+
+            first_page = await reg.list(KIND, TENANT, labels=selector, limit=100)
+            assert [r.metadata.name for r in first_page] == [
+                f"res-{i:03d}" for i in range(140, 150)
+            ]
+
+            seen: list[str] = []
+            token = None
+            while True:
+                page = await reg.list(KIND, TENANT, labels=selector, limit=4, continue_token=token)
+                if not page:
+                    break
+                seen.extend(r.metadata.name for r in page)
+                last = page[-1].metadata
+                token = SQLiteRegistry._encode_token(last.namespace, last.name)
+            assert seen == [f"res-{i:03d}" for i in range(140, 150)]
+        finally:
+            await reg.close()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.contract
+@pytest.mark.parametrize("limit", [0, -1])
+def test_list_rejects_non_positive_limit(limit: int) -> None:
+    """SQLite 中 LIMIT -1 表示不限条数，必须在入口拒绝。"""
+    reg = SQLiteRegistry(":memory:")
+    with pytest.raises(ValueError):
+        asyncio.run(reg.list(KIND, TENANT, limit=limit))

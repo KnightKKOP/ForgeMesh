@@ -1337,7 +1337,7 @@ Foundation
 
 ## 20.6 已知限制
 
-- 控制平面的 `InferenceServiceStatus` 尚无 `endpoints` 字段，而数据平面网关已按契约消费 `status.endpoints`：字段缺失或无可健康实例时，网关明确返回 503，不静默降级。该字段在控制平面补齐后，推理流量路由链路自动打通，是 v1.1 的演进方向。
+- `InferenceServiceStatus.endpoints`（实例地址、`ready`、`protocol`）已进入资源模型、JSON Schema 与 OpenAPI，可经 status 子资源写入，网关按 `protocol` 映射实例上的推理路径；但目前没有调度器与运行时启动器写入真实实例地址，服务停在 `Pending`，网关对推理请求明确返回 503，不静默降级。
 
 # 附录 A. 状态转移矩阵
 

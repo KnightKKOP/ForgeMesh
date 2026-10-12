@@ -76,6 +76,15 @@ class _BenchmarkScheduler:
         return AllocationRef(allocation_id="alloc-bench", resource_id="node-bench")
 
 
+class _BenchmarkWorkflowRuntime:
+    """无外部副作用的 WorkflowRuntime 测试替身（排除真实工作流执行开销）。"""
+
+    async def start(self, defn, inputs, idempotency_key):  # noqa: ANN001
+        from forgemesh.workflow.runtime import RunRef
+
+        return RunRef(run_id=idempotency_key, definition_version=1)
+
+
 def _make_resource(index: int) -> Resource:
     """构造第 ``index`` 个测试资源（独立 name/generation → 独立 dedup_key）。"""
     return Resource(
@@ -98,6 +107,7 @@ def test_reconcile_throughput_and_p99() -> None:
             registry=registry,
             policy_engine=_AllowPolicy(),
             scheduler=_BenchmarkScheduler(),
+            workflow_runtime=_BenchmarkWorkflowRuntime(),
         )
         latencies: list[float] = []
         loop_start = time.perf_counter()

@@ -167,6 +167,15 @@ class _CountingScheduler:
         return AllocationRef(allocation_id=f"alloc-{self.allocate_count}", resource_id="node-1")
 
 
+class _NoopWorkflowRuntime:
+    """总是成功启动的 WorkflowRuntime 测试替身。"""
+
+    async def start(self, defn, inputs, idempotency_key):  # noqa: ANN001
+        from forgemesh.workflow.runtime import RunRef
+
+        return RunRef(run_id=idempotency_key, definition_version=1)
+
+
 def _make_ctx(dedup_key: str) -> ReconcileContext:
     resource = Resource(
         kind="Widget",
@@ -199,6 +208,7 @@ def test_controller_with_processed_store_is_idempotent_across_restart(
             registry=None,
             policy_engine=_AllowPolicy(),
             scheduler=scheduler,
+            workflow_runtime=_NoopWorkflowRuntime(),
             processed_store=store,
         )
         result = await controller.reconcile(_make_ctx("key-1"))
@@ -217,6 +227,7 @@ def test_controller_with_processed_store_is_idempotent_across_restart(
             registry=None,
             policy_engine=_AllowPolicy(),
             scheduler=scheduler,
+            workflow_runtime=_NoopWorkflowRuntime(),
             processed_store=restarted_store,
         )
         after_restart = await restarted_controller.reconcile(_make_ctx("key-1"))
@@ -242,6 +253,7 @@ def test_controller_default_keeps_memory_behavior() -> None:
             registry=None,
             policy_engine=_AllowPolicy(),
             scheduler=scheduler,
+            workflow_runtime=_NoopWorkflowRuntime(),
         )
         assert controller._processed_store is None
         first = await controller.reconcile(_make_ctx("key-1"))
@@ -254,6 +266,7 @@ def test_controller_default_keeps_memory_behavior() -> None:
             registry=None,
             policy_engine=_AllowPolicy(),
             scheduler=scheduler,
+            workflow_runtime=_NoopWorkflowRuntime(),
         )
         third = await fresh.reconcile(_make_ctx("key-1"))
         assert third.done is True

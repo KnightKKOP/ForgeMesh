@@ -15,6 +15,10 @@
 8. **重观察**：收集执行后的新观测状态（P1 简化为标记完成）。
 9. **更新 status + 安排下次**：写回 status patch，返回 requeue_after。
 
+需要分配或执行工作流、却未注入对应组件时，在任何副作用之前返回
+``Ready=False``（``SchedulerUnavailable`` / ``WorkflowRuntimeUnavailable``），
+而不是跳过该步骤后宣称协调完成。
+
 终止协调（Terminating，对齐 architecture.md §5.3/§12.4 与 development-plan
 第 7 章删除闭环）
 --------------------------------------------------------------------
@@ -75,8 +79,10 @@ class ReconciliationController(Reconciler):
         registry: 资源注册表（权威状态，``ResourceRegistry`` 实例）。
         policy_engine: 策略引擎（授权校验，不可绕过）。
         decision_provider: 可选决策 Provider（生成候选动作，仅建议非授权）。
-        scheduler: 可选调度器（资源分配的唯一执行点）。
-        workflow_runtime: 可选工作流运行时（执行协调工作流）。
+        scheduler: 可选调度器（资源分配的唯一执行点）；未注入时，需要分配的
+            资源报告 ``Ready=False``（``SchedulerUnavailable``）。
+        workflow_runtime: 可选工作流运行时（执行协调工作流）；未注入时，需要
+            执行工作流的资源报告 ``Ready=False``（``WorkflowRuntimeUnavailable``）。
         release_provider: 可选受控释放 Provider（``Terminating`` 时释放外部
             副作用）；``None`` 为 Noop 语义——仅移除 finalizer 后物理删除。
         processed_store: 可选去重键持久化存储（对齐 architecture §5.5"不能
@@ -202,6 +208,25 @@ class ReconciliationController(Reconciler):
                 },
             )
 
+        # 必须先于任何副作用检查：否则可能分配了资源却没有运行时部署它。
+        missing = self._missing_executor(diff)
+        if missing is not None:
+            reason, message = missing
+            return ReconcileResult(
+                done=False,
+                requeue_after=None,
+                status_patch={
+                    "conditions": [
+                        {
+                            "type": "Ready",
+                            "status": "False",
+                            "reason": reason,
+                            "message": message,
+                        }
+                    ]
+                },
+            )
+
         # 步骤 6：Scheduler 分配（如果需要且调度器可用）
         allocation_ref = None
         if self._scheduler is not None and diff.get("needs_allocation"):
@@ -269,6 +294,17 @@ class ReconciliationController(Reconciler):
             requeue_after=None,
             status_patch={"conditions": conditions},
         )
+
+    def _missing_executor(self, diff: dict[str, Any]) -> tuple[str, str] | None:
+        """返回本轮所需但未注入的执行组件对应的 ``(reason, message)``；齐备时返回 ``None``。"""
+        if diff.get("needs_allocation") and self._scheduler is None:
+            return "SchedulerUnavailable", "no scheduler is configured to allocate resources"
+        if diff.get("needs_workflow") and self._workflow is None:
+            return (
+                "WorkflowRuntimeUnavailable",
+                "no workflow runtime is configured to run the reconcile workflow",
+            )
+        return None
 
     # ------------------------------------------------------------------ #
     # 去重键登记（持久化 store 优先，回退内存 set）

@@ -1,0 +1,15 @@
+# ForgeMesh 网关镜像。构建上下文为仓库根目录：
+#   docker build -f deploy/docker/Dockerfile.gateway -t forgemesh/gateway:0.0.1 .
+#
+# 静态编译（网关只依赖标准库），运行在 distroless 镜像中，用户为 nonroot（uid 65532）。
+FROM golang:1.22 AS build
+
+WORKDIR /src
+COPY gateway/ ./
+RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/gateway ./cmd/gateway
+
+FROM gcr.io/distroless/static-debian12:nonroot
+
+COPY --from=build /out/gateway /gateway
+EXPOSE 8081
+ENTRYPOINT ["/gateway"]

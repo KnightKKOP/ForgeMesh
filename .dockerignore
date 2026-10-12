@@ -1,0 +1,8 @@
+# 镜像只需要 packages/（控制平面）与 gateway/（网关），见 deploy/docker/Dockerfile.*
+*
+!packages/
+!gateway/
+**/__pycache__/
+**/*.egg-info/
+**/.pytest_cache/
+gateway/bin/

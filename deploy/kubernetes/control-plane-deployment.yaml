@@ -1,8 +1,27 @@
-# ForgeMesh 控制平面 Kubernetes 部署（阶段 0 占位）
+# ForgeMesh 控制平面 Kubernetes 部署
 #
-# 说明：阶段 0 仅提供骨架，镜像占位、无 DB 依赖（探针恒为 ok）。
-#      生产部署需补齐：资源请求/限制、serviceAccount、NetworkPolicy、
-#      PodDisruptionBudget、Secret 引用（密钥不落盘）与多副本领导权选举。
+# 镜像由 deploy/docker/Dockerfile.control-plane 构建；推送到自己的镜像仓库后替换 image。
+# API key 文件放在 Secret forgemesh-api-keys 中（键名 api-keys.json），部署前先创建：
+#   kubectl -n forgemesh create secret generic forgemesh-api-keys --from-file=api-keys.json
+#
+# ADR-013：SQLite 权威库只允许一个写者。replicas 固定为 1，更新策略为 Recreate（旧 Pod 退出后
+# 才启动新 Pod），避免滚动更新期间两个 Pod 同时写同一个库；数据卷为 ReadWriteOnce。
+# 尚未提供：serviceAccount、NetworkPolicy。
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: forgemesh-control-plane-data
+  namespace: forgemesh
+  labels:
+    app.kubernetes.io/name: control-plane
+    app.kubernetes.io/part-of: forgemesh
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -13,6 +32,8 @@ metadata:
     app.kubernetes.io/part-of: forgemesh
 spec:
   replicas: 1
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       app.kubernetes.io/name: control-plane
@@ -21,10 +42,25 @@ spec:
       labels:
         app.kubernetes.io/name: control-plane
     spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
       containers:
         - name: control-plane
-          image: forgemesh/control-plane:0.0.1   # 占位镜像
+          image: forgemesh/control-plane:0.0.1
           imagePullPolicy: IfNotPresent
+          env:
+            - name: FORGEMESH_HOST
+              value: "0.0.0.0"
+            - name: FORGEMESH_DB_PATH
+              value: /var/lib/forgemesh/forgemesh.db
+            - name: FORGEMESH_API_KEYS_FILE
+              value: /etc/forgemesh/api-keys.json
           ports:
             - name: http
               containerPort: 8080
@@ -47,6 +83,28 @@ spec:
             limits:
               cpu: "500m"
               memory: "512Mi"
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/forgemesh
+            - name: api-keys
+              mountPath: /etc/forgemesh
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: forgemesh-control-plane-data
+        - name: api-keys
+          secret:
+            secretName: forgemesh-api-keys
+        - name: tmp
+          emptyDir: {}
 ---
 apiVersion: v1
 kind: Service

@@ -1,16 +1,19 @@
-"""ForgeMesh 控制平面 HTTP 应用骨架（阶段 0）。
+"""ForgeMesh 控制平面 HTTP 应用。
 
 设计要点
 --------
-* **仅契约、不实现**：所有 ``/api/v1/...`` 端点返回 ``501 Not Implemented``，
-  并携带统一错误信封 ``{"error": {"code", "message", "correlationId"}}``，与
+* **真实路由**：挂载 :func:`forgemesh.controlplane.api.create_api_router`
+  （资源 CRUD / 工作流 / 决策），错误统一使用
+  ``{"error": {"code", "message", "correlationId"}}`` 信封，与
   ``api/openapi/openapi.yaml`` 一致。
-* **不连接数据库**：阶段 0 不接入 PostgreSQL / Redis，也不假设任何外部依赖。
-* **探针**：``/healthz``（存活）与 ``/readyz``（就绪）返回 :class:`HealthResponse`。
-* **FastAPI 可选兜底**：若运行环境未安装 FastAPI，本模块自动回退到纯标准库
-  ``http.server``，提供一个只读最小服务（探针 + 501 占位），保证骨架在无第三方
-  Web 框架时仍可导入与启动。生产实现必须使用 FastAPI（或等效 ASGI 框架），
-  并接入权威资源注册表（``forgemesh.core.registry``）与工作流引擎。
+* **配置**：权威存储路径取自环境变量 ``FORGEMESH_DB_PATH``（默认
+  ``forgemesh.db``）；监听地址取自 ``FORGEMESH_HOST`` / ``FORGEMESH_PORT``
+  （默认 ``127.0.0.1:8080``，未接入认证前不默认对外暴露）。
+* **无导入副作用**：数据库在应用启动（lifespan）时才打开，导入本模块不会
+  创建文件。
+* **探针**：``/healthz``（存活）恒为 ok；``/readyz``（就绪）探测权威存储可用。
+* **FastAPI 可选兜底**：若运行环境未安装 FastAPI，回退到纯标准库
+  ``http.server``，仅提供探针与 501 占位。
 
 兼容 Python 3.9+ / Pydantic v2。
 """
@@ -18,6 +21,10 @@
 from __future__ import annotations
 
 import json
+import logging
+import os
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from typing import Any
 
 from pydantic import BaseModel
@@ -30,14 +37,23 @@ try:  # pragma: no cover - 取决于运行环境是否安装 FastAPI
 except Exception:  # pragma: no cover - 兜底路径
     _FASTAPI_AVAILABLE = False
 
+logger = logging.getLogger(__name__)
+
 #: 对外 API 版本前缀（架构 13.1）。
 API_PREFIX = "/api/v1"
 
-#: 阶段 0 占位错误码。
+#: 兜底服务（无 FastAPI）的占位错误码。
 NOT_IMPLEMENTED_CODE = "NOT_IMPLEMENTED"
 
 #: 控制平面版本（用于探针与事件 producer.version）。
 CONTROL_PLANE_VERSION = "0.0.1"
+
+DB_PATH_ENV = "FORGEMESH_DB_PATH"
+DEFAULT_DB_PATH = "forgemesh.db"
+HOST_ENV = "FORGEMESH_HOST"
+DEFAULT_HOST = "127.0.0.1"
+PORT_ENV = "FORGEMESH_PORT"
+DEFAULT_PORT = 8080
 
 
 class HealthResponse(BaseModel):
@@ -70,36 +86,45 @@ def error_envelope(
     return {"error": error}
 
 
-#: 阶段 0 占位路由表：方法、路径、说明。真实实现将在此注册到路由器。
-PLACEHOLDER_ROUTES = (
-    ("GET", f"{API_PREFIX}/inference-services", "列出推理服务"),
-    ("POST", f"{API_PREFIX}/inference-services", "创建推理服务"),
-    ("GET", f"{API_PREFIX}/inference-services/{{name}}", "获取推理服务"),
-    ("DELETE", f"{API_PREFIX}/inference-services/{{name}}", "删除推理服务"),
-    ("POST", f"{API_PREFIX}/workflows", "启动工作流运行"),
-    ("POST", f"{API_PREFIX}/decisions", "请求结构化决策"),
-)
-
-
 def _placeholder_payload(method: str, path: str) -> dict[str, Any]:
-    """生成占位响应载荷（501）。"""
+    """生成兜底服务的占位响应载荷（501）。"""
     return error_envelope(
         NOT_IMPLEMENTED_CODE,
-        f"阶段 0 占位：{method} {path} 尚未实现。",
+        f"未安装 FastAPI：{method} {path} 不可用。",
     )
+
+
+def resolve_db_path(db_path: str | None = None) -> str:
+    """显式参数优先，其次环境变量 ``FORGEMESH_DB_PATH``，最后默认值。"""
+    return db_path or os.environ.get(DB_PATH_ENV) or DEFAULT_DB_PATH
 
 
 if _FASTAPI_AVAILABLE:
 
-    def create_app() -> FastAPI:
-        """创建 FastAPI 应用并注册探针与占位路由。
+    def create_app(db_path: str | None = None) -> FastAPI:
+        """创建 FastAPI 应用：探针 + 真实 API 路由；注册中心在启动时初始化。
 
-        阶段 0 **不连接数据库**，所有资源/运行端点返回 501。
+        Args:
+            db_path: SQLite 权威存储路径；为空时按 :func:`resolve_db_path` 解析。
         """
+        # 延迟导入：api.routes 反向依赖本模块的 error_envelope。
+        from .api import create_api_router
+        from .api.dependencies import get_registry, init_registry
+
+        @asynccontextmanager
+        async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+            path = resolve_db_path(db_path)
+            registry = init_registry(path)
+            logger.info("control plane registry opened: %s", path)
+            try:
+                yield
+            finally:
+                await registry.close()
+
         application = FastAPI(
             title="ForgeMesh Control Plane API",
             version=CONTROL_PLANE_VERSION,
-            description="阶段 0 契约骨架（占位，未实现业务逻辑）。",
+            lifespan=lifespan,
         )
 
         @application.get("/healthz", response_model=HealthResponse, tags=["probes"])
@@ -108,33 +133,25 @@ if _FASTAPI_AVAILABLE:
             return HealthResponse(status="ok")
 
         @application.get("/readyz", response_model=HealthResponse, tags=["probes"])
-        async def readyz() -> HealthResponse:
-            """就绪探针（阶段 0 恒为 ok）。"""
+        async def readyz() -> Any:
+            """就绪探针：权威存储不可用时返回 503。"""
+            try:
+                await get_registry().ping()
+            except Exception as exc:  # noqa: BLE001 - 任何存储故障都视为未就绪
+                return JSONResponse(
+                    status_code=503,
+                    content=error_envelope("NOT_READY", f"registry unavailable: {exc}"),
+                )
             return HealthResponse(status="ok")
 
-        for method, path, _description in PLACEHOLDER_ROUTES:
-
-            def _make_handler(p: str = path, m: str = method):
-                async def _handler() -> JSONResponse:
-                    return JSONResponse(status_code=501, content=_placeholder_payload(m, p))
-
-                return _handler
-
-            application.add_api_route(
-                path,
-                _make_handler(),
-                methods=[method],
-                status_code=501,
-                include_in_schema=False,
-            )
-
+        application.include_router(create_api_router())
         return application
 
     app = create_app()
 
 else:  # pragma: no cover - 兜底路径：无 FastAPI 时使用标准库实现
 
-    def create_app() -> FastAPI:  # type: ignore[valid-type]
+    def create_app(db_path: str | None = None) -> FastAPI:  # type: ignore[valid-type]
         """无 FastAPI 环境时的占位工厂（抛出明确错误）。"""
         raise RuntimeError(
             "未检测到 FastAPI。请安装可选依赖：pip install 'forgemesh-control-plane[api]'，"
@@ -171,35 +188,34 @@ else:  # pragma: no cover - 兜底路径：无 FastAPI 时使用标准库实现
             self._write_json(501, _placeholder_payload("DELETE", self.path))
 
         def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
-            # 阶段 0 骨架：抑制默认访问日志，避免噪声。
             return
 
-    def run_fallback_server(host: str = "0.0.0.0", port: int = 8080) -> None:
+    def run_fallback_server(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT) -> None:
         """启动标准库兜底 HTTP 服务（阻塞）。"""
         server = HTTPServer((host, port), _FallbackHandler)
         server.serve_forever()
 
 
 def main() -> None:
-    """命令行入口：优先 FastAPI + uvicorn，否则回退标准库服务。"""
-    if _FASTAPI_AVAILABLE:
-        try:  # pragma: no cover - 依赖运行时环境
-            import uvicorn
+    """命令行入口：监听地址取自 ``FORGEMESH_HOST`` / ``FORGEMESH_PORT``。"""
+    host = os.environ.get(HOST_ENV, DEFAULT_HOST)
+    port = int(os.environ.get(PORT_ENV, str(DEFAULT_PORT)))
+    if _FASTAPI_AVAILABLE:  # pragma: no cover - 依赖运行时环境
+        import uvicorn
 
-            uvicorn.run(app, host="0.0.0.0", port=8080)
-            return
-        except Exception:
-            pass
-    run_fallback_server()
+        uvicorn.run(app, host=host, port=port)
+        return
+    run_fallback_server(host, port)  # pragma: no cover
 
 
 __all__ = [
     "API_PREFIX",
     "NOT_IMPLEMENTED_CODE",
     "CONTROL_PLANE_VERSION",
-    "PLACEHOLDER_ROUTES",
+    "DB_PATH_ENV",
     "HealthResponse",
     "error_envelope",
+    "resolve_db_path",
     "create_app",
     "app",
     "main",

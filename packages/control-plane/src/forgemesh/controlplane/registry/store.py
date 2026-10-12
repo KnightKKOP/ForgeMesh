@@ -797,6 +797,14 @@ class SQLiteRegistry(ResourceRegistry):
     # 生命周期
     # ------------------------------------------------------------------ #
 
+    async def ping(self) -> None:
+        """探测连接可用（就绪探针使用）；连接已关闭或损坏时抛 ``sqlite3.Error``。"""
+
+        def _ping() -> None:
+            self._conn.execute("SELECT 1").fetchone()
+
+        await self._run(_ping)
+
     async def close(self) -> None:
         """关闭数据库连接。"""
         await self._run(self._conn.close)

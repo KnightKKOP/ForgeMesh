@@ -1,4 +1,8 @@
-"""注册中心变更记录单元测试：同事务追加、增量读取、清理，以及跨租户键列表。"""
+"""注册中心变更记录与控制器读取的单元测试。
+
+覆盖变更记录的同事务追加、增量读取与清理，以及控制器使用的跨租户键列表和
+带 phase 的读取。
+"""
 
 from __future__ import annotations
 
@@ -138,6 +142,24 @@ def test_changes_are_read_incrementally_and_pruned_without_reusing_seq() -> None
 def test_changes_since_rejects_non_positive_limit() -> None:
     with pytest.raises(ValueError):
         _run(SQLiteRegistry().changes_since(0, limit=0))
+
+
+@pytest.mark.unit
+def test_get_with_phase_reports_termination_of_base_resources() -> None:
+    reg = SQLiteRegistry()
+    widget = _resource("w", kind="Widget").model_copy(update={"finalizers": ["example.com/x"]})
+    _run(reg.put(widget))
+    _run(reg.put(_ready_service("svc")))
+    _run(reg.request_delete("Widget", NAMESPACE, "w", TENANT))
+
+    resource, phase = _run(reg.get_with_phase("Widget", NAMESPACE, "w", TENANT))
+    service, service_phase = _run(reg.get_with_phase(KIND, NAMESPACE, "svc", TENANT))
+
+    assert phase == "Terminating"
+    assert not hasattr(resource, "status")
+    assert service_phase == service.status.phase == "Ready"
+    with pytest.raises(NotFoundError):
+        _run(reg.get_with_phase(KIND, NAMESPACE, "svc", "tenant-b"))
 
 
 @pytest.mark.unit

@@ -886,6 +886,37 @@ class SQLiteRegistry(ResourceRegistry):
     # 控制器读取（跨租户，仅供控制平面内部使用）
     # ------------------------------------------------------------------ #
 
+    async def get_with_phase(
+        self,
+        kind: str,
+        namespace: str | None,
+        name: str,
+        tenant_id: str,
+    ) -> tuple[Resource, str | None]:
+        """读取资源及 ``phase`` 列记录的生命周期阶段。
+
+        基类资源的 payload 没有 ``status`` 子树，``Terminating`` 只记录在 ``phase``
+        列（见 :meth:`request_delete`），只读 payload 无法判断是否进入受控删除。
+
+        Raises:
+            NotFoundError: 资源不存在（或跨租户不可见）。
+        """
+
+        def _get_with_phase() -> tuple[Resource, str | None]:
+            row = self._conn.execute(
+                "SELECT body, phase FROM resources "
+                "WHERE tenant_id=? AND kind=? AND namespace IS ? AND name=?",
+                (tenant_id, kind, namespace, name),
+            ).fetchone()
+            if row is None:
+                raise NotFoundError(
+                    f"resource not found: kind={kind} "
+                    f"namespace={namespace!r} name={name} tenant_id={tenant_id}",
+                )
+            return self._row_to_resource(row), row["phase"]
+
+        return await self._run(_get_with_phase)
+
     async def list_resource_keys(
         self, kinds: Collection[str] | None = None
     ) -> builtins.list[ResourceKey]:

@@ -7,6 +7,7 @@
   :func:`mark_lost_instances`；
 * :mod:`.fake` —— 在控制平面进程内为每个实例提供 OpenAI 兼容桩服务的
   :class:`FakeLauncher`（CI 与本地开发）；
+* :mod:`.vllm_process` —— 把每个实例作为本机 vLLM 子进程运行的 :class:`VLLMProcessLauncher`；
 * :mod:`.network` —— 启动器共用的地址校验与健康检查；
 * :mod:`.memory` —— 测试替身 :class:`InMemoryLauncher`。
 
@@ -20,6 +21,7 @@ from .launcher import LaunchedInstance, LaunchRequest, RuntimeLauncher
 from .memory import InMemoryLauncher
 from .recovery import INSTANCE_LOST_REASON, mark_lost_instances
 from .release import DeploymentReleaser
+from .vllm_process import VLLMProcessLauncher
 from .workflow import (
     DEPLOYMENT_WORKFLOW,
     LAUNCH_INSTANCE,
@@ -47,6 +49,7 @@ __all__ = [
     "LaunchedInstance",
     "RuntimeLauncher",
     "StepCallable",
+    "VLLMProcessLauncher",
     "deployment_inputs",
     "deployment_run_key",
     "deployment_workflow",

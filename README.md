@@ -159,10 +159,22 @@ curl -s -H "Authorization: Bearer fmk_…" http://127.0.0.1:8080/api/v1/inferenc
 | `FORGEMESH_DB_PATH` | `forgemesh.db` | SQLite 权威存储文件；同一文件只允许一个控制平面实例写入（ADR-013）。以 WAL 模式打开，运行时旁边有 `-wal` / `-shm` 文件，不能直接复制文件做备份，见 [备份与灾备演练](docs/operations/backup-restore.md) |
 | `FORGEMESH_HOST` | `127.0.0.1` | 监听地址 |
 | `FORGEMESH_PORT` | `8080` | 监听端口 |
+| `FORGEMESH_INVENTORY_FILE` | — | 静态加速器清单（JSON，格式见下），设置后启用首次适配调度器；文件不可读或格式非法时拒绝启动，修改后需重启。未设置时不启用调度器 |
 
 > 请求可以不带 `X-Tenant-Id`；带了就必须与 key 绑定的租户一致，否则返回 `403`。缺少或无效的 key 返回 `401`。
 
-控制平面启动后会自动协调 `InferenceService`：新建、修改或请求删除的资源在 0.5 秒内被处理，协调结果写入 `status.conditions`（例如 `Ready=False` 及其原因）。仓库目前还没有调度器实现，因此新建的服务会停在 `Pending`，并带有 `Ready=False`（`SchedulerUnavailable`）条件。控制器与 API 运行在同一个进程中，是权威存储的唯一写者（ADR-013）：请以单进程运行，不要使用 `uvicorn --workers` 或多副本。
+加速器清单列出调度器可以分配的节点与设备，例如一个节点上的两张 80 GiB 显卡：
+
+```json
+{"nodes": [{"id": "node-a", "devices": [
+  {"id": "gpu-0", "type": "nvidia-gpu", "memoryGiB": 80},
+  {"id": "gpu-1", "type": "nvidia-gpu", "memoryGiB": 80}
+]}]}
+```
+
+节点 `id` 在清单内唯一，设备 `id` 在所属节点内唯一，节点与设备都至少一个，不允许其他字段；`type` 与 `spec.resources.accelerator.type` 按字符串精确匹配，`memoryGiB` 是单卡显存（正整数，不接受 `"80"` 或 `80.0`）。调度器按清单顺序取第一个能凑齐 `count` 张卡的节点，在该节点内按顺序取类型匹配、显存不低于 `minMemoryGiB` 且未被占用的设备，不跨节点凑数。分配按资源 `uid` 记录在权威存储中（`allocations` / `allocation_devices`），同一设备同时至多属于一个生效的分配；分配不设租约，在资源删除时释放：持有分配的资源无论处于哪个 phase，`DELETE` 都返回 `202` 并先进入 `Terminating`。
+
+控制平面启动后会自动协调 `InferenceService`：新建、修改或请求删除的资源在 0.5 秒内被处理，协调结果写入 `status.conditions`（例如 `Ready=False` 及其原因）。未设置 `FORGEMESH_INVENTORY_FILE` 时，新建的服务会停在 `Pending`，并带有 `Ready=False`（`SchedulerUnavailable`）条件；设置后，由于应用尚未接入工作流运行时，条件为 `Ready=False`（`WorkflowRuntimeUnavailable`），协调器在分配之前停下，暂不占用设备。控制器与 API 运行在同一个进程中，是权威存储的唯一写者（ADR-013）：请以单进程运行，不要使用 `uvicorn --workers` 或多副本。
 
 ### Go 网关
 

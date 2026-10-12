@@ -27,6 +27,9 @@
 - `scripts/compose_smoke.sh` 端到端冒烟：构建镜像并按 compose 启动，经网关验证无 key 返回 `401`、创建与读取推理服务、控制器写入 `status`，重启控制平面后资源仍在。CI 新增 `compose-smoke` job 执行该脚本。
 - CI `go` job 新增 `gofmt` 检查与 `go vet`，网关测试改以 `-race` 运行。
 - [docs/operations/backup-restore.md](docs/operations/backup-restore.md) 新增容器部署中的备份与恢复（2.5 / 3.4 节）：镜像不含 `sqlite3` 命令行、根文件系统只读，改在容器内用备份 API 生成快照并写回；Kubernetes 上 PVC 应使用块存储。
+- 调度器 `forgemesh.controlplane.scheduler.FirstFitScheduler`：按静态加速器清单首次适配分配。清单是 JSON 文件，路径取自 `FORGEMESH_INVENTORY_FILE`（未设置时不启用调度器），列出节点及其设备（`id` / `type` / `memoryGiB`），严格校验（未知字段、隐式类型转换、空列表、重复 id 都是错误），文件不可读或非法时控制平面拒绝启动，格式见 README「运行控制平面」。调度器按清单顺序取第一个能凑齐数量的节点（类型精确匹配、单卡显存不低于 `minMemoryGiB`，不跨节点）；同一幂等键返回同一分配（重启后亦然）；资源已持有仍满足需求的分配时直接复用，不满足时报冲突，须先释放；`feasible()` 只读，`release()` 幂等。分配不设租约，资源删除时由协调器释放。应用尚未接入工作流运行时，因此协调器在分配之前即报告 `Ready=False`（`WorkflowRuntimeUnavailable`）。
+- 设备级独占：新表 `allocation_devices` 记录每个分配占用的 `(node_id, device_id)`，部分唯一索引 `idx_allocation_devices_one_active` 保证一个设备至多属于一个 Active 分配，触发器 `trg_allocation_devices_follow_status` 让设备随分配状态一起释放。`SQLiteRegistry.create_allocation` 在同一个 `BEGIN IMMEDIATE` 事务中检查归属资源（存在、uid 一致、不在 `Terminating`）、幂等键（重放返回原分配，用过的键不再复用）、资源与设备是否已被占用，再一起写入分配与设备行；另新增 `get_allocation`、`get_allocation_by_idempotency_key`、`allocated_devices`、`release_active_allocation`，分配记录包含 `devices`。
+- 调度契约：`ScheduleRequest` 新增 `resource_ref`（`ResourceRef`：`kind` / `namespace` / `name` / `uid`）与 `idempotency_key`，`AllocationRef` 新增 `devices`（`AllocatedDevice`：`node_id` / `device_id`）。协调器以 `{uid}:{generation}`（`allocation_idempotency_key`）为幂等键，`requirements` 取自 `spec.resources.accelerator`（`{"accelerator": {"type", "count", "minMemoryGiB"}}`）；没有 `metadata.uid` 的资源报告 `Ready=False`（`MissingUid`），不分配。
 
 ### Changed
 
@@ -53,6 +56,9 @@
 - README 与 CONTRIBUTING 的安装命令改为 `make install`：在仓库根目录执行 `uv sync` 只会创建一个空的虚拟环境，随后 `make test` 找不到 pytest。README 目录树列出全部 10 个插件，并补充容器部署说明。
 - [docs/architecture/module-mapping.md](docs/architecture/module-mapping.md)：更正网关文件与测试数量（33 / 17）和上游变量名（`GATEWAY_UPSTREAM_URL`），部署小节与 CI 小节按当前工件更新，偏差 D2 处置后移除。
 - 删除源码与测试 docstring 中「兼容 Python 3.9+」/「兼容 3.9–3.12」的说法（各子包 `requires-python` 已是 `>=3.12`，代码使用 `X | None` 与 `enum.StrEnum`，在 3.9 上无法导入）；CONTRIBUTING 的类型注解约定改为与 ruff `UP` 规则一致的 `list[X]` / `X | None`。
+- **破坏性**：`ScheduleRequest` 必须提供 `resource_ref` 与 `idempotency_key`（见 Added）；`resource_kind` 改为只读属性（等同 `resource_ref.kind`），构造时传入会被拒绝。`AllocationRef.resource_id` 改为归属资源的 `uid`。
+- **破坏性**：`allocations.resource_id` 改为归属资源的 `uid`（此前协调器按 `{kind}/{name}` 查找），同一租户内同一 uid 至多一个 Active 分配：部分唯一索引 `idx_allocations_one_active_per_tenant_resource`（`ON allocations(tenant_id, resource_id) WHERE status = 'Active'`）取代 `idx_allocations_one_active_per_resource`，打开旧库时自动替换，已有行保留。旧库中以 `{kind}/{name}` 记录的分配不做迁移，也不再随资源删除释放（此前仓库没有调度器实现，正常部署不会产生这类分配）。
+- **破坏性**：持有 Active 分配的资源无论处于哪个 phase，`DELETE` 都返回 `202` 并先进入 `Terminating`（此前 `Pending` / `Scheduling` / `Preparing` / `Failed` / `Unknown` 直接物理删除并返回 `204`），由协调器释放分配后再物理删除；检查之后才提交的分配使这次删除失败（`409`），而不是遗留一个没有归属的分配。OpenAPI 已同步。
 
 ### Deprecated
 
@@ -78,7 +84,7 @@
 - `request_delete` 与 `release_allocation` 读后写不校验版本，期间提交的写入会丢失、期间追加的 finalizer 会被绕过：现以读取到的 `resource_version` / 状态为条件做 CAS，竞争失败抛出 `ConflictError`（DELETE 端点返回 `409`）。
 - 调和器在 deny / require_approval / 分配失败等无副作用路径上也记录去重键，重新入队后命中幂等短路，被阻塞的资源在 spec 变更或 24h 去重 TTL 过期前不会被重新评估：这些路径不再记录去重键。
 - 生产代码中没有任何地方驱动调和器，创建的资源永远停在 `Pending`、`status` 从不更新：现由控制器驱动（见 Added）。
-- 调和器在没有注入调度器或工作流运行时的情况下跳过分配与部署、登记去重键并报告 `Ready=True`（`Reconciled`），实际什么都没做：现在任何副作用之前检查，返回 `Ready=False`，原因为 `SchedulerUnavailable` 或 `WorkflowRuntimeUnavailable`，且不登记去重键。目前仓库没有调度器实现，默认部署中新建的服务会停在 `Pending` 并带有 `Ready=False`（`SchedulerUnavailable`）。
+- 调和器在没有注入调度器或工作流运行时的情况下跳过分配与部署、登记去重键并报告 `Ready=True`（`Reconciled`），实际什么都没做：现在任何副作用之前检查，返回 `Ready=False`，原因为 `SchedulerUnavailable` 或 `WorkflowRuntimeUnavailable`，且不登记去重键。未设置 `FORGEMESH_INVENTORY_FILE` 时（默认部署），新建的服务会停在 `Pending` 并带有 `Ready=False`（`SchedulerUnavailable`）。
 - 网关把入站路径原样拼接到实例地址，请求以 `/api/v1/inference/{svc}/chat` 到达推理运行时，而 vLLM 与 TGI 都不提供这个路径：现按实例的 `protocol` 转发到 `/v1/chat/completions`（`openai-chat`）或 `/generate_stream`（`tgi-generate`），查询串保留。
 - 网关解析推理服务时不带命名空间，控制平面因此只查找不带命名空间的服务，带命名空间的服务无法经网关调用：现由带命名空间的路由解析（见 Added）。
 - OpenAPI 没有描述 `GET` / `DELETE /api/v1/inference-services/{name}` 的 `namespace` 查询参数，而实现一直支持它，网关解析带命名空间的服务时也依赖它：现已补上，并写明省略时指不带命名空间的资源（列表接口省略时则不按命名空间过滤）。
@@ -89,6 +95,10 @@
 - compose 拓扑无法运行（module-mapping 偏差 D2）：引用的 `Dockerfile.control-plane` 不存在，gateway 没有构建配置；compose 设置的 `FORGEMESH_UPSTREAM` 网关并不读取（网关读取 `GATEWAY_UPSTREAM_URL`），端口写成 `8000`（网关监听 `8081`）；控制平面默认只监听容器内的回环地址，网关访问不到；数据库写在容器文件系统中，重建容器即丢失；控制平面依赖它并不使用的 postgres，postgres 以默认口令发布在所有网卡上。现改为见 Changed。
 - Kubernetes 控制平面清单把数据库写在容器文件系统中，Pod 重建即丢失全部资源；默认的 `RollingUpdate` 在更新期间同时运行新旧两个 Pod，违反 ADR-013 的单写者约束；控制平面默认只监听回环地址，kubelet 探针访问不到。现改为 PVC + `Recreate`，并设置 `FORGEMESH_HOST=0.0.0.0`（见 Changed）。
 - `tests/unit/controlplane/test_registry.py` 有两处 `reg.close()` 未被 await，关闭逻辑从未执行。
+- 分配不是幂等的（改进计划 4.10）：调度请求不携带资源身份与幂等键，同一 generation 的每次重放（去重键丢失、进程在分配之后 status 写入之前退出、重启后重试）都会再分配一次；数据库也不阻止两个分配占用同一设备：现以 `{uid}:{generation}` 为幂等键，同一键返回同一分配，设备独占由数据库约束保证（见 Added）；同名资源删除后重建（新 uid）得到新的分配。
+- 协调器传给调度器的 `requirements` 恒为空，调度器无从得知资源申请了几张什么卡：现取自 `spec.resources.accelerator`。
+- 删除处于 `Pending` / `Scheduling` 等无副作用 phase、但已持有分配的资源时直接物理删除，分配及其设备永远不会被释放：现先进入 `Terminating`（见 Changed）。
+- `Terminating` 协调按 `{kind}/{name}` 释放分配，忽略命名空间，删除一个服务可能释放另一个命名空间中同名服务的分配：现按资源 uid（限本租户）释放。资源已被删除、或同名资源已以新 uid 重建时，只释放原资源的分配，不再移除新资源的 finalizer 并把它删除。
 
 ### Security
 

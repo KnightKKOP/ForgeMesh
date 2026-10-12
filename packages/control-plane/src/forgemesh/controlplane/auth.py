@@ -17,18 +17,15 @@ key 文件格式（与网关的 ``GATEWAY_API_KEYS_FILE`` 共用）::
     {"keys": [{"id": "acme-ci", "sha256": "<64 位十六进制>", "tenantId": "acme",
                "subject": "ci-bot", "scopes": ["read", "write"]}]}
 
-生成新 key：``python -m forgemesh.controlplane.auth keygen --tenant acme --subject ci-bot``。
+生成新 key：``python -m forgemesh.controlplane.keygen --tenant acme --subject ci-bot``。
 """
 
 from __future__ import annotations
 
-import argparse
 import hashlib
 import hmac
-import json
 import os
 import secrets
-import sys
 from collections.abc import Iterable, Mapping
 from pathlib import Path
 from typing import Protocol
@@ -271,45 +268,3 @@ def authenticator_from_env(environ: Mapping[str, str] | None = None) -> Authenti
             "local development"
         )
     return ApiKeyAuthenticator.from_file(path)
-
-
-def _keygen(args: argparse.Namespace) -> int:
-    key = generate_api_key()
-    entry = ApiKeyEntry(
-        id=args.id or f"{args.tenant}-{args.subject}",
-        sha256=hash_api_key(key),
-        tenantId=args.tenant,
-        subject=args.subject,
-        scopes=tuple(args.scope) if args.scope else (SCOPE_READ, SCOPE_WRITE),
-    )
-    print("API key (store it in a secret manager; it is not shown again):")
-    print(key)
-    print('Key file entry (append it to the "keys" array):')
-    print(json.dumps(entry.model_dump(by_alias=True, mode="json"), ensure_ascii=False))
-    return 0
-
-
-def main(argv: list[str] | None = None) -> int:
-    """命令行入口：``keygen`` 生成新 key 及对应的 key 文件条目。"""
-    parser = argparse.ArgumentParser(prog="python -m forgemesh.controlplane.auth")
-    commands = parser.add_subparsers(dest="command", required=True)
-    keygen = commands.add_parser("keygen", help="generate an API key bound to a tenant")
-    keygen.add_argument("--tenant", required=True, help="tenant bound to the key")
-    keygen.add_argument("--subject", required=True, help="subject (service account or user)")
-    keygen.add_argument("--id", help="entry id (default: <tenant>-<subject>)")
-    keygen.add_argument(
-        "--scope",
-        action="append",
-        choices=sorted(KNOWN_SCOPES),
-        help="granted scope, repeatable (default: read and write)",
-    )
-    args = parser.parse_args(argv)
-    try:
-        return _keygen(args)
-    except ValidationError as exc:
-        print(f"invalid key parameters: {exc}", file=sys.stderr)
-        return 2
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())

@@ -21,7 +21,7 @@ import (
 //	{"keys": [{"id": "acme-ci", "sha256": "<64 位十六进制>", "tenantId": "acme",
 //	           "subject": "ci-bot", "scopes": ["read", "write"]}]}
 //
-// 新 key 由 `python -m forgemesh.controlplane.auth keygen` 生成。
+// 新 key 由 `python -m forgemesh.controlplane.keygen` 生成。
 type APIKey struct {
 	ID       string
 	SHA256   string

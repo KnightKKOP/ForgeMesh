@@ -25,7 +25,7 @@ from forgemesh.controlplane.auth import (
     hash_api_key,
     load_api_keys,
 )
-from forgemesh.controlplane.auth import main as auth_main
+from forgemesh.controlplane.keygen import main as keygen_main
 
 KEY_A = "fmk_key-for-tenant-a"
 KEY_B = "fmk_key-for-tenant-b"
@@ -206,8 +206,14 @@ def test_authenticator_from_env(tmp_path) -> None:
 
 
 @pytest.mark.unit
+def test_keygen_rejects_invalid_parameters(capsys) -> None:
+    assert keygen_main(["--tenant", "", "--subject", "ci"]) == 2
+    assert "invalid key parameters" in capsys.readouterr().err
+
+
+@pytest.mark.unit
 def test_keygen_prints_a_key_matching_its_entry(capsys) -> None:
-    assert auth_main(["keygen", "--tenant", "acme", "--subject", "ci", "--scope", "read"]) == 0
+    assert keygen_main(["--tenant", "acme", "--subject", "ci", "--scope", "read"]) == 0
 
     lines = capsys.readouterr().out.strip().splitlines()
     key, entry = lines[1], ApiKeyEntry.model_validate_json(lines[-1])

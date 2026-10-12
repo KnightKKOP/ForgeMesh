@@ -31,7 +31,7 @@ func newAPIChain(l *Limiter, route http.Handler) http.Handler {
 	api := Chain(route,
 		Correlation(DefaultCorrelationHeader),
 		Authz(DefaultTenantHeader),
-		RateLimit(l, DefaultTenantHeader),
+		RateLimit(l),
 	)
 	return Recovery(log.New(io.Discard, "", 0))(api)
 }

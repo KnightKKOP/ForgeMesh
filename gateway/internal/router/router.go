@@ -99,7 +99,7 @@ func New(cfg config.Config, logger *log.Logger) (*Router, error) {
 	apiHandler := middleware.Chain(apiMux,
 		middleware.Correlation(cfg.CorrelationHeader),
 		middleware.Authenticate(authn, cfg.TenantHeader),
-		middleware.RateLimit(limiter, cfg.TenantHeader),
+		middleware.RateLimit(limiter),
 	)
 
 	// 顶层路由：探针不经过鉴权/限流。

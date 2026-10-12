@@ -5,7 +5,6 @@ import (
 	"net"
 	"net/http"
 	"strconv"
-	"strings"
 	"sync"
 	"time"
 )
@@ -116,20 +115,18 @@ func (l *Limiter) maybeGC(now time.Time) {
 	}
 }
 
-// RateLimit 返回按租户限流的中间件。
+// RateLimit 返回按租户限流的中间件，须位于 Authenticate 之后。
 //
-// key 选取优先使用请求头中的租户身份；若缺失（尚未经过鉴权或匿名流量），
-// 退化为按客户端 IP 限流，保证入口不被单点打爆。
-func RateLimit(l *Limiter, tenantHeader string) Middleware {
+// key 取自认证中间件注入 context 的租户（来自已验证的凭证），而不是请求头——否则客户端
+// 每换一个租户头就能得到一个新令牌桶。context 中没有租户时（链上未启用认证）按 TCP 对端
+// 地址限流；X-Forwarded-For 可由客户端任意填写，不参与 key 计算。
+func RateLimit(l *Limiter) Middleware {
 	if l == nil {
 		panic("middleware: RateLimit 需要非空 Limiter")
 	}
-	if tenantHeader == "" {
-		tenantHeader = DefaultTenantHeader
-	}
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			key := rateLimitKey(r, tenantHeader)
+			key := rateLimitKey(r)
 			allowed, retryAfter := l.Allow(key)
 			if !allowed {
 				// Retry-After 采用秒级向上取整，最小为 1。
@@ -146,27 +143,16 @@ func RateLimit(l *Limiter, tenantHeader string) Middleware {
 	}
 }
 
-// rateLimitKey 计算限流 key：租户头 → 上下文租户 → 客户端 IP。
-func rateLimitKey(r *http.Request, tenantHeader string) string {
-	if tenant := strings.TrimSpace(r.Header.Get(tenantHeader)); tenant != "" {
-		return "tenant:" + tenant
-	}
+// rateLimitKey 计算限流 key：已认证的租户 → TCP 对端地址。
+func rateLimitKey(r *http.Request) string {
 	if tenant := TenantFromContext(r.Context()); tenant != "" {
 		return "tenant:" + tenant
 	}
 	return "ip:" + clientIP(r)
 }
 
-// clientIP 尽力提取客户端 IP；优先 X-Forwarded-For 首段，否则使用 RemoteAddr。
+// clientIP 返回 TCP 对端地址（RemoteAddr 的主机部分）。
 func clientIP(r *http.Request) string {
-	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-		if idx := strings.IndexByte(xff, ','); idx >= 0 {
-			xff = xff[:idx]
-		}
-		if ip := strings.TrimSpace(xff); ip != "" {
-			return ip
-		}
-	}
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
 		return r.RemoteAddr

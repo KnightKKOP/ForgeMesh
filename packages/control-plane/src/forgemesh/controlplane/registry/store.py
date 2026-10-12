@@ -37,10 +37,19 @@ Allocation 持久化
 ``idx_allocations_one_active_per_resource`` 兜底「同一 ``resource_id`` 至多一个
 Active 分配」；``release_allocation`` 走 ``ALLOCATION_STATE_MACHINE`` 校验。
 
+变更记录
+--------
+每次写入 ``resources`` 都在**同一事务**中向 ``resource_changes`` 追加一条
+记录（:class:`ChangeType`），控制器按 ``seq`` 增量轮询以发现待协调的资源
+（不依赖 PostgreSQL ``LISTEN/NOTIFY``，见 ADR-013），处理完后调用
+:meth:`SQLiteRegistry.prune_changes` 清理。
+
 租户隔离
 --------
-所有查询均以 ``tenant_id`` 作为首要过滤条件；跨租户访问一律视为
+面向租户的查询均以 ``tenant_id`` 作为首要过滤条件；跨租户访问一律视为
 :class:`~forgemesh.core.errors.NotFoundError`，不泄露存在性。
+:meth:`SQLiteRegistry.list_resource_keys` 与 :meth:`SQLiteRegistry.changes_since`
+是例外：它们跨租户返回资源键，仅供控制平面内部的控制器使用，不得暴露给 API。
 
 兼容 Python 3.9+。
 """
@@ -54,8 +63,9 @@ import json
 import logging
 import sqlite3
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Collection
 from dataclasses import dataclass, field
+from enum import StrEnum
 from typing import Any, TypeVar
 from uuid import uuid4
 
@@ -124,7 +134,52 @@ CREATE TABLE IF NOT EXISTS allocations (
 CREATE INDEX IF NOT EXISTS idx_allocations_tenant ON allocations(tenant_id);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_allocations_one_active_per_resource
     ON allocations(resource_id) WHERE status = 'Active';
+CREATE TABLE IF NOT EXISTS resource_changes (
+    seq INTEGER PRIMARY KEY AUTOINCREMENT,
+    tenant_id TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    namespace TEXT,
+    name TEXT NOT NULL,
+    change TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
 """
+
+
+class ChangeType(StrEnum):
+    """``resource_changes.change`` 的取值。"""
+
+    CREATED = "created"
+    UPDATED = "updated"
+    STATUS = "status"
+    TERMINATING = "terminating"
+    DELETED = "deleted"
+
+
+@dataclass(frozen=True)
+class ResourceKey:
+    """跨租户唯一定位一个资源。"""
+
+    tenant_id: str
+    kind: str
+    namespace: str | None
+    name: str
+
+
+@dataclass(frozen=True)
+class ResourceChange:
+    """``resource_changes`` 中的一条记录。
+
+    Attributes:
+        seq: 单调递增的序号；``AUTOINCREMENT`` 保证清理后也不复用，否则消费方
+            的游标会漏读清理之后写入的记录。
+        key: 发生变更的资源。
+        change: 变更类型。
+    """
+
+    seq: int
+    key: ResourceKey
+    change: ChangeType
 
 
 @dataclass(frozen=True)
@@ -168,6 +223,22 @@ class SQLiteRegistry(ResourceRegistry):
                 return fn()
 
         return await asyncio.to_thread(_locked)
+
+    @staticmethod
+    def _record_change(
+        cur: sqlite3.Cursor,
+        tenant_id: str,
+        kind: str,
+        namespace: str | None,
+        name: str,
+        change: ChangeType,
+    ) -> None:
+        """在调用方的事务中追加一条变更记录（随调用方一起提交或回滚）。"""
+        cur.execute(
+            "INSERT INTO resource_changes (tenant_id, kind, namespace, name, change) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (tenant_id, kind, namespace, name, change.value),
+        )
 
     def _init_schema(self) -> None:
         """创建表与索引（幂等），并对存量库做列迁移。"""
@@ -382,6 +453,7 @@ class SQLiteRegistry(ResourceRegistry):
                             body,
                         ),
                     )
+                    self._record_change(cur, tenant_id, kind, namespace, name, ChangeType.CREATED)
                     self._conn.commit()
                     return stored
                 # ---- Update-CAS ----
@@ -427,6 +499,7 @@ class SQLiteRegistry(ResourceRegistry):
                         f"does not match current or resource does not exist "
                         f"(kind={kind} namespace={namespace!r} name={name})",
                     )
+                self._record_change(cur, tenant_id, kind, namespace, name, ChangeType.UPDATED)
                 self._conn.commit()
                 return stored
             except sqlite3.IntegrityError as exc:
@@ -512,6 +585,7 @@ class SQLiteRegistry(ResourceRegistry):
                     f"resource not found: kind={kind} "
                     f"namespace={namespace!r} name={name} tenant_id={tenant_id}",
                 )
+            self._record_change(cur, tenant_id, kind, namespace, name, ChangeType.DELETED)
             self._conn.commit()
 
         await self._run(_delete)
@@ -600,6 +674,7 @@ class SQLiteRegistry(ResourceRegistry):
                         f"request_delete raced with concurrent write: kind={kind} "
                         f"namespace={namespace!r} name={name} tenant_id={tenant_id}",
                     )
+                self._record_change(cur, tenant_id, kind, namespace, name, ChangeType.DELETED)
                 self._conn.commit()
                 return RequestDeleteResult(True, [])
             # finalizer 非空（或自动追加）→ 受控删除：置 Terminating。
@@ -639,6 +714,7 @@ class SQLiteRegistry(ResourceRegistry):
                     f"request_delete raced with concurrent write: kind={kind} "
                     f"namespace={namespace!r} name={name} tenant_id={tenant_id}",
                 )
+            self._record_change(cur, tenant_id, kind, namespace, name, ChangeType.TERMINATING)
             self._conn.commit()
             logger.info(
                 "delete requested: kind=%s name=%s tenant_id=%s → Terminating "
@@ -653,6 +729,82 @@ class SQLiteRegistry(ResourceRegistry):
             return RequestDeleteResult(False, effective)
 
         return await self._run(_request_delete)
+
+    # ------------------------------------------------------------------ #
+    # 控制器读取（跨租户，仅供控制平面内部使用）
+    # ------------------------------------------------------------------ #
+
+    async def list_resource_keys(
+        self, kinds: Collection[str] | None = None
+    ) -> builtins.list[ResourceKey]:
+        """跨租户列出资源键，供控制器在启动和全量同步时重建工作队列。
+
+        Args:
+            kinds: 只列出这些 kind；``None`` 表示全部。
+        """
+        if kinds is not None and not kinds:
+            return []
+        kind_list = sorted(kinds) if kinds is not None else []
+
+        def _list_keys() -> list[ResourceKey]:
+            sql = "SELECT tenant_id, kind, namespace, name FROM resources"
+            if kind_list:
+                sql += f" WHERE kind IN ({', '.join('?' for _ in kind_list)})"
+            sql += " ORDER BY tenant_id, kind, COALESCE(namespace, ''), name"
+            rows = self._conn.execute(sql, tuple(kind_list)).fetchall()
+            return [
+                ResourceKey(row["tenant_id"], row["kind"], row["namespace"], row["name"])
+                for row in rows
+            ]
+
+        return await self._run(_list_keys)
+
+    async def changes_since(self, seq: int, limit: int = 500) -> builtins.list[ResourceChange]:
+        """按序号升序返回 ``seq`` 之后的至多 ``limit`` 条变更记录。
+
+        Raises:
+            ValueError: ``limit`` 小于 1。
+        """
+        if limit < 1:
+            raise ValueError(f"limit must be >= 1, got {limit}")
+
+        def _changes() -> list[ResourceChange]:
+            rows = self._conn.execute(
+                "SELECT seq, tenant_id, kind, namespace, name, change FROM resource_changes "
+                "WHERE seq > ? ORDER BY seq LIMIT ?",
+                (seq, limit),
+            ).fetchall()
+            return [
+                ResourceChange(
+                    seq=row["seq"],
+                    key=ResourceKey(row["tenant_id"], row["kind"], row["namespace"], row["name"]),
+                    change=ChangeType(row["change"]),
+                )
+                for row in rows
+            ]
+
+        return await self._run(_changes)
+
+    async def latest_change_seq(self) -> int:
+        """当前最大的变更序号；没有记录时返回 0。"""
+
+        def _latest() -> int:
+            row = self._conn.execute(
+                "SELECT COALESCE(MAX(seq), 0) AS seq FROM resource_changes"
+            ).fetchone()
+            return int(row["seq"])
+
+        return await self._run(_latest)
+
+    async def prune_changes(self, up_to_seq: int) -> int:
+        """删除序号不大于 ``up_to_seq`` 的变更记录，返回删除条数。"""
+
+        def _prune() -> int:
+            cur = self._conn.execute("DELETE FROM resource_changes WHERE seq <= ?", (up_to_seq,))
+            self._conn.commit()
+            return cur.rowcount
+
+        return await self._run(_prune)
 
     # ------------------------------------------------------------------ #
     # Allocation 持久化（development-plan 7.2 DDL）
@@ -813,6 +965,9 @@ class SQLiteRegistry(ResourceRegistry):
 __all__ = [
     "DEFAULT_RELEASE_FINALIZER",
     "SIDE_EFFECT_PHASES",
+    "ChangeType",
     "RequestDeleteResult",
+    "ResourceChange",
+    "ResourceKey",
     "SQLiteRegistry",
 ]

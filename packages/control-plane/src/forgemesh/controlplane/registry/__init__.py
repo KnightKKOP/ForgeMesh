@@ -5,13 +5,19 @@ from __future__ import annotations
 from .store import (
     DEFAULT_RELEASE_FINALIZER,
     SIDE_EFFECT_PHASES,
+    ChangeType,
     RequestDeleteResult,
+    ResourceChange,
+    ResourceKey,
     SQLiteRegistry,
 )
 
 __all__ = [
     "DEFAULT_RELEASE_FINALIZER",
     "SIDE_EFFECT_PHASES",
+    "ChangeType",
     "RequestDeleteResult",
+    "ResourceChange",
+    "ResourceKey",
     "SQLiteRegistry",
 ]

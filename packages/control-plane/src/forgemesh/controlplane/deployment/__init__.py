@@ -8,6 +8,8 @@
 * :mod:`.fake` —— 在控制平面进程内为每个实例提供 OpenAI 兼容桩服务的
   :class:`FakeLauncher`（CI 与本地开发）；
 * :mod:`.vllm_process` —— 把每个实例作为本机 vLLM 子进程运行的 :class:`VLLMProcessLauncher`；
+* :mod:`.config` —— 按环境变量（``FORGEMESH_RUNTIME_LAUNCHER`` 等）选择启动器的
+  :func:`launcher_from_env`；
 * :mod:`.network` —— 启动器共用的地址校验与健康检查；
 * :mod:`.memory` —— 测试替身 :class:`InMemoryLauncher`。
 
@@ -16,6 +18,7 @@
 
 from __future__ import annotations
 
+from .config import RUNTIME_LAUNCHER_ENV, LauncherConfigError, launcher_from_env
 from .fake import FakeLauncher
 from .launcher import LaunchedInstance, LaunchRequest, RuntimeLauncher
 from .memory import InMemoryLauncher
@@ -40,6 +43,7 @@ __all__ = [
     "INSTANCE_LOST_REASON",
     "LAUNCH_INSTANCE",
     "PREPARE_MODEL",
+    "RUNTIME_LAUNCHER_ENV",
     "VERIFY_INSTANCE",
     "DeploymentReleaser",
     "DeploymentSteps",
@@ -47,6 +51,7 @@ __all__ = [
     "InMemoryLauncher",
     "LaunchRequest",
     "LaunchedInstance",
+    "LauncherConfigError",
     "RuntimeLauncher",
     "StepCallable",
     "VLLMProcessLauncher",
@@ -54,5 +59,6 @@ __all__ = [
     "deployment_run_key",
     "deployment_workflow",
     "launched_instance",
+    "launcher_from_env",
     "mark_lost_instances",
 ]

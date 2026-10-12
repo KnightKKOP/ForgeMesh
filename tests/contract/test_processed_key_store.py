@@ -19,9 +19,9 @@
 「标记写入自身失败 → 无假已处理」，跨库同事务能力以记录形式留档（见模块
 docstring 末尾）。
 
-并发防护对比：``ProcessedKeyStore`` 临界区以 ``threading.Lock`` 串行化
-（``dedup.py`` ``__init__``），规避了 ``SQLiteRegistry`` 的缺陷 R-1（单实例
-共享连接无锁并发交错，见 ``test_registry_consistency.py`` 模块 docstring）。
+并发防护：``ProcessedKeyStore`` 临界区以 ``threading.Lock`` 串行化
+（``dedup.py`` ``__init__``）；``SQLiteRegistry`` 修复缺陷 R-1 后同样以实例级锁
+串行化共享连接（见 ``test_registry_consistency.py`` 模块 docstring）。
 """
 
 from __future__ import annotations

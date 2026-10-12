@@ -17,13 +17,11 @@
 串行化写事务，``UPDATE ... WHERE resource_version=?`` 提供原子 CAS。该形态
 经 100 轮并发验证全部满足「恰好一胜 + 终态正确」（见下方缺陷记录的对照）。
 
-发现的实现缺陷（记录，不在本任务修复）
-----------------------------------------
-**缺陷 R-1（高）**：``SQLiteRegistry``（``registry/store.py`` ``__init__``，
-对比 ``reconciler/dedup.py`` 的 ``ProcessedKeyStore`` 自带 ``threading.Lock``）
-共享单一 ``sqlite3.Connection`` 且无任何锁保护。当**同一实例**上的两个异步
-方法经 ``asyncio.to_thread`` 在两个线程并发写（单进程多任务并发场景）时，
-连接级事务交错会导致：
+缺陷 R-1（已修复）
+------------------
+``SQLiteRegistry`` 的所有异步方法共享同一个 ``sqlite3.Connection``。修复前该连接
+没有任何锁保护，**同一实例**上的两个异步方法经 ``asyncio.to_thread`` 在两个线程
+并发写（单进程多任务并发场景）时，连接级事务交错会导致：
 
 1. **成功方写入丢失**：失败方 ``self._conn.rollback()``（store.py CAS 路径
    ``rowcount == 0`` 分支 / ``IntegrityError`` 分支）回滚连接级共享事务，
@@ -34,10 +32,10 @@
 3. **底层错误泄漏**：``sqlite3.InterfaceError: bad parameter or other API
    misuse`` 直接抛给调用方。
 
-200 轮并发探测中约 31 轮（≈15%）出现上述任一现象。建议修复方向：参照
-``ProcessedKeyStore`` 为 ``SQLiteRegistry`` 增加连接级锁，或改用每线程/
-每调用独立连接。本文件的并发测试因此采用「独立实例 × 同一 DB 文件」形态
-验证 CAS 契约本身；单实例共享连接的并发缺陷以上述记录形式留档。
+修复前 200 轮并发探测中约 31 轮（≈15%）出现上述任一现象。现在每次数据库调用都在
+实例级 ``threading.RLock`` 内执行（``registry/store.py`` ``_run``），同一实例并发写的
+回归用例见 ``test_registry_hardening.py``。本文件的并发测试采用「独立实例 × 同一
+DB 文件」形态，验证 CAS 契约本身。
 """
 
 from __future__ import annotations

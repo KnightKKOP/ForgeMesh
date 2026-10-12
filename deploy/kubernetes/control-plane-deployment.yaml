@@ -6,6 +6,8 @@
 #
 # ADR-013：SQLite 权威库只允许一个写者。replicas 固定为 1，更新策略为 Recreate（旧 Pod 退出后
 # 才启动新 Pod），避免滚动更新期间两个 Pod 同时写同一个库；数据卷为 ReadWriteOnce。
+# SQLite 以 WAL 模式运行，依赖共享内存文件：PVC 的 StorageClass 应是块存储，不能是 NFS 类文件系统。
+# 备份与恢复见 docs/operations/backup-restore.md 2.5 / 3.4 节。
 # 尚未提供：serviceAccount、NetworkPolicy。
 apiVersion: v1
 kind: PersistentVolumeClaim

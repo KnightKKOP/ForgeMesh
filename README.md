@@ -188,7 +188,7 @@ curl -s -H "Authorization: Bearer fmk_…" http://127.0.0.1:8081/api/v1/inferenc
 scripts/compose_smoke.sh   # 端到端冒烟（CI 同样执行）
 ```
 
-控制平面的 SQLite 数据库在 compose 卷 `control-plane-data` 中。Kubernetes 清单见 `deploy/kubernetes/`：数据库放在 PersistentVolumeClaim 上，key 文件来自 Secret `forgemesh-api-keys`，更新策略为 `Recreate`，保证任何时刻只有一个控制平面写数据库（ADR-013）。
+控制平面的 SQLite 数据库在 compose 卷 `control-plane-data` 中。Kubernetes 清单见 `deploy/kubernetes/`：数据库放在 PersistentVolumeClaim 上，key 文件来自 Secret `forgemesh-api-keys`，更新策略为 `Recreate`，保证任何时刻只有一个控制平面写数据库（ADR-013）。容器中的备份与恢复见 [备份与灾备演练](docs/operations/backup-restore.md) 2.5 / 3.4 节。
 
 ---
 

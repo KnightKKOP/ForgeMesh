@@ -13,6 +13,7 @@ from __future__ import annotations
 
 from .runtime import (
     RetryPolicy,
+    RunInfo,
     RunRef,
     Step,
     WorkflowDefinition,
@@ -40,5 +41,6 @@ __all__ = [
     "RetryPolicy",
     "WorkflowDefinition",
     "RunRef",
+    "RunInfo",
     "WorkflowRuntime",
 ]

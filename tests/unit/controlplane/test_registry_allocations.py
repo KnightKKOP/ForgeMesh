@@ -8,7 +8,8 @@
 * 同一资源至多一个 Active 分配、同一设备至多属于一个 Active 分配，冲突时不写库；
 * 同名资源在不同命名空间 / 租户中各自持有分配；
 * 释放后设备回到空闲；约束由数据库强制（直接写库、独立连接并发、重启后依然成立）；
-* 打开存量库时以按租户的唯一索引取代旧索引。
+* 打开存量库时以按租户的唯一索引取代旧索引；
+* 持有 Active 分配的资源无论处于哪个 phase，删除都先进入 ``Terminating``。
 
 测试以 ``asyncio.run`` 驱动异步方法，不依赖 pytest-asyncio。
 """
@@ -20,13 +21,14 @@ import sqlite3
 from collections.abc import Iterator
 
 import pytest
-from forgemesh.controlplane.registry import SQLiteRegistry
+from forgemesh.controlplane.registry import DEFAULT_RELEASE_FINALIZER, SQLiteRegistry
 from forgemesh.core.errors import ConflictError, NotFoundError
 from forgemesh.core.objects import ObjectMeta
 from forgemesh.core.scheduler import AllocatedDevice, ResourceRef
 from forgemesh.resource.allocation import Allocation
 from forgemesh.resource.inference import (
     AcceleratorSpec,
+    InferencePhase,
     InferenceService,
     InferenceServiceSpec,
     ModelRef,
@@ -46,8 +48,9 @@ def _service(
     namespace: str | None = "team-a",
     uid: str = "uid-1",
     tenant_id: str = TENANT,
+    phase: InferencePhase = InferencePhase.PENDING,
 ) -> InferenceService:
-    return InferenceService(
+    service = InferenceService(
         metadata=ObjectMeta(name=name, namespace=namespace, uid=uid, tenant_id=tenant_id),
         spec=InferenceServiceSpec(
             model=ModelRef(reference="models/llama"),
@@ -57,6 +60,8 @@ def _service(
             ),
         ),
     )
+    service.status.phase = phase
+    return service
 
 
 def _ref(service: InferenceService) -> ResourceRef:
@@ -261,6 +266,46 @@ def test_the_database_enforces_exclusivity_without_the_registry_checks(registry)
     conn.execute("UPDATE allocations SET status = 'Expired' WHERE id = ?", (first["id"],))
     conn.commit()
     assert asyncio.run(registry.allocated_devices()) == frozenset()
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "phase",
+    [
+        InferencePhase.PENDING,
+        InferencePhase.SCHEDULING,
+        InferencePhase.PREPARING,
+        InferencePhase.FAILED,
+        InferencePhase.UNKNOWN,
+    ],
+)
+def test_deleting_a_resource_that_holds_an_allocation_goes_through_terminating(registry, phase):
+    """没有外部副作用的 phase 也要先释放分配：资源进入 Terminating，分配留给协调器释放。"""
+    owner = _put(registry, phase=phase)
+    asyncio.run(registry.create_allocation(TENANT, owner, "uid-1:1", [GPU0]))
+
+    result = asyncio.run(registry.request_delete(KIND, "team-a", "svc", TENANT))
+
+    assert result.deleted is False
+    assert result.finalizers == [DEFAULT_RELEASE_FINALIZER]
+    _, stored_phase = asyncio.run(registry.get_with_phase(KIND, "team-a", "svc", TENANT))
+    assert stored_phase == "Terminating"
+    assert asyncio.run(registry.get_active_allocation("uid-1", TENANT)) is not None
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "phase", [InferencePhase.PENDING, InferencePhase.SCHEDULING, InferencePhase.UNKNOWN]
+)
+def test_deleting_a_resource_without_an_active_allocation_is_immediate(registry, phase):
+    """从未分配、或分配已释放的无副作用资源仍直接物理删除。"""
+    released = _put(registry, phase=phase)
+    record = asyncio.run(registry.create_allocation(TENANT, released, "uid-1:1", [GPU0]))
+    asyncio.run(registry.release_allocation(record["id"], TENANT))
+    _put(registry, name="svc-2", uid="uid-2", phase=phase)
+
+    for name in ("svc", "svc-2"):
+        assert asyncio.run(registry.request_delete(KIND, "team-a", name, TENANT)).deleted is True
 
 
 @pytest.mark.unit

@@ -213,6 +213,36 @@ def test_request_delete_does_not_bypass_concurrently_added_finalizer() -> None:
 
 
 @pytest.mark.contract
+def test_request_delete_does_not_drop_a_resource_that_just_got_an_allocation() -> None:
+    """物理删除以「仍没有 Active 分配」为条件：检查之后并发获得的分配不会随删除泄漏。"""
+
+    async def scenario() -> None:
+        reg = SQLiteRegistry(":memory:")
+        try:
+            await reg.put(_make_resource("victim"))
+            conn = reg._conn
+            reg._conn = _InterleavedWriter(
+                conn,
+                trigger="SELECT 1 FROM allocations",
+                statement=(
+                    "INSERT INTO allocations (id, tenant_id, resource_id, status) "
+                    "VALUES ('raced', 'tenant-a', 'uid-victim', 'Active')"
+                ),
+            )
+            with pytest.raises(ConflictError):
+                await reg.request_delete(KIND, "ns-a", "victim", TENANT)
+            reg._conn = conn
+
+            assert await reg.get(KIND, "ns-a", "victim", TENANT) is not None
+            retried = await reg.request_delete(KIND, "ns-a", "victim", TENANT)
+            assert retried.deleted is False
+        finally:
+            await reg.close()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.contract
 def test_release_allocation_does_not_overwrite_terminal_state() -> None:
     """释放分配以读到的状态为条件：并发过期后不得被改写为 Released。"""
 

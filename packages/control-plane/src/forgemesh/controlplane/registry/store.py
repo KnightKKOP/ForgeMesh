@@ -25,9 +25,9 @@
   等并列，由强类型子类的 ``status.phase`` 提取；基类 ``Resource`` 无 phase，
   列为 ``NULL``），以 ``finalizers`` 列镜像 payload 中的 finalizer 列表。
 * :meth:`request_delete` 为删除入口：finalizers 非空（或 phase 属于有副作用
-  态，自动追加默认 finalizer）→ 置 ``phase='Terminating'`` 持久化并交由协调器
-  驱动「受控释放 → 清空 finalizer → 物理删除」；否则直接物理 DELETE
-  （与既有 ``delete()`` 行为一致，向后兼容）。
+  态、或资源持有 Active 分配，自动追加默认 finalizer）→ 置 ``phase='Terminating'``
+  持久化并交由协调器驱动「受控释放 → 清空 finalizer → 释放分配 → 物理删除」；
+  否则直接物理 DELETE（与既有 ``delete()`` 行为一致）。
 * ``put()`` 的 Update-CAS 路径按 kind 接入权威状态机（``INFERENCE_STATE_MACHINE``
   等）校验 phase 转移：非法跳变抛
   :class:`~forgemesh.core.errors.InvalidStateTransition`；首次创建（无旧记录）
@@ -115,8 +115,8 @@ _KIND_MODELS: dict[str, type[Resource]] = {
 DEFAULT_RELEASE_FINALIZER = "forgemesh.io/resource-release"
 
 #: 视为「有外部副作用」的 phase：request_delete 时自动追加默认 finalizer，
-#: 先受控释放 GPU/实例再物理删除。Pending/Scheduling/Failed/Unknown 无外部
-#: 副作用，直接物理删除（向后兼容）。
+#: 先受控释放 GPU/实例再物理删除。其余 phase（Pending/Scheduling/Failed/Unknown）
+#: 的资源只有持有 Active 分配时才同样受控删除，否则直接物理删除。
 SIDE_EFFECT_PHASES = frozenset({"Ready", "Degraded", "Updating", "Deploying", "Verifying"})
 
 
@@ -402,6 +402,17 @@ class SQLiteRegistry(ResourceRegistry):
         status = getattr(resource, "status", None)
         phase = getattr(status, "phase", None)
         return str(phase) if phase is not None else None
+
+    @staticmethod
+    def _holds_allocation(cur: sqlite3.Cursor, tenant_id: str, uid: str | None) -> bool:
+        """uid 为 ``uid`` 的资源当前是否持有 Active 分配（没有 uid 的资源不会持有）。"""
+        if uid is None:
+            return False
+        row = cur.execute(
+            "SELECT 1 FROM allocations WHERE tenant_id=? AND resource_id=? AND status=?",
+            (tenant_id, uid, AllocationStatus.ACTIVE.value),
+        ).fetchone()
+        return row is not None
 
     @staticmethod
     def _validate_phase_transition(kind: str, current: str | None, target: str | None) -> None:
@@ -713,11 +724,11 @@ class SQLiteRegistry(ResourceRegistry):
         * finalizers 非空 → 持久化 ``phase='Terminating'``（非法转移抛
           :class:`~forgemesh.core.errors.InvalidStateTransition`），返回
           ``deleted=False``，由协调器驱动受控释放；
-        * finalizers 为空且 phase 属于有副作用态（:data:`SIDE_EFFECT_PHASES`，
-          如 ``Ready``）→ 自动追加默认 finalizer
-          :data:`DEFAULT_RELEASE_FINALIZER` 后同上；
-        * 其余（Pending/Scheduling/Failed/Unknown/无 phase）无外部副作用，
-          直接物理 DELETE（与 :meth:`delete` 行为一致，向后兼容）。
+        * finalizers 为空，但 phase 属于有副作用态（:data:`SIDE_EFFECT_PHASES`，
+          如 ``Ready``）或资源（按 uid）持有 Active 分配 → 自动追加默认 finalizer
+          :data:`DEFAULT_RELEASE_FINALIZER` 后同上，分配由协调器在物理删除前释放；
+        * 其余（无 finalizer、非副作用态且没有 Active 分配）直接物理 DELETE（与
+          :meth:`delete` 行为一致），以读到的版本且「仍没有 Active 分配」为条件。
 
         payload 与 ``finalizers`` 列双写保持一致；子类 payload 的
         ``status.phase``（若存在）同步为 ``Terminating``，基类 payload 不引入
@@ -738,15 +749,16 @@ class SQLiteRegistry(ResourceRegistry):
         Raises:
             NotFoundError: 目标资源不存在（或跨租户不可见）。
             InvalidStateTransition: 当前 phase 不允许转移到 ``Terminating``。
-            ConflictError: 读取后资源被并发修改（``resource_version`` 已变化），
-                调用方应重新读取后重试。
+            ConflictError: 读取后资源被并发修改（``resource_version`` 已变化）或
+                并发获得了分配，调用方应重新读取后重试。
         """
         terminating = "Terminating"
+        active = AllocationStatus.ACTIVE.value
 
         def _request_delete() -> RequestDeleteResult:
             cur = self._conn.cursor()
             row = cur.execute(
-                "SELECT body, phase, finalizers, resource_version FROM resources "
+                "SELECT body, phase, finalizers, resource_version, uid FROM resources "
                 "WHERE tenant_id=? AND kind=? AND namespace IS ? AND name=?",
                 (tenant_id, kind, namespace, name),
             ).fetchone()
@@ -762,16 +774,20 @@ class SQLiteRegistry(ResourceRegistry):
                 # 幂等：删除请求已受理，仍在受控释放流程中。
                 return RequestDeleteResult(False, list(current_finalizers))
             effective = list(current_finalizers)
-            if not effective and phase in SIDE_EFFECT_PHASES:
+            if not effective and (
+                phase in SIDE_EFFECT_PHASES or self._holds_allocation(cur, tenant_id, row["uid"])
+            ):
                 effective.append(DEFAULT_RELEASE_FINALIZER)
             if not effective:
-                # 无 finalizer 且无外部副作用 → 直接物理删除（向后兼容）。
-                # 以读到的版本为条件：并发写入可能刚追加了 finalizer。
+                # 无 finalizer、无外部副作用 → 直接物理删除。以读到的版本且仍没有
+                # Active 分配为条件：并发写入可能刚追加了 finalizer 或分配。
                 cur.execute(
                     "DELETE FROM resources "
                     "WHERE tenant_id=? AND kind=? AND namespace IS ? AND name=? "
-                    " AND resource_version=?",
-                    (tenant_id, kind, namespace, name, read_version),
+                    " AND resource_version=? AND NOT EXISTS ("
+                    "  SELECT 1 FROM allocations"
+                    "  WHERE tenant_id=? AND resource_id=? AND status=?)",
+                    (tenant_id, kind, namespace, name, read_version, tenant_id, row["uid"], active),
                 )
                 if cur.rowcount == 0:
                     self._conn.rollback()

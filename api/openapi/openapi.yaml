@@ -169,15 +169,15 @@ paths:
       responses:
         "202":
           description: >
-            已受理删除（异步）——资源持有 finalizer（或有外部副作用自动追加），
-            置为 Terminating，由协调器驱动「受控释放 GPU → 清空 finalizer →
-            物理删除」闭环（development-plan 第 7 章）。
+            已受理删除（异步）——资源持有 finalizer（有外部副作用或持有加速器
+            分配时自动追加），置为 Terminating，由协调器驱动「受控释放 GPU →
+            清空 finalizer → 释放分配 → 物理删除」闭环（development-plan 第 7 章）。
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/TerminatingResponse"
         "204":
-          description: 已直接删除（无 finalizer，无外部副作用）
+          description: 已直接删除（无 finalizer，无外部副作用，没有加速器分配）
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":
@@ -349,8 +349,9 @@ components:
     TerminatingResponse:
       type: object
       description: >
-        受控删除受理响应：资源持有 finalizer（或有外部副作用自动追加默认
-        finalizer），已置为 Terminating，等待协调器完成受控释放后物理删除。
+        受控删除受理响应：资源持有 finalizer（有外部副作用或持有加速器分配时
+        自动追加默认 finalizer），已置为 Terminating，等待协调器完成受控释放后
+        物理删除。
       required: [name, phase]
       properties:
         name:

@@ -1,0 +1,20 @@
+# 叠加在 docker-compose.yaml 之上，打开推理服务的完整闭环，不需要 GPU：
+#   docker compose -f deploy/docker/docker-compose.yaml \
+#     -f deploy/docker/docker-compose.fake-runtime.yaml up --build
+#
+# 控制平面使用 fake-runtime-inventory.json（一个节点、一块虚构设备 gpu-0）与假启动器：
+# 每个推理实例是控制平面进程内的 OpenAI 兼容桩服务（GET /health、流式
+# POST /v1/chat/completions，回复固定文本），只用于 CI 冒烟与本地开发。实例在控制平面
+# 容器内监听全部地址、端口由内核挑选，写进 status.endpoints 的主机是服务名 control-plane；
+# 网关经 /api/v1/namespaces/{ns}/inference/{svc}/chat 转发到容器的私网地址（默认允许）。
+# 实例端口不发布到宿主机。实例随控制平面进程结束：重启控制平面后 Ready 的服务转为
+# Degraded，需删除后重新创建。
+services:
+  control-plane:
+    environment:
+      FORGEMESH_INVENTORY_FILE: /etc/forgemesh/inventory.json
+      FORGEMESH_RUNTIME_LAUNCHER: fake
+      FORGEMESH_FAKE_LAUNCHER_BIND_HOST: 0.0.0.0
+      FORGEMESH_FAKE_LAUNCHER_ADVERTISE_HOST: control-plane
+    volumes:
+      - ./fake-runtime-inventory.json:/etc/forgemesh/inventory.json:ro

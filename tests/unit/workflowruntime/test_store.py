@@ -243,6 +243,101 @@ def test_version_fixed() -> None:
 
 
 # --------------------------------------------------------------------------- #
+# 步骤结果、失败原因、按幂等键查询、文件库
+# --------------------------------------------------------------------------- #
+@pytest.mark.unit
+def test_step_result_is_kept_by_later_transitions_and_attempts_are_counted() -> None:
+    """不带 result 的状态更新保留已有结果；每次进入 Running 计一次尝试。"""
+    store = WorkflowStore()
+    ref = asyncio_run(store.create_run(_make_definition(), {}, "key-result"))
+    for status, result in (
+        (StepStatus.RUNNING, None),
+        (StepStatus.RETRYING, {"error": "boom"}),
+        (StepStatus.RUNNING, None),
+        (StepStatus.SUCCEEDED, {"instanceId": "i-1"}),
+        (StepStatus.COMPENSATING, None),
+        (StepStatus.COMPENSATED, None),
+    ):
+        asyncio_run(store.update_step_status(ref.run_id, "prepare", status.value, result))
+
+    run = asyncio_run(store.get_run(ref.run_id))
+    prepare = next(s for s in run["steps"] if s["step_id"] == "prepare")
+    assert prepare["status"] == StepStatus.COMPENSATED.value
+    assert prepare["result"] == {"instanceId": "i-1"}
+    assert prepare["attempt_count"] == 2
+
+
+@pytest.mark.unit
+def test_update_run_status_records_the_error() -> None:
+    """``error`` 随状态写入，之后不带 error 的更新保留它。"""
+    store = WorkflowStore()
+    ref = asyncio_run(store.create_run(_make_definition(), {}, "key-error"))
+    assert asyncio_run(store.get_run(ref.run_id))["error"] is None
+
+    asyncio_run(store.update_run_status(ref.run_id, WorkflowStatus.RUNNING.value))
+    asyncio_run(
+        store.update_run_status(ref.run_id, WorkflowStatus.COMPENSATING.value, "step 'x' failed")
+    )
+    asyncio_run(store.update_run_status(ref.run_id, WorkflowStatus.FAILED.value))
+
+    run = asyncio_run(store.get_run(ref.run_id))
+    assert run["status"] == WorkflowStatus.FAILED.value
+    assert run["error"] == "step 'x' failed"
+
+
+@pytest.mark.unit
+def test_get_run_by_idempotency_key() -> None:
+    """按幂等键查询运行实例；不存在时返回 None，不创建。"""
+    store = WorkflowStore()
+    ref = asyncio_run(store.create_run(_make_definition(), {"model": "m"}, "uid-1:1"))
+
+    run = asyncio_run(store.get_run_by_idempotency_key("uid-1:1"))
+    assert run == asyncio_run(store.get_run(ref.run_id))
+    assert asyncio_run(store.get_run_by_idempotency_key("uid-1:2")) is None
+    assert [r["run_id"] for r in asyncio_run(store.list_pending_runs())] == [ref.run_id]
+
+
+@pytest.mark.unit
+def test_file_database_uses_wal_and_old_files_gain_the_error_column(tmp_path) -> None:
+    """文件库启用 WAL；没有 ``error`` 列的旧库打开时补列，已有运行可读。"""
+    import sqlite3
+
+    db_file = str(tmp_path / "workflows.db")
+    legacy = sqlite3.connect(db_file)
+    legacy.executescript(
+        """
+        CREATE TABLE workflow_runs (
+            run_id TEXT PRIMARY KEY,
+            idempotency_key TEXT UNIQUE NOT NULL,
+            definition_name TEXT NOT NULL,
+            definition_version INTEGER NOT NULL,
+            definition_json5 TEXT NOT NULL,
+            inputs TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'Pending',
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL,
+            timeout_seconds INTEGER
+        );
+        INSERT INTO workflow_runs VALUES (
+            'run-old', 'key-old', 'deploy-flow', 1, '{"name": "deploy-flow", "steps": []}',
+            '{}', 'Running', 0, 0, NULL
+        );
+        """
+    )
+    legacy.close()
+
+    store = WorkflowStore(db_file)
+    run = asyncio_run(store.get_run("run-old"))
+    asyncio_run(store.close())
+
+    assert run["status"] == WorkflowStatus.RUNNING.value
+    assert run["error"] is None
+    check = sqlite3.connect(db_file)
+    assert check.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
+    check.close()
+
+
+# --------------------------------------------------------------------------- #
 # 辅助
 # --------------------------------------------------------------------------- #
 def asyncio_run(coro):

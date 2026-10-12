@@ -9,7 +9,9 @@ plan → authorize → prepare → deploy → verify → commit …），并保�
 * ``commit`` 步骤重新校验资源版本/分配所有权/验收条件，不盲目置 Ready；
 * 高风险步骤支持 ``requiresApproval`` 与补偿（compensate）。
 
-阶段 0 的占位实现对所有执行方法抛出 :class:`NotImplementedError`。
+阶段 0 的占位实现对所有执行方法抛出 :class:`NotImplementedError`。真正执行工作流的
+运行时是 :class:`forgemesh.workflowruntime.runtime.LocalWorkflowRuntime`（后台执行、
+补偿、重启恢复），``workflow-reference`` 插件即以它为实现。
 """
 
 from __future__ import annotations

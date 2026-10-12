@@ -7,17 +7,20 @@
 --------
 * **反向拓扑序**：最后执行的步骤最先补偿（LIFO 语义），保证依赖关系正确回滚。
 * **无补偿跳过**：未注册补偿 handler 的步骤标记为 ``SKIPPED``。
-* **补偿失败不中断**：某步补偿失败标记为 ``COMPENSATION_FAILED``，仍继续补偿其余步骤，
-  以最大化清理效果。
+* **补偿失败不中断**：某步补偿失败标记为 ``COMPENSATION_FAILED``（异常记 WARNING 日志），
+  仍继续补偿其余步骤，以最大化清理效果。
 """
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Awaitable, Callable
 from typing import Any
 
 from forgemesh.workflow.runtime import Step, WorkflowDefinition
 from forgemesh.workflow.states import StepStatus
+
+logger = logging.getLogger(__name__)
 
 #: 补偿 handler 类型：async (step, inputs) -> dict。
 CompensationHandler = Callable[[Step, dict[str, Any]], Awaitable[dict[str, Any]]]
@@ -116,6 +119,7 @@ class CompensationExecutor:
                 results[step_id] = StepStatus.COMPENSATED
             except Exception:
                 # 补偿失败不中断，继续补偿其余步骤以最大化清理。
+                logger.warning("compensation of step %r failed", step_id, exc_info=True)
                 results[step_id] = StepStatus.COMPENSATION_FAILED
 
         return results

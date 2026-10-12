@@ -5,6 +5,9 @@
 * :mod:`.release` —— 删除资源时取消部署、停止实例的 :class:`DeploymentReleaser`；
 * :mod:`.recovery` —— 重启之后把实例已不在运行的 ``Ready`` 服务转为 ``Degraded`` 的
   :func:`mark_lost_instances`；
+* :mod:`.fake` —— 在控制平面进程内为每个实例提供 OpenAI 兼容桩服务的
+  :class:`FakeLauncher`（CI 与本地开发）；
+* :mod:`.network` —— 启动器共用的地址校验与健康检查；
 * :mod:`.memory` —— 测试替身 :class:`InMemoryLauncher`。
 
 本包只依赖工作流契约（``forgemesh-workflow-api``），不依赖具体的工作流运行时。
@@ -12,6 +15,7 @@
 
 from __future__ import annotations
 
+from .fake import FakeLauncher
 from .launcher import LaunchedInstance, LaunchRequest, RuntimeLauncher
 from .memory import InMemoryLauncher
 from .recovery import INSTANCE_LOST_REASON, mark_lost_instances
@@ -37,6 +41,7 @@ __all__ = [
     "VERIFY_INSTANCE",
     "DeploymentReleaser",
     "DeploymentSteps",
+    "FakeLauncher",
     "InMemoryLauncher",
     "LaunchRequest",
     "LaunchedInstance",

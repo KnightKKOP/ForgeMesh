@@ -87,7 +87,7 @@ func New(cfg config.Config, logger *log.Logger) (*Router, error) {
 		unhealthyCooldown = upstream.DefaultUnhealthyCooldown
 	}
 	resolver := upstream.NewResolver(cfg.UpstreamURL, nil, resolverTTL, unhealthyCooldown, logger)
-	streamProxy := stream.New(resolver, cfg.TenantHeader, logger)
+	streamProxy := stream.New(resolver, cfg.TenantHeader, stream.NewAddressPolicy(cfg.InstanceAllowedCIDRs), logger)
 
 	// 精细路由仅在 API 前缀内匹配（顶层已按 /api/v1/ 分流）。
 	apiMux := http.NewServeMux()

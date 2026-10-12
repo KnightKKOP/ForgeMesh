@@ -86,6 +86,7 @@ func newResolverEnv(t *testing.T, ttlSec, cooldownSec int, eps ...string) *resol
 		ResolverTTLSeconds:       ttlSec,
 		UnhealthyCooldownSeconds: cooldownSec,
 		AuthMode:                 config.AuthModeDev,
+		InstanceAllowedCIDRs:     loopbackOnly,
 	}
 	r, err := New(cfg, log.New(io.Discard, "", 0))
 	if err != nil {

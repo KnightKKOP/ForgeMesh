@@ -12,7 +12,8 @@
 // （如 openai-chat 为 /v1/chat/completions），查询串原样保留。
 //
 // 安全约束（见开发计划 §14.1）：仅做转发，不缓存、不落盘任何响应内容；
-// 调用方的平台凭证（Authorization、Cookie）不会转发给实例。
+// 调用方的平台凭证（Authorization、Cookie）不会转发给实例；只连接 AddressPolicy
+// 允许的实例地址，status.endpoints 被写成内网或元数据服务地址时不会成为跳板。
 package stream
 
 import (
@@ -57,11 +58,11 @@ type Proxy struct {
 // New 构造流式代理。
 //
 // resolver 提供按服务名的实例解析；tenantHeader 为提取租户身份的请求头名
-// （与认证中间件一致）；logger 为 nil 时使用 log.Default()。
+// （与认证中间件一致）；policy 限定可以连接的实例地址；logger 为 nil 时使用 log.Default()。
 //
 // 客户端不设置整体超时（流式连接可能长时间保持），仅对响应头到达设置超时，
 // 防止上游僵死连接长期占用资源。
-func New(resolver Resolver, tenantHeader string, logger *log.Logger) *Proxy {
+func New(resolver Resolver, tenantHeader string, policy AddressPolicy, logger *log.Logger) *Proxy {
 	if logger == nil {
 		logger = log.Default()
 	}
@@ -81,6 +82,7 @@ func New(resolver Resolver, tenantHeader string, logger *log.Logger) *Proxy {
 				DialContext: (&net.Dialer{
 					Timeout:   10 * time.Second,
 					KeepAlive: 30 * time.Second,
+					Control:   policy.control,
 				}).DialContext,
 				// 关闭响应压缩，避免代理层引入额外缓冲/转换。
 				DisableCompression: true,
@@ -151,6 +153,11 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, upstreamURL, end
 		p.logger.Printf("stream upstream error: corr=%s path=%s endpoint=%s err=%v",
 			r.Header.Get("X-Correlation-ID"), r.URL.Path, endpoint, err)
 		p.resolver.ReportFailure(endpoint)
+		if errors.Is(err, ErrAddressNotAllowed) {
+			writeJSONError(w, http.StatusBadGateway, "INSTANCE_ADDRESS_NOT_ALLOWED",
+				"实例地址不在允许连接的范围内: "+endpoint)
+			return
+		}
 		http.Error(w, http.StatusText(http.StatusBadGateway), http.StatusBadGateway)
 		return
 	}

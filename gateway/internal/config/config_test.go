@@ -128,3 +128,34 @@ func TestLoad_InvalidResolverValues(t *testing.T) {
 		})
 	}
 }
+
+// TestLoad_InstanceAllowedCIDRs 验证实例允许网段的解析：未设置为空，逗号分隔、忽略空白与空项，
+// 网段按掩码归一化；非 CIDR 取值被拒绝。
+func TestLoad_InstanceAllowedCIDRs(t *testing.T) {
+	setAPIKeyAuthEnv(t)
+	t.Setenv(envInstanceAllowedCIDRs, "")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load 应成功: %v", err)
+	}
+	if len(cfg.InstanceAllowedCIDRs) != 0 {
+		t.Fatalf("未设置时应为空，实际 %v", cfg.InstanceAllowedCIDRs)
+	}
+
+	t.Setenv(envInstanceAllowedCIDRs, " 10.20.0.0/16, 127.0.0.1/8 ,,fd00::/8")
+	if cfg, err = Load(); err != nil {
+		t.Fatalf("Load 应成功: %v", err)
+	}
+	got := make([]string, 0, len(cfg.InstanceAllowedCIDRs))
+	for _, prefix := range cfg.InstanceAllowedCIDRs {
+		got = append(got, prefix.String())
+	}
+	if want := "10.20.0.0/16 127.0.0.0/8 fd00::/8"; strings.Join(got, " ") != want {
+		t.Fatalf("网段应为 %s，实际 %v", want, got)
+	}
+
+	t.Setenv(envInstanceAllowedCIDRs, "10.0.0.5")
+	if _, err = Load(); err == nil || !strings.Contains(err.Error(), envInstanceAllowedCIDRs) {
+		t.Fatalf("非 CIDR 取值应被拒绝并提及 %s，实际 %v", envInstanceAllowedCIDRs, err)
+	}
+}

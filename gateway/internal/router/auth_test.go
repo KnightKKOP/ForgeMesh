@@ -46,14 +46,15 @@ func apiKeyConfig(t *testing.T, upstreamURL string) config.Config {
 		t.Fatalf("写入 key 文件失败: %v", err)
 	}
 	return config.Config{
-		ListenAddr:        ":0",
-		UpstreamURL:       upstreamURL,
-		RateLimitRPS:      1000,
-		RateLimitBurst:    1000,
-		TenantHeader:      "X-Tenant-ID",
-		CorrelationHeader: "X-Correlation-ID",
-		AuthMode:          config.AuthModeAPIKey,
-		APIKeysFile:       path,
+		ListenAddr:           ":0",
+		UpstreamURL:          upstreamURL,
+		RateLimitRPS:         1000,
+		RateLimitBurst:       1000,
+		TenantHeader:         "X-Tenant-ID",
+		CorrelationHeader:    "X-Correlation-ID",
+		AuthMode:             config.AuthModeAPIKey,
+		APIKeysFile:          path,
+		InstanceAllowedCIDRs: loopbackOnly,
 	}
 }
 

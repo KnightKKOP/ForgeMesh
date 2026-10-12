@@ -6,23 +6,29 @@ import (
 	"log"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/Mekoforge/ForgeMesh/gateway/internal/config"
 )
 
+// loopbackOnly 只允许连接回环地址：测试中的推理实例都运行在 127.0.0.1。
+var loopbackOnly = []netip.Prefix{netip.MustParsePrefix("127.0.0.0/8")}
+
 // newTestRouter 构造 dev 认证模式的测试用网关处理器；upstreamURL 指向被测的模拟上游。
 func newTestRouter(t *testing.T, upstreamURL string) *Router {
 	t.Helper()
 	cfg := config.Config{
-		ListenAddr:        ":0",
-		UpstreamURL:       upstreamURL,
-		RateLimitRPS:      1000,
-		RateLimitBurst:    1000,
-		TenantHeader:      "X-Tenant-ID",
-		CorrelationHeader: "X-Correlation-ID",
-		AuthMode:          config.AuthModeDev,
+		ListenAddr:           ":0",
+		UpstreamURL:          upstreamURL,
+		RateLimitRPS:         1000,
+		RateLimitBurst:       1000,
+		TenantHeader:         "X-Tenant-ID",
+		CorrelationHeader:    "X-Correlation-ID",
+		AuthMode:             config.AuthModeDev,
+		InstanceAllowedCIDRs: loopbackOnly,
 	}
 	r, err := New(cfg, log.New(io.Discard, "", 0))
 	if err != nil {
@@ -215,6 +221,51 @@ func TestInferenceChat_NamespacedRoute(t *testing.T) {
 	}
 	if instanceGotPath != "/generate_stream" {
 		t.Fatalf("实例收到的路径应为 tgi-generate 的推理路径，实际 %q", instanceGotPath)
+	}
+}
+
+// TestInferenceChat_DefaultPolicyRefusesLoopbackInstance 验证未配置实例允许网段时，
+// 网关不连接 status.endpoints 中的回环地址，返回 502 INSTANCE_ADDRESS_NOT_ALLOWED。
+func TestInferenceChat_DefaultPolicyRefusesLoopbackInstance(t *testing.T) {
+	var instanceHits atomic.Int64
+	instance := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		instanceHits.Add(1)
+	}))
+	defer instance.Close()
+	controlPlane := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, fmt.Sprintf(
+			`{"status":{"phase":"Ready","endpoints":[{"url":%q,"protocol":"openai-chat"}]}}`,
+			instance.URL))
+	}))
+	defer controlPlane.Close()
+
+	r, err := New(config.Config{
+		ListenAddr:        ":0",
+		UpstreamURL:       controlPlane.URL,
+		RateLimitRPS:      1000,
+		RateLimitBurst:    1000,
+		TenantHeader:      "X-Tenant-ID",
+		CorrelationHeader: "X-Correlation-ID",
+		AuthMode:          config.AuthModeDev,
+	}, log.New(io.Discard, "", 0))
+	if err != nil {
+		t.Fatalf("New 失败: %v", err)
+	}
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/inference/svc-a/chat", nil)
+	req.Header.Set("X-Tenant-ID", "tenant-a")
+	r.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("回环实例应被拒绝（502），实际 %d（body=%s）", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), `"code":"INSTANCE_ADDRESS_NOT_ALLOWED"`) {
+		t.Fatalf("错误体应含 INSTANCE_ADDRESS_NOT_ALLOWED，实际: %s", rec.Body.String())
+	}
+	if got := instanceHits.Load(); got != 0 {
+		t.Fatalf("回环实例不应收到请求，实际 %d 次", got)
 	}
 }
 

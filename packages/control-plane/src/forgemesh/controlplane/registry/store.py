@@ -2,7 +2,8 @@
 
 对齐 ``forgemesh.core.registry.ResourceRegistry`` 契约，以 SQLite 作为权威状态
 存储后端（阶段 P1）。所有异步方法通过 :func:`asyncio.to_thread` 包装同步 sqlite3
-调用，适配事件循环环境。
+调用，适配事件循环环境；同一实例共享单一连接，所有数据库访问经实例级锁串行化
+（sqlite3 连接级事务不可跨线程交错，否则一方 rollback 会连带丢弃另一方未提交的写入）。
 
 并发语义
 --------
@@ -52,8 +53,10 @@ import builtins
 import json
 import logging
 import sqlite3
+import threading
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, TypeVar
 from uuid import uuid4
 
 from forgemesh.core.errors import ConflictError, NotFoundError
@@ -65,6 +68,8 @@ from forgemesh.resource.states import ALLOCATION_STATE_MACHINE, INFERENCE_STATE_
 from pydantic import ValidationError
 
 logger = logging.getLogger(__name__)
+
+_T = TypeVar("_T")
 
 #: kind → 权威状态机映射；未登记的 kind 视为不受管，put() 跳过转移校验。
 _KIND_STATE_MACHINES = {
@@ -148,11 +153,21 @@ class SQLiteRegistry(ResourceRegistry):
         # check_same_thread=False：asyncio.to_thread 会在不同线程执行 sqlite 调用。
         self._conn = sqlite3.connect(db_path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
+        self._lock = threading.RLock()
         self._init_schema()
 
     # ------------------------------------------------------------------ #
     # 内部辅助
     # ------------------------------------------------------------------ #
+
+    async def _run(self, fn: Callable[[], _T]) -> _T:
+        """在工作线程中持锁执行一段同步数据库操作（读写均串行化）。"""
+
+        def _locked() -> _T:
+            with self._lock:
+                return fn()
+
+        return await asyncio.to_thread(_locked)
 
     def _init_schema(self) -> None:
         """创建表与索引（幂等），并对存量库做列迁移。"""
@@ -273,7 +288,7 @@ class SQLiteRegistry(ResourceRegistry):
                 )
             return self._row_to_resource(row)
 
-        return await asyncio.to_thread(_get)
+        return await self._run(_get)
 
     async def put(
         self,
@@ -386,7 +401,7 @@ class SQLiteRegistry(ResourceRegistry):
                     f"namespace={namespace!r} name={name} tenant_id={tenant_id}",
                 ) from exc
 
-        return await asyncio.to_thread(_put)
+        return await self._run(_put)
 
     async def list(
         self,
@@ -432,7 +447,7 @@ class SQLiteRegistry(ResourceRegistry):
                 ]
             return results
 
-        return await asyncio.to_thread(_list)
+        return await self._run(_list)
 
     async def delete(
         self,
@@ -459,7 +474,7 @@ class SQLiteRegistry(ResourceRegistry):
                 )
             self._conn.commit()
 
-        await asyncio.to_thread(_delete)
+        await self._run(_delete)
 
     async def request_delete(
         self,
@@ -590,7 +605,7 @@ class SQLiteRegistry(ResourceRegistry):
             )
             return RequestDeleteResult(False, effective)
 
-        return await asyncio.to_thread(_request_delete)
+        return await self._run(_request_delete)
 
     # ------------------------------------------------------------------ #
     # Allocation 持久化（development-plan 7.2 DDL）
@@ -645,7 +660,7 @@ class SQLiteRegistry(ResourceRegistry):
                 ) from exc
             return allocation_id
 
-        return await asyncio.to_thread(_put_allocation)
+        return await self._run(_put_allocation)
 
     async def get_active_allocation(
         self,
@@ -664,7 +679,7 @@ class SQLiteRegistry(ResourceRegistry):
             ).fetchone()
             return dict(row) if row is not None else None
 
-        return await asyncio.to_thread(_get_active)
+        return await self._run(_get_active)
 
     async def release_allocation(
         self,
@@ -708,7 +723,7 @@ class SQLiteRegistry(ResourceRegistry):
                     reason,
                 )
 
-        await asyncio.to_thread(_release)
+        await self._run(_release)
 
     async def list_allocations(
         self,
@@ -723,7 +738,7 @@ class SQLiteRegistry(ResourceRegistry):
             ).fetchall()
             return [dict(row) for row in rows]
 
-        return await asyncio.to_thread(_list_allocations)
+        return await self._run(_list_allocations)
 
     # ------------------------------------------------------------------ #
     # 生命周期
@@ -731,7 +746,7 @@ class SQLiteRegistry(ResourceRegistry):
 
     async def close(self) -> None:
         """关闭数据库连接。"""
-        await asyncio.to_thread(self._conn.close)
+        await self._run(self._conn.close)
 
 
 __all__ = [

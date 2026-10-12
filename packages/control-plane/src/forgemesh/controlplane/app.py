@@ -8,7 +8,10 @@
   ``api/openapi/openapi.yaml`` 一致。
 * **配置**：权威存储路径取自环境变量 ``FORGEMESH_DB_PATH``（默认
   ``forgemesh.db``）；监听地址取自 ``FORGEMESH_HOST`` / ``FORGEMESH_PORT``
-  （默认 ``127.0.0.1:8080``，未接入认证前不默认对外暴露）。
+  （默认 ``127.0.0.1:8080``）。
+* **认证**：启动时按 ``FORGEMESH_AUTH_MODE`` 构造认证器（默认 ``apikey``，需要
+  ``FORGEMESH_API_KEYS_FILE``），配置缺失或非法时拒绝启动；``dev`` 模式只允许
+  监听回环地址（见 :mod:`forgemesh.controlplane.auth`）。
 * **无导入副作用**：数据库在应用启动（lifespan）时才打开，导入本模块不会
   创建文件。
 * **探针**：``/healthz``（存活）恒为 ok；``/readyz``（就绪）探测权威存储可用。
@@ -20,14 +23,27 @@
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import logging
 import os
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from pydantic import BaseModel
+
+from .auth import (
+    AUTH_MODE_DEV,
+    AUTH_MODE_ENV,
+    AuthConfigError,
+    HeaderAuthenticator,
+    auth_mode_from_env,
+    authenticator_from_env,
+)
+
+if TYPE_CHECKING:  # pragma: no cover - 仅静态类型检查使用
+    from .auth import Authenticator
 
 try:  # pragma: no cover - 取决于运行环境是否安装 FastAPI
     from fastapi import FastAPI
@@ -101,26 +117,46 @@ def resolve_db_path(db_path: str | None = None) -> str:
 
 if _FASTAPI_AVAILABLE:
 
-    def create_app(db_path: str | None = None) -> FastAPI:
-        """创建 FastAPI 应用：探针 + 真实 API 路由；注册中心在启动时初始化。
+    def create_app(
+        db_path: str | None = None, authenticator: Authenticator | None = None
+    ) -> FastAPI:
+        """创建 FastAPI 应用：探针 + 真实 API 路由；认证器与注册中心在启动时初始化。
 
         Args:
             db_path: SQLite 权威存储路径；为空时按 :func:`resolve_db_path` 解析。
+            authenticator: 认证器；为空时在启动时按环境变量构造
+                （见 :func:`forgemesh.controlplane.auth.authenticator_from_env`），
+                配置缺失或非法则启动失败。
         """
         # 延迟导入：api.routes 反向依赖本模块的 error_envelope。
         from .api import create_api_router
-        from .api.dependencies import get_registry, init_registry
+        from .api.dependencies import (
+            get_registry,
+            init_authenticator,
+            init_registry,
+            reset_authenticator,
+        )
         from .api.errors import install_exception_handlers
 
         @asynccontextmanager
         async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+            auth = authenticator if authenticator is not None else authenticator_from_env()
+            if isinstance(auth, HeaderAuthenticator):
+                logger.warning(
+                    "%s=%s: tenant identity is taken from the X-Tenant-Id header without "
+                    "verification; use this mode for local development only",
+                    AUTH_MODE_ENV,
+                    AUTH_MODE_DEV,
+                )
             path = resolve_db_path(db_path)
             registry = init_registry(path)
             logger.info("control plane registry opened: %s", path)
+            init_authenticator(auth)
             try:
                 yield
             finally:
                 await registry.close()
+                reset_authenticator()
 
         application = FastAPI(
             title="ForgeMesh Control Plane API",
@@ -153,7 +189,9 @@ if _FASTAPI_AVAILABLE:
 
 else:  # pragma: no cover - 兜底路径：无 FastAPI 时使用标准库实现
 
-    def create_app(db_path: str | None = None) -> FastAPI:  # type: ignore[valid-type]
+    def create_app(  # type: ignore[valid-type]
+        db_path: str | None = None, authenticator: Authenticator | None = None
+    ) -> FastAPI:
         """无 FastAPI 环境时的占位工厂（抛出明确错误）。"""
         raise RuntimeError(
             "未检测到 FastAPI。请安装可选依赖：pip install 'forgemesh-control-plane[api]'，"
@@ -198,10 +236,31 @@ else:  # pragma: no cover - 兜底路径：无 FastAPI 时使用标准库实现
         server.serve_forever()
 
 
+def _is_loopback(host: str) -> bool:
+    if host == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
 def main() -> None:
-    """命令行入口：监听地址取自 ``FORGEMESH_HOST`` / ``FORGEMESH_PORT``。"""
+    """命令行入口：监听地址取自 ``FORGEMESH_HOST`` / ``FORGEMESH_PORT``。
+
+    ``FORGEMESH_AUTH_MODE=dev`` 时只允许监听回环地址，否则拒绝启动。
+    """
     host = os.environ.get(HOST_ENV, DEFAULT_HOST)
     port = int(os.environ.get(PORT_ENV, str(DEFAULT_PORT)))
+    try:
+        mode = auth_mode_from_env()
+    except AuthConfigError as exc:
+        raise SystemExit(str(exc)) from exc
+    if mode == AUTH_MODE_DEV and not _is_loopback(host):
+        raise SystemExit(
+            f"{AUTH_MODE_ENV}={AUTH_MODE_DEV} trusts the X-Tenant-Id header and may only listen "
+            f"on a loopback address, but {HOST_ENV}={host}"
+        )
     if _FASTAPI_AVAILABLE:  # pragma: no cover - 依赖运行时环境
         import uvicorn
 

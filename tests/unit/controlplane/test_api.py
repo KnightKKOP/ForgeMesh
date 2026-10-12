@@ -7,7 +7,7 @@
 * 查询不存在返回 404；
 * 删除：无副作用资源 204 直接物理删除；有副作用态（Ready）202 Terminating；
 * 列表返回多个资源；
-* 缺失 ``X-Tenant-Id`` 头返回 400。
+* 缺失 ``X-Tenant-Id`` 头返回 401（dev 认证模式）。
 
 使用 FastAPI ``TestClient``（同步驱动），不依赖 pytest-asyncio。
 """
@@ -165,9 +165,11 @@ def test_list_inference_services(client: TestClient) -> None:
 
 
 def test_missing_tenant_header(client: TestClient) -> None:
-    """无 X-Tenant-Id 头返回 400。"""
+    """dev 认证模式下无 X-Tenant-Id 头返回 401，且不落库。"""
     resp = client.post("/api/v1/inference-services", json=_payload())
-    assert resp.status_code == 400, resp.text
+    assert resp.status_code == 401, resp.text
+    assert resp.headers["WWW-Authenticate"].startswith("Bearer")
+    assert asyncio.run(get_registry().list("InferenceService", "tenant-a")) == []
 
 
 def test_create_preserves_spec_and_assigns_server_fields(client: TestClient) -> None:

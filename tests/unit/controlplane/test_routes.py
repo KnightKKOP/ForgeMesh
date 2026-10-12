@@ -168,10 +168,10 @@ def test_start_workflow_validation_error(client: TestClient) -> None:
 
 
 def test_start_workflow_missing_tenant_header(client: TestClient) -> None:
-    """缺 X-Tenant-Id 头返回 400（对齐现有租户依赖行为）。"""
+    """缺 X-Tenant-Id 头返回 401（dev 认证模式），不触达 runtime。"""
     init_workflow_runtime(StubWorkflowRuntime())
     resp = client.post("/api/v1/workflows", json={"definition": "gpu-onboarding", "version": 1})
-    assert resp.status_code == 400, resp.text
+    assert resp.status_code == 401, resp.text
 
 
 def test_start_workflow_runtime_not_injected(client: TestClient) -> None:
@@ -292,10 +292,10 @@ def test_decision_router_exception(client: TestClient) -> None:
 
 
 def test_decision_missing_tenant_header(client: TestClient) -> None:
-    """缺 X-Tenant-Id 头返回 400。"""
+    """缺 X-Tenant-Id 头返回 401（dev 认证模式）。"""
     init_decision_router(StubDecisionRouter(result=_ok_result()))
     resp = client.post("/api/v1/decisions", json={"question": "inference.schedule", "context": {}})
-    assert resp.status_code == 400, resp.text
+    assert resp.status_code == 401, resp.text
 
 
 def test_decision_validation_error(client: TestClient) -> None:

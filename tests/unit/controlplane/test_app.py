@@ -6,6 +6,7 @@ import pytest
 from fastapi.testclient import TestClient
 from forgemesh.controlplane.api.dependencies import get_registry, reset_runtime_components
 from forgemesh.controlplane.app import DB_PATH_ENV, create_app
+from forgemesh.controlplane.auth import AUTH_MODE_DEV, AUTH_MODE_ENV
 
 HEADERS = {"X-Tenant-Id": "acme"}
 BODY = {
@@ -20,7 +21,8 @@ BODY = {
 
 
 @pytest.fixture(autouse=True)
-def _reset_components():
+def _reset_components(monkeypatch):
+    monkeypatch.setenv(AUTH_MODE_ENV, AUTH_MODE_DEV)
     reset_runtime_components()
     yield
     reset_runtime_components()

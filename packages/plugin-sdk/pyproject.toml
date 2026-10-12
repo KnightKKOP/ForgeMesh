@@ -9,6 +9,7 @@ description = "ForgeMesh plugin SDK contract (PluginManifest, lifecycle, permiss
 requires-python = ">=3.12"
 dependencies = [
     "pydantic>=2,<3",
+    "pyyaml>=6.0.1",
     "forgemesh-core",
 ]
 

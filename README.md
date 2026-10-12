@@ -137,18 +137,29 @@ make clean           # 清理构建与缓存产物
 
 ### 运行控制平面
 
+控制平面与网关默认要求 API key（[ADR-014](docs/design-decisions/adr-014.md)）：每个 key 绑定一个租户和一组 scope（`read` / `write` / `*`），租户只取自 key，不取自请求头。
+
 ```bash
-FORGEMESH_DB_PATH=./forgemesh.db .venv/bin/forgemesh-control-plane
-curl -s http://127.0.0.1:8080/readyz   # {"status":"ok",...}
+# 1. 生成 key：第 2 行是 key（只显示这一次），最后一行是 key 文件条目
+.venv/bin/python -m forgemesh.controlplane.keygen --tenant acme --subject ci-bot
+
+# 2. 把条目放进 key 文件的 "keys" 数组（文件只含 SHA-256 摘要，网关与控制平面共用）
+#    {"keys": [{"id": "acme-ci-bot", "sha256": "…", "tenantId": "acme", "subject": "ci-bot", "scopes": ["read", "write"]}]}
+
+# 3. 启动并调用
+FORGEMESH_API_KEYS_FILE=./api-keys.json FORGEMESH_DB_PATH=./forgemesh.db .venv/bin/forgemesh-control-plane
+curl -s -H "Authorization: Bearer fmk_…" http://127.0.0.1:8080/api/v1/inference-services
 ```
 
 | 环境变量 | 默认值 | 说明 |
 | --- | --- | --- |
+| `FORGEMESH_AUTH_MODE` | `apikey` | `apikey`：校验 `Authorization: Bearer <key>`；`dev`：直接信任 `X-Tenant-Id` 请求头，只允许监听回环地址，仅供本地开发 |
+| `FORGEMESH_API_KEYS_FILE` | — | `apikey` 模式必填，缺失或格式非法时拒绝启动 |
 | `FORGEMESH_DB_PATH` | `forgemesh.db` | SQLite 权威存储文件；同一文件只允许一个控制平面实例写入（ADR-013） |
 | `FORGEMESH_HOST` | `127.0.0.1` | 监听地址 |
 | `FORGEMESH_PORT` | `8080` | 监听端口 |
 
-> 控制平面按 `X-Tenant-Id` 请求头识别租户、不校验凭证，请保持回环监听，不要直接暴露给不可信网络。
+> 请求可以不带 `X-Tenant-Id`；带了就必须与 key 绑定的租户一致，否则返回 `403`。缺少或无效的 key 返回 `401`。
 
 ### Go 网关
 
@@ -156,6 +167,8 @@ curl -s http://127.0.0.1:8080/readyz   # {"status":"ok",...}
 cd gateway
 go test ./...       # 运行网关测试
 go build ./cmd/gateway  # 构建网关二进制
+GATEWAY_API_KEYS_FILE=../api-keys.json make run   # 默认 apikey 模式，监听 :8081
+make run-dev        # dev 模式：信任租户请求头，只监听 127.0.0.1:8081
 ```
 
 ---

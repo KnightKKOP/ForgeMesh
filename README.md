@@ -212,7 +212,7 @@ ForgeMesh 目前处于预览阶段，API 稳定性标注为 `beta`：minor 版�
 
 ### 核心控制平面（M2）
 - **资源注册中心**：SQLite 持久化，乐观并发 CAS，租户隔离，分页游标（现状：API 尚未返回分页游标）
-- **协调控制器**：9 步声明式闭环（获取→查询→比较→生成候选→策略校验→调度分配→执行→重观察→更新状态）（现状：自 1.1.0 起由控制器自动驱动；仓库中还没有调度器实现，新建的推理服务停在 `Pending`，并报告 `Ready=False`（`SchedulerUnavailable`））
+- **协调控制器**：9 步声明式闭环（获取→查询→比较→生成候选→策略校验→调度分配→执行→重观察→更新状态）（现状：自 1.1.0 起由控制器自动驱动；设置 `FORGEMESH_INVENTORY_FILE` 后启用 first-fit 调度器，但应用还没有接入工作流运行时，新建的推理服务停在 `Pending`，并报告 `Ready=False`：未设置清单时为 `SchedulerUnavailable`，设置后为 `WorkflowRuntimeUnavailable`）
 - **策略引擎**：allow/deny/require_approval 三态决策，配额规则，高风险审批触发
   - 说明：Decision Router 的 `OK/FALLBACK_REQUIRED/FAILED` 是决策路由层的另一组状态，与 Policy 三态不混用
 - **插件管理器**：Manifest 解析校验，生命周期状态机，能力发现，权限授予（现状：授予的权限直接取自插件清单自己的声明）
@@ -254,7 +254,7 @@ ForgeMesh 目前处于预览阶段，API 稳定性标注为 `beta`：minor 版�
 
 | 类型 | 数量 |
 |------|------|
-| Python 测试 | **1244** |
+| Python 测试 | **1350** |
 | Go 测试 | 134 个测试函数，全部通过 |
 | ruff 检查 | All checks passed |
 

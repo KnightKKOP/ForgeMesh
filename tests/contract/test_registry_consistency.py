@@ -254,7 +254,7 @@ def test_backup_restore_from_copied_db_file(tmp_path) -> None:
         _run(source.put(created, expected_version="0"))
         _run(source.put(_make_resource(name="node", uid="uid-node", generation=7)))
     finally:
-        # 先关闭源连接再复制：确保 rollback journal 已合并、数据全量落盘
+        # 先关闭源连接再复制：最后一个连接关闭时 WAL 合并回主库文件，数据全量落盘
         _run(source.close())
 
     # 模拟备份：复制 DB 文件（文件级备份恢复路径）

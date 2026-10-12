@@ -81,6 +81,8 @@ from forgemesh.resource.inference import Endpoint, InferenceService
 from forgemesh.resource.states import ALLOCATION_STATE_MACHINE, INFERENCE_STATE_MACHINE
 from pydantic import ValidationError
 
+from ..sqlite import connect
+
 logger = logging.getLogger(__name__)
 
 _T = TypeVar("_T")
@@ -233,8 +235,7 @@ class SQLiteRegistry(ResourceRegistry):
 
     def __init__(self, db_path: str = ":memory:") -> None:
         self._db_path = db_path
-        # check_same_thread=False：asyncio.to_thread 会在不同线程执行 sqlite 调用。
-        self._conn = sqlite3.connect(db_path, check_same_thread=False)
+        self._conn = connect(db_path)
         self._conn.row_factory = sqlite3.Row
         self._lock = threading.RLock()
         self._init_schema()

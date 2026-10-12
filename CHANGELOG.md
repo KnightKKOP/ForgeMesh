@@ -40,6 +40,8 @@
 - **破坏性**：网关默认不连接回环、链路本地、未指定、组播地址与已知云元数据服务地址上的推理实例（见 Security）；实例运行在本机时需设置 `GATEWAY_INSTANCE_ALLOWED_CIDRS`（`make run-dev` 已允许 `127.0.0.0/8,::1/128`）。
 - 网关连接池：流式代理与控制平面客户端每个主机最多保留 64 个空闲连接（此前为 `net/http` 默认的 2 个，一波并发请求之后大部分连接被关闭，下一波重新建连）；资源反代等待控制平面响应头最多 30 秒。
 - 网关 Resolver 合并同一服务的并发未命中，只查询一次控制平面，查询不随发起它的请求取消；"服务不存在 / 未就绪 / 无可用实例"缓存 1 秒（不超过 `GATEWAY_RESOLVER_TTL_SECONDS`），`403`、其他控制平面错误与网络错误仍不缓存。
+- 控制平面的 SQLite 存储（Registry、去重键、任务、审计、Outbox）统一以 WAL 模式打开并启用外键约束（`forgemesh.controlplane.sqlite.connect`）。此前为回滚日志模式，而 Registry 与去重键存储共用同一个文件：一个连接上的读事务未结束时，另一个连接的提交只能等待，超过 5 秒以 `database is locked` 失败。运行期间数据库文件旁会有 `-wal` / `-shm` 文件，不能直接复制文件做备份；`synchronous` 保持 `FULL`。
+- 去重键存储 `ProcessedKeyStore` 不再在每次 `seen` / `mark` 时删除过期键并提交：`seen` 不报告超过 TTL 的键，过期键最多每 `min(TTL, 60 秒)` 删除一次，启动后的第一次调用即清理上次运行留下的过期键。
 
 ### Deprecated
 
@@ -62,6 +64,8 @@
 - 网关解析推理服务时不带命名空间，控制平面因此只查找不带命名空间的服务，带命名空间的服务无法经网关调用：现由带命名空间的路由解析（见 Added）。
 - 网关 `/readyz` 只对上游做 TCP 拨号，控制平面的权威存储不可用（其 `/readyz` 返回 `503`）或端口被其他进程占用时仍报告就绪：现请求控制平面的 `/readyz`，返回 `200` 才就绪，否则返回 `503`（`upstream not ready` / `upstream unreachable`）。
 - 推理实例返回错误（如 vLLM 对非法参数返回 `400` JSON）时，网关把响应的 `Content-Type` 改成 `text/event-stream`：现只对 2xx 响应这样设置，错误响应保留实例的 `Content-Type`。
+- [docs/operations/backup-restore.md](docs/operations/backup-restore.md) 的热备份方法「`PRAGMA wal_checkpoint(TRUNCATE)` 后 `cp` 主库文件」在控制平面写入期间不安全：复制途中的自动 checkpoint 会改写主库文件，备份可能不一致甚至损坏；脚本只看 `PRAGMA integrity_check` 的退出码，而 `sqlite3` 检查出损坏时同样返回 `0`。现改为 `VACUUM INTO`（脚本）/ `Connection.backup`（Python）在线快照，校验输出必须为 `ok`，数据库路径不存在时报错，而不是备份一个新建的空库。
+- 备份文档列出的 `data/registry.db` / `audit.db` / `decisions.db` 并不存在，控制平面的权威状态只在 `FORGEMESH_DB_PATH` 一个文件中。恢复时旧库的 `-wal` / `-shm` 随旧库一起改名保留（`-wal` 中可能有尚未合并回主库的已提交事务），全量恢复示例改为先停止、再启动控制平面。
 
 ### Security
 

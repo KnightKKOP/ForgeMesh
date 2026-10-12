@@ -155,7 +155,7 @@ curl -s -H "Authorization: Bearer fmk_…" http://127.0.0.1:8080/api/v1/inferenc
 | --- | --- | --- |
 | `FORGEMESH_AUTH_MODE` | `apikey` | `apikey`：校验 `Authorization: Bearer <key>`；`dev`：直接信任 `X-Tenant-Id` 请求头，只允许监听回环地址，仅供本地开发 |
 | `FORGEMESH_API_KEYS_FILE` | — | `apikey` 模式必填，缺失或格式非法时拒绝启动 |
-| `FORGEMESH_DB_PATH` | `forgemesh.db` | SQLite 权威存储文件；同一文件只允许一个控制平面实例写入（ADR-013） |
+| `FORGEMESH_DB_PATH` | `forgemesh.db` | SQLite 权威存储文件；同一文件只允许一个控制平面实例写入（ADR-013）。以 WAL 模式打开，运行时旁边有 `-wal` / `-shm` 文件，不能直接复制文件做备份，见 [备份与灾备演练](docs/operations/backup-restore.md) |
 | `FORGEMESH_HOST` | `127.0.0.1` | 监听地址 |
 | `FORGEMESH_PORT` | `8080` | 监听端口 |
 

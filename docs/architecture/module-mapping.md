@@ -123,7 +123,7 @@
 | 当前代码路径 | `packages/control-plane/src/forgemesh/controlplane/`：`registry/{models,store}.py`、`reconciler/{core,dedup}.py`、`controller/{manager,queue}.py`、`api/{routes,dependencies,errors}.py`、`plugin_manager.py`、`outbox.py`、`audit.py`、`tasks.py`、`heartbeat.py`、`observability.py`、`diagnostics.py`、`app.py`、`auth.py`、`keygen.py`（共 24 个 `.py`；其中 `auth.py` / `keygen.py` / `api/errors.py` 为 API 认证与错误信封，见 ADR-014；`controller/` 驱动协调器并回写 status；其余与任务书的 9 个子模块一一对应） |
 | 核心契约 | 实现 `core-contracts` 的 `ResourceRegistry` / `Reconciler` / `Scheduler`；`app.py` 提供 HTTP 服务（FastAPI，未安装时回退纯标准库占位——生产必须 FastAPI/ASGI），并在 lifespan 中运行控制器；控制器按序号增量读取 `resource_changes` 变更记录，经 `update_status`（status 子资源，CAS）回写协调结果；Outbox 事务性事件（architecture.md 3.3 规则 7）；`ProcessedKeyStore` 去重（reconciler/dedup.py） |
 | 运行形态 | 单实例控制平面进程（模块化单体，architecture.md 3.3 规则 8）；ADR-013 约束：仅允许单写方写同一 SQLite 权威库；控制器与 API 同进程运行，不得以多个 worker 进程启动 |
-| 数据所有权 | **全部业务资源权威状态**（registry/store.py）、审计事件（audit.py → `data/audit.db`）、Outbox 事件、任务与心跳状态 |
+| 数据所有权 | **全部业务资源权威状态**（registry/store.py）、审计事件（audit.py，默认内存库，控制平面应用尚未接入）、Outbox 事件、任务与心跳状态 |
 | 允许依赖 | `forgemesh.core` / `forgemesh.resource` / `forgemesh.policy` / `forgemesh.decision` / `forgemesh.workflow*` / `forgemesh.plugin`（plugin-sdk）、标准库 `sqlite3`、FastAPI |
 | 禁止依赖 | 任何插件私有模块（`decision_rules` / `gpu_nvidia` 等，扫描二验证 ✅，见 3.2） |
 | 测试路径 | `tests/unit/controlplane/`：`test_api.py`、`test_routes.py`、`test_registry.py`、`test_reconciler.py`、`test_dedup_store.py`、`test_plugin_manager.py`、`test_outbox.py`、`test_audit.py`、`test_tasks.py`、`test_heartbeat.py`、`test_observability.py`、`test_diagnostics.py`、`test_app.py`、`test_auth.py`、`test_controller_manager.py`、`test_controller_queue.py`、`test_registry_changes.py`、`test_registry_status.py`（18 个文件，glob 核对） |
@@ -153,7 +153,7 @@
 | 当前代码路径 | `packages/decision-api/src/forgemesh/decision/{provider,router,records,circuit_breaker,degradation}.py` |
 | 核心契约 | `DecisionProvider(Protocol)` + `DecisionRequest` / `DecisionCandidate`（provider.py）；`DecisionRouter` + `DecisionResult`（router.py，路由层状态 `OK/FALLBACK_REQUIRED/FAILED`——与 Policy 三态是两层状态）；`DecisionRecord` / `DecisionRecordStore`（records.py，含 `approval_status` 审批字段，对齐 development-plan 5.5 / IVT-11）；熔断与降级（circuit_breaker.py / degradation.py） |
 | 运行形态 | 进程内模块 |
-| 数据所有权 | 决策记录的**契约与默认存储实现**同包（`DecisionRecordStore` → `data/decisions.db`）——见偏差 D1 |
+| 数据所有权 | 决策记录的**契约与默认存储实现**同包（`DecisionRecordStore`，默认内存库）——见偏差 D1 |
 | 允许依赖 | `forgemesh.core`（errors）、pydantic、标准库 `sqlite3`（**现状如此，边界见 D1**） |
 | 禁止依赖 | 插件私有模块、Web 框架、LLM SDK、requests |
 | 测试路径 | `tests/unit/decision/test_router.py`、`test_records.py`、`test_circuit_breaker.py`、`test_degradation.py` |
@@ -285,9 +285,9 @@
 | 字段 | 内容 |
 |---|---|
 | 架构模块 | L6 权威存储（过渡态：SQLite；目标态：PostgreSQL） |
-| 当前代码路径 | `packages/control-plane/src/forgemesh/controlplane/registry/store.py`（`SQLiteRegistry`，权威资源状态，CAS 乐观并发 `resource_version`）；`packages/decision-api/src/forgemesh/decision/records.py`（`DecisionRecordStore` → `data/decisions.db`）；`packages/workflow-runtime/src/forgemesh/workflowruntime/store.py`（工作流运行存储）；审计 `audit.py` → `data/audit.db` |
+| 当前代码路径 | `packages/control-plane/src/forgemesh/controlplane/registry/store.py`（`SQLiteRegistry`，权威资源状态，CAS 乐观并发 `resource_version`）；`packages/decision-api/src/forgemesh/decision/records.py`（`DecisionRecordStore`）；`packages/workflow-runtime/src/forgemesh/workflowruntime/store.py`（工作流运行存储）；审计 `audit.py` |
 | 核心契约 | ADR-013：**SQLite 为权威存储、单控制平面实例写、禁止扩展 replicas；PostgreSQL 为目标态**（迁移由真实 SLO/基准触发）；Registry 对齐 `core-contracts.ResourceRegistry` 契约 |
-| 运行形态 | 进程内嵌入式（SQLite 文件，默认 `data/registry.db` / `audit.db` / `decisions.db`，见 docs/operations/backup-restore.md） |
+| 运行形态 | 进程内嵌入式：控制平面应用只打开 `FORGEMESH_DB_PATH` 一个 SQLite 文件（Registry 与去重键，WAL 模式），审计、决策记录、工作流存储默认使用内存库；备份见 docs/operations/backup-restore.md |
 | 数据所有权 | 权威写方：控制平面**唯一实例**（registry/audit/outbox）；决策记录写方为 Decision 链路（D1 关联） |
 | 允许依赖 | 标准库 `sqlite3`（仅控制平面实现层；API 层现状见 D1） |
 | 禁止依赖 | 第三方 DB 驱动（v1.x）、多实例并发写同一库文件 |
@@ -315,7 +315,7 @@
 | 字段 | 内容 |
 |---|---|
 | 架构模块 | 部署拓扑与运维文档（L6 平台基础设施落地） |
-| 当前代码路径 | `deploy/docker/docker-compose.yaml`（postgres + control-plane + gateway，**声明为目标拓扑预置、暂不实际运行**，含 ADR-013 单实例注记）；`deploy/kubernetes/{namespace,control-plane-deployment}.yaml`（replicas: 1，镜像 `0.0.1` 占位）；`docs/operations/backup-restore.md`（RPO≤5min / RTO≤15min、三库备份演练）；示例 `examples/single-node/{inference-service,plugin-vllm}.yaml`、`examples/multi-tenant/tenant-quota.yaml` |
+| 当前代码路径 | `deploy/docker/docker-compose.yaml`（postgres + control-plane + gateway，**声明为目标拓扑预置、暂不实际运行**，含 ADR-013 单实例注记）；`deploy/kubernetes/{namespace,control-plane-deployment}.yaml`（replicas: 1，镜像 `0.0.1` 占位）；`docs/operations/backup-restore.md`（RPO≤5min / RTO≤15min、在线备份与恢复演练）；示例 `examples/single-node/{inference-service,plugin-vllm}.yaml`、`examples/multi-tenant/tenant-quota.yaml` |
 | 核心契约 | ADR-013 单控制平面实例约束（k8s 清单 `replicas: 1` 与之一致）；docker-compose 头注释明确"阶段 0 目标拓扑，控制平面不连接数据库" |
 | 运行形态 | 部署工件（YAML）+ 运维文档（Markdown） |
 | 数据所有权 | 无（pgdata 卷属目标态预置，当前未启用） |

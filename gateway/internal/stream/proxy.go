@@ -1,7 +1,8 @@
 // Package stream 实现 SSE / 流式分块的透明代理。
 //
 // 与普通反代的区别：
-//   - 设置 text/event-stream 并禁用各级缓冲（含 nginx 的 X-Accel-Buffering）。
+//   - 成功响应设置 text/event-stream（错误响应保留实例的 Content-Type），并禁用各级
+//     缓冲（含 nginx 的 X-Accel-Buffering）。
 //   - 逐块读取上游响应并立即 Flush，保证 token 实时到达客户端。
 //   - 通过继承客户端请求的 context，客户端断开会自动取消上游请求，避免资源泄漏。
 //
@@ -198,8 +199,10 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, upstreamURL, end
 		}
 		dst[k] = append([]string(nil), vs...)
 	}
-	// 强制流式语义。
-	dst.Set("Content-Type", "text/event-stream")
+	// 成功响应强制流式语义；错误响应保留实例的 Content-Type，客户端才能按格式解析错误体。
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		dst.Set("Content-Type", "text/event-stream")
+	}
 	dst.Set("Cache-Control", "no-cache")
 	dst.Set("Connection", "keep-alive")
 	// 关闭 nginx 等中间层对响应的缓冲。

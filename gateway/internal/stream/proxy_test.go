@@ -705,6 +705,37 @@ func TestProxy_Upstream5xxCountsFailure(t *testing.T) {
 	}
 }
 
+// TestProxy_ErrorResponseKeepsContentType 验证实例的错误响应保留原 Content-Type 与响应体，
+// 不被改成 text/event-stream。
+func TestProxy_ErrorResponseKeepsContentType(t *testing.T) {
+	const errBody = `{"object":"error","message":"max_tokens is too large","code":400}`
+	upstreamSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(errBody))
+	}))
+	defer upstreamSrv.Close()
+
+	res := newFakeResolver([]string{upstreamSrv.URL}, nil)
+	proxy := New(res, "X-Tenant-ID", allowLoopback, nil)
+
+	rec := httptest.NewRecorder()
+	proxy.ServeHTTP(rec, newChatRequest("svc-a"))
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("4xx 应透传，实际 %d", rec.Code)
+	}
+	if ct := rec.Header().Get("Content-Type"); ct != "application/json" {
+		t.Fatalf("错误响应应保留实例的 Content-Type application/json，实际 %q", ct)
+	}
+	if got := rec.Body.String(); got != errBody {
+		t.Fatalf("错误响应体应原样透传，\nwant %q\ngot  %q", errBody, got)
+	}
+	if got := res.failureCount(upstreamSrv.URL); got != 0 {
+		t.Fatalf("4xx 不应计实例失败，实际 %d", got)
+	}
+}
+
 // TestBuildUpstreamURL 验证实例基址、协议推理路径与查询串的拼接逻辑。
 func TestBuildUpstreamURL(t *testing.T) {
 	cases := []struct {

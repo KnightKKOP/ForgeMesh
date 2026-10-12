@@ -160,11 +160,11 @@ type Resolver struct {
 // NewResolver 构造解析器。
 //
 // controlPlaneURL 为控制平面基地址（如 "http://control-plane:8080"）；
-// client 为 nil 时使用带 5s 超时的默认客户端；ttl / cooldown 非正数时
+// client 为 nil 时使用带 5s 超时、连接池放宽的默认客户端；ttl / cooldown 非正数时
 // 使用 DefaultResolverTTL / DefaultUnhealthyCooldown；logger 为 nil 时用 log.Default()。
 func NewResolver(controlPlaneURL string, client *http.Client, ttl, cooldown time.Duration, logger *log.Logger) *Resolver {
 	if client == nil {
-		client = &http.Client{Timeout: resolveHTTPTimeout}
+		client = &http.Client{Timeout: resolveHTTPTimeout, Transport: newControlPlaneTransport()}
 	}
 	if ttl <= 0 {
 		ttl = DefaultResolverTTL

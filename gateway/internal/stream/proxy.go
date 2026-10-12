@@ -36,6 +36,14 @@ import (
 // readBufferSize 是单次读取上游响应体的缓冲区大小。
 const readBufferSize = 32 * 1024
 
+// 实例连接池：Go 默认每个主机只保留 2 个空闲连接，一波并发流式请求结束后多数连接
+// 会被关闭，下一波请求只能重新建连。
+const (
+	maxIdleConns        = 512
+	maxIdleConnsPerHost = 64
+	idleConnTimeout     = 90 * time.Second
+)
+
 // Resolver 抽象「推理服务 → 实例 endpoint 列表」的解析与健康上报，
 // 由 upstream.Resolver 实现；以接口注入便于测试替换。
 type Resolver interface {
@@ -85,6 +93,10 @@ func New(resolver Resolver, tenantHeader string, policy AddressPolicy, logger *l
 					KeepAlive: 30 * time.Second,
 					Control:   policy.control,
 				}).DialContext,
+				MaxIdleConns:        maxIdleConns,
+				MaxIdleConnsPerHost: maxIdleConnsPerHost,
+				IdleConnTimeout:     idleConnTimeout,
+				TLSHandshakeTimeout: 10 * time.Second,
 				// 关闭响应压缩，避免代理层引入额外缓冲/转换。
 				DisableCompression: true,
 			},

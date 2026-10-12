@@ -11,9 +11,24 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"time"
 
 	"github.com/Mekoforge/ForgeMesh/gateway/internal/middleware"
 )
+
+// controlPlaneResponseHeaderTimeout 是等待控制平面响应头的上限；控制平面的接口都是
+// 短请求（决策请求的单个 Provider 默认限时 5s）。
+const controlPlaneResponseHeaderTimeout = 30 * time.Second
+
+// newControlPlaneTransport 返回连接控制平面的 Transport：沿用 http.DefaultTransport 的
+// 设置，放宽每个主机的空闲连接数（默认 2），并限制等待响应头的时间。
+func newControlPlaneTransport() *http.Transport {
+	t := http.DefaultTransport.(*http.Transport).Clone()
+	t.MaxIdleConns = 256
+	t.MaxIdleConnsPerHost = 64
+	t.ResponseHeaderTimeout = controlPlaneResponseHeaderTimeout
+	return t
+}
 
 // Client 是对 httputil.ReverseProxy 的薄封装，实现 http.Handler。
 type Client struct {
@@ -40,6 +55,7 @@ func New(target *url.URL, correlationHeader, tenantHeader string, logger *log.Lo
 	}
 
 	c.proxy = &httputil.ReverseProxy{
+		Transport: newControlPlaneTransport(),
 		// Rewrite 是 Go 1.20+ 推荐的请求改写入口（与 Director 互斥）。
 		Rewrite: func(pr *httputil.ProxyRequest) {
 			// 将请求路由到上游并保留原始路径 /api/v1/*。

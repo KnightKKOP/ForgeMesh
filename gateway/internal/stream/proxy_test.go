@@ -382,6 +382,64 @@ func TestProxy_PassesNamespaceToResolver(t *testing.T) {
 	}
 }
 
+// TestProxy_ReusesConnectionsAcrossConcurrentStreams 验证一波并发流式请求结束后连接留在池中，
+// 下一波同样并发度的请求不再新建连接（Go 默认每个主机只保留 2 个空闲连接）。
+func TestProxy_ReusesConnectionsAcrossConcurrentStreams(t *testing.T) {
+	const concurrency = 8
+	var newConns atomic.Int64
+	var mu sync.Mutex
+	var gate chan struct{}
+	var arrived sync.WaitGroup
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		g := gate
+		mu.Unlock()
+		arrived.Done()
+		<-g // 整波请求同时在途，每个请求各占一个连接
+		_, _ = w.Write([]byte("data: ok\n\n"))
+	}))
+	srv.Config.ConnState = func(_ net.Conn, state http.ConnState) {
+		if state == http.StateNew {
+			newConns.Add(1)
+		}
+	}
+	srv.Start()
+	defer srv.Close()
+
+	proxy := New(newFakeResolver([]string{srv.URL}, nil), "X-Tenant-ID", allowLoopback, nil)
+	wave := func() {
+		mu.Lock()
+		gate = make(chan struct{})
+		g := gate
+		mu.Unlock()
+		arrived.Add(concurrency)
+		var done sync.WaitGroup
+		for i := 0; i < concurrency; i++ {
+			done.Add(1)
+			go func() {
+				defer done.Done()
+				rec := httptest.NewRecorder()
+				proxy.ServeHTTP(rec, newChatRequest("svc-a"))
+				if rec.Code != http.StatusOK {
+					t.Errorf("请求应 200，实际 %d", rec.Code)
+				}
+			}()
+		}
+		arrived.Wait()
+		close(g)
+		done.Wait()
+	}
+
+	wave()
+	if got := newConns.Load(); got != concurrency {
+		t.Fatalf("第一波应建立 %d 个连接，实际 %d", concurrency, got)
+	}
+	wave()
+	if got := newConns.Load(); got != concurrency {
+		t.Fatalf("第二波应复用空闲连接，实际新建了 %d 个", got-concurrency)
+	}
+}
+
 // TestProxy_HopByHopHeadersFiltered 验证实例响应中的 hop-by-hop 头被过滤不转发给客户端。
 func TestProxy_HopByHopHeadersFiltered(t *testing.T) {
 	upstreamSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

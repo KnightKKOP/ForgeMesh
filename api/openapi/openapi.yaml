@@ -81,6 +81,7 @@ paths:
             type: string
         - name: namespace
           in: query
+          description: 只列出该命名空间中的资源；省略时不按命名空间过滤。
           schema:
             type: string
         - name: limit
@@ -136,6 +137,11 @@ paths:
       - name: name
         in: path
         required: true
+        schema:
+          type: string
+      - name: namespace
+        in: query
+        description: 资源所在的命名空间；省略时指不带命名空间的资源。
         schema:
           type: string
     get:

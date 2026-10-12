@@ -17,7 +17,7 @@
 * **信号**：``signal`` 直接映射为 Temporal Signal，用于审批唤醒。
 * **幂等**：同一 ``idempotency_key`` 复用既有 workflow_id，不产生重复副作用。
 
-兼容 Python 3.9+ / Pydantic v2。
+基于 Pydantic v2。
 """
 
 from __future__ import annotations

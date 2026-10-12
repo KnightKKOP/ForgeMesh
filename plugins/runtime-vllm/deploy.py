@@ -15,7 +15,7 @@
   占用的设备与并行度，不隐式抢占。
 * **测试友好**：实例启动器（launcher）可注入，无真实 vLLM 进程时用 mock 即可测试。
 
-兼容 Python 3.9+ / Pydantic v2。
+基于 Pydantic v2。
 """
 
 from __future__ import annotations

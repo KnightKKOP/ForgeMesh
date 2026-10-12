@@ -13,7 +13,7 @@
 * ``idempotency_key`` 保证重复分配请求幂等（不产生重复副作用）。
 
 字段命名与 DDL 保持一致（snake_case），便于持久化层直接映射。
-兼容 Python 3.9+ / Pydantic v2。
+基于 Pydantic v2。
 """
 
 from __future__ import annotations

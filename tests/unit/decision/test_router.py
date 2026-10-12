@@ -11,8 +11,6 @@
 * ``deadline_ms`` 生效：与全局 ``timeout_seconds`` 取较小值。
 
 按要求使用 ``asyncio.get_event_loop().run_until_complete`` 驱动协程。
-
-兼容 Python 3.9+。
 """
 
 from __future__ import annotations
@@ -77,7 +75,7 @@ class BoomProvider(DecisionProvider):
 
 @pytest.fixture(autouse=True)
 def _fresh_event_loop():
-    """为每个测试提供干净的 current event loop（兼容 3.9–3.12）。"""
+    """为每个测试提供干净的 current event loop。"""
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     try:

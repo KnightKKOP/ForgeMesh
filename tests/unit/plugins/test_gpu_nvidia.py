@@ -8,8 +8,6 @@
   通过/失败、``validate_all`` 汇总、可诊断信息。
 * **health** — ``check_device`` Healthy/Degraded/Unhealthy、``check_all``、
   温度/ECC 阈值、``monitor_loop`` 周期循环。
-
-兼容 Python 3.9+。
 """
 
 from __future__ import annotations
@@ -35,7 +33,7 @@ from gpu_nvidia_plugin.preflight import (
 
 @pytest.fixture(autouse=True)
 def _fresh_event_loop():
-    """为每个测试提供干净的 current event loop（兼容 3.9–3.12）。"""
+    """为每个测试提供干净的 current event loop。"""
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     try:

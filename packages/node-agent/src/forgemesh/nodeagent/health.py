@@ -10,7 +10,7 @@
 
 :class:`MetricsCollector` 采集利用率/显存等指标，供心跳附带上报。
 
-兼容 Python 3.9+ / Pydantic v2。
+基于 Pydantic v2。
 """
 
 from __future__ import annotations

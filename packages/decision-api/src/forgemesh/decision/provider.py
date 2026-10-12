@@ -3,8 +3,6 @@
 JEV 只回答「有哪些候选动作」，**不**分配资源、**不**写资源终态
 （架构不变量 INV-1 / INV-3）。候选的 ``confidence`` 仅用于排序与解释，
 绝不作为授权凭证。
-
-兼容 Python 3.9+。
 """
 
 from __future__ import annotations

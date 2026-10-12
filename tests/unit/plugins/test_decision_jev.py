@@ -6,8 +6,6 @@
 * ``JEVProvider.decide``：多规则匹配、无匹配返回空、provider_id/version。
 * ``JEVProvider.from_file``：从 JSON 文件加载。
 * 与 ``DecisionRouter`` 集成。
-
-兼容 Python 3.9+。
 """
 
 from __future__ import annotations
@@ -27,7 +25,7 @@ from forgemesh.decision.router import DecisionRouter
 
 @pytest.fixture(autouse=True)
 def _fresh_event_loop():
-    """为每个测试提供干净的 current event loop（兼容 3.9–3.12）。"""
+    """为每个测试提供干净的 current event loop。"""
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     try:

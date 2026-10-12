@@ -8,7 +8,7 @@
 * 多租户隔离（``tenant_id`` 贯穿身份、资源、事件与计量边界）。
 
 字段命名与 DDL 保持一致（snake_case），便于持久化层直接映射。
-兼容 Python 3.9+ / Pydantic v2。
+基于 Pydantic v2。
 """
 
 from __future__ import annotations

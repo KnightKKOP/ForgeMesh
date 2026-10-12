@@ -12,7 +12,7 @@
 :class:`IdempotencyGuard` 以 ``task_id`` + ``idempotency_key`` 去重，防止重连后
 重复执行同一幂等任务。
 
-对齐 architecture 10.3（重连/幂等语义）与 ADR-009。兼容 Python 3.9+。
+对齐 architecture 10.3（重连/幂等语义）与 ADR-009。
 """
 
 from __future__ import annotations

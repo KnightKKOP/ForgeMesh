@@ -1,0 +1,40 @@
+# ForgeMesh 控制平面镜像。构建上下文为仓库根目录：
+#   docker build -f deploy/docker/Dockerfile.control-plane -t forgemesh/control-plane:0.0.1 .
+#
+# 以非 root 用户（uid 10001）运行；SQLite 数据库位于 /var/lib/forgemesh，应挂载持久卷。
+# 镜像内不写其他路径，可以只读根文件系统运行（/tmp 另挂 tmpfs）。
+FROM python:3.12-slim AS build
+
+ENV PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+RUN python -m venv /opt/forgemesh
+COPY packages/ /src/packages/
+# 在同一条命令里安装全部本地包：forgemesh-* 之间的依赖由这里列出的目录满足，不会去 PyPI 查找同名包。
+RUN /opt/forgemesh/bin/pip install \
+      /src/packages/core-contracts \
+      /src/packages/resource-model \
+      /src/packages/workflow-api \
+      /src/packages/decision-api \
+      /src/packages/policy-engine \
+      /src/packages/plugin-sdk \
+      "/src/packages/control-plane[api]"
+
+FROM python:3.12-slim
+
+RUN groupadd --system --gid 10001 forgemesh \
+    && useradd --uid 10001 --gid forgemesh --no-create-home \
+       --home-dir /nonexistent --shell /usr/sbin/nologin forgemesh \
+    && install -d -o forgemesh -g forgemesh -m 0750 /var/lib/forgemesh
+COPY --from=build /opt/forgemesh /opt/forgemesh
+
+ENV PATH=/opt/forgemesh/bin:$PATH \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    FORGEMESH_HOST=0.0.0.0 \
+    FORGEMESH_PORT=8080 \
+    FORGEMESH_DB_PATH=/var/lib/forgemesh/forgemesh.db
+
+USER 10001:10001
+WORKDIR /var/lib/forgemesh
+EXPOSE 8080
+CMD ["forgemesh-control-plane"]

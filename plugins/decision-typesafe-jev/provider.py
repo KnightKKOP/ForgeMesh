@@ -15,8 +15,6 @@
 外部依赖（TypeSafe 云端 API）经 :class:`JevClient` 协议注入：默认实现
 :class:`HttpJevClient` 仅使用标准库（不引入第三方 HTTP 依赖）；测试可注入
 :class:`StaticJevClient`，无需真实网络。
-
-兼容 Python 3.9+。
 """
 
 from __future__ import annotations

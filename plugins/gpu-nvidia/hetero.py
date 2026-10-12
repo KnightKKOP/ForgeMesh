@@ -13,7 +13,7 @@ NVIDIA 不完全一致。本模块**显式报告所有能力差异，不隐藏�
   ``critical`` / ``warning`` / ``info``，关键字段差异直接影响调度正确性。
 * **人类可读**：``format_report`` 生成可直接展示的差异报告文本。
 
-兼容 Python 3.9+ / Pydantic v2。
+基于 Pydantic v2。
 """
 
 from __future__ import annotations

@@ -9,8 +9,6 @@
 * :class:`RateLimiter` —— 令牌桶限流器，恒定速率补充令牌，支持突发。
 * :class:`PriorityQueue` —— 优先级队列，按 :class:`Priority` 排序、同优先级 FIFO。
 * :class:`QoSManager` —— 准入管理器，组合优先级 + 限流 + 全局并发数判断。
-
-兼容 Python 3.9+。
 """
 from __future__ import annotations
 

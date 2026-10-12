@@ -11,7 +11,7 @@
 * **观测 ≠ 授权**：健康状态仅描述事实，不直接改变调度决策。
 * **测试友好**：检查函数可注入 mock，监控循环支持 ``max_iterations`` 限制。
 
-兼容 Python 3.9+ / Pydantic v2。
+基于 Pydantic v2。
 """
 
 from __future__ import annotations

@@ -9,8 +9,6 @@
   多租户隔离、异步线程池执行等逻辑均由 ``UsageStore`` 承担。
 * **追加式不可变**（IVT-10）：记录只插入不更新；计量修正通过新增
   ``correction_of`` 记录实现，原记录始终保留，保证审计可追溯。
-
-兼容 Python 3.9+。
 """
 
 from __future__ import annotations

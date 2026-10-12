@@ -7,8 +7,6 @@
 * **多租户隔离**：所有查询按 ``tenant_id`` 过滤，跨租户访问视为不存在。
 * **异步非阻塞**：SQLite 操作通过 ``asyncio.to_thread`` 在线程池执行，
   避免阻塞事件循环。
-
-兼容 Python 3.9+。
 """
 
 from __future__ import annotations

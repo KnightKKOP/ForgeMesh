@@ -10,8 +10,6 @@
 * **get_capability_report** — 显存 / 切片总量、已用、可用。
 * **状态机** — 非法转移被拒。
 * **并发互斥** — 同 GPU 并发创建不超分。
-
-兼容 Python 3.9+。
 """
 
 from __future__ import annotations
@@ -39,7 +37,7 @@ from gpu_nvidia_plugin.mig import (
 
 @pytest.fixture(autouse=True)
 def _fresh_event_loop() -> Any:
-    """为每个测试提供干净的 current event loop（兼容 3.9–3.12）。"""
+    """为每个测试提供干净的 current event loop。"""
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     try:

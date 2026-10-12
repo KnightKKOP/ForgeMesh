@@ -7,8 +7,6 @@
 
 * **决策 ≠ 授权**（INV-1/INV-3）：仅产出候选，不分配资源、不改写资源终态。
 * **可解释**：每条规则携带 ``rationale`` 供审计。
-
-兼容 Python 3.9+。
 """
 
 from __future__ import annotations

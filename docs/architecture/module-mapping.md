@@ -22,7 +22,7 @@
 - 路径存在性：`ls` / `find` / glob 实测（本文所有路径均已在 2026-10-11 于本分支核对）。
 - 依赖边界：`grep -rn` 对 `--include="*.py"` 的 import 扫描，命令与输出结论逐条记录于第 3 节。
 - 测试基线：`python -m pytest tests/ -q` → **993 passed**（本机 2026-10-11，5.34s）。
-- Go 侧：本机无 Go 工具链，`go test` 以 CI `go` job 为准（gateway 8 个 `*_test.go` 经 glob 核对存在）。
+- Go 侧：本机无 Go 工具链，`go test` 以 CI `go` job 为准（gateway 17 个 `*_test.go` 经 glob 核对存在）。
 
 ---
 
@@ -47,7 +47,7 @@
 | 15 | QoS / Metering | `plugins/qos-basic`、`metering-basic` | 插件 | 已实现且有测试覆盖 |
 | 16 | 持久化 | `control-plane/registry/store.py` 等（SQLite-first） | 进程内（SQLite 文件） | 已实现且有测试覆盖 |
 | 17 | 开发与 CI | `Makefile`、根 `pyproject.toml`、`.github/workflows/ci.yml` | 开发工具链 | 已实现（细节见小节） |
-| 18 | 部署与运维 | `deploy/`、`docs/operations/` | 部署工件 + 运维文档 | 部分计划中（见 D2） |
+| 18 | 部署与运维 | `deploy/`、`docs/operations/` | 部署工件 + 运维文档 | compose 已实现且有测试覆盖；k8s 清单实现待核验（见 2.18） |
 
 > 插件共 **10 个**（含 `decision-typesafe-jev`，PR #3 已合入 main），全部在 `plugins/` 平铺目录（`provider.py` + `manifest.yaml`），由 `api/schemas/plugin-manifest.schema.json` 约束。
 
@@ -75,13 +75,13 @@
 | 字段 | 内容 |
 |---|---|
 | 架构模块 | Data Plane Gateway（L1 推理流量入口，architecture.md 3.1 L1 / Dev-5） |
-| 当前代码路径 | `gateway/cmd/gateway/main.go`；`gateway/internal/{config,health,middleware,router,stream,upstream}/`（共 20 个 `.go` 文件，glob 核对）；`gateway/go.mod`（`github.com/Mekoforge/ForgeMesh/gateway`，go 1.22）；`gateway/Makefile`、`gateway/README.md` |
+| 当前代码路径 | `gateway/cmd/gateway/main.go`；`gateway/internal/{config,health,middleware,router,stream,upstream}/`（共 33 个 `.go` 文件，其中 17 个 `_test.go`，glob 核对）；`gateway/go.mod`（`github.com/Mekoforge/ForgeMesh/gateway`，go 1.22）；`gateway/Makefile`、`gateway/README.md` |
 | 核心契约 | `/api/v1/` REST + SSE 流式转发（见 openapi.yaml）；中间件链 `Recovery → Correlation → Authenticate → RateLimit → LimitRequestBody → Route`；API key 认证（ADR-014，`middleware/{authz,apikey}.go`）；上游解析 `upstream/resolver.go`（按命名空间解析 ready 实例、`protocol` → 实例推理路径、合并回源、健康摘流）；实例地址限制 `stream/addrpolicy.go` |
-| 运行形态 | 独立进程（Go 二进制），经 `FORGEMESH_UPSTREAM` 转发至控制平面 |
+| 运行形态 | 独立进程（Go 二进制），经 `GATEWAY_UPSTREAM_URL` 转发至控制平面 |
 | 数据所有权 | 无权威数据（运行态转发；端点解析缓存为派生数据） |
 | 允许依赖 | 控制平面 HTTP API（上游）、Go 标准库 |
 | 禁止依赖 | Python 进程内模块、直连 SQLite/数据库、任何插件、LLM SDK |
-| 测试路径 | `gateway/internal/` 下 8 个 `*_test.go`：`config_test.go`、`health_test.go`、`middleware/{authz,correlation,ratelimit}_test.go`、`router/router_test.go`、`stream/proxy_test.go`、`upstream/resolver_test.go` |
+| 测试路径 | `gateway/internal/` 下 17 个 `*_test.go`：`config_test.go`、`health_test.go`、`middleware/{apikey,authz,bodylimit,chain,correlation,ratelimit}_test.go`、`router/{auth,resolver,router,tenant_security}_test.go`、`stream/{addrpolicy,proxy,sse_cancel}_test.go`、`upstream/{client,resolver}_test.go`；CI 以 `-race` 运行 |
 | 状态 | 已实现且有测试覆盖（本机无 Go 工具链，`go test` 以 CI `go` job 为准；`find gateway -name "*.py"` = 0，纯 Go 已循证，见 3.4） |
 | 演进动作 | 保留；WP-D1 补多租户安全验证（tenant 绑定、Resolver 行为、SSE 取消、链序） |
 
@@ -300,7 +300,7 @@
 | 字段 | 内容 |
 |---|---|
 | 架构模块 | 开发工具链与持续集成 |
-| 当前代码路径 | `Makefile`（target：`install` / `deps` / `test` / `test-unit` / `test-contract` / `lint` / `fmt` / `clean`，实测核对）；根 `pyproject.toml`（**仅 ruff/pytest/coverage 工具配置，不含打包配置**——monorepo + PEP 420 命名空间包，各子包自带 pyproject）；`.github/workflows/ci.yml`（三 job：`python` 矩阵 lint+pytest、`go` build+test、`architecture-docs` 校验 OpenAPI/Schema/ADR）；`requirements-dev.txt`；根 `conftest.py`；`gateway/Makefile` |
+| 当前代码路径 | `Makefile`（target：`install` / `deps` / `test` / `test-unit` / `test-contract` / `lint` / `fmt` / `clean`，实测核对）；根 `pyproject.toml`（**仅 ruff/pytest/coverage 工具配置，不含打包配置**——monorepo + PEP 420 命名空间包，各子包自带 pyproject）；`.github/workflows/ci.yml`（四 job：`python` 矩阵 lint+pytest（未 await 的协程视为失败）、`go` gofmt+vet+build+`go test -race`、`compose-smoke` 构建镜像并端到端冒烟、`architecture-docs` 校验 OpenAPI/Schema/ADR）；`requirements-dev.txt`；根 `conftest.py`；`gateway/Makefile` |
 | 核心契约 | 子包统一模板（README「统一子包模板」+ CONTRIBUTING）；`requires-python >= 3.12` 基线（WP-A1.3 统一） |
 | 运行形态 | 开发期工具 + CI 流水线（push 触发，`ci-${{ github.ref }}` 分组去重） |
 | 数据所有权 | 无 |
@@ -315,15 +315,15 @@
 | 字段 | 内容 |
 |---|---|
 | 架构模块 | 部署拓扑与运维文档（L6 平台基础设施落地） |
-| 当前代码路径 | `deploy/docker/docker-compose.yaml`（postgres + control-plane + gateway，**声明为目标拓扑预置、暂不实际运行**，含 ADR-013 单实例注记）；`deploy/kubernetes/{namespace,control-plane-deployment}.yaml`（replicas: 1，镜像 `0.0.1` 占位）；`docs/operations/backup-restore.md`（RPO≤5min / RTO≤15min、在线备份与恢复演练）；示例 `examples/single-node/{inference-service,plugin-vllm}.yaml`、`examples/multi-tenant/tenant-quota.yaml` |
-| 核心契约 | ADR-013 单控制平面实例约束（k8s 清单 `replicas: 1` 与之一致）；docker-compose 头注释明确"阶段 0 目标拓扑，控制平面不连接数据库" |
-| 运行形态 | 部署工件（YAML）+ 运维文档（Markdown） |
-| 数据所有权 | 无（pgdata 卷属目标态预置，当前未启用） |
+| 当前代码路径 | `deploy/docker/{Dockerfile.control-plane,Dockerfile.gateway}`（均以非 root 用户运行：控制平面 uid 10001，网关 distroless `nonroot`）与根目录 `.dockerignore`；`deploy/docker/docker-compose.yaml`（control-plane + gateway，只发布在 127.0.0.1；postgres 在 `postgres` profile 中、默认不启动；含 ADR-013 单实例注记）；`deploy/kubernetes/{namespace,control-plane-deployment}.yaml`（replicas: 1、`strategy: Recreate`、数据库在 PVC 上、key 文件来自 Secret `forgemesh-api-keys`）；`scripts/compose_smoke.sh`；`docs/operations/backup-restore.md`（RPO≤5min / RTO≤15min、在线备份与恢复演练）；示例 `examples/single-node/{inference-service,plugin-vllm}.yaml`、`examples/multi-tenant/tenant-quota.yaml` |
+| 核心契约 | ADR-013 单控制平面实例约束：compose 不扩展 control-plane；k8s 清单 `replicas: 1` 且更新策略为 `Recreate`（旧 Pod 退出后才启动新 Pod，更新期间不会有两个写者）；控制平面只使用 SQLite，postgres 为目标态预置 |
+| 运行形态 | 容器镜像（Dockerfile）+ 部署工件（YAML）+ 运维文档（Markdown） |
+| 数据所有权 | 无；控制平面的 SQLite 库位于 compose 卷 `control-plane-data` / k8s PVC `forgemesh-control-plane-data`（pgdata 卷属目标态预置，仅 `postgres` profile 使用） |
 | 允许依赖 | — |
 | 禁止依赖 | —（约束：部署不得暗示多副本写同一 SQLite） |
-| 测试路径 | 无自动化测试（部署工件以评审/文档核验为主）；备份恢复有人工演练清单 |
-| 状态 | **部分计划中**：compose/k8s 为目标拓扑预置（占位镜像）；`Dockerfile.control-plane` 被 compose 引用但**不存在**（偏差 D2）；运维文档已交付 |
-| 演进动作 | 改文档 + 补工件：提供 Dockerfile 或移除 compose 引用（D2）；A1.5 已核对部署文档含单实例约束；目标态 PostgreSQL 部署属阶段 F |
+| 测试路径 | `scripts/compose_smoke.sh`（CI `compose-smoke` job：构建镜像，经网关验证无 key 返回 401、创建与读取 `InferenceService`、控制器写入 `SchedulerUnavailable`，重启控制平面后数据仍在）；k8s 清单无自动化测试；备份恢复有人工演练清单 |
+| 状态 | compose 已实现且有测试覆盖；k8s 清单实现待核验（无自动化测试，尚未提供网关清单、ServiceAccount、NetworkPolicy）；运维文档已交付 |
+| 演进动作 | k8s 补网关清单、ServiceAccount 与 NetworkPolicy；A1.5 已核对部署文档含单实例约束；目标态 PostgreSQL 部署属阶段 F |
 
 ---
 
@@ -372,12 +372,12 @@ grep -rn "controlplane" packages/node-agent/src/ --include="*.py" | grep -v egg-
 
 ```bash
 ls gateway/*.go gateway/cmd/... 2>/dev/null | head   # 根级无 *.go，代码在 cmd/ 与 internal/
-find gateway -name "*.go" | wc -l                     # → 20
+find gateway -name "*.go" | wc -l                     # → 33
 find gateway -name "*.py" -o -name "requirements*.txt" | wc -l   # → 0
 cat gateway/go.mod                                     # module github.com/Mekoforge/ForgeMesh/gateway (go 1.22)
 ```
 
-**输出：** 20 个 `.go`（含 8 个 `_test.go`）、0 个 `.py`、无 Python 依赖清单；`go.mod` 无任何第三方 require（仅标准库 + go 1.22）。
+**输出：** 33 个 `.go`（含 17 个 `_test.go`）、0 个 `.py`、无 Python 依赖清单；`go.mod` 无任何第三方 require（仅标准库 + go 1.22）。
 
 **结论：✅ 符合** —— 网关与 Python 控制平面为进程边界隔离（HTTP 上游），无语言互操作。
 
@@ -423,9 +423,8 @@ grep -rn "decision_rules\|gpu_nvidia\|runtime_vllm\|workflow_temporal" \
 | 编号 | 偏差 | 证据 | 影响 | 建议处置 |
 |---|---|---|---|---|
 | **D1** | 决策记录的契约与 SQLite 存储实现共存于 API 包：`decision-api` 导入 `sqlite3`，违反"契约包不依赖 DB 驱动"的边界规则 | 扫描一命中：`packages/decision-api/src/forgemesh/decision/records.py:18`（`DecisionRecord` + `DecisionRecordStore` 同文件） | 边界纯度受损；存储演进（如 PostgreSQL 迁移）将波及 API 包；属标准库依赖，无外部供应链风险 | **有证据后重构**：将 `DecisionRecordStore` 迁至控制平面实现层（与 `SQLiteRegistry` 同域），API 包仅保留 `DecisionRecord` 模型与存储接口；需 ADR 评审与迁移测试，不属 v1.1 强制项 |
-| **D2** | 部署工件缺失：`deploy/docker/docker-compose.yaml` 的 `control-plane.build.dockerfile` 引用 `deploy/docker/Dockerfile.control-plane`，该文件不存在 | `ls deploy/docker/Dockerfile.control-plane` → EXIT=1；compose 中镜像 `forgemesh/control-plane:0.0.1` 为占位 | `docker compose build` 不可用；与 compose 头部"目标拓扑预置、暂不实际运行"声明一致，故为**已知占位**而非失真 | **补工件或改文档**：要么补 Dockerfile（进入阶段 F），要么在 compose 注释中显式标注 Dockerfile 未提供（A1.5 部署核对时一并处理） |
 
-> 备注两条（不计入偏差）：① compose 中 `control-plane` `depends_on: postgres (service_healthy)` 为目标拓扑依赖，与 ADR-013"当前不连接数据库"的差异已在 compose 头注释声明；② `agent.proto` 为 `v1alpha1` 草案（timestamp 用 RFC 3339 字符串），正式化时机由演进决定。
+> 备注（不计入偏差）：`agent.proto` 为 `v1alpha1` 草案（timestamp 用 RFC 3339 字符串），正式化时机由演进决定。
 
 ---
 

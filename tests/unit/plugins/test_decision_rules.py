@@ -5,8 +5,6 @@
 * ``Rule`` 匹配（条件 True/False）与候选转换。
 * ``RulesProvider.decide``：多规则匹配、无匹配返回空、provider_id/version。
 * 与 ``DecisionRouter`` 集成：主 Provider 返回候选 → 路由成功。
-
-兼容 Python 3.9+。
 """
 
 from __future__ import annotations
@@ -25,7 +23,7 @@ from forgemesh.decision.router import DecisionRouter
 
 @pytest.fixture(autouse=True)
 def _fresh_event_loop():
-    """为每个测试提供干净的 current event loop（兼容 3.9–3.12）。"""
+    """为每个测试提供干净的 current event loop。"""
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     try:

@@ -16,8 +16,6 @@
 
 生命周期转移表直接复用契约 :data:`forgemesh.plugin.manifest.PLUGIN_TRANSITIONS`，
 非法转移抛 :class:`forgemesh.core.errors.InvalidStateTransition`。
-
-兼容 Python 3.9+。
 """
 
 from __future__ import annotations

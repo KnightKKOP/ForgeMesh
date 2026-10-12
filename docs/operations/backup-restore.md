@@ -29,7 +29,7 @@ ForgeMesh 控制平面（`forgemesh-control-plane`）把权威状态存放在**�
 依据 [ADR-013](../design-decisions/adr-013.md)，v1.0.x 权威存储为 SQLite，部署形态为**单控制平面实例**，以下约束为硬性要求：
 
 - **不得启动多个并发写同一 SQLite 权威库的控制平面实例**：SQLite 单文件写锁与 WAL 模式均以单写者为前提，多实例并发写同一库会导致锁竞争（`database is locked`）甚至数据损坏。
-- 部署编排中 control-plane 服务**不得扩展 replicas**（见 `deploy/docker/docker-compose.yaml` 顶部注释）；多实例部署（高可用/水平扩展）须先满足 ADR-013 的 PostgreSQL 迁移判据并完成迁移。
+- 部署编排中 control-plane 服务**不得扩展 replicas**（见 `deploy/docker/docker-compose.yaml` 顶部注释）；Kubernetes 清单固定 `replicas: 1`，并以 `strategy: Recreate` 避免滚动更新期间新旧 Pod 同时写库。多实例部署（高可用/水平扩展）须先满足 ADR-013 的 PostgreSQL 迁移判据并完成迁移。
 - **升级流程**（与本文备份/恢复流程配套）：**停写**（停止控制平面进程）→ **备份**（见 2.2 节）→ **升级**（替换二进制/镜像并应用变更）→ **恢复**（重启进程并验证 `/healthz` 与数据一致性）。
 
 ---
@@ -42,7 +42,7 @@ ForgeMesh 控制平面（`forgemesh-control-plane`）把权威状态存放在**�
 
 - 运行期间已提交的事务可能只在 `-wal` 里。**不要用 `cp` / `rsync` 复制运行中的数据库文件**：复制出的主库缺少这部分事务，复制途中发生的自动 checkpoint 还会改写主库文件，备份可能前后不一致甚至损坏。先执行 `PRAGMA wal_checkpoint` 再复制同样不安全：checkpoint 与复制之间、复制过程中控制平面仍在提交。
 - 主库文件与 `-wal` / `-shm` 是一个整体，移动、删除、恢复时一起处理（见第 3 节）。
-- 数据库放在本地磁盘上：WAL 依赖共享内存文件 `-shm`，不支持 NFS / SMB 等网络文件系统。
+- 数据库放在本地磁盘上：WAL 依赖共享内存文件 `-shm`，不支持 NFS / SMB 等网络文件系统。Kubernetes 上 PVC 的 StorageClass 应是块存储（云盘等），不能是 NFS 类的共享文件系统。
 
 确认数据库处于 WAL 模式：
 
@@ -161,6 +161,28 @@ async def backup_database(db_path: Path, backup_dir: Path) -> Path:
     return await asyncio.to_thread(_backup)
 ```
 
+### 2.5 容器部署中的备份
+
+控制平面镜像不含 `sqlite3` 命令行工具，根文件系统只读，2.2 的脚本无法在容器内运行。在容器内用备份 API 把快照写到数据卷上（数据卷需留出与数据库同样大小的空间），取出后在宿主机上校验：
+
+```bash
+compose=(docker compose -f deploy/docker/docker-compose.yaml)
+"${compose[@]}" exec control-plane python -c "
+import sqlite3
+src = sqlite3.connect('/var/lib/forgemesh/forgemesh.db')
+dst = sqlite3.connect('/var/lib/forgemesh/backup.db')
+src.backup(dst)
+dst.close()
+src.close()
+"
+"${compose[@]}" cp control-plane:/var/lib/forgemesh/backup.db ./forgemesh-backup.db
+"${compose[@]}" exec control-plane rm /var/lib/forgemesh/backup.db
+sqlite3 ./forgemesh-backup.db "PRAGMA integrity_check;"   # 输出必须为 ok
+sha256sum ./forgemesh-backup.db > ./forgemesh-backup.db.sha256
+```
+
+Kubernetes 上用 `kubectl -n forgemesh exec deploy/forgemesh-control-plane -- python -c "…"` 执行同样的快照命令，再用 `kubectl -n forgemesh cp <pod>:/var/lib/forgemesh/backup.db ./forgemesh-backup.db` 取出（`kubectl cp` 需要 Pod 名称；它依赖的 `tar` 在镜像中）。
+
 ---
 
 ## 3. 恢复流程
@@ -238,6 +260,31 @@ curl -sf http://localhost:8080/healthz | jq .
 curl -sf http://localhost:8080/readyz | jq .
 ```
 
+### 3.4 容器部署中的恢复
+
+容器内同样用备份 API 写回：SQLite 打开目标库时会先处理遗留的 `-wal`，写回在一个事务内完成，不会出现 3.1 第 7 步所说的 WAL 错配。先按 3.1 第 3、4 步在宿主机上校验备份文件，把它放在 `./restore/` 下（对 uid 10001 可读，例如权限 0644）：
+
+```bash
+compose=(docker compose -f deploy/docker/docker-compose.yaml)
+"${compose[@]}" stop control-plane
+# 保留当前数据目录（含可能存在的 -wal / -shm）
+"${compose[@]}" cp control-plane:/var/lib/forgemesh ./forgemesh-data.broken
+# 一次性容器挂载同一个数据卷。备份 API 生成的文件仍标记为 WAL 模式，
+# 不加 immutable=1 时 SQLite 要在只读的 /restore 中创建 -wal / -shm，打开即失败
+"${compose[@]}" run --rm --no-deps -v "$PWD/restore:/restore:ro" control-plane python -c "
+import sqlite3
+src = sqlite3.connect('file:/restore/forgemesh-backup.db?immutable=1', uri=True)
+dst = sqlite3.connect('/var/lib/forgemesh/forgemesh.db')
+src.backup(dst)
+dst.close()
+src.close()
+"
+"${compose[@]}" up --detach --wait control-plane   # 等 /readyz 健康检查通过
+curl -sf http://127.0.0.1:8080/readyz
+```
+
+Kubernetes 上先 `kubectl -n forgemesh scale deploy/forgemesh-control-plane --replicas=0` 并等 Pod 退出，再启动一个挂载 PVC `forgemesh-control-plane-data`、以 uid 10001 运行的临时 Pod（同一镜像，命令如 `sleep infinity`）：用 `kubectl cp` 取出 `/var/lib/forgemesh` 保留当前数据、把备份文件复制到它的 `/tmp`，`kubectl exec` 执行上面的恢复命令（源路径改为 `/tmp/forgemesh-backup.db`），删除临时 Pod 后把副本数改回 1。
+
 ---
 
 ## 4. 灾备演练检查清单
@@ -252,7 +299,7 @@ curl -sf http://localhost:8080/readyz | jq .
 
 ### 4.2 备份验证
 
-- [ ] 控制平面运行且有写入时，执行 `forgemesh-backup.sh` 生成一份备份
+- [ ] 控制平面运行且有写入时，执行 `forgemesh-backup.sh` 生成一份备份（容器部署按 2.5 节）
 - [ ] 验证备份文件摘要：`sha256sum -c <backup>.db.sha256` 通过
 - [ ] 验证备份完整性：`PRAGMA integrity_check` 返回 `ok`
 - [ ] 验证备份可打开：`sqlite3 <backup>.db ".tables"` 列出 `allocations`、`processed_dedup_keys`、`resource_changes`、`resources`
@@ -261,7 +308,7 @@ curl -sf http://localhost:8080/readyz | jq .
 ### 4.3 恢复验证
 
 - [ ] 停止控制平面进程
-- [ ] 执行 `forgemesh-restore.sh` 恢复控制平面数据库
+- [ ] 执行 `forgemesh-restore.sh` 恢复控制平面数据库（容器部署按 3.4 节）
 - [ ] 启动控制平面进程
 - [ ] `/healthz` 探针返回 200
 - [ ] `/readyz` 探针返回 200

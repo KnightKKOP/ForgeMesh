@@ -53,8 +53,6 @@ Active 分配」；``release_allocation`` 走 ``ALLOCATION_STATE_MACHINE`` 校�
 :class:`~forgemesh.core.errors.NotFoundError`，不泄露存在性。
 :meth:`SQLiteRegistry.list_resource_keys` 与 :meth:`SQLiteRegistry.changes_since`
 是例外：它们跨租户返回资源键，仅供控制平面内部的控制器使用，不得暴露给 API。
-
-兼容 Python 3.9+。
 """
 
 from __future__ import annotations

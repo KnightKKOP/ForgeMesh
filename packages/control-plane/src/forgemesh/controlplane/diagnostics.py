@@ -14,8 +14,6 @@
   递归替换为 ``"***"``。
 * **correlation_id 累计贯穿**：collect 优先复用 :class:`CorrelationContext`
   中的 correlation_id，否则生成新 ID，写入 bundle 并贯穿全链路。
-
-兼容 Python 3.9+（运行环境 3.12）。
 """
 
 from __future__ import annotations

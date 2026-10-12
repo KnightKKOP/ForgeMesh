@@ -20,9 +20,13 @@
 - 控制器：控制平面在应用启动（lifespan）时运行 `ControllerManager`，自动协调 `InferenceService` 并回写 `status`。Registry 每次写入时在同一事务中追加一条 `resource_changes` 变更记录，控制器按序号增量读取并清理已读记录；启动时全量重建工作队列，另每 10 分钟全量同步一次。工作队列按资源去重、支持延迟重试，失败时指数退避；`status` 以 `resource_version` 做 CAS 写入，去重键在写入成功之后才登记。控制器是单写者（ADR-013），应用只能以单进程运行。
 - Registry status 子资源写入 `update_status`：只修改 `conditions` / `phase` / `observedGeneration`，不递增 `generation`；条件按 `type` 合并，`status` 不变时保留 `lastTransitionTime`；支持以 `resource_version` 做 CAS，未建模的 payload 字段原样保留。另新增 `get_with_phase`、`list_resource_keys`、`changes_since`、`latest_change_seq`、`prune_changes`。
 - `ReconciliationController` 新增 `record_dedup_keys` 参数与 `mark_processed()`：调用方可以在持久化 `status` 之后再登记去重键。
-- `InferenceServiceStatus.endpoints`：每个实例包含 `url`（http/https 基地址，不含凭证、查询串与片段）、`ready`（默认 `true`）、可选的 `instanceId` 与 `protocol`（`openai-chat` / `tgi-generate`），资源模型、JSON Schema 与 OpenAPI 一致；`update_status` 可以整体替换 `endpoints`，写入前逐项校验。
+- `InferenceServiceStatus.endpoints`：每个实例包含 `url`（http/https 基地址，不含凭证、查询串与片段）、`ready`（默认 `true`）、可选的 `instanceId`，以及必填的 `protocol`（`openai-chat` / `tgi-generate`），资源模型、JSON Schema 与 OpenAPI 一致；`update_status` 可以整体替换 `endpoints`，写入前逐项校验。
 - 网关新增带命名空间的推理路由 `/api/v1/namespaces/{ns}/inference/{svc}/chat`：Resolver 以 `?namespace=` 查询控制平面，缓存按租户与命名空间隔离；`/api/v1/inference/{svc}/chat` 继续解析不带命名空间的服务。
 - 网关请求体上限 `GATEWAY_MAX_REQUEST_BODY_BYTES`（默认 10 MiB）：声明的 `Content-Length` 超限时直接返回 `413 REQUEST_TOO_LARGE`，不访问上游；分块传输的请求体读到上限时同样返回 `413`，不计实例失败。
+- 容器镜像：`deploy/docker/Dockerfile.control-plane`（控制平面，以 uid 10001 运行）与 `deploy/docker/Dockerfile.gateway`（静态编译的网关，distroless `nonroot` 用户）；根目录 `.dockerignore` 只把 `packages/` 与 `gateway/` 送入构建上下文。
+- `scripts/compose_smoke.sh` 端到端冒烟：构建镜像并按 compose 启动，经网关验证无 key 返回 `401`、创建与读取推理服务、控制器写入 `status`，重启控制平面后资源仍在。CI 新增 `compose-smoke` job 执行该脚本。
+- CI `go` job 新增 `gofmt` 检查与 `go vet`，网关测试改以 `-race` 运行。
+- [docs/operations/backup-restore.md](docs/operations/backup-restore.md) 新增容器部署中的备份与恢复（2.5 / 3.4 节）：镜像不含 `sqlite3` 命令行、根文件系统只读，改在容器内用备份 API 生成快照并写回；Kubernetes 上 PVC 应使用块存储。
 
 ### Changed
 
@@ -42,6 +46,12 @@
 - 网关 Resolver 合并同一服务的并发未命中，只查询一次控制平面，查询不随发起它的请求取消；"服务不存在 / 未就绪 / 无可用实例"缓存 1 秒（不超过 `GATEWAY_RESOLVER_TTL_SECONDS`），`403`、其他控制平面错误与网络错误仍不缓存。
 - 控制平面的 SQLite 存储（Registry、去重键、任务、审计、Outbox）统一以 WAL 模式打开并启用外键约束（`forgemesh.controlplane.sqlite.connect`）。此前为回滚日志模式，而 Registry 与去重键存储共用同一个文件：一个连接上的读事务未结束时，另一个连接的提交只能等待，超过 5 秒以 `database is locked` 失败。运行期间数据库文件旁会有 `-wal` / `-shm` 文件，不能直接复制文件做备份；`synchronous` 保持 `FULL`。
 - 去重键存储 `ProcessedKeyStore` 不再在每次 `seen` / `mark` 时删除过期键并提交：`seen` 不报告超过 TTL 的键，过期键最多每 `min(TTL, 60 秒)` 删除一次，启动后的第一次调用即清理上次运行留下的过期键。
+- `deploy/docker/docker-compose.yaml` 改为可运行的本地拓扑：control-plane 与 gateway 从本仓库的 Dockerfile 构建，共用 compose secret 中的 key 文件 `deploy/docker/api-keys.json`（需事先生成，已加入 `.gitignore`），只发布在 `127.0.0.1`，以只读根文件系统、去掉全部 capability 运行；gateway 在控制平面 `/readyz` 通过后才启动；控制平面数据库在卷 `control-plane-data` 中；postgres 移入 `postgres` profile，默认不启动；移除过时的 `version` 键。
+- Kubernetes 控制平面清单：数据库放在 PVC `forgemesh-control-plane-data`（ReadWriteOnce）上，更新策略为 `Recreate`；key 文件来自 Secret `forgemesh-api-keys`（键名 `api-keys.json`，部署前需创建）；Pod 以 uid 10001、只读根文件系统运行，不挂载 ServiceAccount token。
+- pytest 把 `RuntimeWarning` 与 `PytestUnraisableExceptionWarning` 视为错误：协程未被 await 时被调用的代码实际没有执行，测试现在会失败，而不是只打印一条警告。
+- README 与 CONTRIBUTING 的安装命令改为 `make install`：在仓库根目录执行 `uv sync` 只会创建一个空的虚拟环境，随后 `make test` 找不到 pytest。README 目录树列出全部 10 个插件，并补充容器部署说明。
+- [docs/architecture/module-mapping.md](docs/architecture/module-mapping.md)：更正网关文件与测试数量（33 / 17）和上游变量名（`GATEWAY_UPSTREAM_URL`），部署小节与 CI 小节按当前工件更新，偏差 D2 处置后移除。
+- 删除源码与测试 docstring 中「兼容 Python 3.9+」/「兼容 3.9–3.12」的说法（各子包 `requires-python` 已是 `>=3.12`，代码使用 `X | None` 与 `enum.StrEnum`，在 3.9 上无法导入）；CONTRIBUTING 的类型注解约定改为与 ruff `UP` 规则一致的 `list[X]` / `X | None`。
 
 ### Deprecated
 
@@ -62,10 +72,14 @@
 - 调和器在没有注入调度器或工作流运行时的情况下跳过分配与部署、登记去重键并报告 `Ready=True`（`Reconciled`），实际什么都没做：现在任何副作用之前检查，返回 `Ready=False`，原因为 `SchedulerUnavailable` 或 `WorkflowRuntimeUnavailable`，且不登记去重键。目前仓库没有调度器实现，默认部署中新建的服务会停在 `Pending` 并带有 `Ready=False`（`SchedulerUnavailable`）。
 - 网关把入站路径原样拼接到实例地址，请求以 `/api/v1/inference/{svc}/chat` 到达推理运行时，而 vLLM 与 TGI 都不提供这个路径：现按实例的 `protocol` 转发到 `/v1/chat/completions`（`openai-chat`）或 `/generate_stream`（`tgi-generate`），查询串保留。
 - 网关解析推理服务时不带命名空间，控制平面因此只查找不带命名空间的服务，带命名空间的服务无法经网关调用：现由带命名空间的路由解析（见 Added）。
+- OpenAPI 没有描述 `GET` / `DELETE /api/v1/inference-services/{name}` 的 `namespace` 查询参数，而实现一直支持它，网关解析带命名空间的服务时也依赖它：现已补上，并写明省略时指不带命名空间的资源（列表接口省略时则不按命名空间过滤）。
 - 网关 `/readyz` 只对上游做 TCP 拨号，控制平面的权威存储不可用（其 `/readyz` 返回 `503`）或端口被其他进程占用时仍报告就绪：现请求控制平面的 `/readyz`，返回 `200` 才就绪，否则返回 `503`（`upstream not ready` / `upstream unreachable`）。
 - 推理实例返回错误（如 vLLM 对非法参数返回 `400` JSON）时，网关把响应的 `Content-Type` 改成 `text/event-stream`：现只对 2xx 响应这样设置，错误响应保留实例的 `Content-Type`。
 - [docs/operations/backup-restore.md](docs/operations/backup-restore.md) 的热备份方法「`PRAGMA wal_checkpoint(TRUNCATE)` 后 `cp` 主库文件」在控制平面写入期间不安全：复制途中的自动 checkpoint 会改写主库文件，备份可能不一致甚至损坏；脚本只看 `PRAGMA integrity_check` 的退出码，而 `sqlite3` 检查出损坏时同样返回 `0`。现改为 `VACUUM INTO`（脚本）/ `Connection.backup`（Python）在线快照，校验输出必须为 `ok`，数据库路径不存在时报错，而不是备份一个新建的空库。
 - 备份文档列出的 `data/registry.db` / `audit.db` / `decisions.db` 并不存在，控制平面的权威状态只在 `FORGEMESH_DB_PATH` 一个文件中。恢复时旧库的 `-wal` / `-shm` 随旧库一起改名保留（`-wal` 中可能有尚未合并回主库的已提交事务），全量恢复示例改为先停止、再启动控制平面。
+- compose 拓扑无法运行（module-mapping 偏差 D2）：引用的 `Dockerfile.control-plane` 不存在，gateway 没有构建配置；compose 设置的 `FORGEMESH_UPSTREAM` 网关并不读取（网关读取 `GATEWAY_UPSTREAM_URL`），端口写成 `8000`（网关监听 `8081`）；控制平面默认只监听容器内的回环地址，网关访问不到；数据库写在容器文件系统中，重建容器即丢失；控制平面依赖它并不使用的 postgres，postgres 以默认口令发布在所有网卡上。现改为见 Changed。
+- Kubernetes 控制平面清单把数据库写在容器文件系统中，Pod 重建即丢失全部资源；默认的 `RollingUpdate` 在更新期间同时运行新旧两个 Pod，违反 ADR-013 的单写者约束；控制平面默认只监听回环地址，kubelet 探针访问不到。现改为 PVC + `Recreate`，并设置 `FORGEMESH_HOST=0.0.0.0`（见 Changed）。
+- `tests/unit/controlplane/test_registry.py` 有两处 `reg.close()` 未被 await，关闭逻辑从未执行。
 
 ### Security
 

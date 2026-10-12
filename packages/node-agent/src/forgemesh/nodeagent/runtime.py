@@ -7,7 +7,7 @@
 
 本模块为内存管理器（不拉起真实进程），适合在 Node Agent 内部维护运行时拓扑并
 向控制平面上报。对齐 architecture 10.1（Node Agent 受控执行）与 ADR-011（版本固定）。
-兼容 Python 3.9+ / Pydantic v2。
+基于 Pydantic v2。
 """
 
 from __future__ import annotations

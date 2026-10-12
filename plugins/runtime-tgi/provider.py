@@ -24,7 +24,7 @@ TGI 特定参数：
 * **契约一致性**：与 runtime-vllm 行为一致（deploy → verify → release 闭环）。
 * **测试友好**：实例启动器、HTTP 客户端、租约释放与分配核验函数均可注入 mock。
 
-兼容 Python 3.9+ / Pydantic v2。
+基于 Pydantic v2。
 """
 
 from __future__ import annotations

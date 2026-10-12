@@ -9,8 +9,6 @@
 * 以 ``"{tenant_id}:{resource_type}"`` 为键存储 :class:`QuotaLimit`，强制多租户隔离。
 * :meth:`QuotaPolicy.consume` 在锁内完成「检查 + 递增」，避免 check-then-act 竞态。
 * :meth:`QuotaPolicy.get_usage` 返回副本，防止外部修改内部状态。
-
-兼容 Python 3.9+。
 """
 from __future__ import annotations
 

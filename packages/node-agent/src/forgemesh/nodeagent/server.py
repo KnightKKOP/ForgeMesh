@@ -15,7 +15,7 @@
 单元测试中引入真实网络依赖。
 
 对齐 architecture 10.1（Node Agent 受控注册）与 ADR-009（最小权限/类型化任务）。
-兼容 Python 3.9+ / Pydantic v2。
+基于 Pydantic v2。
 """
 
 from __future__ import annotations

@@ -10,7 +10,7 @@
 * **可诊断**：失败时携带 ``details``，便于运维定位。
 * **测试友好**：各检查函数可注入 mock。
 
-兼容 Python 3.9+ / Pydantic v2。
+基于 Pydantic v2。
 """
 
 from __future__ import annotations

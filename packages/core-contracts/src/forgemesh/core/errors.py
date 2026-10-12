@@ -10,8 +10,6 @@
 * ``ForbiddenError``   —— 鉴权/准入被拒绝（Policy deny）。
 * ``PreconditionFailedError`` —— 前置条件不满足（如需要审批、版本漂移后 spec 已变）。
 * ``InvalidStateTransition``  —— 状态机非法转移（对齐 workflow/resource 状态机）。
-
-兼容 Python 3.9+。
 """
 
 from __future__ import annotations

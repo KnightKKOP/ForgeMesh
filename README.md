@@ -69,9 +69,10 @@ forgemesh/
 │   └── cli/                    # 命令行工具
 │
 ├── gateway/                    # Go 高性能网关（REST / 流式代理 / 健康检查）
-├── plugins/                    # 可插拔能力实现（9 个插件）
+├── plugins/                    # 可插拔能力实现（10 个插件）
 │   ├── decision-rules/         # 确定性规则决策 Provider
 │   ├── decision-jev/           # JEV 类型化决策 Provider
+│   ├── decision-typesafe-jev/  # TypeSafe AI Jev 决策 Provider
 │   ├── workflow-reference/     # 参考工作流执行器
 │   ├── workflow-temporal/      # Temporal 工作流 Provider
 │   ├── gpu-nvidia/             # NVIDIA GPU Provider（发现 / 预检 / 健康 / MIG / 异构）
@@ -79,7 +80,7 @@ forgemesh/
 │   ├── runtime-tgi/            # TGI 推理 Runtime Provider
 │   ├── qos-basic/              # QoS 优先级与限流插件
 │   └── metering-basic/         # Token 计量插件
-├── deploy/                     # docker / kubernetes / observability
+├── deploy/                     # docker（Dockerfile / compose）/ kubernetes
 ├── tests/                      # unit / contract / compat / e2e / chaos / security
 ├── examples/                   # single-node / multi-node / multi-tenant 示例
 ├── scripts/                    # CI 校验脚本（manifest/OpenAPI/元数据/插件冒烟）
@@ -104,9 +105,9 @@ forgemesh/
 ### 环境要求
 
 - Python **3.12+**（CI 覆盖 3.12）
-- **uv**（Python 包管理器，替代 pip/venv）
 - GNU Make
 - Go **1.22+**（仅当需要开发/构建 `gateway/` 时）
+- Docker 与 Docker Compose v2（仅容器部署时）
 - Git
 
 ### 安装与测试
@@ -117,7 +118,7 @@ git clone git@github.com:Mekoforge/ForgeMesh.git
 cd ForgeMesh
 
 # 2. 安装全部子包（editable）+ 开发依赖
-uv sync          # 或 make install
+make install
 
 # 3. 运行全部测试
 make test
@@ -133,7 +134,7 @@ make fmt             # ruff 自动修复与格式化
 make clean           # 清理构建与缓存产物
 ```
 
-> `make install` 会遍历 `packages/*/`，对含 `pyproject.toml` 的子包执行 `uv pip install -e`，因此新增子包无需修改顶层 Makefile。
+> `make install` 会创建 `.venv`，遍历 `packages/*/`，对含 `pyproject.toml` 的子包执行 `pip install --no-deps -e`，因此新增子包无需修改顶层 Makefile。
 
 ### 运行控制平面
 
@@ -174,6 +175,20 @@ make run-dev        # dev 模式：信任租户请求头，只监听 127.0.0.1:8
 ```
 
 > 网关默认不连接回环、链路本地与云元数据地址上的推理实例。实例运行在本机时设置 `GATEWAY_INSTANCE_ALLOWED_CIDRS=127.0.0.0/8,::1/128`（`make run-dev` 已设置），见 [gateway/README.md](gateway/README.md)「实例地址限制」。
+
+### 容器部署
+
+```bash
+# 1. 生成 key（同上），把 key 文件写到 deploy/docker/api-keys.json（已在 .gitignore 中），
+#    权限设为 0644：两个容器都以非 root 用户读取它
+# 2. 构建镜像并启动控制平面与网关（都只发布在 127.0.0.1）
+docker compose -f deploy/docker/docker-compose.yaml up --build
+curl -s -H "Authorization: Bearer fmk_…" http://127.0.0.1:8081/api/v1/inference-services
+
+scripts/compose_smoke.sh   # 端到端冒烟（CI 同样执行）
+```
+
+控制平面的 SQLite 数据库在 compose 卷 `control-plane-data` 中。Kubernetes 清单见 `deploy/kubernetes/`：数据库放在 PersistentVolumeClaim 上，key 文件来自 Secret `forgemesh-api-keys`，更新策略为 `Recreate`，保证任何时刻只有一个控制平面写数据库（ADR-013）。容器中的备份与恢复见 [备份与灾备演练](docs/operations/backup-restore.md) 2.5 / 3.4 节。
 
 ---
 

@@ -14,7 +14,7 @@
 ``metadata.resourceVersion`` 为乐观并发 CAS 依据，每次成功写入递增。本模块的
 :meth:`Resource.with_generation_bump` 提供不可变的 generation 递增（返回副本）。
 
-兼容 Python 3.9+ / Pydantic v2。
+基于 Pydantic v2。
 """
 
 from __future__ import annotations

@@ -22,7 +22,7 @@
 * **FastAPI 可选兜底**：若运行环境未安装 FastAPI，回退到纯标准库
   ``http.server``，仅提供探针与 501 占位。
 
-兼容 Python 3.9+ / Pydantic v2。
+基于 Pydantic v2。
 """
 
 from __future__ import annotations

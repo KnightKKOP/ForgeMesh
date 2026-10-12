@@ -5,8 +5,6 @@
 
 对齐 development-plan 5.4 / ADR-003。本插件不产出资源终态（INV-1/INV-3），
 任何状态写入必须经 Registry 由 Controller 完成。
-
-兼容 Python 3.9+。
 """
 
 from __future__ import annotations

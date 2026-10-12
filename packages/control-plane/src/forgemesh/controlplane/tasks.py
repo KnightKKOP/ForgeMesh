@@ -12,8 +12,6 @@
   :func:`asyncio.to_thread` 包装同步 sqlite3 调用，``check_same_thread=False``。
 * **去重器**：:class:`TaskDeduplicator` 提供进程内轻量去重（与 SQLite 幂等互补，
   用于下发前的快速判重）。
-
-兼容 Python 3.9+（运行环境 3.12，使用 :class:`enum.StrEnum`）。
 """
 
 from __future__ import annotations

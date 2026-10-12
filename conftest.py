@@ -6,8 +6,6 @@
 做法：以 ``pathlib`` 动态发现 ``<repo_root>/packages/*/src`` 目录，并将
 其绝对路径前置注入 ``sys.path``。该注入在 conftest 模块导入时立即生效，
 早于任何测试模块的收集与导入。
-
-兼容 Python 3.9+。
 """
 
 from __future__ import annotations

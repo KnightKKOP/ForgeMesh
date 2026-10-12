@@ -8,8 +8,6 @@
 
 根级 ``conftest.py`` 已将 ``packages/*/src`` 注入 ``sys.path``，故
 ``forgemesh.decision.*`` / ``forgemesh.resource.*`` 在本 conftest 执行时已可导入。
-
-兼容 Python 3.9+。
 """
 
 from __future__ import annotations

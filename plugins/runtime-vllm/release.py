@@ -14,7 +14,7 @@
 * **不虚占**：``verify_allocation`` 检查设备实际状态，而非仅信任租约释放返回值。
 * **测试友好**：租约释放与分配核验函数均可注入 mock。
 
-兼容 Python 3.9+ / Pydantic v2。
+基于 Pydantic v2。
 """
 
 from __future__ import annotations

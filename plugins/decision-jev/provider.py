@@ -18,8 +18,6 @@ JEV 表达式语法::
     {"and": [expr1, expr2]}                     → all(expr_i)
     {"or":  [expr1, expr2]}                     → any(expr_i)
     {"not": expr}                               → not expr
-
-兼容 Python 3.9+。
 """
 
 from __future__ import annotations

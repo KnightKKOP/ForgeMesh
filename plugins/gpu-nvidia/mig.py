@@ -20,7 +20,7 @@
                      Healthy / Degraded ──destroy──▶ Destroyed
                      Healthy ⇄ Degraded（健康检查可反复执行）
 
-兼容 Python 3.9+ / Pydantic v2。
+基于 Pydantic v2。
 """
 
 from __future__ import annotations

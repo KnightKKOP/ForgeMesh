@@ -13,8 +13,6 @@
   最后一次错误。
 * **超时**：步骤超时抛 :class:`ExecutionError`（``timeout_level=STEP``）；
   工作流超时抛 :class:`ExecutionError`（``timeout_level=WORKFLOW``）。
-
-兼容 Python 3.9+。
 """
 
 from __future__ import annotations

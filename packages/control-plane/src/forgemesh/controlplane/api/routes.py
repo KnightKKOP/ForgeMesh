@@ -20,8 +20,6 @@
 ``DecisionRouter``（见 :func:`.dependencies.init_workflow_runtime` 等）；
 错误统一使用 ``{"error": {"code", "message", "correlationId"}}`` 信封
 （对齐 OpenAPI ``Error`` schema，见 :func:`forgemesh.controlplane.app.error_envelope`）。
-
-兼容 Python 3.9+。
 """
 
 from __future__ import annotations

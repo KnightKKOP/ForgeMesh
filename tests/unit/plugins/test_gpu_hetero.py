@@ -7,8 +7,6 @@
 * **format_report** — 空报告 / 含差异报告 / 汇总统计。
 
 核心原则验证：**能力差异不隐藏**，所有差异必须被显式报告。
-
-兼容 Python 3.9+。
 """
 
 from __future__ import annotations

@@ -11,8 +11,6 @@
 
 非法生命周期转移抛出 :class:`forgemesh.core.errors.InvalidStateTransition`；
 若核心包未就绪，则回退到本地同名兜底异常类。
-
-兼容 Python 3.9+。
 """
 
 from __future__ import annotations

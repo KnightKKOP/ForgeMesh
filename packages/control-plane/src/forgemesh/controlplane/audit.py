@@ -2,8 +2,6 @@
 
 对齐 development-plan 5.5 / INV-4。审计事件记录关键操作，
 correlation_id 全链路贯穿，支持调用链查询。
-
-兼容 Python 3.9+。
 """
 
 from __future__ import annotations

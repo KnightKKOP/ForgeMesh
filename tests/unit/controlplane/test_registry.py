@@ -599,6 +599,6 @@ def test_legacy_db_migration_adds_columns(tmp_path) -> None:
     got = _run(reg.get(KIND, "team-a", "old", TENANT_A))
     assert got.finalizers == []
     # 重复打开幂等
-    reg.close()
+    _run(reg.close())
     reg2 = SQLiteRegistry(str(db_file))
-    reg2.close()
+    _run(reg2.close())

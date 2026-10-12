@@ -2,8 +2,6 @@
 
 覆盖三态状态机：closed → open → half_open → closed/open，
 以及多 Provider 注册表的按 provider_id 隔离。
-
-兼容 Python 3.9+。
 """
 
 from __future__ import annotations

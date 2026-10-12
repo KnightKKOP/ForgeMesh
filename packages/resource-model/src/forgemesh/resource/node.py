@@ -9,7 +9,7 @@
 
 这些实体是控制平面观测到的事实（Observed），不直接作为声明式资源对外暴露；
 字段命名与 DDL 保持一致（snake_case），便于持久化层直接映射。
-兼容 Python 3.9+ / Pydantic v2。
+基于 Pydantic v2。
 """
 
 from __future__ import annotations

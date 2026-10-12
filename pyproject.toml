@@ -29,6 +29,12 @@ python_files = ["test_*.py", "*_test.py"]
 python_classes = ["Test*"]
 python_functions = ["test_*"]
 addopts = "-ra --strict-markers"
+# 未 await 的协程只产生一条 RuntimeWarning，被调用的代码实际没有执行。这条警告在协程对象
+# 回收时发出，pytest 把它转成 PytestUnraisableExceptionWarning，因此两类都要视为错误。
+filterwarnings = [
+    "error::RuntimeWarning",
+    "error::pytest.PytestUnraisableExceptionWarning",
+]
 markers = [
     "unit: 单元测试（每次 PR）",
     "contract: 契约测试（每次 PR）",

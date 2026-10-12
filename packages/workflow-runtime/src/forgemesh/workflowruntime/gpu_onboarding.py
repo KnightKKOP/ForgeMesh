@@ -15,8 +15,6 @@
 
 本模块仅定义工作流结构，不执行真实副作用；执行由
 :class:`forgemesh.workflowruntime.exec.WorkflowExecutor` 驱动。
-
-兼容 Python 3.9+。
 """
 
 from __future__ import annotations

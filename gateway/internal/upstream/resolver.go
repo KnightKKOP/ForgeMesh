@@ -1,12 +1,14 @@
-// resolver.go 实现推理服务名 → 实例 endpoint 列表的解析。
+// resolver.go 实现推理服务 → 实例 endpoint 列表的解析。
 //
-// 数据源：控制平面 GET /api/v1/inference-services/{svc}（携带 X-Tenant-Id 与调用方的
-// Authorization，控制平面据此独立校验调用方，见 WithAuthorization），
-// 从响应 status.endpoints[] 取实例地址（如 "http://10.0.0.1:8000"）。
+// 数据源：控制平面 GET /api/v1/inference-services/{svc}[?namespace={ns}]（携带
+// X-Tenant-Id 与调用方的 Authorization，控制平面据此独立校验调用方，见
+// WithAuthorization），从响应 status.endpoints[] 取就绪实例的地址与协议
+// （如 {"url": "http://10.0.0.1:8000", "protocol": "openai-chat"}）。
 //
 // 设计要点：
 //   - 内存缓存：service→(endpoints, expiry)，TTL 内复用，减少控制平面压力；
-//     缓存 key 含租户 ID，保证多租户同名服务互相隔离。
+//     缓存 key 含租户 ID 与命名空间，保证多租户、多命名空间的同名服务互相隔离。
+//   - 只返回 ready 且协议已知的实例；协议决定实例上的推理路径（见 Protocol.Path）。
 //   - 健康摘流：每个 endpoint 维护连续失败计数，达到阈值（3 次）即标记
 //     unhealthy 进入冷却期；冷却结束后按 half-open 语义重新放行（计数清零，
 //     给实例一次探测机会，避免"一次失败即永久摘除"或"反复抖动"）。
@@ -39,7 +41,7 @@ var (
 	ErrForbidden = errors.New("credentials may not read the inference service")
 	// ErrNotReady 资源 status.phase 不为 Ready：服务尚未就绪。
 	ErrNotReady = errors.New("inference service not Ready")
-	// ErrNoEndpoints status.endpoints 为空（或全部无法解析）：没有可用实例地址。
+	// ErrNoEndpoints status.endpoints 中没有就绪、协议已知且地址合法的实例。
 	ErrNoEndpoints = errors.New("inference service has no usable endpoints")
 	// ErrNoHealthyEndpoints 注册的实例全部处于不健康冷却期。
 	ErrNoHealthyEndpoints = errors.New("no healthy endpoints available")
@@ -59,13 +61,62 @@ const (
 	maxResolveBodySize = 1 << 20 // 1 MiB
 )
 
+// ServiceRef 标识一个推理服务。Namespace 为空表示不带命名空间的服务，与控制平面
+// GET /api/v1/inference-services/{name} 不带 namespace 参数时的语义一致。
+type ServiceRef struct {
+	Namespace string
+	Name      string
+}
+
+// String 返回 "namespace/name"，不带命名空间时只有 name。
+func (s ServiceRef) String() string {
+	if s.Namespace == "" {
+		return s.Name
+	}
+	return s.Namespace + "/" + s.Name
+}
+
+// Protocol 是推理实例提供的协议（对齐资源模型 EndpointProtocol）。
+type Protocol string
+
+// 已知的实例协议。
+const (
+	ProtocolOpenAIChat  Protocol = "openai-chat"
+	ProtocolTGIGenerate Protocol = "tgi-generate"
+)
+
+// protocolPaths 是各协议在实例上的推理路径。
+var protocolPaths = map[Protocol]string{
+	ProtocolOpenAIChat:  "/v1/chat/completions",
+	ProtocolTGIGenerate: "/generate_stream",
+}
+
+// Path 返回协议在实例上的推理路径；未知协议返回 false。
+func (p Protocol) Path() (string, bool) {
+	path, ok := protocolPaths[p]
+	return path, ok
+}
+
+// Endpoint 是一个可以转发推理请求的实例。
+type Endpoint struct {
+	URL      string
+	Protocol Protocol
+}
+
+// endpointPayload 对应资源模型的 Endpoint；ready 缺省视为就绪（与资源模型默认值一致）。
+type endpointPayload struct {
+	URL      string   `json:"url"`
+	Ready    *bool    `json:"ready"`
+	Protocol Protocol `json:"protocol"`
+}
+
 // inferenceServicePayload 是控制平面响应的最小解析结构（camelCase 对齐资源 JSON）。
 // 只声明路由关心的字段，字段缺失（旧版本控制平面）时取零值：
 // phase="" 视为非 Ready、endpoints=nil 视为无实例。
 type inferenceServicePayload struct {
 	Status struct {
-		Phase     string   `json:"phase"`
-		Endpoints []string `json:"endpoints"`
+		Phase     string            `json:"phase"`
+		Endpoints []endpointPayload `json:"endpoints"`
 	} `json:"status"`
 }
 
@@ -82,7 +133,7 @@ func WithAuthorization(ctx context.Context, value string) context.Context {
 
 // cacheEntry 是服务级缓存条目。
 type cacheEntry struct {
-	endpoints []string
+	endpoints []Endpoint
 	expiry    time.Time
 }
 
@@ -102,7 +153,7 @@ type Resolver struct {
 	logger           *log.Logger
 
 	mu     sync.Mutex
-	cache  map[string]cacheEntry      // key: tenantID + "\x00" + svc
+	cache  map[string]cacheEntry      // key: 见 cacheKey
 	health map[string]*endpointHealth // key: endpoint URL 字符串
 }
 
@@ -136,11 +187,11 @@ func NewResolver(controlPlaneURL string, client *http.Client, ttl, cooldown time
 	}
 }
 
-// Resolve 返回 svc 的健康实例 endpoint 列表（已过滤冷却期内的实例）。
+// Resolve 返回服务的健康实例 endpoint 列表（已过滤冷却期内的实例）。
 //
 // 返回哨兵错误：ErrServiceNotFound / ErrNotReady / ErrNoEndpoints /
 // ErrNoHealthyEndpoints；网络错误与控制平面异常返回包装后的普通错误。
-func (r *Resolver) Resolve(ctx context.Context, svc, tenantID string) ([]string, error) {
+func (r *Resolver) Resolve(ctx context.Context, svc ServiceRef, tenantID string) ([]Endpoint, error) {
 	key := cacheKey(tenantID, svc)
 
 	// 先查缓存（TTL 内直接命中，不发请求）。
@@ -173,9 +224,12 @@ func (r *Resolver) Resolve(ctx context.Context, svc, tenantID string) ([]string,
 	return healthy, nil
 }
 
-// fetch 调用控制平面 GET /api/v1/inference-services/{svc} 并提取 endpoints。
-func (r *Resolver) fetch(ctx context.Context, svc, tenantID string) ([]string, error) {
-	reqURL := r.controlPlaneURL + "/api/v1/inference-services/" + url.PathEscape(svc)
+// fetch 调用控制平面 GET /api/v1/inference-services/{svc}[?namespace={ns}] 并提取 endpoints。
+func (r *Resolver) fetch(ctx context.Context, svc ServiceRef, tenantID string) ([]Endpoint, error) {
+	reqURL := r.controlPlaneURL + "/api/v1/inference-services/" + url.PathEscape(svc.Name)
+	if svc.Namespace != "" {
+		reqURL += "?" + url.Values{"namespace": {svc.Namespace}}.Encode()
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
 	if err != nil {
 		return nil, fmt.Errorf("resolver: 构造请求失败: %w", err)
@@ -216,13 +270,20 @@ func (r *Resolver) fetch(ctx context.Context, svc, tenantID string) ([]string, e
 		return nil, fmt.Errorf("%w: svc=%s phase=%q", ErrNotReady, svc, payload.Status.Phase)
 	}
 
-	usable := make([]string, 0, len(payload.Status.Endpoints))
+	usable := make([]Endpoint, 0, len(payload.Status.Endpoints))
 	for _, ep := range payload.Status.Endpoints {
-		if u, err := url.Parse(ep); err != nil || u.Scheme == "" || u.Host == "" {
-			r.logger.Printf("resolver: 跳过非法 endpoint %q (svc=%s)", ep, svc)
+		if ep.Ready != nil && !*ep.Ready {
 			continue
 		}
-		usable = append(usable, ep)
+		if _, known := ep.Protocol.Path(); !known {
+			r.logger.Printf("resolver: 跳过协议未知的 endpoint %q protocol=%q (svc=%s)", ep.URL, ep.Protocol, svc)
+			continue
+		}
+		if u, err := url.Parse(ep.URL); err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+			r.logger.Printf("resolver: 跳过非法 endpoint %q (svc=%s)", ep.URL, svc)
+			continue
+		}
+		usable = append(usable, Endpoint{URL: ep.URL, Protocol: ep.Protocol})
 	}
 	if len(usable) == 0 {
 		return nil, fmt.Errorf("%w: svc=%s", ErrNoEndpoints, svc)
@@ -259,11 +320,11 @@ func (r *Resolver) ReportSuccess(endpoint string) {
 //
 // 冷却期结束的实例按 half-open 语义放行：清零失败计数，给实例一次
 // 重新证明健康的机会；若再连续失败会再次进入冷却。
-func (r *Resolver) filterHealthyLocked(endpoints []string) []string {
+func (r *Resolver) filterHealthyLocked(endpoints []Endpoint) []Endpoint {
 	now := time.Now()
-	healthy := make([]string, 0, len(endpoints))
+	healthy := make([]Endpoint, 0, len(endpoints))
 	for _, ep := range endpoints {
-		h, ok := r.health[ep]
+		h, ok := r.health[ep.URL]
 		if !ok {
 			healthy = append(healthy, ep)
 			continue
@@ -281,7 +342,7 @@ func (r *Resolver) filterHealthyLocked(endpoints []string) []string {
 	return healthy
 }
 
-// cacheKey 生成租户隔离的缓存 key（"\x00" 不会出现在合法 svc 名中）。
-func cacheKey(tenantID, svc string) string {
-	return tenantID + "\x00" + svc
+// cacheKey 生成按租户与命名空间隔离的缓存 key（"\x00" 不会出现在合法的名字中）。
+func cacheKey(tenantID string, svc ServiceRef) string {
+	return tenantID + "\x00" + svc.Namespace + "\x00" + svc.Name
 }

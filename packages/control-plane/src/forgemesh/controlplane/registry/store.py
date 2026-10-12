@@ -77,7 +77,7 @@ from forgemesh.core.errors import ConflictError, NotFoundError, PreconditionFail
 from forgemesh.core.objects import Condition, Resource
 from forgemesh.core.registry import ResourceRegistry
 from forgemesh.resource.allocation import Allocation, AllocationStatus
-from forgemesh.resource.inference import InferenceService
+from forgemesh.resource.inference import Endpoint, InferenceService
 from forgemesh.resource.states import ALLOCATION_STATE_MACHINE, INFERENCE_STATE_MACHINE
 from pydantic import ValidationError
 
@@ -773,7 +773,7 @@ class SQLiteRegistry(ResourceRegistry):
         observed_generation: int | None = None,
         expected_version: str | None = None,
     ) -> Resource:
-        """status 子资源写入：只修改状态条件、phase 与 observedGeneration。
+        """status 子资源写入：只修改状态条件、phase、实例地址与 observedGeneration。
 
         不触碰 spec 与其余元数据，不递增 ``generation``。规则：
 
@@ -783,6 +783,8 @@ class SQLiteRegistry(ResourceRegistry):
           ``status`` 变化时刷新；
         * ``status_patch["phase"]`` 经权威状态机校验，只适用于带 ``status`` 子树
           的资源；
+        * ``status_patch["endpoints"]`` 按 :class:`~forgemesh.resource.inference.Endpoint`
+          校验后整体替换 ``status.endpoints``，只适用于带 ``status`` 子树的资源；
         * ``observed_generation`` 写入元数据列与 ``metadata.observedGeneration``，
           payload 已有 ``status.observedGeneration`` 时一并更新；
         * ``expected_version`` 非空时做 CAS，冲突语义与 :meth:`put` 相同；
@@ -795,15 +797,21 @@ class SQLiteRegistry(ResourceRegistry):
             NotFoundError: 资源不存在（或跨租户不可见）。
             ConflictError: ``expected_version`` 与当前版本不一致。
             InvalidStateTransition: phase 转移非法。
-            ValueError: 补丁含 ``conditions`` / ``phase`` 以外的字段或非法条件，
-                或为没有 ``status`` 子树的资源设置 phase。
+            ValueError: 补丁含 ``conditions`` / ``phase`` / ``endpoints`` 以外的字段、
+                非法条件或实例地址，或为没有 ``status`` 子树的资源设置 phase 或实例地址。
         """
-        unknown = sorted(set(status_patch) - {"conditions", "phase"})
+        unknown = sorted(set(status_patch) - {"conditions", "phase", "endpoints"})
         if unknown:
             raise ValueError(f"unsupported status fields: {unknown}")
         updates = [Condition.model_validate(item) for item in status_patch.get("conditions", [])]
         raw_phase = status_patch.get("phase")
         target_phase = str(raw_phase) if raw_phase is not None else None
+        raw_endpoints = status_patch.get("endpoints")
+        endpoints = (
+            [Endpoint.model_validate(item).model_dump(mode="json") for item in raw_endpoints]
+            if raw_endpoints is not None
+            else None
+        )
 
         def _update_status() -> Resource:
             cur = self._conn.cursor()
@@ -835,6 +843,10 @@ class SQLiteRegistry(ResourceRegistry):
                 self._validate_phase_transition(kind, phase, target_phase)
                 status["phase"] = target_phase
                 phase = target_phase
+            if endpoints is not None:
+                if not has_status:
+                    raise ValueError(f"{kind} payload has no status subtree to hold endpoints")
+                status["endpoints"] = endpoints
             if updates:
                 holder = status if has_status else body
                 holder["conditions"] = _merge_conditions(

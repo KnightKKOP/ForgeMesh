@@ -20,6 +20,8 @@
 - 控制器：控制平面在应用启动（lifespan）时运行 `ControllerManager`，自动协调 `InferenceService` 并回写 `status`。Registry 每次写入时在同一事务中追加一条 `resource_changes` 变更记录，控制器按序号增量读取并清理已读记录；启动时全量重建工作队列，另每 10 分钟全量同步一次。工作队列按资源去重、支持延迟重试，失败时指数退避；`status` 以 `resource_version` 做 CAS 写入，去重键在写入成功之后才登记。控制器是单写者（ADR-013），应用只能以单进程运行。
 - Registry status 子资源写入 `update_status`：只修改 `conditions` / `phase` / `observedGeneration`，不递增 `generation`；条件按 `type` 合并，`status` 不变时保留 `lastTransitionTime`；支持以 `resource_version` 做 CAS，未建模的 payload 字段原样保留。另新增 `get_with_phase`、`list_resource_keys`、`changes_since`、`latest_change_seq`、`prune_changes`。
 - `ReconciliationController` 新增 `record_dedup_keys` 参数与 `mark_processed()`：调用方可以在持久化 `status` 之后再登记去重键。
+- `InferenceServiceStatus.endpoints`：每个实例包含 `url`（http/https 基地址，不含凭证、查询串与片段）、`ready`（默认 `true`）、可选的 `instanceId` 与 `protocol`（`openai-chat` / `tgi-generate`），资源模型、JSON Schema 与 OpenAPI 一致；`update_status` 可以整体替换 `endpoints`，写入前逐项校验。
+- 网关新增带命名空间的推理路由 `/api/v1/namespaces/{ns}/inference/{svc}/chat`：Resolver 以 `?namespace=` 查询控制平面，缓存按租户与命名空间隔离；`/api/v1/inference/{svc}/chat` 继续解析不带命名空间的服务。
 
 ### Changed
 
@@ -33,6 +35,7 @@
 - **破坏性**：网关的 `401` 响应体由纯文本改为统一错误信封 `{"error": {"code", "message", "correlationId"}}`（新增的 `403` 同样使用信封）；推理实例不再收到调用方的 `Authorization` / `Cookie`。
 - 控制平面全部错误响应统一为错误信封：框架层 404 / 405 不再返回 `{"detail": ...}`，请求校验失败由 `422` 改为 `400`，未捕获异常返回不含内部细节的 `500 INTERNAL_ERROR`（细节写入日志）。
 - 网关接受任意大小写的 `Bearer` scheme（如 `bearer`）。
+- **破坏性**：网关消费的 `status.endpoints` 由字符串数组改为对象数组（见 Added），只使用 `ready` 且协议已知的实例；JSON Schema 中资源模型从未实现的单数 `status.endpoint` 一并移除。
 
 ### Deprecated
 
@@ -51,6 +54,8 @@
 - 调和器在 deny / require_approval / 分配失败等无副作用路径上也记录去重键，重新入队后命中幂等短路，被阻塞的资源在 spec 变更或 24h 去重 TTL 过期前不会被重新评估：这些路径不再记录去重键。
 - 生产代码中没有任何地方驱动调和器，创建的资源永远停在 `Pending`、`status` 从不更新：现由控制器驱动（见 Added）。
 - 调和器在没有注入调度器或工作流运行时的情况下跳过分配与部署、登记去重键并报告 `Ready=True`（`Reconciled`），实际什么都没做：现在任何副作用之前检查，返回 `Ready=False`，原因为 `SchedulerUnavailable` 或 `WorkflowRuntimeUnavailable`，且不登记去重键。目前仓库没有调度器实现，默认部署中新建的服务会停在 `Pending` 并带有 `Ready=False`（`SchedulerUnavailable`）。
+- 网关把入站路径原样拼接到实例地址，请求以 `/api/v1/inference/{svc}/chat` 到达推理运行时，而 vLLM 与 TGI 都不提供这个路径：现按实例的 `protocol` 转发到 `/v1/chat/completions`（`openai-chat`）或 `/generate_stream`（`tgi-generate`），查询串保留。
+- 网关解析推理服务时不带命名空间，控制平面因此只查找不带命名空间的服务，带命名空间的服务无法经网关调用：现由带命名空间的路由解析（见 Added）。
 
 ### Security
 

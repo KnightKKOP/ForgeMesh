@@ -18,16 +18,26 @@ import (
 // fakeResolver 是测试用的解析器替身：返回固定 endpoint 列表并记录上报调用。
 type fakeResolver struct {
 	mu        sync.Mutex
-	endpoints []string
+	endpoints []upstream.Endpoint
 	err       error
 
 	failures map[string]int
 	success  map[string]int
-	// resolveCalls 记录 Resolve 调用参数，供断言。
-	lastSvc, lastTenant string
+	// lastSvc / lastTenant 记录最近一次 Resolve 的参数，供断言。
+	lastSvc    upstream.ServiceRef
+	lastTenant string
 }
 
-func newFakeResolver(endpoints []string, err error) *fakeResolver {
+// newFakeResolver 把每个 URL 当作 openai-chat 实例。
+func newFakeResolver(urls []string, err error) *fakeResolver {
+	endpoints := make([]upstream.Endpoint, 0, len(urls))
+	for _, u := range urls {
+		endpoints = append(endpoints, upstream.Endpoint{URL: u, Protocol: upstream.ProtocolOpenAIChat})
+	}
+	return newFakeResolverWithEndpoints(endpoints, err)
+}
+
+func newFakeResolverWithEndpoints(endpoints []upstream.Endpoint, err error) *fakeResolver {
 	return &fakeResolver{
 		endpoints: endpoints,
 		err:       err,
@@ -36,7 +46,7 @@ func newFakeResolver(endpoints []string, err error) *fakeResolver {
 	}
 }
 
-func (f *fakeResolver) Resolve(_ context.Context, svc, tenantID string) ([]string, error) {
+func (f *fakeResolver) Resolve(_ context.Context, svc upstream.ServiceRef, tenantID string) ([]upstream.Endpoint, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.lastSvc, f.lastTenant = svc, tenantID
@@ -240,7 +250,7 @@ func TestProxy_SSEForwarding(t *testing.T) {
 }
 
 // TestProxy_RoundRobin 验证轮询分发：4 次请求在 2 个实例间均匀分配，
-// 且每次请求都打到当前选中实例的原始路径。
+// 且每次请求都打到实例协议对应的推理路径。
 func TestProxy_RoundRobin(t *testing.T) {
 	var hitsA, hitsB atomic.Int64
 	var mu sync.Mutex
@@ -277,9 +287,91 @@ func TestProxy_RoundRobin(t *testing.T) {
 	mu.Lock()
 	defer mu.Unlock()
 	for _, p := range gotPaths {
-		if p != "/api/v1/inference/svc-a/chat" {
-			t.Fatalf("实例收到的路径应保持入站路径，实际 %q", p)
+		if p != "/v1/chat/completions" {
+			t.Fatalf("实例收到的路径应为 openai-chat 的推理路径，实际 %q", p)
 		}
+	}
+}
+
+// TestProxy_MapsProtocolToInstancePath 验证请求转发到实例协议对应的推理路径：
+// 实例地址的路径前缀与入站查询串保留，入站路径本身不拼接到实例上。
+func TestProxy_MapsProtocolToInstancePath(t *testing.T) {
+	cases := []struct {
+		protocol upstream.Protocol
+		want     string
+	}{
+		{upstream.ProtocolOpenAIChat, "/llama/v1/chat/completions?stream=true"},
+		{upstream.ProtocolTGIGenerate, "/llama/generate_stream?stream=true"},
+	}
+	for _, tc := range cases {
+		t.Run(string(tc.protocol), func(t *testing.T) {
+			requests := make(chan string, 1)
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				requests <- r.URL.RequestURI()
+				_, _ = w.Write([]byte("data: ok\n\n"))
+			}))
+			defer srv.Close()
+
+			res := newFakeResolverWithEndpoints(
+				[]upstream.Endpoint{{URL: srv.URL + "/llama", Protocol: tc.protocol}}, nil)
+			req := newChatRequest("svc-a")
+			req.URL.RawQuery = "stream=true"
+			rec := httptest.NewRecorder()
+			New(res, "X-Tenant-ID", nil).ServeHTTP(rec, req)
+
+			if rec.Code != http.StatusOK {
+				t.Fatalf("转发应返回 200，实际 %d（body=%s）", rec.Code, rec.Body.String())
+			}
+			select {
+			case got := <-requests:
+				if got != tc.want {
+					t.Fatalf("实例收到的请求应为 %q，实际 %q", tc.want, got)
+				}
+			default:
+				t.Fatal("实例没有收到请求")
+			}
+		})
+	}
+}
+
+// TestProxy_UnknownProtocol 验证 Resolver 返回协议未知的实例时不转发，计一次失败并返回 502。
+func TestProxy_UnknownProtocol(t *testing.T) {
+	var hits atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+	}))
+	defer srv.Close()
+
+	res := newFakeResolverWithEndpoints([]upstream.Endpoint{{URL: srv.URL, Protocol: "grpc"}}, nil)
+	rec := httptest.NewRecorder()
+	New(res, "X-Tenant-ID", nil).ServeHTTP(rec, newChatRequest("svc-a"))
+
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("未知协议应 502，实际 %d", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), `"code":"INVALID_UPSTREAM"`) {
+		t.Fatalf("错误体应含 INVALID_UPSTREAM，实际: %s", rec.Body.String())
+	}
+	if got := hits.Load(); got != 0 {
+		t.Fatalf("未知协议的实例不应收到请求，实际 %d 次", got)
+	}
+	if got := res.failureCount(srv.URL); got != 1 {
+		t.Fatalf("未知协议应上报 1 次失败，实际 %d", got)
+	}
+}
+
+// TestProxy_PassesNamespaceToResolver 验证带命名空间的路由把 {ns} 与 {svc} 一起交给 Resolver。
+func TestProxy_PassesNamespaceToResolver(t *testing.T) {
+	res := newFakeResolver(nil, upstream.ErrServiceNotFound)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/namespaces/team-a/inference/svc-a/chat", nil)
+	req.SetPathValue("ns", "team-a")
+	req.SetPathValue("svc", "svc-a")
+	req.Header.Set("X-Tenant-ID", "tenant-a")
+	New(res, "X-Tenant-ID", nil).ServeHTTP(httptest.NewRecorder(), req)
+
+	want := upstream.ServiceRef{Namespace: "team-a", Name: "svc-a"}
+	if res.lastSvc != want {
+		t.Fatalf("Resolver 应收到 %+v，实际 %+v", want, res.lastSvc)
 	}
 }
 
@@ -367,8 +459,8 @@ func TestProxy_ForwardsClientHeaders(t *testing.T) {
 	if receivedTenant != "tenant-a" {
 		t.Fatalf("X-Tenant-ID 头应转发，实际 %q", receivedTenant)
 	}
-	if res.lastSvc != "svc-a" {
-		t.Fatalf("Resolver 应收到 svc=svc-a，实际 %q", res.lastSvc)
+	if want := (upstream.ServiceRef{Name: "svc-a"}); res.lastSvc != want {
+		t.Fatalf("Resolver 应收到 %+v，实际 %+v", want, res.lastSvc)
 	}
 	if res.lastTenant != "tenant-a" {
 		t.Fatalf("Resolver 应收到 tenant=tenant-a，实际 %q", res.lastTenant)
@@ -487,43 +579,39 @@ func TestProxy_Upstream5xxCountsFailure(t *testing.T) {
 	}
 }
 
-// TestBuildUpstreamURL 验证实例基址与入站路径的拼接逻辑。
+// TestBuildUpstreamURL 验证实例基址、协议推理路径与查询串的拼接逻辑。
 func TestBuildUpstreamURL(t *testing.T) {
 	cases := []struct {
 		name     string
 		upstream string
-		reqPath  string
-		reqQuery string
+		path     string
+		rawQuery string
 		want     string
 	}{
 		{
 			name:     "基础拼接",
 			upstream: "http://instance:8000",
-			reqPath:  "/api/v1/inference/svc-a/chat",
-			want:     "http://instance:8000/api/v1/inference/svc-a/chat",
+			path:     "/v1/chat/completions",
+			want:     "http://instance:8000/v1/chat/completions",
 		},
 		{
 			name:     "带 query 透传",
 			upstream: "http://instance:8000",
-			reqPath:  "/api/v1/inference/svc-a/chat",
-			reqQuery: "stream=true",
-			want:     "http://instance:8000/api/v1/inference/svc-a/chat?stream=true",
+			path:     "/v1/chat/completions",
+			rawQuery: "stream=true",
+			want:     "http://instance:8000/v1/chat/completions?stream=true",
 		},
 		{
 			name:     "endpoint 带路径前缀",
-			upstream: "http://instance:8000/v1",
-			reqPath:  "/chat",
-			want:     "http://instance:8000/v1/chat",
+			upstream: "http://instance:8000/llama/",
+			path:     "/generate_stream",
+			want:     "http://instance:8000/llama/generate_stream",
 		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			u, _ := url.Parse(tc.upstream)
-			in, _ := url.Parse(tc.reqPath)
-			if tc.reqQuery != "" {
-				in.RawQuery = tc.reqQuery
-			}
-			got := buildUpstreamURL(u, in)
+			got := buildUpstreamURL(u, tc.path, tc.rawQuery)
 			if got != tc.want {
 				t.Fatalf("buildUpstreamURL = %q, want %q", got, tc.want)
 			}

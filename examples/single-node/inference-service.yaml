@@ -27,4 +27,4 @@ status:
   phase: Pending
   observedGeneration: 0
   conditions: []
-  endpoint: null
+  endpoints: []

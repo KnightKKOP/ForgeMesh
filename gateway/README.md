@@ -38,9 +38,21 @@ ForgeMesh 的**统一外部入口**与**高性能流式代理**。与 Python 控
 | ANY | `/api/v1/inference-services[/...]` | 反代 → Python 控制平面 | 全链 |
 | ANY | `/api/v1/workflows[/...]` | 反代 → Python 控制平面 | 全链 |
 | ANY | `/api/v1/decisions[/...]` | 反代 → Python 控制平面 | 全链 |
-| ANY | `/api/v1/inference/{svc}/chat` | **SSE 流式代理** | 全链 + `read` scope |
+| ANY | `/api/v1/namespaces/{ns}/inference/{svc}/chat` | **SSE 流式代理**（命名空间 `{ns}` 中的服务） | 全链 + `read` scope |
+| ANY | `/api/v1/inference/{svc}/chat` | **SSE 流式代理**（不带命名空间的服务） | 全链 + `read` scope |
 
-`{svc}` 为 Go 1.22 `net/http.ServeMux` 的路径变量语法，表示单个路径段（推理服务标识）。
+`{ns}`、`{svc}` 为 Go 1.22 `net/http.ServeMux` 的路径变量语法，各表示单个路径段（命名空间与推理服务名）。
+
+推理请求不按入站路径转发。Resolver 从控制平面读取服务的 `status.endpoints`，只保留
+`ready` 且协议已知的实例；网关按实例的 `protocol` 把请求转发到对应路径，查询串原样保留，
+实例地址带路径前缀时（如 `http://10.0.0.1:8000/llama`）协议路径接在前缀之后：
+
+| `protocol` | 实例上的路径 |
+| --- | --- |
+| `openai-chat` | `/v1/chat/completions` |
+| `tgi-generate` | `/generate_stream` |
+
+网关不转换请求体，客户端按服务实例的协议格式发送请求。
 
 ### 中间件链
 
@@ -198,9 +210,10 @@ flowchart LR
     RL --> RT{Route}
     RT -->|/healthz /readyz| H[Probe]
     RT -->|/api/v1/resources 等| UP[ReverseProxy]
-    RT -->|/api/v1/inference/{svc}/chat| SP[SSE StreamProxy]
+    RT -->|/api/v1/namespaces/{ns}/inference/{svc}/chat 等| SP[SSE StreamProxy]
     UP --> CP[(Python 控制平面)]
-    SP --> CP
+    SP -->|解析 status.endpoints| CP
+    SP -->|按 protocol 映射路径| INS[(推理实例)]
 ```
 
 ---

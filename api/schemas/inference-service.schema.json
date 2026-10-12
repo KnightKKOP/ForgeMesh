@@ -184,11 +184,33 @@
           "type": "array",
           "items": {"$ref": "#/$defs/Condition"}
         },
-        "endpoint": {
-          "type": ["string", "null"],
-          "description": "服务就绪后的访问端点；未就绪为 null。"
+        "endpoints": {
+          "type": "array",
+          "description": "实例访问地址，由控制器写入；网关只向 ready 的实例转发。",
+          "items": {"$ref": "#/$defs/Endpoint"}
         },
         "lastError": {"type": ["string", "null"]}
+      }
+    },
+    "Endpoint": {
+      "type": "object",
+      "description": "推理实例的访问地址。",
+      "required": ["url", "protocol"],
+      "additionalProperties": false,
+      "properties": {
+        "url": {
+          "type": "string",
+          "format": "uri",
+          "pattern": "^https?://",
+          "description": "实例基地址，不带凭证、查询串与片段，如 http://10.0.0.1:8000。"
+        },
+        "ready": {"type": "boolean", "default": true},
+        "instanceId": {"type": ["string", "null"]},
+        "protocol": {
+          "type": "string",
+          "description": "openai-chat：POST /v1/chat/completions；tgi-generate：POST /generate_stream。",
+          "enum": ["openai-chat", "tgi-generate"]
+        }
       }
     }
   }

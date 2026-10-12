@@ -16,9 +16,10 @@ from __future__ import annotations
 
 from enum import StrEnum
 from typing import Literal
+from urllib.parse import urlsplit
 
 from forgemesh.core.objects import Condition, Resource
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 class InferencePhase(StrEnum):
@@ -127,6 +128,45 @@ class InferenceServiceSpec(BaseModel):
     availability: Availability = Field(default_factory=Availability)
 
 
+class EndpointProtocol(StrEnum):
+    """推理实例提供的协议，决定网关把推理请求转发到实例的哪个路径。"""
+
+    OPENAI_CHAT = "openai-chat"
+    """OpenAI 兼容的 ``POST /v1/chat/completions``（如 vLLM）。"""
+    TGI_GENERATE = "tgi-generate"
+    """Hugging Face TGI 的 ``POST /generate_stream``。"""
+
+
+class Endpoint(BaseModel):
+    """推理实例的访问地址，由控制器写入 ``status.endpoints``。
+
+    Attributes:
+        url: 实例基地址，必须是不带凭证、查询串与片段的 ``http`` / ``https`` URL，
+            如 ``http://10.0.0.1:8000``。
+        ready: 实例能否接收请求；网关只向就绪的实例转发。
+        instanceId: 实例标识（可选）。
+        protocol: 实例协议，见 :class:`EndpointProtocol`。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    url: str
+    ready: bool = True
+    instanceId: str | None = None
+    protocol: EndpointProtocol
+
+    @field_validator("url")
+    @classmethod
+    def _require_base_url(cls, value: str) -> str:
+        parts = urlsplit(value)
+        if parts.scheme not in ("http", "https") or not parts.hostname:
+            raise ValueError("url must be an absolute http or https URL")
+        if parts.username or parts.password or parts.query or parts.fragment:
+            raise ValueError("url must not contain credentials, a query or a fragment")
+        _ = parts.port  # 端口非法时抛 ValueError
+        return value
+
+
 class InferenceServiceStatus(BaseModel):
     """``InferenceService`` 实际状态（Observed State，ADR-002）。
 
@@ -134,6 +174,7 @@ class InferenceServiceStatus(BaseModel):
         phase: 当前生命周期阶段，默认 ``Pending``。
         observedGeneration: 控制器已处理到的 ``metadata.generation``。
         conditions: 结构化状态条件集合。
+        endpoints: 实例访问地址，由控制器经 status 子资源写入；网关据此转发推理请求。
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -141,6 +182,7 @@ class InferenceServiceStatus(BaseModel):
     phase: InferencePhase = InferencePhase.PENDING
     observedGeneration: int = 0
     conditions: list[Condition] = Field(default_factory=list)
+    endpoints: list[Endpoint] = Field(default_factory=list)
 
 
 class InferenceService(Resource):
@@ -163,6 +205,8 @@ __all__ = [
     "ResourcesSpec",
     "Availability",
     "InferenceServiceSpec",
+    "EndpointProtocol",
+    "Endpoint",
     "InferenceServiceStatus",
     "InferenceService",
 ]

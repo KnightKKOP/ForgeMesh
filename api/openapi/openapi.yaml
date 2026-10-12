@@ -288,8 +288,47 @@ components:
           type: object
           additionalProperties: true
         status:
-          type: object
-          additionalProperties: true
+          $ref: "#/components/schemas/InferenceServiceStatus"
+    InferenceServiceStatus:
+      type: object
+      description: 实际状态，只由控制器写入；创建请求中的 status 会被忽略。
+      additionalProperties: true
+      properties:
+        phase:
+          type: string
+        observedGeneration:
+          type: integer
+          minimum: 0
+        conditions:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+        endpoints:
+          type: array
+          description: 实例访问地址；网关只向 ready 的实例转发推理请求。
+          items:
+            $ref: "#/components/schemas/Endpoint"
+    Endpoint:
+      type: object
+      required: [url, protocol]
+      additionalProperties: false
+      properties:
+        url:
+          type: string
+          format: uri
+          description: 实例基地址（http / https，不带凭证、查询串与片段），如 http://10.0.0.1:8000。
+        ready:
+          type: boolean
+          default: true
+        instanceId:
+          type: [string, "null"]
+        protocol:
+          type: string
+          enum: [openai-chat, tgi-generate]
+          description: >-
+            决定网关把推理请求转发到实例的哪个路径：openai-chat 为 POST /v1/chat/completions，
+            tgi-generate 为 POST /generate_stream。
     InferenceServiceList:
       type: object
       required: [items]

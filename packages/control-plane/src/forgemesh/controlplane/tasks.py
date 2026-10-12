@@ -26,6 +26,8 @@ from enum import StrEnum
 from forgemesh.core.errors import NotFoundError
 from pydantic import BaseModel, ConfigDict
 
+from .sqlite import connect
+
 # ---------------------------------------------------------------------- #
 # 枚举
 # ---------------------------------------------------------------------- #
@@ -152,8 +154,7 @@ class TaskStore:
 
     def __init__(self, db_path: str = ":memory:") -> None:
         self._db_path = db_path
-        # check_same_thread=False：asyncio.to_thread 会在不同线程执行 sqlite 调用。
-        self._conn = sqlite3.connect(db_path, check_same_thread=False)
+        self._conn = connect(db_path)
         self._conn.row_factory = sqlite3.Row
         self._init_schema()
 

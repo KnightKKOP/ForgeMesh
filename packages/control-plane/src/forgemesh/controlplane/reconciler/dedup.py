@@ -18,6 +18,8 @@ from datetime import UTC, datetime, timedelta
 
 from pydantic import BaseModel, ConfigDict
 
+from ..sqlite import connect
+
 
 class DedupKey(BaseModel):
     """幂等去重键。
@@ -127,8 +129,7 @@ class ProcessedKeyStore:
     ) -> None:
         self._db_path = db_path
         self._ttl_seconds = ttl_seconds
-        # check_same_thread=False：asyncio.to_thread 会在不同线程执行 sqlite 调用。
-        self._conn = sqlite3.connect(db_path, check_same_thread=False)
+        self._conn = connect(db_path)
         self._conn.row_factory = sqlite3.Row
         self._lock = threading.Lock()
         self._init_schema()

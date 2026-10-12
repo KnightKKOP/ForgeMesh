@@ -20,6 +20,8 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from .sqlite import connect
+
 _SCHEMA_SQL = """\
 CREATE TABLE IF NOT EXISTS outbox_events (
     event_id TEXT PRIMARY KEY,
@@ -74,7 +76,7 @@ class Outbox:
 
     def __init__(self, db_path: str = ":memory:", conn: sqlite3.Connection | None = None) -> None:
         self._db_path = db_path
-        self._conn = conn or sqlite3.connect(db_path, check_same_thread=False)
+        self._conn = conn or connect(db_path)
         self._conn.row_factory = sqlite3.Row
         self._init_schema()
 

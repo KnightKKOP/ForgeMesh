@@ -32,12 +32,12 @@ KEY_B = "fmk_key-for-tenant-b"
 KEY_READ_ONLY = "fmk_read-only-key-for-tenant-a"
 
 ENTRIES = [
-    ApiKeyEntry(id="a", sha256=hash_api_key(KEY_A), tenant_id="tenant-a", subject="alice"),
-    ApiKeyEntry(id="b", sha256=hash_api_key(KEY_B), tenant_id="tenant-b", subject="bob"),
+    ApiKeyEntry(id="a", sha256=hash_api_key(KEY_A), tenantId="tenant-a", subject="alice"),
+    ApiKeyEntry(id="b", sha256=hash_api_key(KEY_B), tenantId="tenant-b", subject="bob"),
     ApiKeyEntry(
         id="ro",
         sha256=hash_api_key(KEY_READ_ONLY),
-        tenant_id="tenant-a",
+        tenantId="tenant-a",
         subject="viewer",
         scopes=("read",),
     ),
@@ -173,6 +173,7 @@ def test_load_api_keys_normalizes_digests(tmp_path) -> None:
             }
         ),
         json.dumps({"keys": [{"id": "a", "sha256": "0" * 64, "tenantId": "t"}]}),
+        json.dumps({"keys": [{"id": "a", "sha256": "0" * 64, "tenant_id": "t", "subject": "s"}]}),
     ],
 )
 def test_load_api_keys_rejects_invalid_files(tmp_path, content) -> None:

@@ -100,9 +100,13 @@ class Authenticator(Protocol):
 
 
 class ApiKeyEntry(BaseModel):
-    """key 文件中的一条记录：只保存 key 的 SHA-256 摘要，不保存明文。"""
+    """key 文件中的一条记录：只保存 key 的 SHA-256 摘要，不保存明文。
 
-    model_config = ConfigDict(extra="forbid", frozen=True, populate_by_name=True)
+    字段只按 JSON 名（``tenantId``）解析，与网关的解析规则保持一致，同一份文件在
+    两个服务中的校验结果相同。
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
 
     id: str = Field(min_length=1)
     sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
@@ -274,7 +278,7 @@ def _keygen(args: argparse.Namespace) -> int:
     entry = ApiKeyEntry(
         id=args.id or f"{args.tenant}-{args.subject}",
         sha256=hash_api_key(key),
-        tenant_id=args.tenant,
+        tenantId=args.tenant,
         subject=args.subject,
         scopes=tuple(args.scope) if args.scope else (SCOPE_READ, SCOPE_WRITE),
     )

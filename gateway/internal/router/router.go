@@ -3,7 +3,7 @@
 // 路由表（对外统一入口，版本前缀 /api/v1/）：
 //
 //	GET  /healthz                              存活探针（无中间件）
-//	GET  /readyz                               就绪探针（探测上游可达，无中间件）
+//	GET  /readyz                               就绪探针（请求控制平面 /readyz，无中间件）
 //	ANY  /api/v1/resources[/...]               反代到 Python 控制平面
 //	ANY  /api/v1/inference-services[/...]      反代到 Python 控制平面
 //	ANY  /api/v1/workflows[/...]               反代到 Python 控制平面

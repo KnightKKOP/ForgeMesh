@@ -1,36 +1,46 @@
 // Package health 提供网关的存活/就绪探针。
 //
 //   - /healthz (liveness)：进程可服务即 200，不依赖外部组件。
-//   - /readyz  (readiness)：探测上游可达性；不可达时返回 503，
-//     以便负载均衡器将本实例摘除（配合优雅停机）。
+//   - /readyz  (readiness)：请求控制平面的 /readyz，控制平面返回 200 才算就绪，
+//     否则返回 503，以便负载均衡器将本实例摘除（配合优雅停机）。控制平面的
+//     /readyz 会探测权威存储，进程在线但存储不可用时同样返回 503。
 package health
 
 import (
-	"net"
+	"io"
 	"net/http"
 	"net/url"
 	"time"
 )
 
-// dialTimeout 是就绪探针连接上游的超时时间。
-const dialTimeout = 2 * time.Second
+// probeTimeout 是就绪探针请求控制平面的超时时间。
+const probeTimeout = 2 * time.Second
+
+// maxProbeBodySize 限制读取并丢弃的控制平面响应体大小；读完响应体连接才能复用。
+const maxProbeBodySize = 64 << 10
 
 // Checker 提供健康检查处理器。
 type Checker struct {
-	upstream *url.URL
-	timeout  time.Duration
-	// dial 可注入，便于单元测试替换 TCP 探测行为。
-	dial func(network, address string, timeout time.Duration) (net.Conn, error)
+	readyURL string // 控制平面 /readyz 的地址；上游地址非法时为空
+	client   *http.Client
 }
 
-// New 基于上游地址构造健康检查器。upstreamURL 非法时，就绪探针将始终返回 503。
+// New 基于上游（控制平面）地址构造健康检查器。upstreamURL 非法时，就绪探针将始终返回 503。
 func New(upstreamURL string) *Checker {
-	u, _ := url.Parse(upstreamURL)
 	return &Checker{
-		upstream: u,
-		timeout:  dialTimeout,
-		dial:     net.DialTimeout,
+		readyURL: readyURL(upstreamURL),
+		client:   &http.Client{Timeout: probeTimeout},
 	}
+}
+
+// readyURL 返回控制平面 /readyz 的地址，保留上游地址的路径前缀（与反向代理拼接路径的
+// 方式一致）；upstreamURL 不是 http(s) 绝对地址时返回空串。
+func readyURL(upstreamURL string) string {
+	u, err := url.Parse(upstreamURL)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+		return ""
+	}
+	return u.JoinPath("readyz").String()
 }
 
 // Live 处理存活探针，始终返回 200。
@@ -38,43 +48,30 @@ func (c *Checker) Live(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, `{"status":"ok"}`)
 }
 
-// Ready 处理就绪探针：TCP 探测上游可达性。
+// Ready 处理就绪探针：请求控制平面的 /readyz，只有 200 视为就绪。
 func (c *Checker) Ready(w http.ResponseWriter, r *http.Request) {
-	target := c.upstreamHostPort()
-	if target == "" {
+	if c.readyURL == "" {
 		writeJSON(w, http.StatusServiceUnavailable, `{"status":"unavailable","reason":"invalid upstream"}`)
 		return
 	}
-
-	dial := c.dial
-	if dial == nil {
-		dial = net.DialTimeout
+	req, err := http.NewRequestWithContext(r.Context(), http.MethodGet, c.readyURL, nil)
+	if err != nil {
+		writeJSON(w, http.StatusServiceUnavailable, `{"status":"unavailable","reason":"invalid upstream"}`)
+		return
 	}
-	conn, err := dial("tcp", target, c.timeout)
+	resp, err := c.client.Do(req)
 	if err != nil {
 		writeJSON(w, http.StatusServiceUnavailable, `{"status":"unavailable","reason":"upstream unreachable"}`)
 		return
 	}
-	_ = conn.Close()
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, maxProbeBodySize))
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		writeJSON(w, http.StatusServiceUnavailable, `{"status":"unavailable","reason":"upstream not ready"}`)
+		return
+	}
 
 	writeJSON(w, http.StatusOK, `{"status":"ready"}`)
-}
-
-// upstreamHostPort 返回上游的 host:port；缺省端口时按 scheme 补全。
-func (c *Checker) upstreamHostPort() string {
-	if c.upstream == nil || c.upstream.Host == "" {
-		return ""
-	}
-	if c.upstream.Port() != "" {
-		return c.upstream.Host
-	}
-	host := c.upstream.Hostname()
-	switch c.upstream.Scheme {
-	case "https":
-		return net.JoinHostPort(host, "443")
-	default:
-		return net.JoinHostPort(host, "80")
-	}
 }
 
 func writeJSON(w http.ResponseWriter, status int, body string) {

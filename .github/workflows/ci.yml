@@ -72,11 +72,35 @@ jobs:
           cache: true
           cache-dependency-path: gateway/go.sum
 
+      - name: Go format
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "ERROR: run gofmt -w on:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: Go vet
+        run: go vet ./...
+
       - name: Go build
         run: go build ./...
 
-      - name: Go test
-        run: go test ./...
+      - name: Go test (race detector)
+        run: go test -race ./...
+
+  compose-smoke:
+    name: Compose · end-to-end smoke
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # 构建两个镜像并启动 deploy/docker/docker-compose.yaml，经网关创建、读取推理服务。
+      - name: Compose smoke test
+        run: scripts/compose_smoke.sh
   architecture-docs:
     name: Architecture docs & schema validation
     runs-on: ubuntu-latest

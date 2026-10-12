@@ -2,7 +2,8 @@
 
 覆盖：幂等去重键、差异计算、Policy 三态
 （allow/deny/require_approval——degraded 已按 architecture 7.5 移除）、
-Scheduler 分配成功与失败、缺少调度器/工作流运行时时如实报告 ``Ready=False``、
+Scheduler 分配成功与失败、分配请求的资源身份与幂等键（uid + generation）、
+缺少调度器/工作流运行时时如实报告 ``Ready=False``、
 幂等性，以及 Terminating 受控删除闭环
 （ReleaseProvider 释放 → 移除 finalizer → 释放 Allocation → 物理删除）。
 """
@@ -17,12 +18,14 @@ import pytest
 from forgemesh.controlplane.reconciler import (
     ProcessedKeyStore,
     ReconciliationController,
+    allocation_idempotency_key,
     compute_dedup_key,
 )
 from forgemesh.controlplane.registry import SQLiteRegistry
 from forgemesh.core.errors import NotFoundError
 from forgemesh.core.objects import ObjectMeta, Resource
 from forgemesh.core.reconciler import ReconcileContext
+from forgemesh.core.scheduler import ResourceRef, ScheduleRequest
 from forgemesh.policy.api import PolicyDecision
 from forgemesh.resource.allocation import Allocation
 from forgemesh.resource.inference import (
@@ -47,12 +50,16 @@ def make_resource(
     generation: int = 1,
     observed_generation: int = 0,
     tenant_id: str = "tenant-1",
+    uid: str | None = "uid-1",
+    namespace: str | None = None,
 ) -> Resource:
     """构造测试用 Resource。"""
     return Resource(
         kind=kind,
         metadata=ObjectMeta(
             name=name,
+            namespace=namespace,
+            uid=uid,
             generation=generation,
             observed_generation=observed_generation,
             tenant_id=tenant_id,
@@ -94,10 +101,12 @@ class MockScheduler:
         self._fail = fail
         self.allocate_called = False
         self.allocate_count = 0
+        self.requests: list[ScheduleRequest] = []
 
     async def allocate(self, req):  # noqa: ANN001
         self.allocate_called = True
         self.allocate_count += 1
+        self.requests.append(req)
         if self._fail:
             raise RuntimeError("allocation failed")
         from forgemesh.core.scheduler import AllocationRef
@@ -361,6 +370,76 @@ def test_reconcile_with_allocation():
     assert result.done is True
     assert scheduler.allocate_called is True
     assert scheduler.allocate_count == 1
+
+
+def _allocating_controller(scheduler: MockScheduler) -> ReconciliationController:
+    return ReconciliationController(
+        registry=None,
+        policy_engine=MockPolicyEngine(PolicyDecision(decision="allow", reason="ok")),
+        scheduler=scheduler,
+        workflow_runtime=StubWorkflowRuntime(),
+    )
+
+
+@pytest.mark.unit
+def test_allocation_request_identifies_the_resource_and_its_generation():
+    """分配请求携带资源身份（含 uid）与由 uid + generation 派生的幂等键。"""
+    resource = make_resource(generation=3, namespace="team-a")
+    scheduler = MockScheduler()
+
+    asyncio.run(_allocating_controller(scheduler).reconcile(make_context(resource)))
+
+    [req] = scheduler.requests
+    assert req.tenant_id == "tenant-1"
+    assert req.resource_ref == ResourceRef(
+        kind="InferenceService", namespace="team-a", name="svc-1", uid="uid-1"
+    )
+    assert req.idempotency_key == allocation_idempotency_key("uid-1", 3) == "uid-1:3"
+
+
+@pytest.mark.unit
+def test_replaying_a_generation_requests_the_same_allocation():
+    """去重键丢失后（如未持久化的进程重启）重放同一 generation 使用同一幂等键；
+    新 generation 与同名重建的资源（新 uid）得到新键。"""
+    scheduler = MockScheduler()
+    for resource in (
+        make_resource(generation=1),
+        make_resource(generation=1),
+        make_resource(generation=2),
+        make_resource(generation=1, uid="uid-2"),
+    ):
+        asyncio.run(_allocating_controller(scheduler).reconcile(make_context(resource)))
+
+    assert [req.idempotency_key for req in scheduler.requests] == [
+        "uid-1:1",
+        "uid-1:1",
+        "uid-1:2",
+        "uid-2:1",
+    ]
+
+
+@pytest.mark.unit
+def test_resource_without_uid_is_not_allocated():
+    """没有 uid 就无法幂等分配：Ready=False（MissingUid），不分配、不启动工作流、不登记去重键。"""
+    ctx = make_context(make_resource(uid=None), {"phase": "Pending"})
+    scheduler = MockScheduler()
+    workflow = StubWorkflowRuntime()
+    controller = ReconciliationController(
+        registry=None,
+        policy_engine=MockPolicyEngine(PolicyDecision(decision="allow", reason="ok")),
+        scheduler=scheduler,
+        workflow_runtime=workflow,
+    )
+
+    result = asyncio.run(controller.reconcile(ctx))
+
+    assert result.done is False
+    assert result.requeue_after is None
+    [condition] = result.status_patch["conditions"]
+    assert (condition["status"], condition["reason"]) == ("False", "MissingUid")
+    assert scheduler.allocate_called is False
+    assert workflow.idempotency_keys == []
+    assert ctx.dedup_key not in controller._processed_keys
 
 
 @pytest.mark.unit

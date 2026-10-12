@@ -214,7 +214,7 @@ class _NoopWorkflowRuntime:
 def _make_ctx(dedup_key: str) -> ReconcileContext:
     resource = Resource(
         kind="Widget",
-        metadata=ObjectMeta(name="w-1", generation=1, tenant_id="tenant-1"),
+        metadata=ObjectMeta(name="w-1", uid="uid-w-1", generation=1, tenant_id="tenant-1"),
     )
     return ReconcileContext(
         resource=resource,

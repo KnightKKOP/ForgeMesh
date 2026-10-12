@@ -10,7 +10,11 @@
 3. **比较差异**：desired vs observed，判断是否需要协调。
 4. **生成候选**：调用 DecisionProvider 产出候选动作（建议，非授权）。
 5. **Policy 校验**：PolicyEngine.check()，deny 则停止（不可绕过，INV-3）。
-6. **Scheduler 分配**：如需分配资源，Scheduler.allocate()（唯一授权分配点）。
+6. **Scheduler 分配**：如需分配资源，Scheduler.allocate()（唯一授权分配点）。请求携带
+   资源身份（kind/namespace/name/uid）与幂等键（uid + generation，见
+   :func:`~forgemesh.controlplane.reconciler.dedup.allocation_idempotency_key`）：同一
+   generation 的重放得到同一分配；没有 ``metadata.uid`` 的资源报告 ``Ready=False``
+   （``MissingUid``），不分配。
 7. **WorkEngine 执行**：如需执行工作流，WorkflowRuntime.start()。
 8. **重观察**：收集执行后的新观测状态（P1 简化为标记完成）。
 9. **更新 status + 安排下次**：写回 status patch，返回 requeue_after。
@@ -44,7 +48,7 @@ from forgemesh.core.reconciler import ReconcileContext, Reconciler, ReconcileRes
 from forgemesh.policy.api import PolicyAction, PolicyEngine
 
 from ..registry.store import DEFAULT_RELEASE_FINALIZER
-from .dedup import ProcessedKeyStore
+from .dedup import ProcessedKeyStore, allocation_idempotency_key
 
 logger = logging.getLogger(__name__)
 
@@ -239,11 +243,33 @@ class ReconciliationController(Reconciler):
         # 步骤 6：Scheduler 分配（如果需要且调度器可用）
         allocation_ref = None
         if self._scheduler is not None and diff.get("needs_allocation"):
-            from forgemesh.core.scheduler import ScheduleRequest
+            from forgemesh.core.scheduler import ResourceRef, ScheduleRequest
 
+            meta = resource.metadata
+            if not meta.uid:
+                return ReconcileResult(
+                    done=False,
+                    requeue_after=None,
+                    status_patch={
+                        "conditions": [
+                            {
+                                "type": "Ready",
+                                "status": "False",
+                                "reason": "MissingUid",
+                                "message": "metadata.uid is required to allocate resources",
+                            }
+                        ]
+                    },
+                )
             sched_req = ScheduleRequest(
                 tenant_id=ctx.tenant_id,
-                resource_kind=resource.kind,
+                resource_ref=ResourceRef(
+                    kind=resource.kind,
+                    namespace=meta.namespace,
+                    name=meta.name,
+                    uid=meta.uid,
+                ),
+                idempotency_key=allocation_idempotency_key(meta.uid, meta.generation),
                 requirements=diff.get("requirements", {}),
             )
             try:

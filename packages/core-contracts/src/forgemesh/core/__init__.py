@@ -29,7 +29,14 @@ from .objects import (
 )
 from .reconciler import ReconcileContext, Reconciler, ReconcileResult
 from .registry import ResourceRegistry
-from .scheduler import AllocationRef, FeasibilityResult, Scheduler, ScheduleRequest
+from .scheduler import (
+    AllocatedDevice,
+    AllocationRef,
+    FeasibilityResult,
+    ResourceRef,
+    Scheduler,
+    ScheduleRequest,
+)
 from .secrets import SecretRef
 
 __all__ = [
@@ -46,8 +53,10 @@ __all__ = [
     "ReconcileResult",
     "Reconciler",
     # scheduler
+    "ResourceRef",
     "ScheduleRequest",
     "FeasibilityResult",
+    "AllocatedDevice",
     "AllocationRef",
     "Scheduler",
     # secrets

@@ -1,7 +1,9 @@
 """幂等去重键生成与持久化。
 
 对齐 development-plan 5.4：dedup_key 由 kind/namespace/name/uid/generation/operation 派生，
-同一键的协调不得重复产生副作用。
+同一键的协调不得重复产生副作用。资源分配另有自己的幂等键
+（:func:`allocation_idempotency_key`，由 uid + generation 派生；``allocations.idempotency_key``
+唯一，一个键只对应一个分配）。
 
 :class:`ProcessedKeyStore` 将已处理去重键持久化到 SQLite（对齐 architecture
 §5.5「不能依赖单进程内存状态保证全局正确性」）：进程重启后已处理键仍然
@@ -78,7 +80,17 @@ def compute_dedup_key(
     )
 
 
-__all__ = ["DedupKey", "ProcessedKeyStore", "compute_dedup_key"]
+def allocation_idempotency_key(uid: str, generation: int) -> str:
+    """派生资源分配的幂等键（``{uid}:{generation}``）。
+
+    同一资源同一 generation 的每次分配请求（重放、进程重启后重试、去重键过期后再次
+    协调）都得到同一键，调度器据此返回已有分配而不是再分配一次。generation 是末段
+    整数，不同 ``(uid, generation)`` 不会得到同一键。
+    """
+    return f"{uid}:{generation}"
+
+
+__all__ = ["DedupKey", "ProcessedKeyStore", "allocation_idempotency_key", "compute_dedup_key"]
 
 
 #: 去重键默认保留时长（24 小时）。

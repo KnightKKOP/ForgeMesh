@@ -111,15 +111,15 @@ func (e *resolverEnv) doChat(t *testing.T, svc string) *httptest.ResponseRecorde
 	return rec
 }
 
-// readyEndpointsJSON 构造控制平面 status.endpoints 响应体。
+// readyEndpointsJSON 构造控制平面 status.endpoints 响应体，每个地址都是 openai-chat 实例。
 func readyEndpointsJSON(phase string, eps []string) string {
-	quoted := make([]string, 0, len(eps))
+	items := make([]string, 0, len(eps))
 	for _, ep := range eps {
-		quoted = append(quoted, fmt.Sprintf("%q", ep))
+		items = append(items, fmt.Sprintf(`{"url":%q,"protocol":"openai-chat"}`, ep))
 	}
 	return fmt.Sprintf(`{"apiVersion":"forgemesh/v1","kind":"InferenceService",`+
 		`"metadata":{"name":"svc-a"},"spec":{},`+
-		`"status":{"phase":%q,"endpoints":[%s]}}`, phase, strings.Join(quoted, ","))
+		`"status":{"phase":%q,"endpoints":[%s]}}`, phase, strings.Join(items, ","))
 }
 
 // TestResolver_TTLCacheServesStaleUntilExpiry 验证 TTL 缓存语义：

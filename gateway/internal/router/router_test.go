@@ -151,7 +151,8 @@ func TestInferenceChat_ResolvesEndpoint(t *testing.T) {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = io.WriteString(w, fmt.Sprintf(
 			`{"apiVersion":"forgemesh/v1","kind":"InferenceService","metadata":{"name":"svc-a"},`+
-				`"spec":{},"status":{"phase":"Ready","endpoints":[%q]}}`, instance.URL))
+				`"spec":{},"status":{"phase":"Ready","endpoints":[{"url":%q,"protocol":"openai-chat"}]}}`,
+			instance.URL))
 	}))
 	defer controlPlane.Close()
 
@@ -171,11 +172,49 @@ func TestInferenceChat_ResolvesEndpoint(t *testing.T) {
 	if ct := rec.Header().Get("Content-Type"); ct != "text/event-stream" {
 		t.Fatalf("Content-Type 应为 text/event-stream，实际 %q", ct)
 	}
-	if instanceGotPath != "/api/v1/inference/svc-a/chat" {
-		t.Fatalf("实例收到路径不符: %q", instanceGotPath)
+	if instanceGotPath != "/v1/chat/completions" {
+		t.Fatalf("实例收到的路径应为 openai-chat 的推理路径，实际 %q", instanceGotPath)
 	}
 	if instanceGotTenant != "tenant-a" {
 		t.Fatalf("租户头应透传到实例，实际 %q", instanceGotTenant)
+	}
+}
+
+// TestInferenceChat_NamespacedRoute 验证带命名空间的推理路由：控制平面按 namespace 查询服务，
+// 请求转发到实例协议（tgi-generate）的推理路径。
+func TestInferenceChat_NamespacedRoute(t *testing.T) {
+	var instanceGotPath string
+	instance := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		instanceGotPath = req.URL.Path
+		_, _ = io.WriteString(w, "data: ok\n\n")
+	}))
+	defer instance.Close()
+
+	var cpGotPath, cpGotNamespace string
+	controlPlane := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		cpGotPath, cpGotNamespace = req.URL.Path, req.URL.Query().Get("namespace")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, fmt.Sprintf(
+			`{"status":{"phase":"Ready","endpoints":[{"url":%q,"protocol":"tgi-generate"}]}}`,
+			instance.URL))
+	}))
+	defer controlPlane.Close()
+
+	r := newTestRouter(t, controlPlane.URL)
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/namespaces/team-a/inference/svc-a/chat", nil)
+	req.Header.Set("X-Tenant-ID", "tenant-a")
+	r.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("推理请求应 200，实际 %d（body=%s）", rec.Code, rec.Body.String())
+	}
+	if cpGotPath != "/api/v1/inference-services/svc-a" || cpGotNamespace != "team-a" {
+		t.Fatalf("控制平面应按 team-a/svc-a 查询，实际 path=%q namespace=%q", cpGotPath, cpGotNamespace)
+	}
+	if instanceGotPath != "/generate_stream" {
+		t.Fatalf("实例收到的路径应为 tgi-generate 的推理路径，实际 %q", instanceGotPath)
 	}
 }
 

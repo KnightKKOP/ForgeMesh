@@ -5,9 +5,11 @@
 //   - 逐块读取上游响应并立即 Flush，保证 token 实时到达客户端。
 //   - 通过继承客户端请求的 context，客户端断开会自动取消上游请求，避免资源泄漏。
 //
-// 路由语义：入站路径 /api/v1/inference/{svc}/chat 中的 {svc} 通过 Resolver
-// 解析为推理服务实例 endpoint，按简单轮询选择一个实例转发（实例级负载均衡），
-// 并依据转发成败向 Resolver 上报，驱动健康摘流与冷却恢复。
+// 路由语义：入站路径 /api/v1/namespaces/{ns}/inference/{svc}/chat 或
+// /api/v1/inference/{svc}/chat（不带命名空间的服务）中的服务通过 Resolver 解析为
+// 推理实例 endpoint，按简单轮询选择一个实例转发（实例级负载均衡），并依据转发
+// 成败向 Resolver 上报，驱动健康摘流与冷却恢复。请求转发到实例协议对应的路径
+// （如 openai-chat 为 /v1/chat/completions），查询串原样保留。
 //
 // 安全约束（见开发计划 §14.1）：仅做转发，不缓存、不落盘任何响应内容；
 // 调用方的平台凭证（Authorization、Cookie）不会转发给实例。
@@ -32,14 +34,14 @@ import (
 // readBufferSize 是单次读取上游响应体的缓冲区大小。
 const readBufferSize = 32 * 1024
 
-// Resolver 抽象「推理服务名 → 实例 endpoint 列表」的解析与健康上报，
+// Resolver 抽象「推理服务 → 实例 endpoint 列表」的解析与健康上报，
 // 由 upstream.Resolver 实现；以接口注入便于测试替换。
 type Resolver interface {
-	// Resolve 返回服务的健康实例 endpoint 列表（如 "http://10.0.0.1:8000"）。
-	Resolve(ctx context.Context, svc, tenantID string) ([]string, error)
-	// ReportFailure 上报一次实例转发失败（驱动摘流）。
+	// Resolve 返回服务的健康实例 endpoint 列表。
+	Resolve(ctx context.Context, svc upstream.ServiceRef, tenantID string) ([]upstream.Endpoint, error)
+	// ReportFailure 上报一次实例转发失败（驱动摘流），endpoint 为实例 URL。
 	ReportFailure(endpoint string)
-	// ReportSuccess 上报一次实例转发成功（清零失败计数）。
+	// ReportSuccess 上报一次实例转发成功（清零失败计数），endpoint 为实例 URL。
 	ReportSuccess(endpoint string)
 }
 
@@ -87,10 +89,10 @@ func New(resolver Resolver, tenantHeader string, logger *log.Logger) *Proxy {
 	}
 }
 
-// ServeHTTP 解析 {svc} → 选择实例 → 转发单个流式请求。
+// ServeHTTP 解析 {ns}/{svc} → 选择实例 → 转发单个流式请求。
 func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	svc := r.PathValue("svc")
-	if svc == "" {
+	svc := upstream.ServiceRef{Namespace: r.PathValue("ns"), Name: r.PathValue("svc")}
+	if svc.Name == "" {
 		writeJSONError(w, http.StatusBadRequest, "MISSING_SERVICE", "路径缺少推理服务名 {svc}")
 		return
 	}
@@ -107,32 +109,33 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	if len(endpoints) == 0 {
 		writeJSONError(w, http.StatusServiceUnavailable, "NO_HEALTHY_UPSTREAM",
-			"推理服务 "+svc+" 当前没有可用实例")
+			"推理服务 "+svc.String()+" 当前没有可用实例")
 		return
 	}
 
 	// 简单轮询：原子递增取模，保证多实例间均匀分发。
 	endpoint := endpoints[int(p.rr.Add(1))%len(endpoints)]
-	target, err := url.Parse(endpoint)
-	if err != nil || target.Scheme == "" || target.Host == "" {
-		p.logger.Printf("stream invalid endpoint: corr=%s svc=%s endpoint=%q err=%v",
-			r.Header.Get("X-Correlation-ID"), svc, endpoint, err)
-		p.resolver.ReportFailure(endpoint)
+	target, err := url.Parse(endpoint.URL)
+	path, known := endpoint.Protocol.Path()
+	if err != nil || target.Scheme == "" || target.Host == "" || !known {
+		p.logger.Printf("stream invalid endpoint: corr=%s svc=%s endpoint=%q protocol=%q err=%v",
+			r.Header.Get("X-Correlation-ID"), svc, endpoint.URL, endpoint.Protocol, err)
+		p.resolver.ReportFailure(endpoint.URL)
 		writeJSONError(w, http.StatusBadGateway, "INVALID_UPSTREAM",
-			"实例地址非法: "+endpoint)
+			"实例地址或协议非法: "+endpoint.URL)
 		return
 	}
 
-	p.forward(w, r, target, endpoint)
+	p.forward(w, r, buildUpstreamURL(target, path, r.URL.RawQuery), endpoint.URL)
 }
 
 // forward 执行单次流式转发，并依据结果向 Resolver 上报健康度。
-func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, target *url.URL, endpoint string) {
+func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, upstreamURL, endpoint string) {
 	// 使用客户端请求的 context：客户端断开时，Go 运行时会取消该 context，
 	// 进而取消这里的上游请求，实现“断连即取消上游”。
 	ctx := r.Context()
 
-	req, err := http.NewRequestWithContext(ctx, r.Method, buildUpstreamURL(target, r.URL), r.Body)
+	req, err := http.NewRequestWithContext(ctx, r.Method, upstreamURL, r.Body)
 	if err != nil {
 		http.Error(w, http.StatusText(http.StatusBadGateway), http.StatusBadGateway)
 		return
@@ -255,11 +258,11 @@ func writeJSONError(w http.ResponseWriter, status int, code, message string) {
 	_ = json.NewEncoder(w).Encode(body)
 }
 
-// buildUpstreamURL 拼接实例基路径与入站请求路径，避免出现双斜杠。
-func buildUpstreamURL(base *url.URL, in *url.URL) string {
+// buildUpstreamURL 拼接实例基路径与协议的推理路径（避免出现双斜杠），并带上查询串。
+func buildUpstreamURL(base *url.URL, path, rawQuery string) string {
 	u := *base
-	u.Path = singleJoiningSlash(base.Path, in.Path)
-	u.RawQuery = in.RawQuery
+	u.Path = singleJoiningSlash(base.Path, path)
+	u.RawQuery = rawQuery
 	return u.String()
 }
 

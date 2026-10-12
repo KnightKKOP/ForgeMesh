@@ -14,11 +14,15 @@ import (
 	"time"
 )
 
-// readyBody 构造控制平面 GET /inference-services/{name} 的响应体。
+// svcA 是测试用的不带命名空间的推理服务。
+var svcA = ServiceRef{Name: "svc-a"}
+
+// readyBody 构造控制平面 GET /inference-services/{name} 的响应体，每个 endpoint 使用
+// openai-chat 协议。
 func readyBody(phase string, endpoints ...string) string {
 	eps := ""
 	for _, ep := range endpoints {
-		eps += fmt.Sprintf("%q,", ep)
+		eps += fmt.Sprintf(`{"url":%q,"protocol":"openai-chat"},`, ep)
 	}
 	if len(eps) > 0 {
 		eps = eps[:len(eps)-1]
@@ -65,11 +69,11 @@ func TestResolve_Success(t *testing.T) {
 	})
 
 	r := newTestResolver(srv.URL, time.Second, time.Second)
-	eps, err := r.Resolve(context.Background(), "svc-a", "tenant-a")
+	eps, err := r.Resolve(context.Background(), svcA, "tenant-a")
 	if err != nil {
 		t.Fatalf("Resolve 应成功，实际错误: %v", err)
 	}
-	if len(eps) != 2 || eps[0] != "http://10.0.0.1:8000" || eps[1] != "http://10.0.0.2:8000" {
+	if len(eps) != 2 || eps[0].URL != "http://10.0.0.1:8000" || eps[1].URL != "http://10.0.0.2:8000" {
 		t.Fatalf("endpoints 不符: %v", eps)
 	}
 	if gotPath != "/api/v1/inference-services/svc-a" {
@@ -99,11 +103,11 @@ func TestResolve_ForwardsCallerAuthorization(t *testing.T) {
 	})
 	r := newTestResolver(srv.URL, time.Nanosecond, time.Second)
 
-	if _, err := r.Resolve(WithAuthorization(context.Background(), "Bearer fmk_k"), "svc-a", "tenant-a"); err != nil {
+	if _, err := r.Resolve(WithAuthorization(context.Background(), "Bearer fmk_k"), svcA, "tenant-a"); err != nil {
 		t.Fatalf("Resolve 应成功: %v", err)
 	}
 	time.Sleep(time.Millisecond)
-	if _, err := r.Resolve(WithAuthorization(context.Background(), ""), "svc-a", "tenant-a"); err != nil {
+	if _, err := r.Resolve(WithAuthorization(context.Background(), ""), svcA, "tenant-a"); err != nil {
 		t.Fatalf("Resolve 应成功: %v", err)
 	}
 
@@ -121,7 +125,7 @@ func TestResolve_Forbidden(t *testing.T) {
 	})
 	r := newTestResolver(srv.URL, time.Second, time.Second)
 
-	if _, err := r.Resolve(context.Background(), "svc-a", "tenant-a"); !errors.Is(err, ErrForbidden) {
+	if _, err := r.Resolve(context.Background(), svcA, "tenant-a"); !errors.Is(err, ErrForbidden) {
 		t.Fatalf("403 应映射为 ErrForbidden，实际 %v", err)
 	}
 }
@@ -132,7 +136,7 @@ func TestResolve_CacheHit(t *testing.T) {
 	r := newTestResolver(srv.URL, time.Minute, time.Second)
 
 	for i := 0; i < 3; i++ {
-		if _, err := r.Resolve(context.Background(), "svc-a", "tenant-a"); err != nil {
+		if _, err := r.Resolve(context.Background(), svcA, "tenant-a"); err != nil {
 			t.Fatalf("第 %d 次 Resolve 失败: %v", i+1, err)
 		}
 	}
@@ -146,11 +150,11 @@ func TestResolve_CacheExpiry(t *testing.T) {
 	srv, calls := newControlPlane(t, nil)
 	r := newTestResolver(srv.URL, 50*time.Millisecond, time.Second)
 
-	if _, err := r.Resolve(context.Background(), "svc-a", "tenant-a"); err != nil {
+	if _, err := r.Resolve(context.Background(), svcA, "tenant-a"); err != nil {
 		t.Fatalf("首次 Resolve 失败: %v", err)
 	}
 	time.Sleep(70 * time.Millisecond)
-	if _, err := r.Resolve(context.Background(), "svc-a", "tenant-a"); err != nil {
+	if _, err := r.Resolve(context.Background(), svcA, "tenant-a"); err != nil {
 		t.Fatalf("过期后 Resolve 失败: %v", err)
 	}
 	if got := calls.Load(); got != 2 {
@@ -163,10 +167,10 @@ func TestResolve_TenantIsolation(t *testing.T) {
 	srv, calls := newControlPlane(t, nil)
 	r := newTestResolver(srv.URL, time.Minute, time.Second)
 
-	if _, err := r.Resolve(context.Background(), "svc-a", "tenant-a"); err != nil {
+	if _, err := r.Resolve(context.Background(), svcA, "tenant-a"); err != nil {
 		t.Fatalf("tenant-a Resolve 失败: %v", err)
 	}
-	if _, err := r.Resolve(context.Background(), "svc-a", "tenant-b"); err != nil {
+	if _, err := r.Resolve(context.Background(), svcA, "tenant-b"); err != nil {
 		t.Fatalf("tenant-b Resolve 失败: %v", err)
 	}
 	if got := calls.Load(); got != 2 {
@@ -182,7 +186,7 @@ func TestResolve_NotFound(t *testing.T) {
 	})
 	r := newTestResolver(srv.URL, time.Second, time.Second)
 
-	_, err := r.Resolve(context.Background(), "svc-a", "tenant-a")
+	_, err := r.Resolve(context.Background(), svcA, "tenant-a")
 	if !errors.Is(err, ErrServiceNotFound) {
 		t.Fatalf("应返回 ErrServiceNotFound，实际: %v", err)
 	}
@@ -195,7 +199,7 @@ func TestResolve_ServerError(t *testing.T) {
 	})
 	r := newTestResolver(srv.URL, time.Second, time.Second)
 
-	_, err := r.Resolve(context.Background(), "svc-a", "tenant-a")
+	_, err := r.Resolve(context.Background(), svcA, "tenant-a")
 	if err == nil {
 		t.Fatal("控制平面 500 应返回错误")
 	}
@@ -209,7 +213,7 @@ func TestResolve_ServerError(t *testing.T) {
 // TestResolve_NetworkError 验证控制平面不可达时返回普通错误。
 func TestResolve_NetworkError(t *testing.T) {
 	r := newTestResolver("http://127.0.0.1:1", time.Second, time.Second)
-	_, err := r.Resolve(context.Background(), "svc-a", "tenant-a")
+	_, err := r.Resolve(context.Background(), svcA, "tenant-a")
 	if err == nil {
 		t.Fatal("网络不可达应返回错误")
 	}
@@ -225,7 +229,7 @@ func TestResolve_EmptyEndpoints(t *testing.T) {
 	})
 	r := newTestResolver(srv.URL, time.Second, time.Second)
 
-	_, err := r.Resolve(context.Background(), "svc-a", "tenant-a")
+	_, err := r.Resolve(context.Background(), svcA, "tenant-a")
 	if !errors.Is(err, ErrNoEndpoints) {
 		t.Fatalf("应返回 ErrNoEndpoints，实际: %v", err)
 	}
@@ -240,7 +244,7 @@ func TestResolve_MissingEndpointsField(t *testing.T) {
 	})
 	r := newTestResolver(srv.URL, time.Second, time.Second)
 
-	_, err := r.Resolve(context.Background(), "svc-a", "tenant-a")
+	_, err := r.Resolve(context.Background(), svcA, "tenant-a")
 	if !errors.Is(err, ErrNoEndpoints) {
 		t.Fatalf("缺失 endpoints 字段应返回 ErrNoEndpoints，实际: %v", err)
 	}
@@ -253,11 +257,11 @@ func TestResolve_InvalidEndpointsFiltered(t *testing.T) {
 	})
 	r := newTestResolver(srv.URL, time.Second, time.Second)
 
-	eps, err := r.Resolve(context.Background(), "svc-a", "tenant-a")
+	eps, err := r.Resolve(context.Background(), svcA, "tenant-a")
 	if err != nil {
 		t.Fatalf("Resolve 应成功: %v", err)
 	}
-	if len(eps) != 1 || eps[0] != "http://10.0.0.1:8000" {
+	if len(eps) != 1 || eps[0].URL != "http://10.0.0.1:8000" {
 		t.Fatalf("应仅保留合法 endpoint，实际: %v", eps)
 	}
 }
@@ -269,7 +273,7 @@ func TestResolve_NotReady(t *testing.T) {
 	})
 	r := newTestResolver(srv.URL, time.Second, time.Second)
 
-	_, err := r.Resolve(context.Background(), "svc-a", "tenant-a")
+	_, err := r.Resolve(context.Background(), svcA, "tenant-a")
 	if !errors.Is(err, ErrNotReady) {
 		t.Fatalf("应返回 ErrNotReady，实际: %v", err)
 	}
@@ -286,7 +290,7 @@ func TestResolve_FailureEjection(t *testing.T) {
 	// 前 2 次失败：仍有两个 endpoint。
 	r.ReportFailure("http://10.0.0.1:8000")
 	r.ReportFailure("http://10.0.0.1:8000")
-	eps, err := r.Resolve(context.Background(), "svc-a", "tenant-a")
+	eps, err := r.Resolve(context.Background(), svcA, "tenant-a")
 	if err != nil {
 		t.Fatalf("未达阈值不应摘流: %v", err)
 	}
@@ -296,11 +300,11 @@ func TestResolve_FailureEjection(t *testing.T) {
 
 	// 第 3 次失败：达到阈值，实例 A 被摘流。
 	r.ReportFailure("http://10.0.0.1:8000")
-	eps, err = r.Resolve(context.Background(), "svc-a", "tenant-a")
+	eps, err = r.Resolve(context.Background(), svcA, "tenant-a")
 	if err != nil {
 		t.Fatalf("摘流一个实例后仍应可解析: %v", err)
 	}
-	if len(eps) != 1 || eps[0] != "http://10.0.0.2:8000" {
+	if len(eps) != 1 || eps[0].URL != "http://10.0.0.2:8000" {
 		t.Fatalf("应只剩实例 B，实际: %v", eps)
 	}
 
@@ -308,7 +312,7 @@ func TestResolve_FailureEjection(t *testing.T) {
 	r.ReportFailure("http://10.0.0.2:8000")
 	r.ReportFailure("http://10.0.0.2:8000")
 	r.ReportFailure("http://10.0.0.2:8000")
-	_, err = r.Resolve(context.Background(), "svc-a", "tenant-a")
+	_, err = r.Resolve(context.Background(), svcA, "tenant-a")
 	if !errors.Is(err, ErrNoHealthyEndpoints) {
 		t.Fatalf("全部摘流应返回 ErrNoHealthyEndpoints，实际: %v", err)
 	}
@@ -324,16 +328,16 @@ func TestResolve_CooldownRecovery(t *testing.T) {
 	for i := 0; i < defaultFailureThreshold; i++ {
 		r.ReportFailure("http://10.0.0.1:8000")
 	}
-	if _, err := r.Resolve(context.Background(), "svc-a", "tenant-a"); !errors.Is(err, ErrNoHealthyEndpoints) {
+	if _, err := r.Resolve(context.Background(), svcA, "tenant-a"); !errors.Is(err, ErrNoHealthyEndpoints) {
 		t.Fatalf("摘流期应返回 ErrNoHealthyEndpoints，实际: %v", err)
 	}
 
 	time.Sleep(80 * time.Millisecond) // 等待冷却结束（half-open 放行）。
-	eps, err := r.Resolve(context.Background(), "svc-a", "tenant-a")
+	eps, err := r.Resolve(context.Background(), svcA, "tenant-a")
 	if err != nil {
 		t.Fatalf("冷却结束后应恢复可用: %v", err)
 	}
-	if len(eps) != 1 || eps[0] != "http://10.0.0.1:8000" {
+	if len(eps) != 1 || eps[0].URL != "http://10.0.0.1:8000" {
 		t.Fatalf("恢复后应返回原 endpoint，实际: %v", eps)
 	}
 }
@@ -352,7 +356,7 @@ func TestReportSuccess_ResetsFailures(t *testing.T) {
 	r.ReportFailure("http://10.0.0.1:8000")
 	r.ReportFailure("http://10.0.0.1:8000")
 
-	if _, err := r.Resolve(context.Background(), "svc-a", "tenant-a"); err != nil {
+	if _, err := r.Resolve(context.Background(), svcA, "tenant-a"); err != nil {
 		t.Fatalf("穿插成功后连续失败未达阈值，不应摘流: %v", err)
 	}
 }
@@ -384,10 +388,81 @@ func TestResolve_Concurrent(t *testing.T) {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			_, _ = r.Resolve(context.Background(), "svc-a", "tenant-a")
+			_, _ = r.Resolve(context.Background(), svcA, "tenant-a")
 			r.ReportFailure(fmt.Sprintf("http://10.0.0.%d:8000", i%2+1))
 			r.ReportSuccess(fmt.Sprintf("http://10.0.0.%d:8000", i%2+1))
 		}(i)
 	}
 	wg.Wait()
+}
+
+// TestResolve_QueriesTheServiceNamespace 验证带命名空间的服务以 namespace 参数查询，
+// 不带命名空间的服务不发送该参数（与控制平面的语义一致）。
+func TestResolve_QueriesTheServiceNamespace(t *testing.T) {
+	var mu sync.Mutex
+	var queries []string
+	srv, _ := newControlPlane(t, func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		queries = append(queries, r.URL.Path+"?"+r.URL.RawQuery)
+		mu.Unlock()
+		_, _ = io.WriteString(w, readyBody("Ready", "http://10.0.0.1:8000"))
+	})
+	r := newTestResolver(srv.URL, time.Minute, time.Second)
+
+	if _, err := r.Resolve(context.Background(), ServiceRef{Namespace: "team a", Name: "svc-a"}, "tenant-a"); err != nil {
+		t.Fatalf("带命名空间的 Resolve 失败: %v", err)
+	}
+	if _, err := r.Resolve(context.Background(), svcA, "tenant-a"); err != nil {
+		t.Fatalf("不带命名空间的 Resolve 失败: %v", err)
+	}
+
+	want := []string{
+		"/api/v1/inference-services/svc-a?namespace=team+a",
+		"/api/v1/inference-services/svc-a?",
+	}
+	if fmt.Sprint(queries) != fmt.Sprint(want) {
+		t.Fatalf("查询不符（命名空间也应区分缓存）:\n got %v\nwant %v", queries, want)
+	}
+}
+
+// TestResolve_KeepsOnlyReadyEndpointsWithKnownProtocols 验证未就绪、协议未知或缺失协议、
+// 非 http(s) 的实例被跳过，保留的实例带上协议。
+func TestResolve_KeepsOnlyReadyEndpointsWithKnownProtocols(t *testing.T) {
+	srv, _ := newControlPlane(t, func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, `{"kind":"InferenceService","status":{"phase":"Ready","endpoints":[
+			{"url":"http://10.0.0.1:8000","protocol":"openai-chat","ready":false},
+			{"url":"http://10.0.0.2:8000","protocol":"grpc"},
+			{"url":"http://10.0.0.3:8000"},
+			{"url":"ftp://10.0.0.4","protocol":"tgi-generate"},
+			{"url":"http://10.0.0.5:8080","protocol":"tgi-generate","ready":true},
+			{"url":"http://10.0.0.6:8000","protocol":"openai-chat"}]}}`)
+	})
+	r := newTestResolver(srv.URL, time.Minute, time.Second)
+
+	eps, err := r.Resolve(context.Background(), svcA, "tenant-a")
+	if err != nil {
+		t.Fatalf("Resolve 应成功: %v", err)
+	}
+	want := []Endpoint{
+		{URL: "http://10.0.0.5:8080", Protocol: ProtocolTGIGenerate},
+		{URL: "http://10.0.0.6:8000", Protocol: ProtocolOpenAIChat},
+	}
+	if fmt.Sprint(eps) != fmt.Sprint(want) {
+		t.Fatalf("endpoints 不符:\n got %v\nwant %v", eps, want)
+	}
+}
+
+// TestProtocolPath 验证协议到实例推理路径的映射。
+func TestProtocolPath(t *testing.T) {
+	for protocol, want := range map[Protocol]string{
+		ProtocolOpenAIChat:  "/v1/chat/completions",
+		ProtocolTGIGenerate: "/generate_stream",
+	} {
+		if got, ok := protocol.Path(); !ok || got != want {
+			t.Fatalf("%s 应映射到 %s，实际 %q (ok=%v)", protocol, want, got, ok)
+		}
+	}
+	if _, ok := Protocol("grpc").Path(); ok {
+		t.Fatal("未知协议不应有路径")
+	}
 }

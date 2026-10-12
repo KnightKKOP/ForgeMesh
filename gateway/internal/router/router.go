@@ -8,9 +8,11 @@
 //	ANY  /api/v1/inference-services[/...]      反代到 Python 控制平面
 //	ANY  /api/v1/workflows[/...]               反代到 Python 控制平面
 //	ANY  /api/v1/decisions[/...]               反代到 Python 控制平面
-//	ANY  /api/v1/inference/{svc}/chat          SSE 流式代理（{svc} 经 Resolver
-//	                                          解析为实例 endpoint，轮询分发；
-//	                                          要求 read 作用域）
+//	ANY  /api/v1/namespaces/{ns}/inference/{svc}/chat
+//	                                          SSE 流式代理（服务经 Resolver 解析为
+//	                                          ready 实例，轮询分发，按实例协议映射
+//	                                          路径；要求 read 作用域）
+//	ANY  /api/v1/inference/{svc}/chat          同上，用于不带命名空间的服务
 //
 // 中间件链（执行顺序）：Recovery → Correlation → Authenticate → RateLimit → Route。
 // Recovery 作为最外层兜底全量请求；探针刻意不经过认证/限流，保证健康检查可用。
@@ -42,8 +44,11 @@ var proxyRoutes = []string{
 	"/api/v1/decisions",
 }
 
-// streamRoutePattern 是流式（SSE）代理路由，{svc} 为推理服务标识。
-const streamRoutePattern = "/api/v1/inference/{svc}/chat"
+// 流式（SSE）代理路由：{ns} 为命名空间，{svc} 为推理服务名。
+const (
+	streamRoutePattern            = "/api/v1/namespaces/{ns}/inference/{svc}/chat"
+	streamWithoutNamespacePattern = "/api/v1/inference/{svc}/chat"
+)
 
 // Router 组装路由表与中间件链，实现 http.Handler。
 type Router struct {
@@ -92,7 +97,9 @@ func New(cfg config.Config, logger *log.Logger) (*Router, error) {
 	}
 	// 推理调用读取服务的 status.endpoints 并调用实例，不修改资源，故要求 read 作用域；
 	// 在网关侧检查，使命中 Resolver 缓存的请求同样受作用域约束。
-	apiMux.Handle(streamRoutePattern, middleware.RequireScope(middleware.ScopeRead)(streamProxy))
+	streamHandler := middleware.RequireScope(middleware.ScopeRead)(streamProxy)
+	apiMux.Handle(streamRoutePattern, streamHandler)
+	apiMux.Handle(streamWithoutNamespacePattern, streamHandler)
 
 	// API 中间件链：Correlation → Authenticate → RateLimit。
 	limiter := middleware.NewRateLimiter(cfg.RateLimitRPS, cfg.RateLimitBurst)

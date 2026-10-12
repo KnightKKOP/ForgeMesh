@@ -196,44 +196,44 @@ scripts/compose_smoke.sh   # 端到端冒烟（CI 同样执行）
 
 ForgeMesh 目前处于预览阶段，API 稳定性标注为 `beta`：minor 版本可能包含破坏性变更，均在 [CHANGELOG](CHANGELOG.md) 中标注（规则见[弃用政策](docs/governance/deprecation-policy.md) 1.4 节）。v1.0.0 发布时曾标注为稳定版本，这一标注已经更正；改回 `stable` 之前，应当满足[架构验收标准](docs/architecture/architecture.md)（第 20 节）。
 
-以下是 v1.0.0 发布时列出的核心能力：
+以下是 v1.0.0 发布时列出的核心能力，与实现不符或尚未完成的部分在条目后以「现状」注明：
 
 ### 核心控制平面（M2）
-- **资源注册中心**：SQLite 持久化，乐观并发 CAS，租户隔离，分页游标
-- **协调控制器**：9 步声明式闭环（获取→查询→比较→生成候选→策略校验→调度分配→执行→重观察→更新状态）
+- **资源注册中心**：SQLite 持久化，乐观并发 CAS，租户隔离，分页游标（现状：API 尚未返回分页游标）
+- **协调控制器**：9 步声明式闭环（获取→查询→比较→生成候选→策略校验→调度分配→执行→重观察→更新状态）（现状：自 1.1.0 起由控制器自动驱动；仓库中还没有调度器实现，新建的推理服务停在 `Pending`，并报告 `Ready=False`（`SchedulerUnavailable`））
 - **策略引擎**：allow/deny/require_approval 三态决策，配额规则，高风险审批触发
   - 说明：Decision Router 的 `OK/FALLBACK_REQUIRED/FAILED` 是决策路由层的另一组状态，与 Policy 三态不混用
-- **插件管理器**：Manifest 解析校验，生命周期状态机，能力发现，权限授予
-- **审计与 Outbox**：事务性 Outbox，异步事件发布，幂等消费，correlation_id 全链路
-- **REST API 与 CLI**：资源 CRUD，状态查询，任务管理，租户上下文注入
+- **插件管理器**：Manifest 解析校验，生命周期状态机，能力发现，权限授予（现状：授予的权限直接取自插件清单自己的声明）
+- **审计与 Outbox**：事务性 Outbox，异步事件发布，幂等消费，correlation_id 全链路（现状：组件已实现，尚未接入控制平面的生产路径）
+- **REST API 与 CLI**：资源 CRUD，状态查询，任务管理，租户上下文注入（现状：没有更新接口；CLI 每条命令使用一个新的内存数据库，尚不可用）
 
 ### 工作流与决策（M3）
 - **工作流引擎**：持久化执行，幂等去重，三级超时，重试策略
-- **参考执行器**：DSL 解析，补偿步骤（反向执行），审批等待与重校验
+- **参考执行器**：DSL 解析，补偿步骤（反向执行），审批等待与重校验（现状：参考工作流运行时的 `start()` 只登记运行、不执行步骤）
 - **熔断器与降级**：closed/open/half-open 状态机，按风险决定是否尝试备用
 - **决策插件**：decision-rules（确定性规则）、decision-jev（JEV 类型化决策）
 
 ### 执行平面与 GPU 生命周期（M4）
-- **Node Agent**：注册认证，设备/驱动探测，本地运行时管理，断线重连，任务恢复
-- **gRPC 任务协议**：6 类任务枚举，心跳与离线检测，幂等键去重
+- **Node Agent**：注册认证，设备/驱动探测，本地运行时管理，断线重连，任务恢复（现状：与控制平面之间只有进程内调用，没有网络传输）
+- **gRPC 任务协议**：6 类任务枚举，心跳与离线检测，幂等键去重（现状：协议定义在 `api/protobuf/agent.proto`，尚未生成代码）
 - **gpu-nvidia 插件**：GPU 枚举，能力采集，驱动/CUDA 预检，周期性健康检查
-- **runtime-vllm 插件**：模型拉取，实例部署，冒烟验证，租约释放
-- **GPU 上线 E2E**：发现→验证→准备→部署→验收→提交 完整闭环
+- **runtime-vllm 插件**：模型拉取，实例部署，冒烟验证，租约释放（现状：默认 launcher 抛出 `NotImplementedError`，部署实例需要注入 launcher）
+- **GPU 上线 E2E**：发现→验证→准备→部署→验收→提交 完整闭环（现状：工作流级测试，各步骤为模拟实现）
 - **故障恢复**：节点离线不误判、控制平面重启恢复、重复事件不盲目重试
 
 ### 生产级治理（M5）
 - **配额与 QoS**：多租户配额策略，服务优先级排队，限流
 - **Token 计量**：追加式 UsageRecord，计量修正事件
-- **可观测性**：OpenTelemetry 接入，8 类关键指标，敏感数据过滤
+- **可观测性**：OpenTelemetry 接入，8 类关键指标，敏感数据过滤（现状：指标与追踪只记录在内存中，没有 Prometheus / OTLP 导出）
 - **诊断包**：统一诊断聚合（资源/工作流/插件/决策/日志），按租户权限受限
-- **插件安全**：制品签名验证，隔离宿主（受限 RPC），升级兼容性
+- **插件安全**：制品签名验证，隔离宿主（受限 RPC），升级兼容性（现状：签名为 HMAC 对称签名，注册插件时不验签；受限 RPC 没有进程级隔离）
 - **安全测试**：租户隔离，插件权限，密钥脱敏，灾备文档
 
 ### 扩展与生态（M6）
 - **MIG 支持**：NVIDIA MIG 实例管理（创建/销毁/发现/健康检查/能力报告），并发安全，资源不超分
 - **异构 GPU**：非 NVIDIA 能力差异显式报告（差异不隐藏）
-- **Temporal Provider**：WorkflowRuntime 契约适配，补偿注册，信号投递
-- **TGI Runtime**：HuggingFace TGI 推理 Runtime Provider（deploy→verify→release 闭环）
+- **Temporal Provider**：WorkflowRuntime 契约适配，补偿注册，信号投递（现状：只有内存客户端，没有接入 temporalio）
+- **TGI Runtime**：HuggingFace TGI 推理 Runtime Provider（deploy→verify→release 闭环）（现状：默认 launcher 抛出 `NotImplementedError`）
 - **插件 SDK**：脚手架生成，Manifest 校验，打包发布，开放契约测试套件
 - **治理文档**：GOVERNANCE / SECURITY / CONTRIBUTING / CODE_OF_CONDUCT 完善，弃用政策
 - **API 版本管理**：OpenAPI 版本号与稳定性标注（当前为 1.1.0、`beta`），CHANGELOG，发布记录，CI 架构文档检查
@@ -242,8 +242,8 @@ ForgeMesh 目前处于预览阶段，API 稳定性标注为 `beta`：minor 版�
 
 | 类型 | 数量 |
 |------|------|
-| Python 测试 | **1115** |
-| Go 测试 | 全部通过 |
+| Python 测试 | **1244** |
+| Go 测试 | 134 个测试函数，全部通过 |
 | ruff 检查 | All checks passed |
 
 ---

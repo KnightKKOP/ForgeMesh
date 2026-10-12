@@ -60,6 +60,14 @@
 
 ### Fixed
 
+- 勘误：1.0.0 变更日志中以下条目与 v1.0.x 的实际交付不符（原文保留作历史记录；README「功能概览」已逐条注明现状）：
+  - 「gRPC 通信层：控制平面 ↔ Node Agent 双向流」：`api/protobuf/agent.proto` 没有生成代码，Node Agent 与控制平面之间只有进程内调用。
+  - 「执行平面 E2E 测试：控制平面 → Node Agent → GPU → 推理全链路」：没有这样的测试；`tests/e2e/` 中只有各步骤为模拟实现的 GPU 上线工作流测试。
+  - 「混沌测试 Chaos：网络分区、节点宕机、GPU 故障注入」：混沌测试以 mock 与内存存储模拟节点离线、控制平面重启、重复事件与工作流恢复，没有网络分区与 GPU 故障注入。
+  - 「可观测性 Observability：metrics（Prometheus）、tracing（OpenTelemetry）」：指标与追踪只记录在内存中，没有 Prometheus / OTLP 导出。
+  - 「插件安全沙箱（ADR-006）：按信任级别隔离执行」与 Security 中的「插件 manifest 签名验证」：隔离只是信任级别到隔离模式的映射，没有进程级隔离；签名为 HMAC 对称签名，注册插件时不验签。
+  - 「Temporal 工作流插件 `workflow-temporal`：生产级工作流编排引擎集成」：只有抽象客户端与内存实现，没有接入 temporalio。
+  - Changed 中的「所有端点从 501 Not Implemented 占位升级为正式实现」，以及 Security 中的「所有 API 端点强制认证与租户隔离」「SSRF 防护：外部 URL 请求经白名单校验」：在 v1.0.x 中均不成立，分别自 1.1.0 起提供（可运行入口挂载真实 API、API Key 认证、网关实例地址策略，见本节与 Security）。
 - 控制平面唯一的可运行应用仍注册阶段 0 占位路由，全部业务端点返回 `501`，已实现的 API 路由只在测试中挂载：现挂载真实路由；SQLite 在应用启动（lifespan）时打开，导入模块不再产生文件副作用；`/readyz` 探测权威存储可用性。
 - `control-plane` 包补齐 `forgemesh-policy-engine` 与 `forgemesh-plugin-sdk` 依赖声明（此前独立安装后导入即失败）。
 - `POST /api/v1/inference-services` 丢弃请求体中的 `spec`、接受任意 `kind`、不分配 `uid` 且返回 `200`：现按 `InferenceService` 强类型校验（`uid`、租户与 `status` 由服务端维护），成功返回 `201`，请求体不合法返回 `400` 错误信封，同名冲突返回 `409`。

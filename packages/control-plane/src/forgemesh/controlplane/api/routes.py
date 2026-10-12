@@ -44,6 +44,7 @@ from .dependencies import (
     get_tenant_id,
     get_workflow_runtime,
 )
+from .errors import validation_details
 
 router = APIRouter(prefix="/api/v1")
 
@@ -127,7 +128,7 @@ async def create_inference_service(
             "BAD_REQUEST",
             "推理服务创建请求校验失败",
             correlation_id,
-            {"errors": _validation_details(exc)},
+            {"errors": validation_details(exc)},
         )
     except ValueError as exc:
         return _error_response(400, "BAD_REQUEST", str(exc), correlation_id)
@@ -256,14 +257,6 @@ class WorkflowRunResponse(BaseModel):
     definition_version: int = Field(alias="definitionVersion")
 
 
-def _validation_details(exc: ValidationError) -> list[dict[str, Any]]:
-    """提取校验错误摘要（loc/msg/type），剥离不可 JSON 序列化的 ``ctx``。"""
-    return [
-        {"loc": [str(x) for x in err["loc"]], "msg": err["msg"], "type": err["type"]}
-        for err in exc.errors()
-    ]
-
-
 def _error_response(
     status_code: int,
     code: str,
@@ -307,7 +300,7 @@ async def start_workflow(
             "BAD_REQUEST",
             "工作流启动请求校验失败",
             correlation_id,
-            {"errors": _validation_details(exc)},
+            {"errors": validation_details(exc)},
         )
 
     try:
@@ -390,7 +383,7 @@ async def request_decision(
             "BAD_REQUEST",
             "决策请求校验失败",
             correlation_id,
-            {"errors": _validation_details(exc)},
+            {"errors": validation_details(exc)},
         )
 
     try:

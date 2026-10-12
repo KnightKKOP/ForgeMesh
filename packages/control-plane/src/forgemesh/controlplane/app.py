@@ -110,6 +110,7 @@ if _FASTAPI_AVAILABLE:
         # 延迟导入：api.routes 反向依赖本模块的 error_envelope。
         from .api import create_api_router
         from .api.dependencies import get_registry, init_registry
+        from .api.errors import install_exception_handlers
 
         @asynccontextmanager
         async def lifespan(_: FastAPI) -> AsyncIterator[None]:
@@ -144,6 +145,7 @@ if _FASTAPI_AVAILABLE:
                 )
             return HealthResponse(status="ok")
 
+        install_exception_handlers(application)
         application.include_router(create_api_router())
         return application
 

@@ -59,7 +59,7 @@ from dataclasses import dataclass, field
 from typing import Any, TypeVar
 from uuid import uuid4
 
-from forgemesh.core.errors import ConflictError, NotFoundError
+from forgemesh.core.errors import ConflictError, NotFoundError, PreconditionFailedError
 from forgemesh.core.objects import Resource
 from forgemesh.core.registry import ResourceRegistry
 from forgemesh.resource.allocation import Allocation, AllocationStatus
@@ -173,7 +173,35 @@ class SQLiteRegistry(ResourceRegistry):
         """创建表与索引（幂等），并对存量库做列迁移。"""
         self._conn.executescript(_SCHEMA_SQL)
         self._migrate_legacy_resources()
+        self._ensure_identity_index()
         self._conn.commit()
+
+    def _ensure_identity_index(self) -> None:
+        """建立把 NULL namespace 视为相等的身份唯一索引。
+
+        SQLite 主键允许 NULL 且 NULL 互不相等，仅靠主键无法阻止 namespace 为空的
+        资源重名。存量库已存在重复记录时拒绝打开，避免静默删除数据。
+        """
+        exists = self._conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='index' AND name='ux_resources_identity'"
+        ).fetchone()
+        if exists is not None:
+            return
+        duplicate = self._conn.execute(
+            "SELECT tenant_id, kind, COALESCE(namespace, '') AS ns, name, COUNT(*) AS n "
+            "FROM resources GROUP BY tenant_id, kind, ns, name HAVING n > 1 LIMIT 1"
+        ).fetchone()
+        if duplicate is not None:
+            raise PreconditionFailedError(
+                "duplicate resources must be removed before upgrading: "
+                f"tenant_id={duplicate['tenant_id']} kind={duplicate['kind']} "
+                f"namespace={duplicate['ns']!r} name={duplicate['name']} "
+                f"count={duplicate['n']}",
+            )
+        self._conn.execute(
+            "CREATE UNIQUE INDEX ux_resources_identity "
+            "ON resources(tenant_id, kind, COALESCE(namespace, ''), name)"
+        )
 
     def _migrate_legacy_resources(self) -> None:
         """存量库幂等迁移：以 ``PRAGMA table_info`` 探测后补 ``phase`` /

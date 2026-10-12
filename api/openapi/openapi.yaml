@@ -71,6 +71,14 @@ paths:
           in: query
           schema:
             type: string
+        - name: limit
+          in: query
+          description: 单页最多返回的条数；超出 1–1000 返回 400。
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 1000
+            default: 100
       responses:
         "200":
           description: 列表
@@ -78,6 +86,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/InferenceServiceList"
+        "400":
+          $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":
@@ -143,6 +153,8 @@ paths:
           description: 已直接删除（无 finalizer，无外部副作用）
         "404":
           $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
 
 
   /api/v1/workflows:

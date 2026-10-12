@@ -135,6 +135,21 @@ make clean           # 清理构建与缓存产物
 
 > `make install` 会遍历 `packages/*/`，对含 `pyproject.toml` 的子包执行 `uv pip install -e`，因此新增子包无需修改顶层 Makefile。
 
+### 运行控制平面
+
+```bash
+FORGEMESH_DB_PATH=./forgemesh.db .venv/bin/forgemesh-control-plane
+curl -s http://127.0.0.1:8080/readyz   # {"status":"ok",...}
+```
+
+| 环境变量 | 默认值 | 说明 |
+| --- | --- | --- |
+| `FORGEMESH_DB_PATH` | `forgemesh.db` | SQLite 权威存储文件；同一文件只允许一个控制平面实例写入（ADR-013） |
+| `FORGEMESH_HOST` | `127.0.0.1` | 监听地址 |
+| `FORGEMESH_PORT` | `8080` | 监听端口 |
+
+> 控制平面按 `X-Tenant-Id` 请求头识别租户、不校验凭证，请保持回环监听，不要直接暴露给不可信网络。
+
 ### Go 网关
 
 ```bash

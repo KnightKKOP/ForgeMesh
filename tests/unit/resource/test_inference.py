@@ -15,6 +15,8 @@ from forgemesh.core.objects import Condition, ObjectMeta
 from forgemesh.resource.inference import (
     AcceleratorSpec,
     Availability,
+    Endpoint,
+    EndpointProtocol,
     InferencePhase,
     InferenceService,
     InferenceServiceSpec,
@@ -139,6 +141,43 @@ def test_status_can_be_provided_explicitly() -> None:
     )
     assert service.status.phase is InferencePhase.READY
     assert service.status.observedGeneration == 3
+
+
+def test_status_endpoints_default_to_empty_and_ready() -> None:
+    """status.endpoints 默认为空；未声明 ready 的实例视为就绪。"""
+    endpoint = Endpoint(url="http://10.0.0.1:8000", protocol="openai-chat")
+
+    assert _make_service().status.endpoints == []
+    assert endpoint.ready is True
+    assert endpoint.protocol is EndpointProtocol.OPENAI_CHAT
+    assert endpoint.model_dump(mode="json") == {
+        "url": "http://10.0.0.1:8000",
+        "ready": True,
+        "instanceId": None,
+        "protocol": "openai-chat",
+    }
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "10.0.0.1:8000",
+        "ftp://10.0.0.1",
+        "http://",
+        "http://user:secret@10.0.0.1:8000",
+        "http://10.0.0.1:8000/?debug=1",
+        "http://10.0.0.1:8000/#frag",
+        "http://10.0.0.1:notaport",
+    ],
+)
+def test_endpoint_url_must_be_a_plain_http_base_url(url: str) -> None:
+    with pytest.raises(ValidationError):
+        Endpoint(url=url, protocol="openai-chat")
+
+
+def test_endpoint_protocol_must_be_known() -> None:
+    with pytest.raises(ValidationError):
+        Endpoint(url="http://10.0.0.1:8000", protocol="grpc")
 
 
 def test_inference_phase_has_eleven_states() -> None:

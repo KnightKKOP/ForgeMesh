@@ -18,6 +18,8 @@ from .allocation import Allocation, AllocationStatus, ResourceLease
 from .inference import (
     AcceleratorSpec,
     Availability,
+    Endpoint,
+    EndpointProtocol,
     InferencePhase,
     InferenceService,
     InferenceServiceSpec,
@@ -53,6 +55,8 @@ __all__ = [
     "AcceleratorSpec",
     "Availability",
     "InferenceServiceSpec",
+    "EndpointProtocol",
+    "Endpoint",
     "InferenceServiceStatus",
     "InferenceService",
     # node

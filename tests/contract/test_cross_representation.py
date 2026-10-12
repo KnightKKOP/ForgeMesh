@@ -68,15 +68,10 @@ def test_inference_service_cross_representation() -> None:
       4. 用 ``Draft202012Validator`` 校验序列化后的 dict 符合 Schema；
       5. 验证 ``spec.resources.accelerator`` 结构正确（不是扁平 ``spec.accelerator``）。
 
-    注：示例 YAML 的 ``status.endpoint`` 与 Python ``InferenceServiceStatus``
-    尚未对齐（阶段 0 已知限制），构造前剔除该字段以聚焦已实现字段的一致性。
-    同理，``Resource`` 基类的顶层 ``conditions`` / ``finalizers``（受控删除
+    注：``Resource`` 基类的顶层 ``conditions`` / ``finalizers``（受控删除
     生命周期字段）不在 InferenceService Schema 顶层定义，序列化后剔除再校验。
     """
     yaml_dict = _load_yaml(EXAMPLES_DIR / "single-node" / "inference-service.yaml")
-
-    # 阶段 0 已知限制：Python InferenceServiceStatus 尚未实现 endpoint/lastError。
-    yaml_dict["status"].pop("endpoint", None)
 
     # Python 模型构造
     obj = InferenceService(**yaml_dict)

@@ -4,7 +4,8 @@
 
 * ``connect`` 启用 WAL 与外键约束，``synchronous`` 保持 ``FULL``，等锁 5 秒；
 * 控制平面的各个存储都以 WAL 模式打开数据库文件；
-* 同一文件上一个连接的读事务不阻塞另一个存储写入。
+* 同一文件上一个连接的读事务不阻塞另一个存储写入；
+* 工作流存储使用同目录的独立文件，控制平面库被写锁占用时照常写入。
 """
 
 from __future__ import annotations
@@ -19,8 +20,10 @@ from forgemesh.controlplane.audit import AuditLog
 from forgemesh.controlplane.outbox import Outbox
 from forgemesh.controlplane.reconciler import ProcessedKeyStore
 from forgemesh.controlplane.registry import SQLiteRegistry
-from forgemesh.controlplane.sqlite import connect
+from forgemesh.controlplane.sqlite import connect, workflow_db_path
 from forgemesh.controlplane.tasks import TaskStore
+from forgemesh.workflow.runtime import Step, WorkflowDefinition
+from forgemesh.workflowruntime.store import WorkflowStore
 
 
 def _close(store) -> None:
@@ -86,3 +89,43 @@ def test_open_read_does_not_block_writes_from_another_store(tmp_path) -> None:
         reader.rollback()
         reader.close()
         _close(store)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("db_path", "expected"),
+    [
+        ("/data/forgemesh.db", "/data/forgemesh.workflows.db"),
+        ("relative/cp.sqlite3", "relative/cp.workflows.db"),
+        ("/data.d/forgemesh", "/data.d/forgemesh.workflows.db"),
+        (":memory:", ":memory:"),
+    ],
+)
+def test_workflow_db_path_is_a_sibling_file(db_path: str, expected: str) -> None:
+    assert workflow_db_path(db_path) == expected
+
+
+@pytest.mark.unit
+def test_workflow_store_writes_while_the_control_plane_database_is_locked(tmp_path) -> None:
+    path = str(tmp_path / "cp.db")
+    writer = connect(path)
+    workflows = WorkflowStore(workflow_db_path(path))
+    try:
+        writer.execute("BEGIN IMMEDIATE")
+        started = time.monotonic()
+        asyncio.run(
+            workflows.create_run(
+                WorkflowDefinition(name="wf", steps=[Step(id="s1", uses="test.step")]), {}, "key-a"
+            )
+        )
+        assert time.monotonic() - started < 1
+        probe = sqlite3.connect(tmp_path / "cp.workflows.db")
+        try:
+            assert probe.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
+            assert probe.execute("SELECT COUNT(*) FROM workflow_runs").fetchone()[0] == 1
+        finally:
+            probe.close()
+    finally:
+        writer.rollback()
+        writer.close()
+        asyncio.run(workflows.close())

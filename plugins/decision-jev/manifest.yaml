@@ -17,7 +17,7 @@ spec:
     - resource.read
     - decision.evaluate
   isolation: restricted-rpc
-  entrypoint: "python -m forgemesh_decision_jev"
+  entrypoint: "provider:JEVProvider"
   healthCheck:
     mode: rpc
     timeoutMs: 3000

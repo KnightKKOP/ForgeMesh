@@ -13,7 +13,8 @@
 
 schema 之外追加两条平台约定检查（manifest 必须满足而 schema 未强制）：
 
-- ``spec.entrypoint`` 必填且为非空字符串（插件入口冒烟的依据）；
+- ``spec.entrypoint`` 必填且为非空字符串（插件入口冒烟按它加载；``<模块>:<类>``
+  格式由 schema 的 pattern 约束）；
 - ``metadata.version`` 必须是语义化版本 MAJOR.MINOR.PATCH（可选预发布/构建后缀）。
 
 任一失败打印"文件名 + 校验错误路径"并以退出码 1 结束；

@@ -17,7 +17,7 @@ spec:
     - resource.read
     - policy.evaluate
   isolation: restricted-rpc
-  entrypoint: "python -m forgemesh_qos_basic"
+  entrypoint: "provider:QoSProvider"
   healthCheck:
     mode: rpc
     timeoutMs: 2000

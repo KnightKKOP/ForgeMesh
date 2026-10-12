@@ -18,7 +18,7 @@ spec:
     - device.read
     - device.partition
   isolation: restricted-rpc
-  entrypoint: "python -m forgemesh_gpu_nvidia"
+  entrypoint: "discovery:GPUDiscoverer"
   healthCheck:
     mode: rpc
     timeoutMs: 2000

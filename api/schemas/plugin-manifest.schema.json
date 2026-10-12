@@ -91,7 +91,11 @@
           "enum": ["in-process", "restricted-rpc", "sandbox"],
           "description": "隔离级别（ADR-006）。"
         },
-        "entrypoint": {"type": "string"},
+        "entrypoint": {
+          "type": "string",
+          "pattern": "^[A-Za-z_][A-Za-z0-9_]*(\\.[A-Za-z_][A-Za-z0-9_]*)*:[A-Za-z_][A-Za-z0-9_]*$",
+          "description": "入口点 <模块>:<类>（如 provider:RulesProvider），模块路径相对于插件包，插件目录须含 __init__.py。"
+        },
         "artifactDigest": {
           "type": "string",
           "description": "制品摘要，如 sha256:...（供应链安全）。"

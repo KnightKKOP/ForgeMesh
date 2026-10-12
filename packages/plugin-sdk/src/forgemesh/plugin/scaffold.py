@@ -98,7 +98,7 @@ spec:
   requires: []
   permissions: []
   isolation: restricted-rpc
-  entrypoint: {{ class_name }}
+  entrypoint: "provider:{{ class_name }}"
 """
 
 # 各 kind 的 provider.py 模板。

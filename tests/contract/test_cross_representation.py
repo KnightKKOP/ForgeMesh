@@ -25,7 +25,7 @@ import yaml
 from forgemesh.core.errors import ForgeMeshError, GovernanceBypassError
 from forgemesh.core.objects import ObjectMeta
 from forgemesh.decision.provider import DecisionRequest
-from forgemesh.plugin.manifest import PluginSpec
+from forgemesh.plugin.manifest import ENTRYPOINT_PATTERN, PluginSpec
 from forgemesh.plugin.permissions import Permission
 from forgemesh.policy.api import PolicyDecision
 from forgemesh.resource.inference import (
@@ -147,13 +147,13 @@ def test_plugin_spec_supply_chain_fields() -> None:
     spec = PluginSpec(
         category="provider",
         isolation="sandbox",
-        entrypoint="main",
+        entrypoint="provider:Main",
         artifactDigest="sha256:abc",
         signature="cosign:xyz",
     )
     dumped = spec.model_dump(by_alias=True)
     assert dumped["isolation"] == "sandbox"
-    assert dumped["entrypoint"] == "main"
+    assert dumped["entrypoint"] == "provider:Main"
     assert dumped["artifactDigest"] == "sha256:abc"
     assert dumped["signature"] == "cosign:xyz"
     # 所有供应链字段都在输出 dict 中
@@ -219,6 +219,44 @@ def test_plugin_permissions_rejected_by_model_and_schema(permissions: list[str])
     assert all("permissions" in error.absolute_path for error in errors)
     with pytest.raises(ValidationError, match="permissions"):
         PluginSpec.model_validate(manifest["spec"])
+
+
+@pytest.mark.contract
+def test_plugin_entrypoint_schema_pattern_matches_model() -> None:
+    """Schema 的入口点正则与模型使用的 ENTRYPOINT_PATTERN 相同。"""
+    schema = _load_json(SCHEMAS_DIR / "plugin-manifest.schema.json")
+    entrypoint = schema["properties"]["spec"]["properties"]["entrypoint"]
+    assert entrypoint["pattern"] == ENTRYPOINT_PATTERN
+
+
+@pytest.mark.contract
+@pytest.mark.parametrize(
+    ("entrypoint", "valid"),
+    [
+        ("provider:RulesProvider", True),
+        ("deploy:VLLMDeployer", True),
+        ("sub.module:Entry", True),
+        ("python -m forgemesh_decision_rules", False),
+        ("RulesProvider", False),
+        ("provider:", False),
+        (":RulesProvider", False),
+        ("provider:Rules.Provider", False),
+        ("../provider:RulesProvider", False),
+    ],
+)
+def test_plugin_entrypoint_format_same_in_model_and_schema(entrypoint: str, valid: bool) -> None:
+    """模型与 Schema 对入口点格式的裁决一致。"""
+    validator = Draft202012Validator(_load_json(SCHEMAS_DIR / "plugin-manifest.schema.json"))
+    manifest = _plugin_manifest_with_permissions(["resource.read"])
+    manifest["spec"]["entrypoint"] = entrypoint
+
+    schema_accepts = not list(validator.iter_errors(manifest))
+    assert schema_accepts is valid
+    if valid:
+        PluginSpec.model_validate(manifest["spec"])
+    else:
+        with pytest.raises(ValidationError, match="entrypoint must be '<module>:<Class>'"):
+            PluginSpec.model_validate(manifest["spec"])
 
 
 # ---------------------------------------------------------------------------

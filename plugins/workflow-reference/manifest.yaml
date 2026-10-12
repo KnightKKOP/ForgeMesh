@@ -18,7 +18,7 @@ spec:
     - resource.write
     - workflow.execute
   isolation: restricted-rpc
-  entrypoint: "python -m forgemesh_workflow_reference"
+  entrypoint: "provider:ReferenceWorkflowRuntime"
   healthCheck:
     mode: rpc
     timeoutMs: 2000

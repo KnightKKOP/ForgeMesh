@@ -21,7 +21,7 @@ spec:
     - inference.deploy
     - inference.inspect
   isolation: restricted-rpc        # 按信任级别隔离（ADR-006）
-  entrypoint: "python -m forgemesh_runtime_vllm"
+  entrypoint: "deploy:VLLMDeployer"
   artifactDigest: sha256:ab12...
   signature: cosign:...
   configuration:

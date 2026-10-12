@@ -179,7 +179,7 @@ class PluginSdk:
         if spec.isolation is None:
             warnings.append("spec.isolation is unset; installer will default to restricted-rpc")
         if spec.entrypoint is None:
-            warnings.append("spec.entrypoint is unset; runtime may fail to locate provider")
+            warnings.append("spec.entrypoint is unset; the plugin cannot be loaded")
         if not spec.compatibility:
             warnings.append("spec.compatibility is empty; core API version pinning recommended")
 

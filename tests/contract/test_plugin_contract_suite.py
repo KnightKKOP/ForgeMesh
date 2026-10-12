@@ -23,6 +23,7 @@ from forgemesh.plugin.isolation import (
     IsolationMode,
     TrustLevel,
 )
+from forgemesh.plugin.loader import load_entrypoint
 from forgemesh.plugin.manifest import (
     PLUGIN_TRANSITIONS,
     PluginCategory,
@@ -67,7 +68,7 @@ def _make_manifest(**spec_overrides: Any) -> PluginManifest:
         "provides": ["test-plugin"],
         "permissions": ["metering.read"],
         "isolation": "restricted-rpc",
-        "entrypoint": "TestPlugin",
+        "entrypoint": "provider:TestPlugin",
     }
     spec_fields.update(spec_overrides)
     return PluginManifest(
@@ -174,6 +175,21 @@ class TestProviderContract:
 
         raw = yaml.safe_load((root / "manifest.yaml").read_text(encoding="utf-8"))
         assert raw["spec"]["category"] == KIND_CATEGORY_MAP[kind]
+
+    @pytest.mark.contract
+    @pytest.mark.parametrize("kind", SUPPORTED_KINDS, ids=SUPPORTED_KINDS)
+    def test_scaffold_entrypoint_loads(self, kind: str, tmp_path: Path) -> None:
+        """生成的 manifest 声明的入口点应能按声明加载并实例化。"""
+        root = ScaffoldGenerator().generate(f"test-{kind}-plugin", kind, tmp_path)
+        import yaml
+
+        raw = yaml.safe_load((root / "manifest.yaml").read_text(encoding="utf-8"))
+        manifest = PluginManifest.model_validate(raw)
+        assert manifest.spec.entrypoint == f"provider:Test{kind.capitalize()}Plugin"
+
+        entry = load_entrypoint(root, manifest.spec.entrypoint)
+        assert entry.__name__ == f"Test{kind.capitalize()}Plugin"
+        entry()
 
     @pytest.mark.contract
     @pytest.mark.parametrize("kind", SUPPORTED_KINDS, ids=SUPPORTED_KINDS)

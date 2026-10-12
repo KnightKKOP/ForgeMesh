@@ -9,6 +9,8 @@
   :class:`~forgemesh.plugin.permissions.Permission` 词表且不得重复；清单不能给自己授权，
   实际授予由管理员决定。
 * **隔离分级**：隔离模式按信任级别由安装器裁决（ADR-006），Manifest 可声明。
+* **入口点**：``entrypoint`` 形如 ``<模块>:<类>``，模块路径相对于插件包（插件目录须含
+  ``__init__.py``），由 :func:`forgemesh.plugin.loader.load_entrypoint` 加载。
 * **供应链**：``artifact_digest`` / ``signature`` 支持制品摘要与签名校验。
 
 非法生命周期转移抛出 :class:`forgemesh.core.errors.InvalidStateTransition`；
@@ -17,6 +19,7 @@
 
 from __future__ import annotations
 
+import re
 from enum import StrEnum
 from typing import Any
 
@@ -87,6 +90,10 @@ PLUGIN_TRANSITIONS: dict[PluginLifecycleState, set[PluginLifecycleState]] = {
     PluginLifecycleState.UNINSTALLED: set(),
 }
 
+#: 入口点格式 ``<模块>:<类>``：模块是相对于插件包的点分路径，类是单个标识符。
+#: ``api/schemas/plugin-manifest.schema.json`` 使用同一正则。
+ENTRYPOINT_PATTERN = r"^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)*:[A-Za-z_][A-Za-z0-9_]*$"
+
 
 class PluginMeta(BaseModel):
     """插件元数据。
@@ -110,7 +117,8 @@ class PluginSpec(BaseModel):
         requires: 依赖的能力标识。
         permissions: 申请的权限（:class:`Permission` 词表，不得重复）；实际授予由管理员决定。
         isolation: 隔离级别（in-process/restricted-rpc/sandbox，ADR-006）。
-        entrypoint: 入口点标识。
+        entrypoint: 入口点 ``<模块>:<类>``（如 ``provider:RulesProvider``），模块路径相对于
+            插件包。
         artifactDigest: 制品摘要（如 sha256:...），供应链安全。
         signature: 制品签名（如 cosign:...），供应链安全。
         configuration: 配置 schema 引用/默认值。
@@ -126,7 +134,9 @@ class PluginSpec(BaseModel):
     requires: list[str] = Field(default_factory=list)
     permissions: list[Permission] = Field(default_factory=list)
     isolation: str | None = Field(default=None, description="隔离级别（in-process/restricted-rpc/sandbox，ADR-006）")
-    entrypoint: str | None = Field(default=None, description="入口点标识")
+    entrypoint: str | None = Field(
+        default=None, description="入口点 <模块>:<类>，模块路径相对于插件包"
+    )
     artifactDigest: str | None = Field(default=None, description="制品摘要（如 sha256:...），供应链安全")
     signature: str | None = Field(default=None, description="制品签名（如 cosign:...），供应链安全")
     configuration: dict[str, Any] = Field(default_factory=dict)
@@ -138,6 +148,15 @@ class PluginSpec(BaseModel):
         duplicates = sorted({p.value for p in value if value.count(p) > 1})
         if duplicates:
             raise ValueError(f"duplicate permissions: {duplicates}")
+        return value
+
+    @field_validator("entrypoint")
+    @classmethod
+    def _entrypoint_format(cls, value: str | None) -> str | None:
+        if value is not None and re.fullmatch(ENTRYPOINT_PATTERN, value) is None:
+            raise ValueError(
+                f"entrypoint must be '<module>:<Class>' relative to the plugin package, got {value!r}"
+            )
         return value
 
 
@@ -191,6 +210,7 @@ def validate_plugin_transition(
 
 
 __all__ = [
+    "ENTRYPOINT_PATTERN",
     "PluginCategory",
     "PluginMeta",
     "PluginSpec",

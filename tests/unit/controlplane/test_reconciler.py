@@ -315,6 +315,35 @@ def test_reconcile_idempotent():
 
 
 @pytest.mark.unit
+@pytest.mark.parametrize("make_store", [lambda: None, lambda: ProcessedKeyStore(":memory:")])
+def test_caller_records_dedup_keys_when_reconciler_does_not(make_store):
+    """record_dedup_keys=False：reconcile 只检查去重键，由调用方在写入 status 后登记。"""
+    ctx = make_context(make_resource(generation=1, observed_generation=0), {"phase": "Pending"})
+    scheduler = MockScheduler()
+    store = make_store()
+    controller = ReconciliationController(
+        registry=None,
+        policy_engine=MockPolicyEngine(PolicyDecision(decision="allow", reason="ok")),
+        scheduler=scheduler,
+        workflow_runtime=StubWorkflowRuntime(),
+        processed_store=store,
+        record_dedup_keys=False,
+    )
+
+    first = asyncio.run(controller.reconcile(ctx))
+    assert first.done is True
+    assert controller.records_dedup_keys is False
+    assert ctx.dedup_key not in controller._processed_keys
+    if store is not None:
+        assert asyncio.run(store.seen(ctx.dedup_key)) is False
+
+    asyncio.run(controller.mark_processed(ctx.dedup_key))
+    again = asyncio.run(controller.reconcile(ctx))
+    assert again.status_patch == {}
+    assert scheduler.allocate_count == 1
+
+
+@pytest.mark.unit
 def test_reconcile_with_allocation():
     """需要分配且 scheduler 可用 → 调用 scheduler.allocate。"""
     resource = make_resource(generation=1, observed_generation=0)

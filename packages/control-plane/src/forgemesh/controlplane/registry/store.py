@@ -14,6 +14,9 @@
   成功后 ``resource_version`` 递增 1。
 * ``resource_version`` 在 DB 中为 ``INTEGER``，对外的
   ``metadata.resourceVersion`` 为字符串（对齐契约 ``Optional[str]``）。
+* :meth:`SQLiteRegistry.update_status` → **status 子资源**：只修改状态条件、
+  phase 与 ``observedGeneration``，不递增 ``generation``，可选 CAS；合并后
+  没有变化时不写库。
 
 受控删除（finalizer 语义，对齐 architecture.md §5.3/§12.4 与 development-plan
 第 7 章）
@@ -37,10 +40,19 @@ Allocation 持久化
 ``idx_allocations_one_active_per_resource`` 兜底「同一 ``resource_id`` 至多一个
 Active 分配」；``release_allocation`` 走 ``ALLOCATION_STATE_MACHINE`` 校验。
 
+变更记录
+--------
+每次写入 ``resources`` 都在**同一事务**中向 ``resource_changes`` 追加一条
+记录（:class:`ChangeType`），控制器按 ``seq`` 增量轮询以发现待协调的资源
+（不依赖 PostgreSQL ``LISTEN/NOTIFY``，见 ADR-013），处理完后调用
+:meth:`SQLiteRegistry.prune_changes` 清理。
+
 租户隔离
 --------
-所有查询均以 ``tenant_id`` 作为首要过滤条件；跨租户访问一律视为
+面向租户的查询均以 ``tenant_id`` 作为首要过滤条件；跨租户访问一律视为
 :class:`~forgemesh.core.errors.NotFoundError`，不泄露存在性。
+:meth:`SQLiteRegistry.list_resource_keys` 与 :meth:`SQLiteRegistry.changes_since`
+是例外：它们跨租户返回资源键，仅供控制平面内部的控制器使用，不得暴露给 API。
 
 兼容 Python 3.9+。
 """
@@ -54,13 +66,15 @@ import json
 import logging
 import sqlite3
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Collection
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
+from enum import StrEnum
 from typing import Any, TypeVar
 from uuid import uuid4
 
 from forgemesh.core.errors import ConflictError, NotFoundError, PreconditionFailedError
-from forgemesh.core.objects import Resource
+from forgemesh.core.objects import Condition, Resource
 from forgemesh.core.registry import ResourceRegistry
 from forgemesh.resource.allocation import Allocation, AllocationStatus
 from forgemesh.resource.inference import InferenceService
@@ -124,7 +138,52 @@ CREATE TABLE IF NOT EXISTS allocations (
 CREATE INDEX IF NOT EXISTS idx_allocations_tenant ON allocations(tenant_id);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_allocations_one_active_per_resource
     ON allocations(resource_id) WHERE status = 'Active';
+CREATE TABLE IF NOT EXISTS resource_changes (
+    seq INTEGER PRIMARY KEY AUTOINCREMENT,
+    tenant_id TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    namespace TEXT,
+    name TEXT NOT NULL,
+    change TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
 """
+
+
+class ChangeType(StrEnum):
+    """``resource_changes.change`` 的取值。"""
+
+    CREATED = "created"
+    UPDATED = "updated"
+    STATUS = "status"
+    TERMINATING = "terminating"
+    DELETED = "deleted"
+
+
+@dataclass(frozen=True)
+class ResourceKey:
+    """跨租户唯一定位一个资源。"""
+
+    tenant_id: str
+    kind: str
+    namespace: str | None
+    name: str
+
+
+@dataclass(frozen=True)
+class ResourceChange:
+    """``resource_changes`` 中的一条记录。
+
+    Attributes:
+        seq: 单调递增的序号；``AUTOINCREMENT`` 保证清理后也不复用，否则消费方
+            的游标会漏读清理之后写入的记录。
+        key: 发生变更的资源。
+        change: 变更类型。
+    """
+
+    seq: int
+    key: ResourceKey
+    change: ChangeType
 
 
 @dataclass(frozen=True)
@@ -139,6 +198,30 @@ class RequestDeleteResult:
 
     deleted: bool
     finalizers: builtins.list[str] = field(default_factory=list)
+
+
+def _merge_conditions(
+    existing: builtins.list[dict[str, Any]],
+    updates: builtins.list[Condition],
+    now: datetime,
+) -> builtins.list[dict[str, Any]]:
+    """按 ``type`` 合并条件；``lastTransitionTime`` 只在条件的 ``status`` 变化时刷新。"""
+    merged = [dict(item) for item in existing]
+    for update in updates:
+        index = next(
+            (i for i, item in enumerate(merged) if item.get("type") == update.type),
+            None,
+        )
+        if index is not None and merged[index].get("status") == update.status:
+            entry = update.model_dump(mode="json", exclude={"lastTransitionTime"})
+            entry["lastTransitionTime"] = merged[index].get("lastTransitionTime")
+        else:
+            entry = update.model_copy(update={"lastTransitionTime": now}).model_dump(mode="json")
+        if index is None:
+            merged.append(entry)
+        else:
+            merged[index] = entry
+    return merged
 
 
 class SQLiteRegistry(ResourceRegistry):
@@ -168,6 +251,22 @@ class SQLiteRegistry(ResourceRegistry):
                 return fn()
 
         return await asyncio.to_thread(_locked)
+
+    @staticmethod
+    def _record_change(
+        cur: sqlite3.Cursor,
+        tenant_id: str,
+        kind: str,
+        namespace: str | None,
+        name: str,
+        change: ChangeType,
+    ) -> None:
+        """在调用方的事务中追加一条变更记录（随调用方一起提交或回滚）。"""
+        cur.execute(
+            "INSERT INTO resource_changes (tenant_id, kind, namespace, name, change) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (tenant_id, kind, namespace, name, change.value),
+        )
 
     def _init_schema(self) -> None:
         """创建表与索引（幂等），并对存量库做列迁移。"""
@@ -283,7 +382,11 @@ class SQLiteRegistry(ResourceRegistry):
         投影到基类已知字段（丢弃未知扩展字段），保证旧 payload / 第三方 kind
         的读回兼容。
         """
-        body = row["body"]
+        return SQLiteRegistry._body_to_resource(row["body"])
+
+    @staticmethod
+    def _body_to_resource(body: str) -> Resource:
+        """按 :meth:`_row_to_resource` 的规则反序列化 payload。"""
         data = json.loads(body)
         if isinstance(data, dict):
             model = _KIND_MODELS.get(data.get("kind", ""))
@@ -382,6 +485,7 @@ class SQLiteRegistry(ResourceRegistry):
                             body,
                         ),
                     )
+                    self._record_change(cur, tenant_id, kind, namespace, name, ChangeType.CREATED)
                     self._conn.commit()
                     return stored
                 # ---- Update-CAS ----
@@ -427,6 +531,7 @@ class SQLiteRegistry(ResourceRegistry):
                         f"does not match current or resource does not exist "
                         f"(kind={kind} namespace={namespace!r} name={name})",
                     )
+                self._record_change(cur, tenant_id, kind, namespace, name, ChangeType.UPDATED)
                 self._conn.commit()
                 return stored
             except sqlite3.IntegrityError as exc:
@@ -512,6 +617,7 @@ class SQLiteRegistry(ResourceRegistry):
                     f"resource not found: kind={kind} "
                     f"namespace={namespace!r} name={name} tenant_id={tenant_id}",
                 )
+            self._record_change(cur, tenant_id, kind, namespace, name, ChangeType.DELETED)
             self._conn.commit()
 
         await self._run(_delete)
@@ -600,6 +706,7 @@ class SQLiteRegistry(ResourceRegistry):
                         f"request_delete raced with concurrent write: kind={kind} "
                         f"namespace={namespace!r} name={name} tenant_id={tenant_id}",
                     )
+                self._record_change(cur, tenant_id, kind, namespace, name, ChangeType.DELETED)
                 self._conn.commit()
                 return RequestDeleteResult(True, [])
             # finalizer 非空（或自动追加）→ 受控删除：置 Terminating。
@@ -639,6 +746,7 @@ class SQLiteRegistry(ResourceRegistry):
                     f"request_delete raced with concurrent write: kind={kind} "
                     f"namespace={namespace!r} name={name} tenant_id={tenant_id}",
                 )
+            self._record_change(cur, tenant_id, kind, namespace, name, ChangeType.TERMINATING)
             self._conn.commit()
             logger.info(
                 "delete requested: kind=%s name=%s tenant_id=%s → Terminating "
@@ -653,6 +761,233 @@ class SQLiteRegistry(ResourceRegistry):
             return RequestDeleteResult(False, effective)
 
         return await self._run(_request_delete)
+
+    async def update_status(
+        self,
+        kind: str,
+        namespace: str | None,
+        name: str,
+        tenant_id: str,
+        status_patch: dict[str, Any],
+        *,
+        observed_generation: int | None = None,
+        expected_version: str | None = None,
+    ) -> Resource:
+        """status 子资源写入：只修改状态条件、phase 与 observedGeneration。
+
+        不触碰 spec 与其余元数据，不递增 ``generation``。规则：
+
+        * ``status_patch["conditions"]`` 按 ``type`` 合并到已有条件：payload 带
+          ``status`` 子树（强类型资源）时写入 ``status.conditions``，否则写入
+          顶层 ``conditions``；``lastTransitionTime`` 由注册中心维护，只在条件的
+          ``status`` 变化时刷新；
+        * ``status_patch["phase"]`` 经权威状态机校验，只适用于带 ``status`` 子树
+          的资源；
+        * ``observed_generation`` 写入元数据列与 ``metadata.observedGeneration``，
+          payload 已有 ``status.observedGeneration`` 时一并更新；
+        * ``expected_version`` 非空时做 CAS，冲突语义与 :meth:`put` 相同；
+        * 合并后没有任何变化时不写库，``resource_version`` 不变，也不追加变更记录。
+
+        Returns:
+            写入后的资源；没有变化时为当前资源。
+
+        Raises:
+            NotFoundError: 资源不存在（或跨租户不可见）。
+            ConflictError: ``expected_version`` 与当前版本不一致。
+            InvalidStateTransition: phase 转移非法。
+            ValueError: 补丁含 ``conditions`` / ``phase`` 以外的字段或非法条件，
+                或为没有 ``status`` 子树的资源设置 phase。
+        """
+        unknown = sorted(set(status_patch) - {"conditions", "phase"})
+        if unknown:
+            raise ValueError(f"unsupported status fields: {unknown}")
+        updates = [Condition.model_validate(item) for item in status_patch.get("conditions", [])]
+        raw_phase = status_patch.get("phase")
+        target_phase = str(raw_phase) if raw_phase is not None else None
+
+        def _update_status() -> Resource:
+            cur = self._conn.cursor()
+            row = cur.execute(
+                "SELECT body, phase, observed_generation, resource_version FROM resources "
+                "WHERE tenant_id=? AND kind=? AND namespace IS ? AND name=?",
+                (tenant_id, kind, namespace, name),
+            ).fetchone()
+            if row is None:
+                raise NotFoundError(
+                    f"resource not found: kind={kind} "
+                    f"namespace={namespace!r} name={name} tenant_id={tenant_id}",
+                )
+            read_version = row["resource_version"]
+            if expected_version is not None and int(expected_version) != read_version:
+                raise ConflictError(
+                    f"status update failed: expected_version={expected_version!r} "
+                    f"does not match current {read_version} "
+                    f"(kind={kind} namespace={namespace!r} name={name})",
+                )
+            original = json.loads(row["body"])
+            body = json.loads(row["body"])
+            status = body.get("status")
+            has_status = isinstance(status, dict)
+            phase = row["phase"]
+            if target_phase is not None:
+                if not has_status:
+                    raise ValueError(f"{kind} payload has no status subtree to hold a phase")
+                self._validate_phase_transition(kind, phase, target_phase)
+                status["phase"] = target_phase
+                phase = target_phase
+            if updates:
+                holder = status if has_status else body
+                holder["conditions"] = _merge_conditions(
+                    holder.get("conditions") or [], updates, datetime.now(UTC)
+                )
+            observed = row["observed_generation"]
+            if observed_generation is not None:
+                observed = observed_generation
+                body["metadata"]["observedGeneration"] = observed_generation
+                if has_status and "observedGeneration" in status:
+                    status["observedGeneration"] = observed_generation
+            if body == original:
+                return self._body_to_resource(row["body"])
+
+            new_version = read_version + 1
+            body["metadata"]["resourceVersion"] = str(new_version)
+            new_body = json.dumps(body, ensure_ascii=False)
+            updated = self._body_to_resource(new_body)
+            cur.execute(
+                "UPDATE resources SET body=?, phase=?, observed_generation=?, "
+                " resource_version=?, updated_at=datetime('now') "
+                "WHERE tenant_id=? AND kind=? AND namespace IS ? AND name=? "
+                " AND resource_version=?",
+                (
+                    new_body,
+                    phase,
+                    observed,
+                    new_version,
+                    tenant_id,
+                    kind,
+                    namespace,
+                    name,
+                    read_version,
+                ),
+            )
+            if cur.rowcount == 0:
+                self._conn.rollback()
+                raise ConflictError(
+                    f"status update raced with concurrent write: kind={kind} "
+                    f"namespace={namespace!r} name={name} tenant_id={tenant_id}",
+                )
+            self._record_change(cur, tenant_id, kind, namespace, name, ChangeType.STATUS)
+            self._conn.commit()
+            return updated
+
+        return await self._run(_update_status)
+
+    # ------------------------------------------------------------------ #
+    # 控制器读取（跨租户，仅供控制平面内部使用）
+    # ------------------------------------------------------------------ #
+
+    async def get_with_phase(
+        self,
+        kind: str,
+        namespace: str | None,
+        name: str,
+        tenant_id: str,
+    ) -> tuple[Resource, str | None]:
+        """读取资源及 ``phase`` 列记录的生命周期阶段。
+
+        基类资源的 payload 没有 ``status`` 子树，``Terminating`` 只记录在 ``phase``
+        列（见 :meth:`request_delete`），只读 payload 无法判断是否进入受控删除。
+
+        Raises:
+            NotFoundError: 资源不存在（或跨租户不可见）。
+        """
+
+        def _get_with_phase() -> tuple[Resource, str | None]:
+            row = self._conn.execute(
+                "SELECT body, phase FROM resources "
+                "WHERE tenant_id=? AND kind=? AND namespace IS ? AND name=?",
+                (tenant_id, kind, namespace, name),
+            ).fetchone()
+            if row is None:
+                raise NotFoundError(
+                    f"resource not found: kind={kind} "
+                    f"namespace={namespace!r} name={name} tenant_id={tenant_id}",
+                )
+            return self._row_to_resource(row), row["phase"]
+
+        return await self._run(_get_with_phase)
+
+    async def list_resource_keys(
+        self, kinds: Collection[str] | None = None
+    ) -> builtins.list[ResourceKey]:
+        """跨租户列出资源键，供控制器在启动和全量同步时重建工作队列。
+
+        Args:
+            kinds: 只列出这些 kind；``None`` 表示全部。
+        """
+        if kinds is not None and not kinds:
+            return []
+        kind_list = sorted(kinds) if kinds is not None else []
+
+        def _list_keys() -> list[ResourceKey]:
+            sql = "SELECT tenant_id, kind, namespace, name FROM resources"
+            if kind_list:
+                sql += f" WHERE kind IN ({', '.join('?' for _ in kind_list)})"
+            sql += " ORDER BY tenant_id, kind, COALESCE(namespace, ''), name"
+            rows = self._conn.execute(sql, tuple(kind_list)).fetchall()
+            return [
+                ResourceKey(row["tenant_id"], row["kind"], row["namespace"], row["name"])
+                for row in rows
+            ]
+
+        return await self._run(_list_keys)
+
+    async def changes_since(self, seq: int, limit: int = 500) -> builtins.list[ResourceChange]:
+        """按序号升序返回 ``seq`` 之后的至多 ``limit`` 条变更记录。
+
+        Raises:
+            ValueError: ``limit`` 小于 1。
+        """
+        if limit < 1:
+            raise ValueError(f"limit must be >= 1, got {limit}")
+
+        def _changes() -> list[ResourceChange]:
+            rows = self._conn.execute(
+                "SELECT seq, tenant_id, kind, namespace, name, change FROM resource_changes "
+                "WHERE seq > ? ORDER BY seq LIMIT ?",
+                (seq, limit),
+            ).fetchall()
+            return [
+                ResourceChange(
+                    seq=row["seq"],
+                    key=ResourceKey(row["tenant_id"], row["kind"], row["namespace"], row["name"]),
+                    change=ChangeType(row["change"]),
+                )
+                for row in rows
+            ]
+
+        return await self._run(_changes)
+
+    async def latest_change_seq(self) -> int:
+        """当前最大的变更序号；没有记录时返回 0。"""
+
+        def _latest() -> int:
+            row = self._conn.execute(
+                "SELECT COALESCE(MAX(seq), 0) AS seq FROM resource_changes"
+            ).fetchone()
+            return int(row["seq"])
+
+        return await self._run(_latest)
+
+    async def prune_changes(self, up_to_seq: int) -> int:
+        """删除序号不大于 ``up_to_seq`` 的变更记录，返回删除条数。"""
+
+        def _prune() -> int:
+            cur = self._conn.execute("DELETE FROM resource_changes WHERE seq <= ?", (up_to_seq,))
+            self._conn.commit()
+            return cur.rowcount
+
+        return await self._run(_prune)
 
     # ------------------------------------------------------------------ #
     # Allocation 持久化（development-plan 7.2 DDL）
@@ -813,6 +1148,9 @@ class SQLiteRegistry(ResourceRegistry):
 __all__ = [
     "DEFAULT_RELEASE_FINALIZER",
     "SIDE_EFFECT_PHASES",
+    "ChangeType",
     "RequestDeleteResult",
+    "ResourceChange",
+    "ResourceKey",
     "SQLiteRegistry",
 ]

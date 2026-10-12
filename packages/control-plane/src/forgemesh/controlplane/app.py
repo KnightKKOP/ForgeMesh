@@ -12,6 +12,10 @@
 * **认证**：启动时按 ``FORGEMESH_AUTH_MODE`` 构造认证器（默认 ``apikey``，需要
   ``FORGEMESH_API_KEYS_FILE``），配置缺失或非法时拒绝启动；``dev`` 模式只允许
   监听回环地址（见 :mod:`forgemesh.controlplane.auth`）。
+* **控制器**：lifespan 中启动 :class:`~forgemesh.controlplane.controller.ControllerManager`，
+  自动协调 ``InferenceService`` 并回写 status；去重键与资源存放在同一个数据库
+  文件中。控制器是单写者（ADR-013），本应用只能以单进程运行（不要使用
+  ``uvicorn --workers``）。
 * **无导入副作用**：数据库在应用启动（lifespan）时才打开，导入本模块不会
   创建文件。
 * **探针**：``/healthz``（存活）恒为 ok；``/readyz``（就绪）探测权威存储可用。
@@ -28,9 +32,11 @@ import json
 import logging
 import os
 from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
+from contextlib import AsyncExitStack, asynccontextmanager
 from typing import TYPE_CHECKING, Any
 
+from forgemesh.policy.engine import DefaultPolicyEngine
+from forgemesh.policy.rules import AuthzRule
 from pydantic import BaseModel
 
 from .auth import (
@@ -41,9 +47,12 @@ from .auth import (
     auth_mode_from_env,
     authenticator_from_env,
 )
+from .controller import ControllerManager
+from .reconciler import ProcessedKeyStore, ReconciliationController
 
 if TYPE_CHECKING:  # pragma: no cover - 仅静态类型检查使用
     from .auth import Authenticator
+    from .registry import SQLiteRegistry
 
 try:  # pragma: no cover - 取决于运行环境是否安装 FastAPI
     from fastapi import FastAPI
@@ -115,6 +124,18 @@ def resolve_db_path(db_path: str | None = None) -> str:
     return db_path or os.environ.get(DB_PATH_ENV) or DEFAULT_DB_PATH
 
 
+def _build_controller(
+    registry: SQLiteRegistry, processed_store: ProcessedKeyStore
+) -> ControllerManager:
+    # 没有授权规则的 DefaultPolicyEngine 拒绝一切操作。资源的创建和删除已经由 API 的
+    # 认证与 scope 把关，协调只是推进这些已被接受的期望状态，因此放行 reconcile。
+    policy = DefaultPolicyEngine(authz_rules=[AuthzRule(action="reconcile", effect="allow")])
+    reconciler = ReconciliationController(
+        registry, policy, processed_store=processed_store, record_dedup_keys=False
+    )
+    return ControllerManager(registry, reconciler)
+
+
 if _FASTAPI_AVAILABLE:
 
     def create_app(
@@ -149,14 +170,18 @@ if _FASTAPI_AVAILABLE:
                     AUTH_MODE_DEV,
                 )
             path = resolve_db_path(db_path)
-            registry = init_registry(path)
-            logger.info("control plane registry opened: %s", path)
-            init_authenticator(auth)
-            try:
+            async with AsyncExitStack() as cleanup:
+                registry = init_registry(path)
+                cleanup.push_async_callback(registry.close)
+                logger.info("control plane registry opened: %s", path)
+                init_authenticator(auth)
+                cleanup.callback(reset_authenticator)
+                processed_store = ProcessedKeyStore(path)
+                cleanup.push_async_callback(processed_store.close)
+                controller = _build_controller(registry, processed_store)
+                cleanup.push_async_callback(controller.stop)
+                await controller.start()
                 yield
-            finally:
-                await registry.close()
-                reset_authenticator()
 
         application = FastAPI(
             title="ForgeMesh Control Plane API",

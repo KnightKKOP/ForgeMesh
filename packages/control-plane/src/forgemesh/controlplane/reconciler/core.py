@@ -15,6 +15,10 @@
 8. **重观察**：收集执行后的新观测状态（P1 简化为标记完成）。
 9. **更新 status + 安排下次**：写回 status patch，返回 requeue_after。
 
+需要分配或执行工作流、却未注入对应组件时，在任何副作用之前返回
+``Ready=False``（``SchedulerUnavailable`` / ``WorkflowRuntimeUnavailable``），
+而不是跳过该步骤后宣称协调完成。
+
 终止协调（Terminating，对齐 architecture.md §5.3/§12.4 与 development-plan
 第 7 章删除闭环）
 --------------------------------------------------------------------
@@ -75,13 +79,18 @@ class ReconciliationController(Reconciler):
         registry: 资源注册表（权威状态，``ResourceRegistry`` 实例）。
         policy_engine: 策略引擎（授权校验，不可绕过）。
         decision_provider: 可选决策 Provider（生成候选动作，仅建议非授权）。
-        scheduler: 可选调度器（资源分配的唯一执行点）。
-        workflow_runtime: 可选工作流运行时（执行协调工作流）。
+        scheduler: 可选调度器（资源分配的唯一执行点）；未注入时，需要分配的
+            资源报告 ``Ready=False``（``SchedulerUnavailable``）。
+        workflow_runtime: 可选工作流运行时（执行协调工作流）；未注入时，需要
+            执行工作流的资源报告 ``Ready=False``（``WorkflowRuntimeUnavailable``）。
         release_provider: 可选受控释放 Provider（``Terminating`` 时释放外部
             副作用）；``None`` 为 Noop 语义——仅移除 finalizer 后物理删除。
         processed_store: 可选去重键持久化存储（对齐 architecture §5.5"不能
             依赖单进程内存状态保证全局正确性"）；``None``（默认）时回退
             内存 set 行为，向后兼容既有测试与单进程部署。
+        record_dedup_keys: 为 ``False`` 时 :meth:`reconcile` 只检查、不登记去重键，
+            由调用方在持久化 ``status_patch`` 之后调用 :meth:`mark_processed`，
+            避免"已登记、状态却没写进去"（控制器管理器使用）。默认 ``True``。
     """
 
     def __init__(
@@ -93,6 +102,7 @@ class ReconciliationController(Reconciler):
         workflow_runtime: Any | None = None,
         release_provider: ReleaseProvider | None = None,
         processed_store: ProcessedKeyStore | None = None,
+        record_dedup_keys: bool = True,
     ) -> None:
         self._registry = registry
         self._policy = policy_engine
@@ -101,16 +111,23 @@ class ReconciliationController(Reconciler):
         self._workflow = workflow_runtime
         self._release_provider = release_provider
         self._processed_store = processed_store
+        self._record_dedup_keys = record_dedup_keys
         # 已处理的去重键（内存级回退路径；processed_store 注入时以 SQLite
         # 持久化为准——architecture §5.5 不依赖单进程内存状态）。
         self._processed_keys: set[str] = set()
+
+    @property
+    def records_dedup_keys(self) -> bool:
+        """:meth:`reconcile` 是否自行登记去重键。"""
+        return self._record_dedup_keys
 
     async def reconcile(self, ctx: ReconcileContext) -> ReconcileResult:
         """执行一轮 9 步协调（或 Terminating 受控释放子流程）。
 
         幂等保证：若 ``ctx.dedup_key`` 已处理过，直接返回 ``done=True``，
         不产生任何重复副作用。注入 ``processed_store`` 时该检查基于
-        SQLite 持久化状态（进程重启后依然生效）。
+        SQLite 持久化状态（进程重启后依然生效）。``record_dedup_keys=False``
+        时本方法不登记去重键，由调用方调用 :meth:`mark_processed`。
 
         Args:
             ctx: 协调上下文（含资源、观测状态、租户边界、去重键）。
@@ -202,6 +219,25 @@ class ReconciliationController(Reconciler):
                 },
             )
 
+        # 必须先于任何副作用检查：否则可能分配了资源却没有运行时部署它。
+        missing = self._missing_executor(diff)
+        if missing is not None:
+            reason, message = missing
+            return ReconcileResult(
+                done=False,
+                requeue_after=None,
+                status_patch={
+                    "conditions": [
+                        {
+                            "type": "Ready",
+                            "status": "False",
+                            "reason": reason,
+                            "message": message,
+                        }
+                    ]
+                },
+            )
+
         # 步骤 6：Scheduler 分配（如果需要且调度器可用）
         allocation_ref = None
         if self._scheduler is not None and diff.get("needs_allocation"):
@@ -270,11 +306,22 @@ class ReconciliationController(Reconciler):
             status_patch={"conditions": conditions},
         )
 
+    def _missing_executor(self, diff: dict[str, Any]) -> tuple[str, str] | None:
+        """返回本轮所需但未注入的执行组件对应的 ``(reason, message)``；齐备时返回 ``None``。"""
+        if diff.get("needs_allocation") and self._scheduler is None:
+            return "SchedulerUnavailable", "no scheduler is configured to allocate resources"
+        if diff.get("needs_workflow") and self._workflow is None:
+            return (
+                "WorkflowRuntimeUnavailable",
+                "no workflow runtime is configured to run the reconcile workflow",
+            )
+        return None
+
     # ------------------------------------------------------------------ #
     # 去重键登记（持久化 store 优先，回退内存 set）
     # ------------------------------------------------------------------ #
 
-    async def _mark_processed(self, key: str) -> None:
+    async def mark_processed(self, key: str) -> None:
         """登记已处理去重键。
 
         注入 ``processed_store`` 时写入 SQLite（进程重启后仍可见，对齐
@@ -284,6 +331,11 @@ class ReconciliationController(Reconciler):
             await self._processed_store.mark(key)
         else:
             self._processed_keys.add(key)
+
+    async def _mark_processed(self, key: str) -> None:
+        """:meth:`reconcile` 内部的登记点；``record_dedup_keys=False`` 时留给调用方。"""
+        if self._record_dedup_keys:
+            await self.mark_processed(key)
 
     # ------------------------------------------------------------------ #
     # 终止协调（受控释放 → 清空 finalizer → 物理删除）

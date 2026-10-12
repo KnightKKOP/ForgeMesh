@@ -1,12 +1,26 @@
-"""控制平面应用入口测试：真实路由已挂载、存储可配置、探针反映存储状态。"""
+"""控制平面应用入口测试：真实路由已挂载、存储可配置、探针反映存储状态、控制器随应用运行。"""
 
 from __future__ import annotations
 
+import asyncio
+import sqlite3
+import time
+from pathlib import Path
+from typing import Any
+
 import pytest
 from fastapi.testclient import TestClient
-from forgemesh.controlplane.api.dependencies import get_registry, reset_runtime_components
+from forgemesh.controlplane.api.dependencies import (
+    ComponentNotReadyError,
+    get_authenticator,
+    get_registry,
+    reset_runtime_components,
+)
 from forgemesh.controlplane.app import DB_PATH_ENV, create_app
 from forgemesh.controlplane.auth import AUTH_MODE_DEV, AUTH_MODE_ENV
+from forgemesh.controlplane.controller import ControllerManager
+from forgemesh.controlplane.registry import SQLiteRegistry
+from forgemesh.resource.inference import InferenceService
 
 HEADERS = {"X-Tenant-Id": "acme"}
 BODY = {
@@ -26,6 +40,33 @@ def _reset_components(monkeypatch):
     reset_runtime_components()
     yield
     reset_runtime_components()
+
+
+def _wait_for_ready_condition(client: TestClient, timeout: float = 5.0) -> dict[str, Any]:
+    """轮询直到控制器为 ``llama`` 写入 ``Ready`` 条件。"""
+    deadline = time.monotonic() + timeout
+    while True:
+        response = client.get(
+            "/api/v1/inference-services/llama", params={"namespace": "default"}, headers=HEADERS
+        )
+        assert response.status_code == 200
+        for condition in response.json()["status"]["conditions"]:
+            if condition["type"] == "Ready":
+                return condition
+        assert time.monotonic() < deadline, "the controller did not report a Ready condition"
+        time.sleep(0.02)
+
+
+async def _store_service(db_file: Path) -> None:
+    registry = SQLiteRegistry(str(db_file))
+    try:
+        await registry.put(
+            InferenceService.model_validate(
+                {**BODY, "metadata": {**BODY["metadata"], "tenantId": "acme", "uid": "uid-llama"}}
+            )
+        )
+    finally:
+        await registry.close()
 
 
 @pytest.mark.unit
@@ -123,3 +164,47 @@ def test_runtime_endpoints_report_missing_components_instead_of_501(tmp_path) ->
         response = client.post("/api/v1/decisions", json={"question": "q"}, headers=HEADERS)
         assert response.status_code == 503
         assert response.json()["error"]["code"] == "DECISION_ROUTER_UNAVAILABLE"
+
+
+@pytest.mark.unit
+def test_controller_reports_why_a_new_service_is_not_ready(tmp_path) -> None:
+    with TestClient(create_app(db_path=str(tmp_path / "cp.db"))) as client:
+        created = client.post("/api/v1/inference-services", json=BODY, headers=HEADERS)
+        assert created.status_code == 201
+
+        ready = _wait_for_ready_condition(client)
+
+    assert ready["status"] == "False"
+    assert ready["reason"] == "SchedulerUnavailable"
+
+
+@pytest.mark.unit
+def test_controller_picks_up_services_stored_while_it_was_not_running(tmp_path) -> None:
+    db_file = tmp_path / "cp.db"
+    asyncio.run(_store_service(db_file))
+
+    with TestClient(create_app(db_path=str(db_file))) as client:
+        ready = _wait_for_ready_condition(client)
+
+    assert ready["reason"] == "SchedulerUnavailable"
+
+
+@pytest.mark.unit
+def test_failed_controller_start_releases_the_registry_and_authenticator(
+    tmp_path, monkeypatch
+) -> None:
+    async def failing_start(self: ControllerManager) -> None:
+        raise RuntimeError("controller failed to start")
+
+    monkeypatch.setattr(ControllerManager, "start", failing_start)
+
+    with (
+        pytest.raises(RuntimeError, match="controller failed to start"),
+        TestClient(create_app(db_path=str(tmp_path / "cp.db"))),
+    ):
+        pass
+
+    with pytest.raises(ComponentNotReadyError):
+        get_authenticator()
+    with pytest.raises(sqlite3.ProgrammingError):
+        asyncio.run(get_registry().ping())

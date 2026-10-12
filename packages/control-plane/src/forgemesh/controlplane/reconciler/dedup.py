@@ -14,6 +14,7 @@ import asyncio
 import hashlib
 import sqlite3
 import threading
+import time
 from datetime import UTC, datetime, timedelta
 
 from pydantic import BaseModel, ConfigDict
@@ -83,6 +84,9 @@ __all__ = ["DedupKey", "ProcessedKeyStore", "compute_dedup_key"]
 #: 去重键默认保留时长（24 小时）。
 DEFAULT_DEDUP_TTL_SECONDS = 24 * 3600.0
 
+#: 两次删除过期键之间的最长间隔（秒）；实际间隔不超过 TTL。
+PURGE_INTERVAL_SECONDS = 60.0
+
 #: 建表与建索引 DDL（幂等执行，表模式参照 registry/store.py）。
 _SCHEMA_SQL = """\
 CREATE TABLE IF NOT EXISTS processed_dedup_keys (
@@ -112,9 +116,11 @@ class ProcessedKeyStore:
     避免同一连接被并发线程交错使用（Python 3.12 sqlite3 对同连接跨线程
     事务交错会抛 ``InterfaceError``）。
 
-    TTL 清理：``seen`` / ``mark`` 时**惰性清理**过期键（``created_at`` 早于
-    ``now - ttl_seconds`` 的行被删除），默认保留 24 小时、可配置。重复
-    ``mark`` 同一键幂等，且刷新 ``created_at``（TTL 从最近一次处理起算）。
+    TTL：``created_at`` 早于 ``now - ttl_seconds`` 的键视为过期，``seen`` 不再报告
+    它们，默认保留 24 小时、可配置。过期键在 ``seen`` / ``mark`` 时**惰性删除**，
+    两次删除之间至少间隔 ``min(ttl_seconds, PURGE_INTERVAL_SECONDS)``：``seen``
+    平时只读，不必每次调用都写一次库。重复 ``mark`` 同一键幂等，且刷新
+    ``created_at``（TTL 从最近一次处理起算）。
 
     Args:
         db_path: SQLite 数据库文件路径，默认 ``:memory:``（内存库，单测友好）；
@@ -129,6 +135,9 @@ class ProcessedKeyStore:
     ) -> None:
         self._db_path = db_path
         self._ttl_seconds = ttl_seconds
+        self._purge_interval = min(ttl_seconds, PURGE_INTERVAL_SECONDS)
+        # time.monotonic() 时刻；0 表示第一次 seen / mark 就清理上次运行留下的过期键。
+        self._next_purge = 0.0
         self._conn = connect(db_path)
         self._conn.row_factory = sqlite3.Row
         self._lock = threading.Lock()
@@ -139,19 +148,25 @@ class ProcessedKeyStore:
         self._conn.executescript(_SCHEMA_SQL)
         self._conn.commit()
 
-    def _purge_expired_unlocked(self) -> None:
-        """删除过期键（调用方须已持有 ``self._lock``）。"""
-        cutoff = (
-            datetime.now(UTC) - timedelta(seconds=self._ttl_seconds)
-        ).isoformat(timespec="microseconds")
+    def _cutoff(self) -> str:
+        """未过期键的最早 ``created_at``。"""
+        expiry = datetime.now(UTC) - timedelta(seconds=self._ttl_seconds)
+        return expiry.isoformat(timespec="microseconds")
+
+    def _purge_expired_if_due_unlocked(self) -> None:
+        """距上次删除已满一个间隔时删除过期键（调用方须已持有 ``self._lock``）。"""
+        now = time.monotonic()
+        if now < self._next_purge:
+            return
+        self._next_purge = now + self._purge_interval
         self._conn.execute(
             "DELETE FROM processed_dedup_keys WHERE created_at < ?",
-            (cutoff,),
+            (self._cutoff(),),
         )
         self._conn.commit()
 
     async def seen(self, key: str) -> bool:
-        """查询去重键是否已处理（触发一次惰性 TTL 清理）。
+        """查询去重键是否已处理且未过期（到期时顺带删除过期键）。
 
         Args:
             key: 去重键（SHA-256 摘要）。
@@ -162,17 +177,17 @@ class ProcessedKeyStore:
 
         def _seen() -> bool:
             with self._lock:
-                self._purge_expired_unlocked()
+                self._purge_expired_if_due_unlocked()
                 row = self._conn.execute(
-                    "SELECT 1 FROM processed_dedup_keys WHERE dedup_key = ?",
-                    (key,),
+                    "SELECT 1 FROM processed_dedup_keys WHERE dedup_key = ? AND created_at >= ?",
+                    (key, self._cutoff()),
                 ).fetchone()
                 return row is not None
 
         return await asyncio.to_thread(_seen)
 
     async def mark(self, key: str) -> None:
-        """标记去重键为已处理（幂等，触发一次惰性 TTL 清理）。
+        """标记去重键为已处理（幂等，到期时顺带删除过期键）。
 
         Args:
             key: 去重键（SHA-256 摘要）。
@@ -180,7 +195,7 @@ class ProcessedKeyStore:
 
         def _mark() -> None:
             with self._lock:
-                self._purge_expired_unlocked()
+                self._purge_expired_if_due_unlocked()
                 self._conn.execute(
                     "INSERT OR REPLACE INTO processed_dedup_keys "
                     "(dedup_key, created_at) VALUES (?, ?)",

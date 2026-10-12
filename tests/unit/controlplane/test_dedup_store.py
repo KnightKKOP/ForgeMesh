@@ -3,7 +3,7 @@
 覆盖（对齐 architecture §5.5「不能依赖单进程内存状态保证全局正确性」）：
 
 * ``seen`` / ``mark`` 往返与幂等；
-* TTL 惰性清理：过期键在后续查询/写入时被删除；
+* TTL 惰性清理：过期键不再被 ``seen`` 报告，并在后续查询/写入时按间隔删除；
 * 重启恢复：新 store 实例打开同一 db 文件后仍 ``seen``；
 * ``ReconciliationController`` 注入 ``processed_store`` 后的幂等语义
   （含"控制器重启后仍不重复副作用"），以及默认 ``None`` 时的内存回退
@@ -116,6 +116,41 @@ def test_expired_keys_are_physically_deleted(tmp_path: pytest.TempPathFactory) -
     finally:
         conn.close()
     assert count == 0
+    _run(store.close())
+
+
+@pytest.mark.unit
+def test_expired_key_is_not_seen_before_it_is_deleted(tmp_path: pytest.TempPathFactory) -> None:
+    """过期键在被物理删除之前 seen 也返回 False（结果不取决于删除时机）。"""
+    import sqlite3
+
+    db_file = tmp_path / "dedup.db"
+    store = ProcessedKeyStore(str(db_file), ttl_seconds=0.05)
+    store._purge_interval = 3600.0
+    _run(store.mark("key-a"))
+    time.sleep(0.1)
+    assert _run(store.seen("key-a")) is False
+
+    conn = sqlite3.connect(str(db_file))
+    try:
+        count = conn.execute("SELECT COUNT(*) FROM processed_dedup_keys").fetchone()[0]
+    finally:
+        conn.close()
+    assert count == 1
+    _run(store.close())
+
+
+@pytest.mark.unit
+def test_purges_at_most_once_per_interval() -> None:
+    """seen / mark 不是每次都执行 DELETE：一个清理间隔内最多删除一次过期键。"""
+    store = ProcessedKeyStore()
+    statements: list[str] = []
+    store._conn.set_trace_callback(statements.append)
+    for i in range(5):
+        _run(store.mark(f"key-{i}"))
+        assert _run(store.seen(f"key-{i}")) is True
+    deletes = [s for s in statements if s.lstrip().upper().startswith("DELETE")]
+    assert len(deletes) == 1
     _run(store.close())
 
 

@@ -31,8 +31,8 @@ from uuid import uuid4
 from fastapi import APIRouter, Depends, Header, HTTPException
 from fastapi.responses import JSONResponse, Response
 from forgemesh.core.errors import ConflictError, NotFoundError
-from forgemesh.core.objects import ObjectMeta, Resource
 from forgemesh.decision.provider import DecisionRequest as InternalDecisionRequest
+from forgemesh.resource.inference import InferenceService
 from forgemesh.workflow.runtime import WorkflowDefinition
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
@@ -48,24 +48,6 @@ from .dependencies import (
 router = APIRouter(prefix="/api/v1")
 
 
-class ResourceCreateRequest(BaseModel):
-    """资源创建请求体。
-
-    Attributes:
-        apiVersion: 资源组/版本，默认 ``forgemesh.io/v1alpha1``。
-        kind: 资源类型（如 ``InferenceService``）。
-        metadata: 资源元数据（name/namespace/labels 等）。
-        spec: 期望状态（P1 基类 ``Resource`` 暂不持久化，后续强类型子类扩展）。
-        status: 观测状态（同上）。
-    """
-
-    apiVersion: str = "forgemesh.io/v1alpha1"
-    kind: str
-    metadata: dict[str, Any]
-    spec: dict[str, Any] | None = None
-    status: dict[str, Any] | None = None
-
-
 class ResourceListResponse(BaseModel):
     """资源列表响应。"""
 
@@ -73,20 +55,52 @@ class ResourceListResponse(BaseModel):
     count: int
 
 
-def _build_resource(body: ResourceCreateRequest, tenant_id: str) -> Resource:
-    """从请求体构造 :class:`Resource`，注入租户上下文。
+#: 由服务端维护、创建请求中一律忽略的元数据字段。请求头 ``X-Tenant-Id`` 为租户
+#: 权威来源，覆盖请求体中的租户字段，防止跨租户伪造。
+_SERVER_OWNED_METADATA = ("tenant_id", "tenantId", "uid", "resourceVersion")
 
-    请求头 ``X-Tenant-Id`` 为租户权威来源，覆盖请求体中可能存在的
-    ``tenant_id`` / ``tenantId`` 字段，防止跨租户伪造。
+#: 列表接口单页条数上限。
+MAX_LIST_LIMIT = 1000
 
-    P1 简化：基类 ``Resource`` 配置 ``extra="forbid"``，不携带 spec/status；
-    强类型子类（如 ``InferenceService``）在后续阶段扩展。
+
+def _build_inference_service(body: dict[str, Any], tenant_id: str) -> InferenceService:
+    """从请求体构造强类型 :class:`InferenceService`（OpenAPI 要求必须携带 ``spec``）。
+
+    租户取自请求头，``uid`` 由服务端分配；``status`` 属于观测状态，只能由控制器
+    写入，创建请求中的 ``status`` 被忽略。
+
+    Raises:
+        ValueError: ``kind`` 不是 ``InferenceService``，或 ``metadata`` 不是对象。
+        pydantic.ValidationError: ``metadata`` / ``spec`` 不满足模型约束。
     """
-    meta_dict = dict(body.metadata)
-    meta_dict.pop("tenant_id", None)
-    meta_dict.pop("tenantId", None)
-    metadata = ObjectMeta(**meta_dict, tenant_id=tenant_id)
-    return Resource(kind=body.kind, metadata=metadata)
+    kind = body.get("kind", "InferenceService")
+    if kind != "InferenceService":
+        raise ValueError(f"kind must be 'InferenceService' on this endpoint, got {kind!r}")
+    metadata = body.get("metadata")
+    if not isinstance(metadata, dict):
+        raise ValueError("metadata must be an object")
+    metadata = {k: v for k, v in metadata.items() if k not in _SERVER_OWNED_METADATA}
+    metadata["tenantId"] = tenant_id
+    metadata["uid"] = uuid4().hex
+    return InferenceService.model_validate(
+        {
+            "apiVersion": body.get("apiVersion", "forgemesh.io/v1alpha1"),
+            "kind": "InferenceService",
+            "metadata": metadata,
+            "spec": body.get("spec"),
+        }
+    )
+
+
+def _invalid_limit(limit: int) -> JSONResponse | None:
+    if 1 <= limit <= MAX_LIST_LIMIT:
+        return None
+    return _error_response(
+        400,
+        "BAD_REQUEST",
+        f"limit must be between 1 and {MAX_LIST_LIMIT}, got {limit}",
+        uuid4().hex,
+    )
 
 
 # ------------------------------------------------------------------ #
@@ -94,22 +108,34 @@ def _build_resource(body: ResourceCreateRequest, tenant_id: str) -> Resource:
 # ------------------------------------------------------------------ #
 
 
-@router.post("/inference-services")
+@router.post("/inference-services", status_code=201)
 async def create_inference_service(
-    body: ResourceCreateRequest,
+    body: dict[str, Any],
     tenant_id: str = Depends(get_tenant_id),
-) -> dict[str, Any]:
-    """创建推理服务。
+    x_correlation_id: str | None = Header(default=None, alias="X-Correlation-Id"),
+) -> Any:
+    """创建推理服务（201）。
 
-    同名资源已存在时返回 HTTP 409（ConflictError）。
+    请求体不合法（缺少 ``spec``、kind 不匹配等）返回 400；同名资源已存在返回 409。
     """
-    registry = get_registry()
-    resource = _build_resource(body, tenant_id)
+    correlation_id = x_correlation_id or uuid4().hex
     try:
-        created = await registry.put(resource)
+        resource = _build_inference_service(body, tenant_id)
+    except ValidationError as exc:
+        return _error_response(
+            400,
+            "BAD_REQUEST",
+            "推理服务创建请求校验失败",
+            correlation_id,
+            {"errors": _validation_details(exc)},
+        )
+    except ValueError as exc:
+        return _error_response(400, "BAD_REQUEST", str(exc), correlation_id)
+    try:
+        created = await get_registry().put(resource)
     except ConflictError as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
-    return created.model_dump(by_alias=True)
+        return _error_response(409, "CONFLICT", str(exc), correlation_id)
+    return JSONResponse(status_code=201, content=created.model_dump(by_alias=True, mode="json"))
 
 
 @router.get("/inference-services")
@@ -117,8 +143,10 @@ async def list_inference_services(
     tenant_id: str = Depends(get_tenant_id),
     namespace: str | None = None,
     limit: int = 100,
-) -> dict[str, Any]:
+) -> Any:
     """列出推理服务（可选按 namespace 过滤、limit 分页）。"""
+    if (invalid := _invalid_limit(limit)) is not None:
+        return invalid
     registry = get_registry()
     items = await registry.list("InferenceService", tenant_id, namespace=namespace, limit=limit)
     return {"items": [r.model_dump(by_alias=True) for r in items], "count": len(items)}
@@ -159,6 +187,8 @@ async def delete_inference_service(
         result = await registry.request_delete("InferenceService", namespace, name, tenant_id)
     except NotFoundError as exc:
         raise HTTPException(status_code=404, detail=f"InferenceService '{name}' not found") from exc
+    except ConflictError as exc:
+        return _error_response(409, "CONFLICT", str(exc), uuid4().hex)
     if result.deleted:
         return Response(status_code=204)
     return JSONResponse(status_code=202, content={"name": name, "phase": "Terminating"})
@@ -175,11 +205,13 @@ async def list_resources(
     kind: str | None = None,
     namespace: str | None = None,
     limit: int = 100,
-) -> dict[str, Any]:
+) -> Any:
     """列出资源（可选按 kind / namespace 过滤）。
 
     未指定 ``kind`` 时返回空列表（P1 简化：避免全表扫描）。
     """
+    if (invalid := _invalid_limit(limit)) is not None:
+        return invalid
     registry = get_registry()
     if kind:
         items = await registry.list(kind, tenant_id, namespace=namespace, limit=limit)

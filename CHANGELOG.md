@@ -11,6 +11,8 @@
 - 新增 [docs/architecture/v1.1-development-plan.md](docs/architecture/v1.1-development-plan.md)（阶段 A–E 可信基线计划）与 [docs/architecture/module-mapping.md](docs/architecture/module-mapping.md)（逻辑模块 ↔ 真实代码路径映射，含依赖边界 import 循证）。
 - 新增 CI 校验脚本：`scripts/validate_manifests.py`（JSON Schema metaschema 自校验 + 10 插件 manifest 实例校验）、`scripts/openapi_semantic_check.py`（operationId 唯一 / $ref 可解析 / 响应完整性）、`scripts/check_metadata_consistency.py`（requires-python>=3.12、描述禁 skeleton/placeholder）、`scripts/plugin_entrypoint_smoke.py`（插件入口进程内冒烟）。
 - 新增契约 / 混沌 / 兼容测试 122 项（1115 vs 993）：Registry CAS 并发 / 租户过滤 / 重启恢复（19）、Workflow 恢复版本固定 / 取消补偿 + Outbox 事务 / 幂等 / 死信（12）、10 插件发布链路 conformance——manifest/isolation 一致性 + 四类 Provider 契约 + 卸载安全（91）。
+- 控制平面可运行入口：`control-plane` 包新增控制台脚本 `forgemesh-control-plane`（`forgemesh.controlplane.app:main`）；权威存储路径取自 `FORGEMESH_DB_PATH`（默认 `forgemesh.db`），监听地址取自 `FORGEMESH_HOST` / `FORGEMESH_PORT`（默认 `127.0.0.1:8080`），启动方式见 README「运行控制平面」。
+- 新增 `tests/contract/test_registry_hardening.py`：并发创建全部持久化、空 namespace 身份唯一、删除 / 释放 CAS、标签过滤与分页等 Registry 回归测试。
 
 ### Changed
 
@@ -19,6 +21,18 @@
 - 包元数据事实统一：全部 10 个子包 `requires-python` 从 `>=3.9` 校准为 `>=3.12`（对齐 README/CI/Ruff 的 Python 3.12 基线）；`control-plane` 与 `workflow-runtime` 包描述去除过时的 skeleton/placeholder 表述，`cli` 与 `node-agent` 包描述同步移除 skeleton 字样。
 - [.github/workflows/ci.yml](.github/workflows/ci.yml)：ADR 检查由硬编码 001–012 改为索引驱动动态校验；architecture-docs job 新增 manifest / OpenAPI 语义 / 元数据一致 / 插件冒烟四道步骤。
 - 修正 `plugins/runtime-tgi`（移除 schema 未定义的 spec.capabilities）与 `plugins/workflow-temporal`（category 改为 provider 并移除 capabilities）manifest 至 schema 合规。
+
+### Fixed
+
+- 控制平面唯一的可运行应用仍注册阶段 0 占位路由，全部业务端点返回 `501`，已实现的 API 路由只在测试中挂载：现挂载真实路由；SQLite 在应用启动（lifespan）时打开，导入模块不再产生文件副作用；`/readyz` 探测权威存储可用性。
+- `control-plane` 包补齐 `forgemesh-policy-engine` 与 `forgemesh-plugin-sdk` 依赖声明（此前独立安装后导入即失败）。
+- `POST /api/v1/inference-services` 丢弃请求体中的 `spec`、接受任意 `kind`、不分配 `uid` 且返回 `200`：现按 `InferenceService` 强类型校验（`uid`、租户与 `status` 由服务端维护），成功返回 `201`，请求体不合法返回 `400` 错误信封，同名冲突返回 `409`。
+- 列表接口的 `limit` 原样传给 SQLite，`limit=-1` 返回全部行：API 层限定为 `[1, 1000]`，越界返回 `400`；Registry 对 `limit < 1` 抛出 `ValueError`。
+- Registry 标签选择器在 `LIMIT` 之后才在 Python 中过滤，首页之外的匹配项永远不会返回，翻页会静默跳过数据：现以 `json_extract` 在 SQL 中先过滤、再排序分页。
+- Registry 全部方法在 `asyncio.to_thread` 工作线程上共用一个 sqlite3 连接且无锁，交错事务中失败写入者的回滚会丢弃其他写入者尚未提交的插入（创建报告成功但未持久化，R-1）：现以实例级 `RLock` 串行化全部数据库调用。
+- `namespace` 为空（NULL）的资源可以同名重复创建（SQLite 主键视 NULL 互不相等），一次 DELETE 会删除全部副本：新增唯一表达式索引 `(tenant_id, kind, COALESCE(namespace, ''), name)`；打开已含重复数据的旧库时抛出 `PreconditionFailedError`，不静默丢行。
+- `request_delete` 与 `release_allocation` 读后写不校验版本，期间提交的写入会丢失、期间追加的 finalizer 会被绕过：现以读取到的 `resource_version` / 状态为条件做 CAS，竞争失败抛出 `ConflictError`（DELETE 端点返回 `409`）。
+- 调和器在 deny / require_approval / 分配失败等无副作用路径上也记录去重键，重新入队后命中幂等短路，被阻塞的资源在 spec 变更或 24h 去重 TTL 过期前不会被重新评估：这些路径不再记录去重键。
 
 ### Security
 

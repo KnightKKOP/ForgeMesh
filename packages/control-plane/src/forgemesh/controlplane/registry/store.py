@@ -2,7 +2,8 @@
 
 对齐 ``forgemesh.core.registry.ResourceRegistry`` 契约，以 SQLite 作为权威状态
 存储后端（阶段 P1）。所有异步方法通过 :func:`asyncio.to_thread` 包装同步 sqlite3
-调用，适配事件循环环境。
+调用，适配事件循环环境；同一实例共享单一连接，所有数据库访问经实例级锁串行化
+（sqlite3 连接级事务不可跨线程交错，否则一方 rollback 会连带丢弃另一方未提交的写入）。
 
 并发语义
 --------
@@ -52,11 +53,13 @@ import builtins
 import json
 import logging
 import sqlite3
+import threading
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, TypeVar
 from uuid import uuid4
 
-from forgemesh.core.errors import ConflictError, NotFoundError
+from forgemesh.core.errors import ConflictError, NotFoundError, PreconditionFailedError
 from forgemesh.core.objects import Resource
 from forgemesh.core.registry import ResourceRegistry
 from forgemesh.resource.allocation import Allocation, AllocationStatus
@@ -65,6 +68,8 @@ from forgemesh.resource.states import ALLOCATION_STATE_MACHINE, INFERENCE_STATE_
 from pydantic import ValidationError
 
 logger = logging.getLogger(__name__)
+
+_T = TypeVar("_T")
 
 #: kind → 权威状态机映射；未登记的 kind 视为不受管，put() 跳过转移校验。
 _KIND_STATE_MACHINES = {
@@ -148,17 +153,55 @@ class SQLiteRegistry(ResourceRegistry):
         # check_same_thread=False：asyncio.to_thread 会在不同线程执行 sqlite 调用。
         self._conn = sqlite3.connect(db_path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
+        self._lock = threading.RLock()
         self._init_schema()
 
     # ------------------------------------------------------------------ #
     # 内部辅助
     # ------------------------------------------------------------------ #
 
+    async def _run(self, fn: Callable[[], _T]) -> _T:
+        """在工作线程中持锁执行一段同步数据库操作（读写均串行化）。"""
+
+        def _locked() -> _T:
+            with self._lock:
+                return fn()
+
+        return await asyncio.to_thread(_locked)
+
     def _init_schema(self) -> None:
         """创建表与索引（幂等），并对存量库做列迁移。"""
         self._conn.executescript(_SCHEMA_SQL)
         self._migrate_legacy_resources()
+        self._ensure_identity_index()
         self._conn.commit()
+
+    def _ensure_identity_index(self) -> None:
+        """建立把 NULL namespace 视为相等的身份唯一索引。
+
+        SQLite 主键允许 NULL 且 NULL 互不相等，仅靠主键无法阻止 namespace 为空的
+        资源重名。存量库已存在重复记录时拒绝打开，避免静默删除数据。
+        """
+        exists = self._conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='index' AND name='ux_resources_identity'"
+        ).fetchone()
+        if exists is not None:
+            return
+        duplicate = self._conn.execute(
+            "SELECT tenant_id, kind, COALESCE(namespace, '') AS ns, name, COUNT(*) AS n "
+            "FROM resources GROUP BY tenant_id, kind, ns, name HAVING n > 1 LIMIT 1"
+        ).fetchone()
+        if duplicate is not None:
+            raise PreconditionFailedError(
+                "duplicate resources must be removed before upgrading: "
+                f"tenant_id={duplicate['tenant_id']} kind={duplicate['kind']} "
+                f"namespace={duplicate['ns']!r} name={duplicate['name']} "
+                f"count={duplicate['n']}",
+            )
+        self._conn.execute(
+            "CREATE UNIQUE INDEX ux_resources_identity "
+            "ON resources(tenant_id, kind, COALESCE(namespace, ''), name)"
+        )
 
     def _migrate_legacy_resources(self) -> None:
         """存量库幂等迁移：以 ``PRAGMA table_info`` 探测后补 ``phase`` /
@@ -206,6 +249,13 @@ class SQLiteRegistry(ResourceRegistry):
         if machine is None or current is None or target is None or current == target:
             return
         machine.validate(current, target)
+
+    @staticmethod
+    def _label_path(key: str) -> str:
+        """把标签键转换为 SQLite JSON 路径（键整体加双引号，兼容 ``.`` 与 ``/``）。"""
+        if '"' in key or "\\" in key:
+            raise ValueError(f"invalid label key: {key!r}")
+        return f'$.metadata.labels."{key}"'
 
     @staticmethod
     def _encode_token(namespace: str | None, name: str) -> str:
@@ -273,7 +323,7 @@ class SQLiteRegistry(ResourceRegistry):
                 )
             return self._row_to_resource(row)
 
-        return await asyncio.to_thread(_get)
+        return await self._run(_get)
 
     async def put(
         self,
@@ -386,7 +436,7 @@ class SQLiteRegistry(ResourceRegistry):
                     f"namespace={namespace!r} name={name} tenant_id={tenant_id}",
                 ) from exc
 
-        return await asyncio.to_thread(_put)
+        return await self._run(_put)
 
     async def list(
         self,
@@ -400,10 +450,19 @@ class SQLiteRegistry(ResourceRegistry):
     ) -> builtins.list[Resource]:
         """按 ``kind`` + 可选 ``namespace`` / ``labels`` 过滤列出资源（分页）。
 
+        标签过滤在 SQL 中先于 ``LIMIT`` 执行，保证每页返回的都是匹配项。
         ``watch=True`` 在阶段 P1 暂未实现，抛 :class:`NotImplementedError`。
+
+        Raises:
+            ValueError: ``limit`` 小于 1，或标签键包含双引号 / 反斜杠。
         """
         if watch:
             raise NotImplementedError("watch stream is not implemented in phase P1")
+        if limit < 1:
+            raise ValueError(f"limit must be >= 1, got {limit}")
+        label_paths = [
+            (self._label_path(key), value) for key, value in sorted((labels or {}).items())
+        ]
 
         def _list() -> list[Resource]:
             sql = "SELECT body FROM resources WHERE tenant_id=? AND kind=?"
@@ -411,6 +470,9 @@ class SQLiteRegistry(ResourceRegistry):
             if namespace is not None:
                 sql += " AND namespace IS ?"
                 params.append(namespace)
+            for path, value in label_paths:
+                sql += " AND json_extract(body, ?) = ?"
+                params.extend([path, value])
             if continue_token is not None:
                 cursor_ns, cursor_name = self._decode_token(continue_token)
                 cursor_ns_key = cursor_ns if cursor_ns is not None else ""
@@ -423,16 +485,9 @@ class SQLiteRegistry(ResourceRegistry):
             sql += " ORDER BY COALESCE(namespace, ''), name LIMIT ?"
             params.append(limit)
             rows = self._conn.execute(sql, tuple(params)).fetchall()
-            results = [self._row_to_resource(r) for r in rows]
-            if labels:
-                results = [
-                    res
-                    for res in results
-                    if all(res.metadata.labels.get(k) == v for k, v in labels.items())
-                ]
-            return results
+            return [self._row_to_resource(r) for r in rows]
 
-        return await asyncio.to_thread(_list)
+        return await self._run(_list)
 
     async def delete(
         self,
@@ -459,7 +514,7 @@ class SQLiteRegistry(ResourceRegistry):
                 )
             self._conn.commit()
 
-        await asyncio.to_thread(_delete)
+        await self._run(_delete)
 
     async def request_delete(
         self,
@@ -504,6 +559,8 @@ class SQLiteRegistry(ResourceRegistry):
         Raises:
             NotFoundError: 目标资源不存在（或跨租户不可见）。
             InvalidStateTransition: 当前 phase 不允许转移到 ``Terminating``。
+            ConflictError: 读取后资源被并发修改（``resource_version`` 已变化），
+                调用方应重新读取后重试。
         """
         terminating = "Terminating"
 
@@ -520,6 +577,7 @@ class SQLiteRegistry(ResourceRegistry):
                     f"namespace={namespace!r} name={name} tenant_id={tenant_id}",
                 )
             phase = row["phase"]
+            read_version = row["resource_version"]
             current_finalizers = json.loads(row["finalizers"] or "[]")
             if phase == terminating:
                 # 幂等：删除请求已受理，仍在受控释放流程中。
@@ -529,22 +587,24 @@ class SQLiteRegistry(ResourceRegistry):
                 effective.append(DEFAULT_RELEASE_FINALIZER)
             if not effective:
                 # 无 finalizer 且无外部副作用 → 直接物理删除（向后兼容）。
+                # 以读到的版本为条件：并发写入可能刚追加了 finalizer。
                 cur.execute(
                     "DELETE FROM resources "
-                    "WHERE tenant_id=? AND kind=? AND namespace IS ? AND name=?",
-                    (tenant_id, kind, namespace, name),
+                    "WHERE tenant_id=? AND kind=? AND namespace IS ? AND name=? "
+                    " AND resource_version=?",
+                    (tenant_id, kind, namespace, name, read_version),
                 )
                 if cur.rowcount == 0:
                     self._conn.rollback()
-                    raise NotFoundError(
-                        f"resource not found: kind={kind} "
+                    raise ConflictError(
+                        f"request_delete raced with concurrent write: kind={kind} "
                         f"namespace={namespace!r} name={name} tenant_id={tenant_id}",
                     )
                 self._conn.commit()
                 return RequestDeleteResult(True, [])
             # finalizer 非空（或自动追加）→ 受控删除：置 Terminating。
             self._validate_phase_transition(kind, phase, terminating)
-            new_version = row["resource_version"] + 1
+            new_version = read_version + 1
             body = json.loads(row["body"])
             body["finalizers"] = effective
             # 仅当 payload 已携带 status 子树（强类型子类）时同步 phase；
@@ -559,7 +619,8 @@ class SQLiteRegistry(ResourceRegistry):
             cur.execute(
                 "UPDATE resources SET body=?, phase=?, finalizers=?, "
                 " resource_version=?, updated_at=datetime('now') "
-                "WHERE tenant_id=? AND kind=? AND namespace IS ? AND name=?",
+                "WHERE tenant_id=? AND kind=? AND namespace IS ? AND name=? "
+                " AND resource_version=?",
                 (
                     json.dumps(body, ensure_ascii=False),
                     terminating,
@@ -569,6 +630,7 @@ class SQLiteRegistry(ResourceRegistry):
                     kind,
                     namespace,
                     name,
+                    read_version,
                 ),
             )
             if cur.rowcount == 0:
@@ -590,7 +652,7 @@ class SQLiteRegistry(ResourceRegistry):
             )
             return RequestDeleteResult(False, effective)
 
-        return await asyncio.to_thread(_request_delete)
+        return await self._run(_request_delete)
 
     # ------------------------------------------------------------------ #
     # Allocation 持久化（development-plan 7.2 DDL）
@@ -645,7 +707,7 @@ class SQLiteRegistry(ResourceRegistry):
                 ) from exc
             return allocation_id
 
-        return await asyncio.to_thread(_put_allocation)
+        return await self._run(_put_allocation)
 
     async def get_active_allocation(
         self,
@@ -664,7 +726,7 @@ class SQLiteRegistry(ResourceRegistry):
             ).fetchone()
             return dict(row) if row is not None else None
 
-        return await asyncio.to_thread(_get_active)
+        return await self._run(_get_active)
 
     async def release_allocation(
         self,
@@ -682,6 +744,7 @@ class SQLiteRegistry(ResourceRegistry):
         Raises:
             NotFoundError: 分配不存在（或跨租户不可见）。
             InvalidStateTransition: 当前状态非 ``Active``（终态不可逆）。
+            ConflictError: 读取后状态被并发修改（如已被另一方释放或过期）。
         """
 
         def _release() -> None:
@@ -694,11 +757,16 @@ class SQLiteRegistry(ResourceRegistry):
                     f"allocation not found: id={allocation_id} tenant_id={tenant_id}",
                 )
             ALLOCATION_STATE_MACHINE.validate(row["status"], AllocationStatus.RELEASED.value)
-            self._conn.execute(
+            cur = self._conn.execute(
                 "UPDATE allocations SET status=?, released_at=datetime('now') "
-                "WHERE tenant_id=? AND id=?",
-                (AllocationStatus.RELEASED.value, tenant_id, allocation_id),
+                "WHERE tenant_id=? AND id=? AND status=?",
+                (AllocationStatus.RELEASED.value, tenant_id, allocation_id, row["status"]),
             )
+            if cur.rowcount == 0:
+                self._conn.rollback()
+                raise ConflictError(
+                    f"allocation changed concurrently: id={allocation_id} tenant_id={tenant_id}",
+                )
             self._conn.commit()
             if reason is not None:
                 logger.debug(
@@ -708,7 +776,7 @@ class SQLiteRegistry(ResourceRegistry):
                     reason,
                 )
 
-        await asyncio.to_thread(_release)
+        await self._run(_release)
 
     async def list_allocations(
         self,
@@ -723,15 +791,23 @@ class SQLiteRegistry(ResourceRegistry):
             ).fetchall()
             return [dict(row) for row in rows]
 
-        return await asyncio.to_thread(_list_allocations)
+        return await self._run(_list_allocations)
 
     # ------------------------------------------------------------------ #
     # 生命周期
     # ------------------------------------------------------------------ #
 
+    async def ping(self) -> None:
+        """探测连接可用（就绪探针使用）；连接已关闭或损坏时抛 ``sqlite3.Error``。"""
+
+        def _ping() -> None:
+            self._conn.execute("SELECT 1").fetchone()
+
+        await self._run(_ping)
+
     async def close(self) -> None:
         """关闭数据库连接。"""
-        await asyncio.to_thread(self._conn.close)
+        await self._run(self._conn.close)
 
 
 __all__ = [

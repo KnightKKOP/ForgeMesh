@@ -164,8 +164,9 @@ class ReconciliationController(Reconciler):
             resource={"kind": resource.kind, "name": resource.metadata.name},
         )
         policy_result = await self._policy.check(ctx, action)
+        # deny / require_approval / 分配失败均未产生副作用：不登记 dedup_key，
+        # 否则 requeue 回来会命中幂等短路，永远不会重新评估。
         if policy_result.decision == "deny":
-            await self._mark_processed(ctx.dedup_key)
             return ReconcileResult(
                 done=False,
                 requeue_after=30.0,
@@ -186,7 +187,6 @@ class ReconciliationController(Reconciler):
             # 工作流），requeue 等待人工审批后重新协调（对齐
             # development-plan 5.6 三态 / architecture 7.5——高风险操作
             # 不允许在审批前放行）
-            await self._mark_processed(ctx.dedup_key)
             return ReconcileResult(
                 done=False,
                 requeue_after=30.0,
@@ -216,7 +216,6 @@ class ReconciliationController(Reconciler):
                 allocation_ref = await self._scheduler.allocate(sched_req)
             except Exception as exc:  # noqa: BLE001 - 分配失败需可重试
                 logger.warning("scheduler allocate failed: %s", exc)
-                await self._mark_processed(ctx.dedup_key)
                 return ReconcileResult(
                     done=False,
                     requeue_after=10.0,

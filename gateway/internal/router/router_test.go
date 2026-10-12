@@ -12,7 +12,7 @@ import (
 	"github.com/Mekoforge/ForgeMesh/gateway/internal/config"
 )
 
-// newTestRouter 构造测试用网关处理器；upstreamURL 指向被测的模拟上游。
+// newTestRouter 构造 dev 认证模式的测试用网关处理器；upstreamURL 指向被测的模拟上游。
 func newTestRouter(t *testing.T, upstreamURL string) *Router {
 	t.Helper()
 	cfg := config.Config{
@@ -22,6 +22,7 @@ func newTestRouter(t *testing.T, upstreamURL string) *Router {
 		RateLimitBurst:    1000,
 		TenantHeader:      "X-Tenant-ID",
 		CorrelationHeader: "X-Correlation-ID",
+		AuthMode:          config.AuthModeDev,
 	}
 	r, err := New(cfg, log.New(io.Discard, "", 0))
 	if err != nil {

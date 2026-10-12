@@ -54,7 +54,7 @@ type Proxy struct {
 // New 构造流式代理。
 //
 // resolver 提供按服务名的实例解析；tenantHeader 为提取租户身份的请求头名
-// （与 Authz 中间件一致）；logger 为 nil 时使用 log.Default()。
+// （与认证中间件一致）；logger 为 nil 时使用 log.Default()。
 //
 // 客户端不设置整体超时（流式连接可能长时间保持），仅对响应头到达设置超时，
 // 防止上游僵死连接长期占用资源。
@@ -95,7 +95,8 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	tenantID := r.Header.Get(p.tenantHeader)
 
-	endpoints, err := p.resolver.Resolve(r.Context(), svc, tenantID)
+	resolveCtx := upstream.WithAuthorization(r.Context(), r.Header.Get("Authorization"))
+	endpoints, err := p.resolver.Resolve(resolveCtx, svc, tenantID)
 	if err != nil {
 		p.logger.Printf("stream resolve error: corr=%s svc=%s tenant=%s err=%v",
 			r.Header.Get("X-Correlation-ID"), svc, tenantID, err)
@@ -220,9 +221,11 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, target *url.URL,
 }
 
 // classifyResolveError 将解析错误映射为 (HTTP 状态码, 错误码)。
-// 服务缺失/未就绪/无实例 → 503；控制平面自身故障 → 502。
+// 凭证无权读取服务 → 403；服务缺失/未就绪/无实例 → 503；控制平面自身故障 → 502。
 func classifyResolveError(err error) (int, string) {
 	switch {
+	case errors.Is(err, upstream.ErrForbidden):
+		return http.StatusForbidden, "FORBIDDEN"
 	case errors.Is(err, upstream.ErrServiceNotFound),
 		errors.Is(err, upstream.ErrNotReady),
 		errors.Is(err, upstream.ErrNoEndpoints),

@@ -86,6 +86,46 @@ func TestResolve_Success(t *testing.T) {
 	}
 }
 
+// TestResolve_ForwardsCallerAuthorization 验证 WithAuthorization 注入的凭证随查询发给控制平面，
+// 未注入时不发送 Authorization。
+func TestResolve_ForwardsCallerAuthorization(t *testing.T) {
+	var mu sync.Mutex
+	var got []string
+	srv, _ := newControlPlane(t, func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		got = append(got, r.Header.Get("Authorization"))
+		mu.Unlock()
+		_, _ = io.WriteString(w, readyBody("Ready", "http://10.0.0.1:8000"))
+	})
+	r := newTestResolver(srv.URL, time.Nanosecond, time.Second)
+
+	if _, err := r.Resolve(WithAuthorization(context.Background(), "Bearer fmk_k"), "svc-a", "tenant-a"); err != nil {
+		t.Fatalf("Resolve 应成功: %v", err)
+	}
+	time.Sleep(time.Millisecond)
+	if _, err := r.Resolve(WithAuthorization(context.Background(), ""), "svc-a", "tenant-a"); err != nil {
+		t.Fatalf("Resolve 应成功: %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(got) != 2 || got[0] != "Bearer fmk_k" || got[1] != "" {
+		t.Fatalf("控制平面收到的 Authorization 应为 [Bearer fmk_k, 空]，实际 %q", got)
+	}
+}
+
+// TestResolve_Forbidden 验证控制平面 403 映射为 ErrForbidden。
+func TestResolve_Forbidden(t *testing.T) {
+	srv, _ := newControlPlane(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+	})
+	r := newTestResolver(srv.URL, time.Second, time.Second)
+
+	if _, err := r.Resolve(context.Background(), "svc-a", "tenant-a"); !errors.Is(err, ErrForbidden) {
+		t.Fatalf("403 应映射为 ErrForbidden，实际 %v", err)
+	}
+}
+
 // TestResolve_CacheHit 验证 TTL 内第二次 Resolve 命中缓存，不再发请求。
 func TestResolve_CacheHit(t *testing.T) {
 	srv, calls := newControlPlane(t, nil)

@@ -37,6 +37,10 @@ func main() {
 	if err != nil {
 		logger.Fatalf("init router: %v", err)
 	}
+	if cfg.AuthMode == config.AuthModeDev {
+		logger.Printf("WARNING: GATEWAY_AUTH_MODE=dev trusts the %s header without verifying credentials; "+
+			"use it for local development only", cfg.TenantHeader)
+	}
 
 	srv := &http.Server{
 		Addr:              cfg.ListenAddr,
@@ -52,7 +56,7 @@ func main() {
 
 	errCh := make(chan error, 1)
 	go func() {
-		logger.Printf("listening on %s upstream=%s", cfg.ListenAddr, cfg.UpstreamURL)
+		logger.Printf("listening on %s upstream=%s auth=%s", cfg.ListenAddr, cfg.UpstreamURL, cfg.AuthMode)
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			errCh <- err
 		}

@@ -9,7 +9,8 @@
 #   /metrics 不要求认证），出站只能访问控制平面的 8080 端口。
 #
 # 启用启动器之后推理实例运行在控制平面的 Pod 内，还要应用 launcher/network-policy.yaml；
-# 让 Prometheus 抓取两边的 /metrics 见 monitoring/network-policy.yaml。
+# 让 Prometheus 抓取两边的 /metrics 见 monitoring/network-policy.yaml；把资源变更事件发往
+# webhook 时，控制平面访问接收方的出站规则见 event-webhook/network-policy.yaml。
 # 集群外的调用方只经 Ingress 控制器访问网关时，可以把网关入站规则的来源收窄到 Ingress 控制器
 # 所在的命名空间；集群 DNS 的标签或端口不同（例如使用 NodeLocal DNSCache）时相应修改 DNS 规则。
 apiVersion: networking.k8s.io/v1

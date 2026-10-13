@@ -1,0 +1,39 @@
+# 与 patch.yaml 一起应用：允许控制平面访问 webhook 的接收方，其他出站流量仍被
+# ../network-policies.yaml 拒绝。NetworkPolicy 不能按域名放行：按接收方的位置保留下面的
+# 一条规则并改成实际的取值，删去另一条。
+#
+# - 接收方在集群内：它所在的命名空间、它的 Pod 的标签与容器端口（经 Service 访问时同样按
+#   Pod 的容器端口匹配，不是 Service 的端口）；
+# - 接收方在集群外：它的 IP 地址段与端口。地址不固定的接收方（如经 CDN 提供的服务）无法用
+#   IP 地址段可靠地放行，改经出站代理发送：控制平面遵循 HTTPS_PROXY / HTTP_PROXY / NO_PROXY
+#   环境变量，这条规则改为允许访问代理。
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: forgemesh-control-plane-event-webhook
+  namespace: forgemesh
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: control-plane
+  policyTypes:
+    - Egress
+  egress:
+    # 集群内的接收方
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: event-receiver
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: event-receiver
+      ports:
+        - protocol: TCP
+          port: 8080
+    # 集群外的接收方（192.0.2.0/24 是文档专用的地址段）
+    - to:
+        - ipBlock:
+            cidr: 192.0.2.10/32
+      ports:
+        - protocol: TCP
+          port: 443

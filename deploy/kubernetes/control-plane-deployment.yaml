@@ -15,6 +15,7 @@
 # 服务停在 Pending（SchedulerUnavailable）。设置方法见 README「Kubernetes 部署」：不需要 GPU 的
 # 假启动器见 launcher/fake-runtime-patch.yaml；vllm-process / tgi-process 启动器在控制平面的容器内
 # 运行 vLLM / TGI，需要装有它们的镜像与分配了 GPU 的 Pod，仓库没有提供。
+# 资源变更事件默认写进日志；发往 webhook 见 event-webhook/patch.yaml。
 apiVersion: v1
 kind: ServiceAccount
 metadata:

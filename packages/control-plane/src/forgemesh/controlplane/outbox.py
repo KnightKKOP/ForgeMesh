@@ -18,7 +18,7 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from .sqlite import connect
+from .sqlite import Database
 
 _SCHEMA_SQL = """\
 CREATE TABLE IF NOT EXISTS outbox_events (
@@ -69,52 +69,57 @@ class Outbox:
 
     Args:
         db_path: SQLite 数据库路径，默认 :memory:。
-        conn: 可选的外部 SQLite 连接（用于与业务事务共享）。
+        database: 与业务存储共用的数据库；给出时忽略 ``db_path``，:meth:`close`
+            不关闭它（由创建者关闭）。
     """
 
-    def __init__(self, db_path: str = ":memory:", conn: sqlite3.Connection | None = None) -> None:
-        self._db_path = db_path
-        self._conn = conn or connect(db_path)
-        self._conn.row_factory = sqlite3.Row
+    def __init__(self, db_path: str = ":memory:", *, database: Database | None = None) -> None:
+        self._owns_db = database is None
+        self._db = database if database is not None else Database(db_path)
+        self._conn = self._db.conn
         self._init_schema()
 
     def _init_schema(self) -> None:
         """创建表与索引（幂等）。"""
-        self._conn.executescript(_SCHEMA_SQL)
-        self._conn.commit()
+        with self._db.lock:
+            self._conn.executescript(_SCHEMA_SQL)
+            self._conn.commit()
 
     @property
-    def conn(self) -> sqlite3.Connection:
-        """暴露连接，供业务事务共享。"""
-        return self._conn
+    def database(self) -> Database:
+        """事件表所在的数据库，供业务写入与事件共用同一个连接和锁。"""
+        return self._db
 
     def put(self, event: OutboxEvent) -> None:
-        """写入事件（同步，应在业务事务中调用）。
+        """写入事件并提交。"""
 
-        与业务状态更新在同一事务中执行，保证原子性。
-        """
-        self._conn.execute(
-            "INSERT INTO outbox_events (event_id, aggregate_type, aggregate_id, "
-            "event_type, payload, created_at, status) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (
-                event.event_id,
-                event.aggregate_type,
-                event.aggregate_id,
-                event.event_type,
-                json.dumps(event.payload, ensure_ascii=False),
-                event.created_at,
-                event.status,
-            ),
-        )
-        self._conn.commit()
+        def _put() -> None:
+            self._conn.execute(
+                "INSERT INTO outbox_events (event_id, aggregate_type, aggregate_id, "
+                "event_type, payload, created_at, status) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    event.event_id,
+                    event.aggregate_type,
+                    event.aggregate_id,
+                    event.event_type,
+                    json.dumps(event.payload, ensure_ascii=False),
+                    event.created_at,
+                    event.status,
+                ),
+            )
+            self._conn.commit()
+
+        self._db.call(_put)
 
     def get_pending(self, limit: int = 100) -> list[OutboxEvent]:
         """获取待发布事件，按创建时间升序排列。"""
-        rows = self._conn.execute(
-            "SELECT * FROM outbox_events WHERE status = 'pending' ORDER BY created_at LIMIT ?",
-            (limit,),
-        ).fetchall()
+        rows = self._db.call(
+            lambda: self._conn.execute(
+                "SELECT * FROM outbox_events WHERE status = 'pending' ORDER BY created_at LIMIT ?",
+                (limit,),
+            ).fetchall()
+        )
         return [self._row_to_event(r) for r in rows]
 
     def mark_published(self, event_id: str) -> None:
@@ -122,14 +127,18 @@ class Outbox:
 
         仅当事件处于 pending 状态时才可标记；否则抛 ValueError。
         """
-        cur = self._conn.execute(
-            "UPDATE outbox_events SET status = 'published', published_at = ? "
-            "WHERE event_id = ? AND status = 'pending'",
-            (time.time(), event_id),
-        )
-        if cur.rowcount == 0:
-            raise ValueError(f"event not found or already published: {event_id}")
-        self._conn.commit()
+
+        def _mark() -> None:
+            cur = self._conn.execute(
+                "UPDATE outbox_events SET status = 'published', published_at = ? "
+                "WHERE event_id = ? AND status = 'pending'",
+                (time.time(), event_id),
+            )
+            if cur.rowcount == 0:
+                raise ValueError(f"event not found or already published: {event_id}")
+            self._conn.commit()
+
+        self._db.call(_mark)
 
     def mark_failed(self, event_id: str, reason: str = "") -> None:
         """标记事件发布失败。
@@ -138,17 +147,24 @@ class Outbox:
             event_id: 事件标识。
             reason: 失败原因（保留用于未来扩展，当前未持久化）。
         """
-        self._conn.execute(
-            "UPDATE outbox_events SET status = 'failed' WHERE event_id = ? AND status = 'pending'",
-            (event_id,),
-        )
-        self._conn.commit()
+
+        def _mark() -> None:
+            self._conn.execute(
+                "UPDATE outbox_events SET status = 'failed' "
+                "WHERE event_id = ? AND status = 'pending'",
+                (event_id,),
+            )
+            self._conn.commit()
+
+        self._db.call(_mark)
 
     def get_stats(self) -> dict[str, int]:
         """获取 Outbox 统计信息（各状态事件数量）。"""
-        rows = self._conn.execute(
-            "SELECT status, COUNT(*) as cnt FROM outbox_events GROUP BY status"
-        ).fetchall()
+        rows = self._db.call(
+            lambda: self._conn.execute(
+                "SELECT status, COUNT(*) as cnt FROM outbox_events GROUP BY status"
+            ).fetchall()
+        )
         return {row["status"]: row["cnt"] for row in rows}
 
     @staticmethod
@@ -166,8 +182,9 @@ class Outbox:
         )
 
     async def close(self) -> None:
-        """关闭数据库连接。"""
-        await asyncio.to_thread(self._conn.close)
+        """关闭数据库连接（共用的 ``database`` 由创建者关闭）。"""
+        if self._owns_db:
+            await asyncio.to_thread(self._db.close)
 
 
 class Dispatcher:

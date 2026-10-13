@@ -30,6 +30,7 @@ from forgemesh.controlplane.outbox import (
     Outbox,
     OutboxEvent,
 )
+from forgemesh.controlplane.sqlite import Database
 
 
 def _run(coro):
@@ -57,11 +58,11 @@ def _make_event(
 def _open_shared_outbox(db_file) -> tuple[Outbox, sqlite3.Connection]:
     """打开共享连接的 Outbox 并初始化业务表。
 
-    实现提供的事务集成方式即 ``Outbox(conn=...)`` 共享同一 SQLite 连接，
-    业务状态与事件记录在该连接的同一事务上下文中写入。
+    实现提供的事务集成方式即 ``Outbox(database=...)`` 与业务存储共用一个
+    :class:`Database`，业务状态与事件记录在该连接的同一事务上下文中写入。
     """
-    conn = sqlite3.connect(str(db_file), check_same_thread=False)
-    outbox = Outbox(conn=conn)
+    outbox = Outbox(database=Database(str(db_file)))
+    conn = outbox.database.conn
     conn.execute(
         "CREATE TABLE IF NOT EXISTS biz_services (id TEXT PRIMARY KEY, status TEXT NOT NULL)"
     )
@@ -315,11 +316,11 @@ def test_manual_replay_failed_event(tmp_path) -> None:
     assert side_effects == []
 
     # 手动重放：通过 Outbox 暴露的共享连接重置状态（模拟运维重放动作）。
-    outbox.conn.execute(
+    outbox.database.conn.execute(
         "UPDATE outbox_events SET status = 'pending' WHERE event_id = ?",
         ("evt-replay",),
     )
-    outbox.conn.commit()
+    outbox.database.conn.commit()
     assert [e.event_id for e in outbox.get_pending()] == ["evt-replay"]
 
     replay_round = Dispatcher(outbox, flaky_publisher)

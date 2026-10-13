@@ -5,7 +5,9 @@
 * ``connect`` 启用 WAL 与外键约束，``synchronous`` 保持 ``FULL``，等锁 5 秒；
 * 控制平面的各个存储都以 WAL 模式打开数据库文件；
 * 同一文件上一个连接的读事务不阻塞另一个存储写入；
-* 工作流存储使用同目录的独立文件，控制平面库被写锁占用时照常写入。
+* 工作流存储使用同目录的独立文件，控制平面库被写锁占用时照常写入；
+* :class:`Database`：异常时回滚、拒绝遗留未提交的事务、事务整体提交或回滚，
+  共用它的存储不会丢失彼此的写入。
 """
 
 from __future__ import annotations
@@ -17,11 +19,12 @@ import time
 
 import pytest
 from forgemesh.controlplane.audit import AuditLog
-from forgemesh.controlplane.outbox import Outbox
+from forgemesh.controlplane.outbox import Outbox, OutboxEvent
 from forgemesh.controlplane.reconciler import ProcessedKeyStore
 from forgemesh.controlplane.registry import SQLiteRegistry
-from forgemesh.controlplane.sqlite import connect, workflow_db_path
-from forgemesh.controlplane.tasks import TaskStore
+from forgemesh.controlplane.sqlite import Database, connect, workflow_db_path
+from forgemesh.controlplane.tasks import TaskStatus, TaskStore
+from forgemesh.core.errors import NotFoundError
 from forgemesh.workflow.runtime import Step, WorkflowDefinition
 from forgemesh.workflowruntime.store import WorkflowStore
 
@@ -129,3 +132,107 @@ def test_workflow_store_writes_while_the_control_plane_database_is_locked(tmp_pa
         writer.rollback()
         writer.close()
         asyncio.run(workflows.close())
+
+
+def _values(conn: sqlite3.Connection) -> list[str]:
+    return [row[0] for row in conn.execute("SELECT v FROM t ORDER BY v")]
+
+
+@pytest.mark.unit
+def test_database_call_rolls_back_when_the_function_raises() -> None:
+    db = Database()
+    try:
+        db.conn.execute("CREATE TABLE t (v TEXT)")
+
+        def _fail() -> None:
+            db.conn.execute("INSERT INTO t VALUES ('lost')")
+            raise RuntimeError("boom")
+
+        def _write() -> None:
+            db.conn.execute("INSERT INTO t VALUES ('kept')")
+            db.conn.commit()
+
+        with pytest.raises(RuntimeError, match="boom"):
+            db.call(_fail)
+        assert not db.conn.in_transaction
+        db.call(_write)
+        assert _values(db.conn) == ["kept"]
+    finally:
+        db.close()
+
+
+@pytest.mark.unit
+def test_database_call_refuses_to_leave_a_transaction_open() -> None:
+    db = Database()
+    try:
+        db.conn.execute("CREATE TABLE t (v TEXT)")
+        with pytest.raises(RuntimeError, match="left a transaction open"):
+            db.call(db.conn.execute, "INSERT INTO t VALUES ('uncommitted')")
+        assert not db.conn.in_transaction
+        assert _values(db.conn) == []
+    finally:
+        db.close()
+
+
+@pytest.mark.unit
+def test_database_transaction_commits_or_rolls_back_as_a_unit(tmp_path) -> None:
+    path = str(tmp_path / "cp.db")
+    db = Database(path)
+    probe = sqlite3.connect(path, timeout=0)
+    try:
+        db.conn.execute("CREATE TABLE t (v TEXT)")
+        with db.transaction() as conn:
+            conn.execute("INSERT INTO t VALUES ('a')")
+            assert _values(probe) == []
+            # 事务开始即持有写锁：其他连接此时无法写入。
+            with pytest.raises(sqlite3.OperationalError, match="locked"):
+                probe.execute("INSERT INTO t VALUES ('other')")
+            probe.rollback()
+            with pytest.raises(RuntimeError, match="already open"), db.transaction():
+                pass
+        assert _values(probe) == ["a"]
+
+        with pytest.raises(RuntimeError, match="boom"), db.transaction() as conn:
+            conn.execute("INSERT INTO t VALUES ('b')")
+            raise RuntimeError("boom")
+        assert not db.conn.in_transaction
+        assert _values(probe) == ["a"]
+    finally:
+        probe.close()
+        db.close()
+
+
+@pytest.mark.unit
+def test_stores_sharing_a_database_do_not_lose_each_others_writes(tmp_path) -> None:
+    """任务存储与 Outbox 共用一个连接：一方的回滚不会连带丢弃另一方尚未提交的写入。"""
+
+    async def scenario() -> None:
+        database = Database(str(tmp_path / "cp.db"))
+        tasks = TaskStore(database=database)
+        outbox = Outbox(database=database)
+
+        def put(event_id: str) -> None:
+            with database.transaction():
+                outbox.put(
+                    OutboxEvent(
+                        event_id=event_id, aggregate_type="T", aggregate_id="a", event_type="t"
+                    )
+                )
+
+        try:
+            for round_no in range(10):
+                puts = [asyncio.to_thread(put, f"evt-{round_no}-{i}") for i in range(16)]
+                misses = [
+                    tasks.update_status(f"missing-{i}", TaskStatus.RUNNING) for i in range(16)
+                ]
+                results = await asyncio.gather(*puts, *misses, return_exceptions=True)
+                assert results[:16] == [None] * 16
+                assert all(isinstance(r, NotFoundError) for r in results[16:])
+            assert outbox.get_stats() == {"pending": 160}
+            await tasks.close()
+            await outbox.close()
+            assert database.call(lambda: database.conn.execute("SELECT 1").fetchone()[0]) == 1
+        finally:
+            database.close()
+
+    asyncio.run(scenario())

@@ -97,7 +97,6 @@ import json
 import logging
 import secrets
 import sqlite3
-import threading
 from collections.abc import Callable, Collection, Iterator, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -114,7 +113,7 @@ from forgemesh.resource.inference import Endpoint, InferenceService
 from forgemesh.resource.states import ALLOCATION_STATE_MACHINE, INFERENCE_STATE_MACHINE
 from pydantic import ValidationError
 
-from ..sqlite import connect
+from ..sqlite import Database
 
 logger = logging.getLogger(__name__)
 
@@ -330,9 +329,9 @@ class SQLiteRegistry(ResourceRegistry):
 
     def __init__(self, db_path: str = ":memory:") -> None:
         self._db_path = db_path
-        self._conn = connect(db_path)
-        self._conn.row_factory = sqlite3.Row
-        self._lock = threading.RLock()
+        self._db = Database(db_path)
+        self._conn = self._db.conn
+        self._lock = self._db.lock
         self._init_schema()
         self._page_token_key = self._load_page_token_key()
 
@@ -341,13 +340,9 @@ class SQLiteRegistry(ResourceRegistry):
     # ------------------------------------------------------------------ #
 
     async def _run(self, fn: Callable[[], _T]) -> _T:
-        """在工作线程中持锁执行一段同步数据库操作（读写均串行化）。"""
-
-        def _locked() -> _T:
-            with self._lock:
-                return fn()
-
-        return await asyncio.to_thread(_locked)
+        """在工作线程中持锁执行一段同步数据库操作（读写均串行化）；``fn`` 抛出异常时
+        回滚它未提交的写入，不会被下一次提交连带提交。"""
+        return await self._db.run(fn)
 
     @staticmethod
     def _record_change(
@@ -1753,7 +1748,7 @@ class SQLiteRegistry(ResourceRegistry):
 
     async def close(self) -> None:
         """关闭数据库连接。"""
-        await self._run(self._conn.close)
+        await asyncio.to_thread(self._db.close)
 
 
 __all__ = [

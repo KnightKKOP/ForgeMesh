@@ -104,6 +104,29 @@ def test_shared_instance_concurrent_writes_are_not_lost() -> None:
 
 
 @pytest.mark.contract
+def test_unexpected_error_rolls_back_the_partial_write(monkeypatch) -> None:
+    """写入中途抛出非预期异常时回滚：残留的写入不能被下一次提交连带提交。"""
+
+    def broken(*args, **kwargs) -> None:
+        raise RuntimeError("boom")
+
+    async def scenario() -> None:
+        reg = SQLiteRegistry(":memory:")
+        try:
+            monkeypatch.setattr(reg, "_record_change", broken)
+            with pytest.raises(RuntimeError, match="boom"):
+                await reg.put(_make_resource("orphan"))
+            monkeypatch.undo()
+            await reg.put(_make_resource("next"))
+            assert [r.metadata.name for r in await reg.list(KIND, TENANT)] == ["next"]
+            assert [c.key.name for c in await reg.changes_since(0)] == ["next"]
+        finally:
+            await reg.close()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.contract
 def test_create_without_namespace_rejects_duplicate_name() -> None:
     """namespace 为空的同名资源只能创建一次（SQLite 主键 NULL 互不相等）。"""
 

@@ -8,7 +8,7 @@ info:
     统一响应信封与错误码见 components。资源权威 Schema 见 api/schemas/。
     beta 阶段的 minor 版本可能包含破坏性变更，均在 CHANGELOG 中以「破坏性」标注；
     x-stability 改为 stable 之后，按 docs/governance/deprecation-policy.md 保证 major 版本内兼容。
-    认证（ADR-014）：除探针外的全部端点要求 Authorization: Bearer <API key>，
+    认证（ADR-014）：除探针与 /metrics 外的全部端点要求 Authorization: Bearer <API key>，
     租户取自 key 绑定的租户；X-Tenant-Id 请求头可以省略，携带时必须与之一致，
     否则返回 403。读接口要求 read scope，写接口要求 write scope。
     任何端点遇到未预期的内部错误都返回 500（错误码 INTERNAL_ERROR，不含内部细节），
@@ -35,7 +35,7 @@ tags:
   - name: audit
     description: 审计记录查询（只读，限定在凭证绑定的租户内）
   - name: probes
-    description: 存活与就绪探针
+    description: 存活与就绪探针、Prometheus 指标
 
 paths:
   /healthz:
@@ -70,6 +70,23 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/Error"
+  /metrics:
+    get:
+      tags: [probes]
+      summary: Prometheus 指标
+      description: >-
+        Prometheus 文本格式 0.0.4 的聚合指标，与探针一样不要求认证。标签只取有限的值
+        （路由模板、方法、状态码、枚举），不含租户、名称、命名空间或 uid。
+        不在 /api/v1 之下，网关不转发。
+      operationId: metrics
+      security: []
+      responses:
+        "200":
+          description: 抓取时的指标
+          content:
+            text/plain:
+              schema:
+                type: string
 
   /api/v1/inference-services:
     parameters:

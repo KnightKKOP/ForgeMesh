@@ -42,7 +42,9 @@
   控制器（含定期核对实例与回收分配）、工作流运行时与启动器之后，关闭数据库之前最后停止。
 * **无导入副作用**：数据库在应用启动（lifespan）时才打开，导入本模块不会
   创建文件。
-* **探针**：``/healthz``（存活）恒为 ok；``/readyz``（就绪）探测权威存储可用。
+* **探针与指标**：``/healthz``（存活）恒为 ok；``/readyz``（就绪）探测权威存储可用；
+  ``/metrics`` 以 Prometheus 文本格式输出聚合指标（见 :mod:`forgemesh.controlplane.telemetry`）。
+  三者都不要求认证。
 * **FastAPI 可选兜底**：若运行环境未安装 FastAPI，回退到纯标准库
   ``http.server``，仅提供探针与 501 占位。
 
@@ -89,11 +91,13 @@ from .deployment import (
     reclaim_orphaned_allocations,
     record_file_path,
 )
+from .metrics import CONTENT_TYPE
 from .outbox import Dispatcher
 from .publishers import publisher_from_env
 from .reconciler import ProcessedKeyStore, ReconciliationController
 from .scheduler import INVENTORY_FILE_ENV, FirstFitScheduler, inventory_from_env
 from .sqlite import workflow_db_path
+from .telemetry import ControlPlaneMetrics
 from .version import CONTROL_PLANE_VERSION
 
 if TYPE_CHECKING:  # pragma: no cover - 仅静态类型检查使用
@@ -105,7 +109,7 @@ if TYPE_CHECKING:  # pragma: no cover - 仅静态类型检查使用
 
 try:  # pragma: no cover - 取决于运行环境是否安装 FastAPI
     from fastapi import FastAPI
-    from fastapi.responses import JSONResponse
+    from fastapi.responses import JSONResponse, PlainTextResponse
 
     _FASTAPI_AVAILABLE = True
 except Exception:  # pragma: no cover - 兜底路径
@@ -264,6 +268,9 @@ if _FASTAPI_AVAILABLE:
             reset_registry,
         )
         from .api.errors import install_exception_handlers
+        from .api.middleware import TelemetryMiddleware
+
+        metrics = ControlPlaneMetrics()
 
         @asynccontextmanager
         async def lifespan(_: FastAPI) -> AsyncIterator[None]:
@@ -338,6 +345,7 @@ if _FASTAPI_AVAILABLE:
             version=CONTROL_PLANE_VERSION,
             lifespan=lifespan,
         )
+        application.add_middleware(TelemetryMiddleware, metrics=metrics.http)
 
         @application.get("/healthz", response_model=HealthResponse, tags=["probes"])
         async def healthz() -> HealthResponse:
@@ -355,6 +363,11 @@ if _FASTAPI_AVAILABLE:
                     content=error_envelope("NOT_READY", f"registry unavailable: {exc}"),
                 )
             return HealthResponse(status="ok")
+
+        @application.get("/metrics", tags=["probes"], response_class=PlainTextResponse)
+        async def prometheus_metrics() -> PlainTextResponse:
+            """Prometheus 指标（文本格式 0.0.4）：只含聚合数据，不要求认证。"""
+            return PlainTextResponse(await metrics.registry.scrape(), media_type=CONTENT_TYPE)
 
         install_exception_handlers(application)
         application.include_router(create_api_router())

@@ -201,7 +201,7 @@ def test_unhandled_errors_return_an_opaque_500_envelope(tmp_path, monkeypatch) -
 
     app = create_app(db_path=str(tmp_path / "cp.db"))
     with TestClient(app, raise_server_exceptions=False) as client:
-        monkeypatch.setattr(get_registry(), "list", failing_list)
+        monkeypatch.setattr(get_registry(), "list_page", failing_list)
         response = client.get("/api/v1/inference-services", headers=HEADERS)
 
     assert response.status_code == 500

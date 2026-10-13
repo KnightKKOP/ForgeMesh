@@ -3,7 +3,7 @@
 对齐 ``api/openapi/openapi.yaml`` 契约，以 ``/api/v1`` 为前缀：
 
 * ``POST   /inference-services``          —— 创建推理服务
-* ``GET    /inference-services``          —— 列出推理服务
+* ``GET    /inference-services``          —— 列出推理服务（``limit`` 条一页，``pageToken`` 翻页）
 * ``GET    /inference-services/{name}``   —— 获取单个推理服务
 * ``PUT    /inference-services/{name}``   —— 整体替换 spec / labels / annotations
 * ``PATCH  /inference-services/{name}``   —— JSON Merge Patch（RFC 7386）更新，规则同 PUT
@@ -13,7 +13,7 @@
   ``Terminating``，协调器驱动受控释放后物理删除，见 development-plan 第 7 章）
 * ``POST   /workflows``                   —— 启动工作流运行（development-plan 5.4）
 * ``POST   /decisions``                   —— 结构化决策（决策≠授权，development-plan 5.5）
-* ``GET    /resources``                   —— 通用资源列表（可选 kind 过滤）
+* ``GET    /resources``                   —— 通用资源列表（按 kind 过滤，分页同上）
 
 租户取自已验证的凭证（见 :func:`.dependencies.get_principal` 与
 :mod:`forgemesh.controlplane.auth`），作为多租户隔离的权威来源，覆盖请求体中的
@@ -32,7 +32,7 @@ from collections.abc import Callable
 from typing import Any
 from uuid import uuid4
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Request
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, Response
 from forgemesh.core.errors import ConflictError, NotFoundError
 from forgemesh.core.objects import Resource
@@ -42,7 +42,7 @@ from forgemesh.workflow.runtime import WorkflowDefinition
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from ..app import error_envelope
-from ..registry import ConflictReason, SQLiteRegistry
+from ..registry import ConflictReason, InvalidPageTokenError, SQLiteRegistry
 from .dependencies import (
     ComponentNotReadyError,
     get_decision_router,
@@ -67,14 +67,6 @@ from .updates import (
 router = APIRouter(prefix="/api/v1")
 
 _KIND = "InferenceService"
-
-
-class ResourceListResponse(BaseModel):
-    """资源列表响应。"""
-
-    items: list[dict[str, Any]]
-    count: int
-
 
 #: 新建资源的 ``metadata.generation``（``observedGeneration`` 为 0：控制器尚未处理）。
 INITIAL_GENERATION = 1
@@ -132,6 +124,41 @@ def _invalid_limit(limit: int) -> JSONResponse | None:
     )
 
 
+async def _list_response(
+    registry: SQLiteRegistry,
+    kind: str,
+    tenant_id: str,
+    namespace: str | None,
+    page_token: str | None,
+    limit: int,
+) -> dict[str, Any]:
+    """列表响应 ``{"items", "count", "nextPageToken"}``；还有更多结果时才带 ``nextPageToken``。
+
+    空的 ``pageToken`` 等同于省略（第一页）。
+
+    Raises:
+        ApiError: ``pageToken`` 无效，或签发给了另一个租户或另一组过滤条件（400）。
+    """
+    try:
+        page = await registry.list_page(
+            kind, tenant_id, namespace=namespace, page_token=page_token or None, limit=limit
+        )
+    except InvalidPageTokenError as exc:
+        raise ApiError(
+            400,
+            "BAD_REQUEST",
+            "invalid pageToken: it is malformed, was modified, or was issued for "
+            "a different tenant or filter set",
+        ) from exc
+    body: dict[str, Any] = {
+        "items": [resource.model_dump(by_alias=True, mode="json") for resource in page.items],
+        "count": len(page.items),
+    }
+    if page.next_page_token is not None:
+        body["nextPageToken"] = page.next_page_token
+    return body
+
+
 def _resource_response(resource: Resource, status_code: int = 200) -> JSONResponse:
     """单个资源的 JSON 表示，附带当前版本的 ``ETag``。"""
     return JSONResponse(
@@ -184,12 +211,17 @@ async def list_inference_services(
     registry: SQLiteRegistry = Depends(require_registry),
     namespace: str | None = None,
     limit: int = 100,
+    page_token: str | None = Query(default=None, alias="pageToken"),
 ) -> Any:
-    """列出推理服务（可选按 namespace 过滤、limit 分页）。"""
+    """列出推理服务（可选按 namespace 过滤），按 ``(namespace, name)`` 升序分页。
+
+    响应带 ``nextPageToken`` 时还有下一页：以相同的 ``namespace`` 把它作为 ``pageToken``
+    传回（``limit`` 可以不同）；无效、被篡改或签发给另一租户 / 另一组过滤条件的
+    ``pageToken`` 返回 400。
+    """
     if (invalid := _invalid_limit(limit)) is not None:
         return invalid
-    items = await registry.list("InferenceService", tenant_id, namespace=namespace, limit=limit)
-    return {"items": [r.model_dump(by_alias=True) for r in items], "count": len(items)}
+    return await _list_response(registry, _KIND, tenant_id, namespace, page_token, limit)
 
 
 @router.get("/inference-services/{name}", dependencies=[Depends(require_read)])
@@ -359,18 +391,22 @@ async def list_resources(
     kind: str | None = None,
     namespace: str | None = None,
     limit: int = 100,
+    page_token: str | None = Query(default=None, alias="pageToken"),
 ) -> Any:
-    """列出资源（可选按 kind / namespace 过滤）。
+    """列出某个 kind 的资源（可选按 namespace 过滤），分页规则同推理服务列表。
 
-    未指定 ``kind`` 时返回空列表（P1 简化：避免全表扫描）。
+    未指定 ``kind`` 时返回空列表（P1 简化：避免全表扫描）；这时不会签发 ``nextPageToken``，
+    带 ``pageToken`` 返回 400。
     """
     if (invalid := _invalid_limit(limit)) is not None:
         return invalid
-    if kind:
-        items = await registry.list(kind, tenant_id, namespace=namespace, limit=limit)
-    else:
-        items = []
-    return {"items": [r.model_dump(by_alias=True) for r in items], "count": len(items)}
+    if not kind:
+        if page_token:
+            raise ApiError(
+                400, "BAD_REQUEST", "invalid pageToken: a listing without kind has no further pages"
+            )
+        return {"items": [], "count": 0}
+    return await _list_response(registry, kind, tenant_id, namespace, page_token, limit)
 
 
 # ------------------------------------------------------------------ #

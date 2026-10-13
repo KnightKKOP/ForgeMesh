@@ -28,6 +28,8 @@ tags:
     description: 工作流运行启动与状态查询
   - name: decisions
     description: 结构化决策请求（决策≠授权；授权由 Scheduler/Policy 完成）
+  - name: resources
+    description: 按 kind 列出资源（只读）
   - name: probes
     description: 存活与就绪探针
 
@@ -70,6 +72,9 @@ paths:
       tags: [inference-services]
       summary: 列出推理服务
       operationId: listInferenceServices
+      description: >-
+        按 (namespace, name) 升序分页，不带命名空间的资源排在最前。响应带 nextPageToken 时
+        还有下一页：以相同的过滤条件把它作为 pageToken 传回。
       parameters:
         - name: tenantId
           in: query
@@ -80,22 +85,12 @@ paths:
           description: 从未生效，服务端忽略；租户取自凭证（ADR-014）。
           schema:
             type: string
-        - name: namespace
-          in: query
-          description: 只列出该命名空间中的资源；省略时不按命名空间过滤。
-          schema:
-            type: string
-        - name: limit
-          in: query
-          description: 单页最多返回的条数；超出 1–1000 返回 400。
-          schema:
-            type: integer
-            minimum: 1
-            maximum: 1000
-            default: 100
+        - $ref: "#/components/parameters/NamespaceFilter"
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/PageToken"
       responses:
         "200":
-          description: 列表
+          description: 一页推理服务
           content:
             application/json:
               schema:
@@ -338,8 +333,66 @@ paths:
           $ref: "#/components/responses/Forbidden"
 
 
+  /api/v1/resources:
+    get:
+      tags: [resources]
+      summary: 按 kind 列出资源
+      operationId: listResources
+      description: >-
+        与推理服务列表相同的排序与分页规则；省略 kind 时返回空列表（不做全表扫描），这时不会
+        签发 nextPageToken，带 pageToken 返回 400。
+      parameters:
+        - name: kind
+          in: query
+          description: 资源类型，如 InferenceService。
+          schema:
+            type: string
+        - $ref: "#/components/parameters/NamespaceFilter"
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/PageToken"
+      responses:
+        "200":
+          description: 一页资源
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ResourceList"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+
+
 components:
   parameters:
+    NamespaceFilter:
+      name: namespace
+      in: query
+      description: 只列出该命名空间中的资源；省略时不按命名空间过滤。
+      schema:
+        type: string
+    Limit:
+      name: limit
+      in: query
+      description: 单页最多返回的条数；超出 1–1000 返回 400。
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 1000
+        default: 100
+    PageToken:
+      name: pageToken
+      in: query
+      description: >-
+        上一页响应中的 nextPageToken（不透明字符串），空字符串等同于省略。只对签发它的租户与
+        同一组过滤条件（namespace；资源列表还有 kind）有效，limit 可以逐页变化；格式不对、
+        被修改或用于其他租户 / 过滤条件时返回 400。控制平面重启后仍然有效。
+      schema:
+        type: string
     IfMatch:
       name: If-Match
       in: header
@@ -517,14 +570,60 @@ components:
             tgi-generate 为 POST /generate_stream。
     InferenceServiceList:
       type: object
-      required: [items]
+      required: [items, count]
       properties:
         items:
           type: array
           items:
             $ref: "#/components/schemas/InferenceService"
+        count:
+          $ref: "#/components/schemas/PageCount"
         nextPageToken:
+          $ref: "#/components/schemas/NextPageToken"
+    Resource:
+      type: object
+      description: >-
+        通用资源表示：apiVersion、kind、metadata，加上该 kind 特有的字段（如 InferenceService
+        的 spec / status，见 InferenceService）。
+      required: [apiVersion, kind, metadata]
+      additionalProperties: true
+      properties:
+        apiVersion:
           type: string
+        kind:
+          type: string
+        metadata:
+          $ref: "#/components/schemas/ObjectMeta"
+        conditions:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+        finalizers:
+          type: array
+          items:
+            type: string
+    ResourceList:
+      type: object
+      required: [items, count]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/Resource"
+        count:
+          $ref: "#/components/schemas/PageCount"
+        nextPageToken:
+          $ref: "#/components/schemas/NextPageToken"
+    PageCount:
+      type: integer
+      minimum: 0
+      description: 本页的条数（不是总数）。
+    NextPageToken:
+      type: string
+      description: >-
+        还有更多结果时出现，最后一页不带此字段：作为 pageToken 传回即得下一页。游标记录位置而
+        不是快照，翻页期间新建或删除的资源可能出现也可能缺席，全程存在的资源恰好出现一次。
     TerminatingResponse:
       type: object
       description: >

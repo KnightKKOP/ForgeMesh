@@ -5,7 +5,9 @@ setuptools>=68
 wheel
 pytest>=7
 pytest-cov
-ruff
+# ruff 的格式风格与规则集随 minor 版本变化，限定在一个系列；升级时以 make fmt 重新格式化
+# 全仓库，与版本号一起提交。
+ruff>=0.17,<0.18
 pydantic>=2,<3
 cryptography>=42
 jsonschema

@@ -54,6 +54,25 @@ jobs:
       - name: Pytest
         run: python -m pytest
 
+  package-imports:
+    name: Packages · fresh-venv imports
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      # 上面的 python job 把全部包装进同一个环境，漏声明的依赖会被兄弟包或
+      # requirements-dev.txt 掩盖；这里每个包各用一个全新的虚拟环境，只装它声明的依赖。
+      - name: Import every module of each package
+        run: python scripts/check_package_imports.py
+
   go:
     name: Go gateway · build & test
     runs-on: ubuntu-latest

@@ -35,6 +35,11 @@
   分配过期。关闭时依次停止控制器、工作流运行时、启动器（其实例随之停止）。
   ``POST /workflows`` 不使用这个运行时（仍返回 503）。未设置时不部署，协调器在分配之前
   即报告 ``WorkflowRuntimeUnavailable``。
+* **事件**：lifespan 中运行 Outbox 的 :class:`~forgemesh.controlplane.outbox.Dispatcher`，
+  发布资源写入时记下的变更事件（至少一次）。发布器按 ``FORGEMESH_EVENT_WEBHOOK_URL`` 等
+  环境变量选择（见 :mod:`forgemesh.controlplane.publishers`）：默认写日志，设置后 ``POST``
+  到 webhook；配置非法时拒绝启动。Dispatcher 在恢复部署、核对实例之前启动；关闭时在
+  控制器（含定期核对实例与回收分配）、工作流运行时与启动器之后，关闭数据库之前最后停止。
 * **无导入副作用**：数据库在应用启动（lifespan）时才打开，导入本模块不会
   创建文件。
 * **探针**：``/healthz``（存活）恒为 ok；``/readyz``（就绪）探测权威存储可用。
@@ -84,6 +89,8 @@ from .deployment import (
     reclaim_orphaned_allocations,
     record_file_path,
 )
+from .outbox import Dispatcher
+from .publishers import publisher_from_env
 from .reconciler import ProcessedKeyStore, ReconciliationController
 from .scheduler import INVENTORY_FILE_ENV, FirstFitScheduler, inventory_from_env
 from .sqlite import workflow_db_path
@@ -92,6 +99,7 @@ from .version import CONTROL_PLANE_VERSION
 if TYPE_CHECKING:  # pragma: no cover - 仅静态类型检查使用
     from .auth import Authenticator
     from .deployment import RuntimeLauncher
+    from .publishers import EventPublisher
     from .registry import SQLiteRegistry
     from .scheduler import Inventory
 
@@ -121,6 +129,8 @@ DEFAULT_PORT = 8080
 CONTROLLER_POLL_INTERVAL_SECONDS = 0.5
 #: 部署进行中时协调器查询工作流运行的间隔（秒）。
 WORKFLOW_POLL_INTERVAL_SECONDS = 2.0
+#: Outbox Dispatcher 查询到期事件的间隔（秒）。
+EVENT_POLL_INTERVAL_SECONDS = 0.5
 
 
 class HealthResponse(BaseModel):
@@ -229,7 +239,9 @@ def _build_controller(
 if _FASTAPI_AVAILABLE:
 
     def create_app(
-        db_path: str | None = None, authenticator: Authenticator | None = None
+        db_path: str | None = None,
+        authenticator: Authenticator | None = None,
+        event_publisher: EventPublisher | None = None,
     ) -> FastAPI:
         """创建 FastAPI 应用：探针 + 真实 API 路由；认证器与注册中心在启动时初始化。
 
@@ -238,6 +250,9 @@ if _FASTAPI_AVAILABLE:
             authenticator: 认证器；为空时在启动时按环境变量构造
                 （见 :func:`forgemesh.controlplane.auth.authenticator_from_env`），
                 配置缺失或非法则启动失败。
+            event_publisher: Outbox 事件的发布器；为空时在启动时按环境变量构造
+                （见 :func:`forgemesh.controlplane.publishers.publisher_from_env`），
+                配置非法则启动失败。
         """
         # 延迟导入：api.routes 反向依赖本模块的 error_envelope。
         from .api import create_api_router
@@ -260,6 +275,7 @@ if _FASTAPI_AVAILABLE:
                     AUTH_MODE_ENV,
                     AUTH_MODE_DEV,
                 )
+            publisher = event_publisher if event_publisher is not None else publisher_from_env()
             inventory = inventory_from_env()
             if inventory is not None:
                 logger.info(
@@ -276,6 +292,12 @@ if _FASTAPI_AVAILABLE:
                 cleanup.push_async_callback(registry.close)
                 cleanup.callback(reset_registry)
                 logger.info("control plane registry opened: %s", path)
+                dispatcher = Dispatcher(
+                    registry.outbox, publisher, poll_interval=EVENT_POLL_INTERVAL_SECONDS
+                )
+                dispatcher.start()
+                cleanup.push_async_callback(dispatcher.shutdown)
+                logger.info("outbox events are published with %r", publisher)
                 init_authenticator(auth)
                 cleanup.callback(reset_authenticator)
                 processed_store = ProcessedKeyStore(path)
@@ -343,7 +365,9 @@ if _FASTAPI_AVAILABLE:
 else:  # pragma: no cover - 兜底路径：无 FastAPI 时使用标准库实现
 
     def create_app(  # type: ignore[valid-type]
-        db_path: str | None = None, authenticator: Authenticator | None = None
+        db_path: str | None = None,
+        authenticator: Authenticator | None = None,
+        event_publisher: EventPublisher | None = None,
     ) -> FastAPI:
         """无 FastAPI 环境时的占位工厂（抛出明确错误）。"""
         raise RuntimeError(

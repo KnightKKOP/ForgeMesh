@@ -77,8 +77,10 @@ Allocation 持久化
 :meth:`SQLiteRegistry.prune_changes` 清理。
 
 同一事务中还向 :attr:`SQLiteRegistry.outbox` 写入一条资源变更事件（ADR-008 事务性
-Outbox，信封与事件类型见 :mod:`forgemesh.controlplane.events`）：资源写入失败时不会
-留下事件，事件写入失败时资源写入一并回滚。
+Outbox，信封与事件类型见 :mod:`forgemesh.controlplane.events`）；API 写入（``put`` /
+``update_spec`` / ``delete`` / ``request_delete`` 给出调用主体 ``principal``）再向
+:attr:`SQLiteRegistry.audit_log` 写入一条审计记录。资源写入失败时不会留下事件与审计
+记录，二者写入失败时资源写入一并回滚。
 
 租户隔离
 --------
@@ -118,6 +120,8 @@ from forgemesh.resource.inference import Endpoint, InferenceService
 from forgemesh.resource.states import ALLOCATION_STATE_MACHINE, INFERENCE_STATE_MACHINE
 from pydantic import ValidationError
 
+from ..audit import AuditEvent, AuditLog
+from ..auth import Principal
 from ..events import ResourceEventChange, resource_event
 from ..outbox import Outbox
 from ..sqlite import Database
@@ -251,6 +255,15 @@ _EVENT_CHANGES = {
     ChangeType.DELETED: ResourceEventChange.DELETED,
 }
 
+#: 变更记录类型 → 审计记录的 ``action``（受理的删除请求与物理删除都是 ``delete``）。
+_AUDIT_ACTIONS = {
+    ChangeType.CREATED: "create",
+    ChangeType.UPDATED: "update",
+    ChangeType.STATUS: "update_status",
+    ChangeType.TERMINATING: "delete",
+    ChangeType.DELETED: "delete",
+}
+
 
 class ConflictReason(StrEnum):
     """:meth:`SQLiteRegistry.update_spec` 拒绝写入的原因（``ConflictError.details["reason"]``）。"""
@@ -352,11 +365,17 @@ class SQLiteRegistry(ResourceRegistry):
         self._init_schema()
         self._page_token_key = self._load_page_token_key()
         self._outbox = Outbox(database=self._db)
+        self._audit = AuditLog(database=self._db)
 
     @property
     def outbox(self) -> Outbox:
         """资源变更事件所在的 Outbox（与注册表共用连接），供事件分发器发布。"""
         return self._outbox
+
+    @property
+    def audit_log(self) -> AuditLog:
+        """API 写入的审计记录（与注册表共用连接）。"""
+        return self._audit
 
     # ------------------------------------------------------------------ #
     # 内部辅助
@@ -391,26 +410,59 @@ class SQLiteRegistry(ResourceRegistry):
         version: int,
         phase: str | None,
         correlation_id: str | None,
+        principal: Principal | None = None,
     ) -> None:
-        """在调用方的事务中写入一条资源变更事件（随调用方一起提交或回滚）。
+        """在调用方的事务中写入一条资源变更事件；给出 ``principal``（API 写入）时再写入一条
+        审计记录。二者随调用方一起提交或回滚，使用同一个关联 ID（为空时生成一个新的）。
 
         ``body`` / ``version`` / ``phase`` 描述写入之后的资源；删除时为删除前最后的状态。
         """
+        correlation_id = correlation_id or uuid4().hex
         resource = self._body_to_resource(body)
-        self._outbox.put(
-            resource_event(
-                tenant_id=key.tenant_id,
-                kind=key.kind,
-                namespace=key.namespace,
-                name=key.name,
-                change=_EVENT_CHANGES[change],
-                resource=resource.model_dump(mode="json", by_alias=True),
-                version=version,
-                phase=phase,
-                uid=resource.metadata.uid,
+        event = resource_event(
+            tenant_id=key.tenant_id,
+            kind=key.kind,
+            namespace=key.namespace,
+            name=key.name,
+            change=_EVENT_CHANGES[change],
+            resource=resource.model_dump(mode="json", by_alias=True),
+            version=version,
+            phase=phase,
+            uid=resource.metadata.uid,
+            correlation_id=correlation_id,
+        )
+        self._outbox.put(event)
+        if principal is None:
+            return
+        self._audit.put(
+            AuditEvent(
                 correlation_id=correlation_id,
+                tenant_id=key.tenant_id,
+                actor=principal.subject,
+                key_id=principal.key_id,
+                action=_AUDIT_ACTIONS[change],
+                resource_type=key.kind,
+                namespace=key.namespace,
+                resource_id=key.name,
+                outcome="success",
+                details={
+                    "change": _EVENT_CHANGES[change].value,
+                    "resourceUid": resource.metadata.uid,
+                    "resourceVersion": version,
+                    "eventId": event.event_id,
+                },
+                timestamp=event.created_at,
             )
         )
+
+    @staticmethod
+    def _check_principal(principal: Principal | None, tenant_id: str) -> None:
+        """审计记录的主体须属于被写入资源的租户。"""
+        if principal is not None and principal.tenant_id != tenant_id:
+            raise ValueError(
+                f"principal of tenant {principal.tenant_id!r} cannot write resources of "
+                f"tenant {tenant_id!r}"
+            )
 
     @contextlib.contextmanager
     def _immediate_transaction(self) -> Iterator[sqlite3.Cursor]:
@@ -689,6 +741,8 @@ class SQLiteRegistry(ResourceRegistry):
         expected_version: str | None = None,
         actor: str | None = None,
         correlation_id: str | None = None,
+        *,
+        principal: Principal | None = None,
     ) -> Resource:
         """写入（Create 或 Update-CAS）资源，返回写入后的最新对象。
 
@@ -696,13 +750,17 @@ class SQLiteRegistry(ResourceRegistry):
         * ``expected_version`` 非 ``None`` → Update-CAS；版本不匹配或资源不存在抛
           ConflictError。成功后 ``resource_version`` 递增。
 
-        ``correlation_id`` 写入同一事务中的资源变更事件（为空时生成一个新的）；
-        ``actor`` 保留用于审计。
+        同一事务中写入资源变更事件（``correlation_id`` 为空时生成一个新的）；给出
+        ``principal``（API 写入的调用主体）时再写入一条审计记录。``actor`` 不入库。
+
+        Raises:
+            ValueError: ``principal`` 不属于资源的租户。
         """
         meta = resource.metadata
         tenant_id = meta.tenant_id
         if tenant_id is None:
             raise ConflictError("metadata.tenant_id (tenantId) must not be empty")
+        self._check_principal(principal, tenant_id)
         namespace = meta.namespace
         name = meta.name
         kind = resource.kind
@@ -743,7 +801,15 @@ class SQLiteRegistry(ResourceRegistry):
                         ),
                     )
                     self._record_change(cur, tenant_id, kind, namespace, name, ChangeType.CREATED)
-                    self._emit(key, ChangeType.CREATED, body, new_version, phase, correlation_id)
+                    self._emit(
+                        key,
+                        ChangeType.CREATED,
+                        body,
+                        new_version,
+                        phase,
+                        correlation_id,
+                        principal,
+                    )
                     self._conn.commit()
                     return stored
                 # ---- Update-CAS ----
@@ -790,7 +856,9 @@ class SQLiteRegistry(ResourceRegistry):
                         f"(kind={kind} namespace={namespace!r} name={name})",
                     )
                 self._record_change(cur, tenant_id, kind, namespace, name, ChangeType.UPDATED)
-                self._emit(key, ChangeType.UPDATED, body, new_version, phase, correlation_id)
+                self._emit(
+                    key, ChangeType.UPDATED, body, new_version, phase, correlation_id, principal
+                )
                 self._conn.commit()
                 return stored
             except sqlite3.IntegrityError as exc:
@@ -897,11 +965,14 @@ class SQLiteRegistry(ResourceRegistry):
         tenant_id: str,
         actor: str | None = None,
         correlation_id: str | None = None,
+        *,
+        principal: Principal | None = None,
     ) -> None:
         """删除资源；不存在或跨租户时抛 :class:`NotFoundError`。
 
-        ``correlation_id`` 写入同一事务中的资源变更事件（为空时生成一个新的）。
+        同一事务中写入资源变更事件与（给出 ``principal`` 时）审计记录，同 :meth:`put`。
         """
+        self._check_principal(principal, tenant_id)
         key = ResourceKey(tenant_id, kind, namespace, name)
 
         def _delete() -> None:
@@ -931,6 +1002,7 @@ class SQLiteRegistry(ResourceRegistry):
                 row["resource_version"],
                 row["phase"],
                 correlation_id,
+                principal,
             )
             self._conn.commit()
 
@@ -944,6 +1016,8 @@ class SQLiteRegistry(ResourceRegistry):
         tenant_id: str,
         actor: str | None = None,
         correlation_id: str | None = None,
+        *,
+        principal: Principal | None = None,
     ) -> RequestDeleteResult:
         """受控删除入口：finalizer 非空 → ``Terminating``；为空 → 物理 DELETE。
 
@@ -969,8 +1043,11 @@ class SQLiteRegistry(ResourceRegistry):
             namespace: 命名空间（可为 ``None``）。
             name: 资源名。
             tenant_id: 租户标识（多租户边界）。
-            actor: 操作发起者标识（审计用）。
-            correlation_id: 关联追踪标识，写入同一事务中的资源变更事件（为空时生成一个新的）。
+            actor: 操作发起者标识（只用于日志）。
+            correlation_id: 关联追踪标识，写入同一事务中的资源变更事件与审计记录（为空时
+                生成一个新的）。
+            principal: API 写入的调用主体；给出时同一事务中写入一条审计记录。幂等返回
+                （已处于 ``Terminating``）时不写入任何记录。
 
         Returns:
             :class:`RequestDeleteResult`：``deleted=True`` 已物理删除；
@@ -981,7 +1058,9 @@ class SQLiteRegistry(ResourceRegistry):
             InvalidStateTransition: 当前 phase 不允许转移到 ``Terminating``。
             ConflictError: 读取后资源被并发修改（``resource_version`` 已变化）或
                 并发获得了分配，调用方应重新读取后重试。
+            ValueError: ``principal`` 不属于资源的租户。
         """
+        self._check_principal(principal, tenant_id)
         terminating = "Terminating"
         active = AllocationStatus.ACTIVE.value
         key = ResourceKey(tenant_id, kind, namespace, name)
@@ -1028,7 +1107,13 @@ class SQLiteRegistry(ResourceRegistry):
                     )
                 self._record_change(cur, tenant_id, kind, namespace, name, ChangeType.DELETED)
                 self._emit(
-                    key, ChangeType.DELETED, row["body"], read_version, phase, correlation_id
+                    key,
+                    ChangeType.DELETED,
+                    row["body"],
+                    read_version,
+                    phase,
+                    correlation_id,
+                    principal,
                 )
                 self._conn.commit()
                 return RequestDeleteResult(True, [])
@@ -1072,7 +1157,13 @@ class SQLiteRegistry(ResourceRegistry):
                 )
             self._record_change(cur, tenant_id, kind, namespace, name, ChangeType.TERMINATING)
             self._emit(
-                key, ChangeType.TERMINATING, new_body, new_version, terminating, correlation_id
+                key,
+                ChangeType.TERMINATING,
+                new_body,
+                new_version,
+                terminating,
+                correlation_id,
+                principal,
             )
             self._conn.commit()
             logger.info(
@@ -1238,6 +1329,7 @@ class SQLiteRegistry(ResourceRegistry):
         expected_version: str | None = None,
         expected_uid: str | None = None,
         correlation_id: str | None = None,
+        principal: Principal | None = None,
     ) -> Resource:
         """期望状态写入：整体替换 ``spec``、``metadata.labels`` 与 ``metadata.annotations``。
 
@@ -1247,8 +1339,9 @@ class SQLiteRegistry(ResourceRegistry):
         * ``spec`` 按模型规范化（补齐默认值）后与当前值比较，变化时 ``generation`` 加 1；
           只有 labels / annotations 变化时 ``generation`` 不变；
         * 有变化时 ``resource_version`` 加 1，并追加 ``updated`` 变更记录（控制器据此
-          重新协调）与资源变更事件（``correlation_id`` 为空时生成一个新的）；没有任何变化
-          时不写库，返回当前资源；
+          重新协调）与资源变更事件（``correlation_id`` 为空时生成一个新的），给出
+          ``principal``（API 写入的调用主体）时再写入一条审计记录；没有任何变化时不写库，
+          返回当前资源；
         * 资源处于 ``Terminating`` 时拒绝，先于 uid / 版本检查（重新读取后重试也不会成功）；
         * ``expected_uid`` / ``expected_version`` 非空时须与当前 uid / 版本相同（版本按
           字符串比较）；同名资源被删除后重建时版本会从 0 重新计数，uid 可以识别这种情况。
@@ -1262,12 +1355,13 @@ class SQLiteRegistry(ResourceRegistry):
             NotFoundError: 资源不存在（或跨租户不可见）。
             ConflictError: 资源处于 ``Terminating``，或 uid / 版本与预期不同；
                 ``details["reason"]`` 为 :class:`ConflictReason` 的取值。
-            ValueError: kind 没有登记强类型模型。
+            ValueError: kind 没有登记强类型模型，或 ``principal`` 不属于资源的租户。
             pydantic.ValidationError: 替换后的资源不满足模型约束（``ValueError`` 的子类）。
         """
         model = _KIND_MODELS.get(kind)
         if model is None:
             raise ValueError(f"spec updates are not supported for kind {kind!r}")
+        self._check_principal(principal, tenant_id)
         target = f"kind={kind} namespace={namespace!r} name={name}"
         key = ResourceKey(tenant_id, kind, namespace, name)
 
@@ -1333,7 +1427,13 @@ class SQLiteRegistry(ResourceRegistry):
                 )
                 self._record_change(cur, tenant_id, kind, namespace, name, ChangeType.UPDATED)
                 self._emit(
-                    key, ChangeType.UPDATED, new_body, new_version, row["phase"], correlation_id
+                    key,
+                    ChangeType.UPDATED,
+                    new_body,
+                    new_version,
+                    row["phase"],
+                    correlation_id,
+                    principal,
                 )
                 return self._body_to_resource(new_body)
 

@@ -2,7 +2,7 @@
 
 覆盖：整体替换与 JSON Merge Patch 的写入结果、generation 只随 spec 递增、服务端维护的
 字段被忽略、不可变字段、uid / resourceVersion / If-Match 前置条件与并发冲突、Terminating
-拒绝更新、媒体类型，以及合并补丁与 If-Match 解析本身。
+拒绝更新、媒体类型、更新写入的事件与审计记录，以及合并补丁与 If-Match 解析本身。
 """
 
 from __future__ import annotations
@@ -556,6 +556,58 @@ def test_patch_must_be_a_json_object(client: TestClient, content: bytes) -> None
 
     assert response.status_code == 400, response.text
     assert _error(response)[0] == "BAD_REQUEST"
+
+
+# ------------------------------------------------------------------ #
+# 事件与审计记录
+# ------------------------------------------------------------------ #
+
+
+@pytest.mark.parametrize("method", ["PUT", "PATCH"])
+def test_updates_write_the_event_and_the_audit_record_of_the_caller(
+    client: TestClient, method: str
+) -> None:
+    """与创建、删除相同：同一事务中写入资源变更事件与审计记录，带调用主体与关联 ID。"""
+    headers = {"X-Correlation-Id": "corr-update"}
+    if method == "PUT":
+        response = _put(client, _with_model(_get(client), "models/mistral"), **headers)
+    else:
+        response = _patch(client, {"spec": {"model": {"reference": "models/mistral"}}}, **headers)
+
+    assert response.status_code == 200, response.text
+    registry = get_registry()
+    records = registry.audit_log.query_by_tenant("tenant-a")
+    create, update = sorted(records, key=lambda record: record.timestamp)
+    _, event = registry.outbox.get_pending()
+    assert create.action == "create"
+    assert (update.action, update.actor, update.key_id) == ("update", "dev:tenant-a", None)
+    assert (update.resource_type, update.namespace, update.resource_id) == (
+        "InferenceService",
+        "default",
+        "svc-1",
+    )
+    assert update.correlation_id == event.payload["correlationId"] == "corr-update"
+    assert update.details == {
+        "change": "updated",
+        "resourceUid": response.json()["metadata"]["uid"],
+        "resourceVersion": 1,
+        "eventId": event.event_id,
+    }
+    assert event.payload["data"]["resource"] == response.json()
+
+
+def test_unchanged_and_rejected_updates_write_no_audit_record(client: TestClient) -> None:
+    unchanged = _put(client, _get(client))
+    stale = _patch(client, {"metadata": {"labels": None}}, **{"If-Match": '"stale"'})
+
+    assert (unchanged.status_code, stale.status_code) == (200, 409)
+    registry = get_registry()
+    assert [record.action for record in registry.audit_log.query_by_tenant("tenant-a")] == [
+        "create"
+    ]
+    assert [event.event_type for event in registry.outbox.get_pending()] == [
+        "inference.service.created"
+    ]
 
 
 # ------------------------------------------------------------------ #

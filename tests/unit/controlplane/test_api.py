@@ -177,6 +177,28 @@ def test_delete_pending_service_holding_an_allocation_returns_202(client: TestCl
     assert resp.json() == {"name": "svc-1", "phase": "Terminating"}
 
 
+def test_terminating_delete_is_audited_with_the_dev_principal(client: TestClient) -> None:
+    """dev 模式的调用主体为 ``dev:<租户>``，没有凭证 id；受理的删除请求记为 ``delete``。"""
+    created = client.post("/api/v1/inference-services", json=_payload(), headers=TENANT_HEADERS)
+    uid = created.json()["metadata"]["uid"]
+    owner = ResourceRef(kind="InferenceService", namespace="default", name="svc-1", uid=uid)
+    device = AllocatedDevice(node_id="node-a", device_id="gpu-0")
+    asyncio.run(get_registry().create_allocation("tenant-a", owner, f"{uid}:1", [device]))
+
+    resp = client.delete(
+        "/api/v1/inference-services/svc-1",
+        headers={**TENANT_HEADERS, "X-Correlation-Id": "corr-delete"},
+        params={"namespace": "default"},
+    )
+
+    assert resp.status_code == 202, resp.text
+    records = get_registry().audit_log.query_by_tenant("tenant-a")
+    delete, create = records
+    assert (create.action, create.actor, create.key_id) == ("create", "dev:tenant-a", None)
+    assert (delete.action, delete.correlation_id) == ("delete", "corr-delete")
+    assert delete.details is not None and delete.details["change"] == "terminating"
+
+
 def test_list_inference_services(client: TestClient) -> None:
     """创建多个 → LIST 返回列表。"""
     for i in range(3):

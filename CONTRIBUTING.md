@@ -51,8 +51,10 @@ make test
 | `make test` | 运行全部测试（pytest） |
 | `make test-unit` | 仅单元测试 |
 | `make test-contract` | 仅契约测试 |
+| `make coverage` | 运行全部测试并检查总覆盖率下限（与 CI 相同） |
 | `make lint` | ruff 静态检查 |
 | `make fmt` | ruff 自动修复与格式化 |
+| `make audit` | 用 pip-audit 检查 `.venv` 中第三方依赖的已知漏洞（与 CI 相同，需要网络）；网关为 `make -C gateway vulncheck` |
 | `make clean` | 清理构建与缓存产物 |
 
 ---
@@ -125,7 +127,8 @@ Signed-off-by: Zhang San <zhangsan@example.com>
   - `integration` / `e2e` / `chaos` / `security`：由 CI 分阶段执行。
 - **新增公共契约（接口/Schema/事件）必须附带契约测试**，确保版本兼容。
 - 测试应可重复、无外部副作用、不依赖真实 GPU/数据库（单元/契约测试）。
-- 保持覆盖率不下降；核心模块（`packages/core-contracts`、`packages/resource-model`）优先。
+- 保持覆盖率不下降：总覆盖率低于根 `pyproject.toml` 中的 `fail_under` 时 CI 失败（本地用 `make coverage` 检查）。这个下限只升不降，覆盖率提高之后可以随 PR 调高；核心模块（`packages/core-contracts`、`packages/resource-model`）优先。
+- 每个包都要声明它导入的全部第三方包与 `forgemesh-*` 包：CI 的 `package-imports` job 把每个包装进只带它声明的依赖的全新虚拟环境，再导入它的全部模块（本地运行 `.venv/bin/python scripts/check_package_imports.py [包目录名...]`，需要网络）。
 
 > 测试布局见 `tests/unit`、`tests/contract`、`tests/integration`、`tests/e2e`、`tests/chaos`、`tests/security`。
 

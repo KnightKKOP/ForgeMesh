@@ -9,6 +9,7 @@
 * 同名资源在不同命名空间 / 租户中各自持有分配；
 * 释放后设备回到空闲；约束由数据库强制（直接写库、独立连接并发、重启后依然成立）；
 * 归属资源已不存在的 Active 分配列为孤立的分配，只在归属资源仍不存在时标记为 ``Expired``；
+  旧库中以 ``{kind}/{name}`` 记录的分配不对应任何资源，也是孤立的；
 * 打开存量库时以按租户的唯一索引取代旧索引；
 * 持有 Active 分配的资源无论处于哪个 phase，删除都先进入 ``Terminating``。
 
@@ -283,6 +284,24 @@ def test_an_allocation_expires_as_an_orphan_only_while_its_owner_is_gone(registr
     }
     assert records[orphan["id"]]["released_at"] is not None
     assert asyncio.run(registry.allocated_devices()) == {GPU0}
+
+
+@pytest.mark.unit
+def test_an_allocation_recorded_under_kind_and_name_is_an_orphan(registry):
+    """旧库中以 ``{kind}/{name}`` 记录的分配不对应任何资源的 uid：同名资源存在时也是孤立的
+    分配，可以标记为 Expired；这个资源以 uid 记录的分配不受影响。"""
+    held = _allocate(registry, "gpu-0")
+    legacy_id = asyncio.run(
+        registry.put_allocation(
+            Allocation(resource_id=f"{KIND}/svc", tenant_id=TENANT, idempotency_key="legacy-key")
+        )
+    )
+
+    [orphan] = asyncio.run(registry.list_orphaned_allocations())
+    assert orphan["id"] == legacy_id
+    assert asyncio.run(registry.expire_orphaned_allocation(legacy_id)) is True
+    assert asyncio.run(registry.get_allocation(legacy_id))["status"] == "Expired"
+    assert asyncio.run(registry.get_allocation(held["id"]))["status"] == "Active"
 
 
 @pytest.mark.unit

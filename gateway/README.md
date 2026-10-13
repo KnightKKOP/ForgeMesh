@@ -34,7 +34,7 @@ ForgeMesh 的**统一外部入口**与**高性能流式代理**。与 Python 控
 | --- | --- | --- | --- |
 | GET | `/healthz` | 存活探针（始终 200） | 仅 Observe、Recovery |
 | GET | `/readyz` | 就绪探针（请求控制平面 `/readyz`，非 200 或不可达时 503） | 仅 Observe、Recovery |
-| GET | `/metrics` | Prometheus 指标（见「可观测性」；`GET` / `HEAD` 之外返回 405） | 仅 Observe、Recovery |
+| GET | `/metrics` | Prometheus 指标（见「可观测性」；`GET` / `HEAD` 之外返回 `405 METHOD_NOT_ALLOWED`） | 仅 Observe、Recovery |
 | ANY | `/api/v1/resources[/...]` | 反代 → Python 控制平面 | 全链 |
 | ANY | `/api/v1/inference-services[/...]` | 反代 → Python 控制平面 | 全链 |
 | ANY | `/api/v1/workflows[/...]` | 反代 → Python 控制平面 | 全链 |
@@ -42,6 +42,8 @@ ForgeMesh 的**统一外部入口**与**高性能流式代理**。与 Python 控
 | ANY | `/api/v1/audit-events[/...]` | 反代 → Python 控制平面（审计查询） | 全链 |
 | ANY | `/api/v1/namespaces/{ns}/inference/{svc}/chat` | **SSE 流式代理**（命名空间 `{ns}` 中的服务） | 全链 + `read` scope |
 | ANY | `/api/v1/inference/{svc}/chat` | **SSE 流式代理**（不带命名空间的服务） | 全链 + `read` scope |
+| ANY | `/api/v1/` 下的其他路径 | `404 ROUTE_NOT_FOUND` | 全链 |
+| ANY | 其他路径 | `404 ROUTE_NOT_FOUND` | Observe、Recovery、Correlation、TraceContext、AccessLog |
 
 `{ns}`、`{svc}` 为 Go 1.22 `net/http.ServeMux` 的路径变量语法，各表示单个路径段（命名空间与推理服务名）。
 
@@ -81,15 +83,48 @@ Observe → Recovery → Correlation → TraceContext → AccessLog → Authenti
 ```
 
 - **Observe**：按路由类别记录请求数与耗时（见「可观测性」），位于最外层：Recovery 兜底的 500 与被认证、限流拒绝的请求都计入。
-- **Recovery**：兜底 panic → 500，记录堆栈，进程不退出（覆盖全量请求）。
+- **Recovery**：兜底全量请求的 panic，日志带关联 ID、trace-id 与堆栈；响应头尚未写出时返回 `500 INTERNAL_ERROR`，已写出时中止响应（见「错误响应」）。
 - **Correlation**：缺失则用 `crypto/rand` 生成 128-bit hex 关联 ID，注入 context 与响应头；已携带则透传。
 - **TraceContext**：沿用或生成 W3C `traceparent`，trace-id 注入 context（见「可观测性」）。
 - **AccessLog**：每个请求一行访问日志，带关联 ID 与 trace-id；位于 Authenticate 之前，被认证或限流拒绝的请求同样记录。
 - **Authenticate**：按 `GATEWAY_AUTH_MODE` 校验凭证——`apikey`（默认）以 `Authorization: Bearer <key>` 的 SHA-256 摘要查 key 文件，`dev` 直接信任租户头。已验证的主体（subject / 租户 / scope）注入 context，并以已验证的租户**覆写**入站租户头。缺少或无效凭证返回 `401`（带 `WWW-Authenticate: Bearer realm="forgemesh"`），租户头与 key 绑定的租户不一致返回 `403`，响应体均为 JSON 错误信封。
-- **RateLimit**：按已验证租户的令牌桶限流，超限 `429 + Retry-After`；位于 Authenticate 之后，被拒请求不消耗令牌；不读取租户头或 `X-Forwarded-For`。
+- **RateLimit**：按已验证租户的令牌桶限流，超限返回 `429 RATE_LIMITED` 与 `Retry-After`；位于 Authenticate 之后，被拒请求不消耗令牌；不读取租户头或 `X-Forwarded-For`。
 - **LimitRequestBody**：请求体上限为 `GATEWAY_MAX_REQUEST_BODY_BYTES`（默认 10 MiB）。声明的 `Content-Length` 超限时直接返回 `413 REQUEST_TOO_LARGE`，不访问上游；分块传输的请求体读到上限时，反代与流式代理同样返回 `413`，不计实例失败。
 
 > 说明：探针与 `/metrics` 刻意不经过认证/限流（也不写访问日志），保证负载均衡健康检查与指标抓取始终可用。
+
+### 错误响应
+
+网关自己返回的错误响应都是 JSON 错误信封（`Content-Type: application/json`，结构即 OpenAPI 中的 `Error`）：
+
+```json
+{"error": {"code": "RATE_LIMITED", "message": "rate limit exceeded", "correlationId": "ad1cd525116940f682ea882c0c7a6b67", "traceId": "4bf92f3577b34da6a3ce929d0e0e4736"}}
+```
+
+`correlationId` 与响应头中的关联 ID 相同，`traceId` 是这个请求的 trace-id（见「可观测性」）。
+探针与 `/metrics` 不经过 Correlation 与 TraceContext，它们的错误信封（`/metrics` 的 `405`、
+panic 兜底的 `500`）没有这两个字段。客户端按状态码与 `error.code` 区分错误，不要解析 `message`。
+
+| 状态码 | `code` | 场景 |
+| --- | --- | --- |
+| `401` | `UNAUTHENTICATED` | 缺少或无效凭证（`dev` 模式下为缺少租户头），带 `WWW-Authenticate` |
+| `403` | `FORBIDDEN` | 租户头与 key 绑定的租户不一致；推理路由缺少 `read` scope；控制平面拒绝 Resolver 的查询 |
+| `404` | `ROUTE_NOT_FOUND` | 没有匹配的路由（有别于控制平面表示资源不存在的 `NOT_FOUND`：客户端据此区分地址错误与资源不存在） |
+| `405` | `METHOD_NOT_ALLOWED` | `/metrics` 收到 `GET` / `HEAD` 之外的方法（带 `Allow: GET, HEAD`） |
+| `413` | `REQUEST_TOO_LARGE` | 请求体超过 `GATEWAY_MAX_REQUEST_BODY_BYTES` |
+| `429` | `RATE_LIMITED` | 超过租户的限流（带 `Retry-After`：攒够一个令牌所需的秒数，向上取整，至少为 `1`） |
+| `500` | `INTERNAL_ERROR` | 处理器在写出响应头之前 panic（信封不含 panic 的内容，细节只写入日志） |
+| `502` | `UPSTREAM_UNAVAILABLE` | 没有收到控制平面（资源接口反代）或推理实例的响应，如连接失败，或控制平面 30 秒内没有返回响应头 |
+| `502` | `UPSTREAM_RESOLVE_FAILED` | Resolver 没能从控制平面取得服务的状态：网络错误、`2xx` / `403` / `404` 之外的状态码，或响应无法读取、不是合法 JSON |
+| `502` | `INVALID_UPSTREAM` | 实例地址或协议非法 |
+| `502` | `INSTANCE_ADDRESS_NOT_ALLOWED` | 实例地址不在允许连接的范围内（见「实例地址限制」） |
+| `503` | `NO_HEALTHY_UPSTREAM` | 推理服务不存在、未就绪或没有可用实例 |
+
+控制平面与推理实例的响应（含错误响应）原样透传，网关不改写。以下响应不是错误信封：探针的
+状态文档（如 `/readyz` 的 `503 {"status":"unavailable","reason":"upstream not ready"}`），以及
+`net/http` 在路由之前拒绝的请求（如请求行或请求头格式错误），后者是纯文本。处理器在写出响应头
+之后 panic 时（如控制平面的响应体中途中断），状态码与已写出的响应体都无法更改，网关中止响应，
+客户端读到的是不完整的响应。
 
 ### Header 转发与剥离策略
 
@@ -168,17 +203,15 @@ trace-id 或 parent-id 全零、版本 `ff` 都不合法；版本 `00` 必须恰
 `traceparent`，控制平面按同样的规则读取它（见根 README「可观测性」）。网关不记录 span，也不
 导出追踪（OTLP 导出尚未实现）。
 
-**访问日志**：`/api/v1/` 下的每个请求结束时，网关向标准输出写一行（与网关的其他日志相同）：
+**访问日志**：探针与 `/metrics` 之外的每个请求结束时，网关向标准输出写一行（与网关的其他日志相同）：
 
 ```
 gateway 2026/10/13 03:53:36 access method=POST path="/api/v1/namespaces/default/inference/llama/chat" status=200 duration=1.234s corr=ad1cd525116940f682ea882c0c7a6b67 trace=4bf92f3577b34da6a3ce929d0e0e4736
 ```
 
 `path` 不含查询串，流式请求的 `duration` 是整个流的时长；被认证、限流拒绝的请求同样记录；
-处理器在写出响应头之前 panic 时记 `status=500`。网关的 JSON 错误信封
-（`{"error": {"code", "message", "correlationId", "traceId"}}`）与反代、流式代理的错误日志
-（`corr=… trace=…`）带同一组 ID。连接上游失败时的 `502` 与 Recovery 兜底的 `500` 是纯文本
-响应、不带 `traceId`，可按响应头中的关联 ID 在访问日志中找到 trace-id。
+处理器在写出响应头之前 panic 时记 `status=500`。网关的错误信封（见「错误响应」）与反代、
+流式代理的错误日志、Recovery 的 panic 日志（`corr=… trace=…`）带同一组 ID。
 
 ---
 
@@ -217,7 +250,7 @@ gateway/
     ├── middleware/
     │   ├── middleware.go           # Middleware 类型 + Chain 组合子
     │   ├── observe.go              # 按路由类别记录请求数与耗时
-    │   ├── recovery.go             # panic 兜底 → 500
+    │   ├── recovery.go             # panic 兜底 → 500 INTERNAL_ERROR
     │   ├── correlation.go          # 关联 ID 生成/透传 + context 注入
     │   ├── tracecontext.go         # W3C traceparent 校验/生成 + context 注入
     │   ├── accesslog.go            # 访问日志（带关联 ID 与 trace-id）

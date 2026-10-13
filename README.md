@@ -283,14 +283,14 @@ CLI 只管理 `InferenceService`（写作 `inferenceservice` 或 `inferenceservi
 
 **wait**：每秒读取一次资源。`--for ready` 在同一次读取中 `status.phase` 为 `Ready`、`Ready` 条件为 `True` 且 `metadata.observedGeneration` 等于 `generation` 时成功，这时服务运行的是当前的 `spec`（见「REST API」）：`spec` 变化之后，服务先以旧的 `observedGeneration` 保持 `Ready`，再经 `Updating` 重新部署，`wait` 等到新的 `spec` 部署完成。资源正在删除，或在当前的 `spec` 下进入 `Failed`（`spec` 变化之前控制器不会再部署它）时立即失败；其他状态都继续等待，如 `Updating`、重新部署中的 `Degraded`，以及 `spec` 变化之后还没重新部署的 `Failed`。超时时报告最后看到的状态：被策略拒绝、等待审批或缺少调度器 / 启动器的更新不写 `status`，服务一直以旧的 `observedGeneration` 停在 `Ready` / `Degraded`，消息说明更新没有开始、原因见控制平面的日志。`--for delete` 在资源不存在时成功（退出码 `0`），输出如 `InferenceService default/llama deleted`：开始等待时资源已经不存在（例如 `delete` 之后控制器在第一次读取之前就删除了它）同样如此，结果不取决于这个先后；因此名称或命名空间写错时也报告成功。读取遇到限流（`429`，按 `Retry-After` 推迟下一次读取）或 `502`–`504` 时继续等待；连接失败只在此前收到过 HTTP 响应时视为暂时故障，第一次请求就连不上时立即失败。
 
-**错误与退出码**：错误消息写到标准错误，以 `Error:` 开头（参数写错时是 argparse 的用法提示）。错误信封显示为 `<message> (HTTP <状态码> <code>[, reason <details.reason>], correlation id <关联 ID>)`，请求校验失败时逐行列出字段与原因；网关自己的纯文本 `429` 与 `502` 分别报告为被网关限流（附上 `Retry-After` 的秒数）与网关连不上控制平面。一次调用的全部请求带同一个随机的 `X-Correlation-Id`，可以用它在网关与控制平面的日志中找到这次调用。`forgemesh --help` 列出同一张退出码表：
+**错误与退出码**：错误消息写到标准错误，以 `Error:` 开头（参数写错时是 argparse 的用法提示）。错误信封显示为 `<message> (HTTP <状态码> <code>[, reason <details.reason>], correlation id <关联 ID>)`，请求校验失败时逐行列出字段与原因，带 `Retry-After` 时（如网关限流的 `429`）附上秒数。不是错误信封的响应报告状态码：纯文本的 `429` 与 `502`（如网关前面的反向代理返回的）报告为被限流与连不上上游，其他附上正文的第一行。一次调用的全部请求带同一个随机的 `X-Correlation-Id`，可以用它在网关与控制平面的日志中找到这次调用。`forgemesh --help` 列出同一张退出码表：
 
 | 退出码 | 含义 |
 | --- | --- |
 | `0` | 成功 |
-| `1` | 其他错误，如地址不提供 ForgeMesh API（不是错误信封的 `404`、重定向）或响应无法解析 |
+| `1` | 其他错误，如地址不提供 ForgeMesh API（错误码不是 `NOT_FOUND` 的 `404`，如网关的 `ROUTE_NOT_FOUND`；重定向）或响应无法解析 |
 | `2` | 参数、配置或资源文档不合法，没有发出请求 |
-| `3` | 资源不存在（`404`）；`wait --for delete` 此时以 `0` 成功 |
+| `3` | 资源不存在（`404 NOT_FOUND`）；`wait --for delete` 此时以 `0` 成功 |
 | `4` | 冲突（`409`），如资源正在删除，或 `apply` 的 5 次尝试都遇到并发修改 |
 | `5` | 请求被拒绝（`400`、`405`、`413`、`415` 等其他 4xx） |
 | `6` | 认证或授权失败（`401`、`403`） |

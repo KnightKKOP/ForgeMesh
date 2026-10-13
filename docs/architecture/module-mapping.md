@@ -22,7 +22,7 @@
 - 路径存在性：`ls` / `find` / glob 实测（本文所有路径均已在 2026-10-11 于本分支核对）。
 - 依赖边界：`grep -rn` 对 `--include="*.py"` 的 import 扫描，命令与输出结论逐条记录于第 3 节。
 - 测试基线：`python -m pytest tests/ -q` → **993 passed**（本机 2026-10-11，5.34s）。
-- Go 侧：本机无 Go 工具链，`go test` 以 CI `go` job 为准（gateway 29 个 `*_test.go` 经 glob 核对存在）。
+- Go 侧：本机无 Go 工具链，`go test` 以 CI `go` job 为准（gateway 31 个 `*_test.go` 经 glob 核对存在）。
 
 ---
 
@@ -76,13 +76,13 @@
 | 字段 | 内容 |
 |---|---|
 | 架构模块 | Data Plane Gateway（L1 推理流量入口，architecture.md 3.1 L1 / Dev-5） |
-| 当前代码路径 | `gateway/cmd/gateway/main.go`；`gateway/internal/{config,health,metrics,middleware,router,stream,upstream}/`（共 51 个 `.go` 文件，其中 29 个 `_test.go`，glob 核对）；`gateway/go.mod`（`github.com/Mekoforge/ForgeMesh/gateway`，go 1.22）；`gateway/Makefile`、`gateway/README.md` |
+| 当前代码路径 | `gateway/cmd/gateway/main.go`；`gateway/internal/{config,health,metrics,middleware,router,stream,upstream}/`（共 53 个 `.go` 文件，其中 31 个 `_test.go`，glob 核对）；`gateway/go.mod`（`github.com/Mekoforge/ForgeMesh/gateway`，go 1.22）；`gateway/Makefile`、`gateway/README.md` |
 | 核心契约 | `/api/v1/` REST + SSE 流式转发（见 openapi.yaml）；中间件链 `Observe → Recovery → Correlation → TraceContext → AccessLog → Authenticate → RateLimit → LimitRequestBody → Route`；API key 认证（ADR-014，`middleware/{authz,apikey}.go`）；上游解析 `upstream/resolver.go`（按命名空间解析 ready 实例、`protocol` → 实例推理路径、合并回源、健康摘流）；实例地址限制 `stream/addrpolicy.go`；`/metrics`（Prometheus 文本格式，不经认证/限流，`metrics/{metrics,gateway}.go`，测试用解析 `metrics/metricstest`）；W3C `traceparent` 沿用/生成并转发、访问日志（`middleware/{observe,tracecontext,accesslog}.go`） |
 | 运行形态 | 独立进程（Go 二进制），经 `GATEWAY_UPSTREAM_URL` 转发至控制平面 |
 | 数据所有权 | 无权威数据（运行态转发；端点解析缓存为派生数据） |
 | 允许依赖 | 控制平面 HTTP API（上游）、Go 标准库 |
 | 禁止依赖 | Python 进程内模块、直连 SQLite/数据库、任何插件、LLM SDK |
-| 测试路径 | `gateway/internal/` 下 29 个 `*_test.go`：`config_test.go`、`health_test.go`、`metrics/{gateway,metrics}_test.go`、`metrics/metricstest/metricstest_test.go`、`middleware/{accesslog,apikey,authz,bodylimit,chain,correlation,observe,ratelimit,tracecontext}_test.go`、`router/{auth,metrics,resolver,router,tenant_security,tracecontext}_test.go`、`stream/{addrpolicy,metrics,proxy,sse_cancel,tracecontext}_test.go`、`upstream/{client,metrics,resolver,tracecontext}_test.go`；CI 以 `-race` 运行 |
+| 测试路径 | `gateway/internal/` 下 31 个 `*_test.go`：`config_test.go`、`health_test.go`、`metrics/{gateway,metrics}_test.go`、`metrics/metricstest/metricstest_test.go`、`middleware/{accesslog,apikey,authz,bodylimit,chain,correlation,observe,ratelimit,recovery,tracecontext}_test.go`、`router/{auth,errors,metrics,resolver,router,tenant_security,tracecontext}_test.go`、`stream/{addrpolicy,metrics,proxy,sse_cancel,tracecontext}_test.go`、`upstream/{client,metrics,resolver,tracecontext}_test.go`；CI 以 `-race` 运行 |
 | 状态 | 已实现且有测试覆盖（本机无 Go 工具链，`go test` 以 CI `go` job 为准；`find gateway -name "*.py"` = 0，纯 Go 已循证，见 3.4） |
 | 演进动作 | 保留；WP-D1 补多租户安全验证（tenant 绑定、Resolver 行为、SSE 取消、链序） |
 
@@ -332,7 +332,7 @@
 |---|---|
 | 架构模块 | L1 Access Layer 的命令行入口（architecture.md 3.1 L1） |
 | 当前代码路径 | `packages/cli/src/forgemesh/cli/{main,commands,client,config,documents,errors,output}.py`（共 7 个 `.py`，glob 核对；发行名 `forgemesh-cli`，控制台脚本 `forgemesh`） |
-| 核心契约 | 经 `/api/v1/inference-services` 管理 `InferenceService`：`apply`（`GET` 之后 `POST`，或以读到的 `resourceVersion` / `uid` 为前置条件 `PUT`，`409` 时重新读取再试）、`get`、`describe`、`list`（跟随 `nextPageToken`）、`delete`（受控删除，区分 `204` / `202`）、`wait`（`Ready`、`Ready=True` 且 `observedGeneration` 等于 `generation`，或资源消失）；地址取自 `--api-url` / `FORGEMESH_API_URL`（默认网关 `http://127.0.0.1:8081`），key 取自 `--api-key-file` / `FORGEMESH_API_KEY`；错误信封与网关的纯文本 `429` / `502` 映射为按原因区分的退出码（`errors.py` 的 `ExitCode`） |
+| 核心契约 | 经 `/api/v1/inference-services` 管理 `InferenceService`：`apply`（`GET` 之后 `POST`，或以读到的 `resourceVersion` / `uid` 为前置条件 `PUT`，`409` 时重新读取再试）、`get`、`describe`、`list`（跟随 `nextPageToken`）、`delete`（受控删除，区分 `204` / `202`）、`wait`（`Ready`、`Ready=True` 且 `observedGeneration` 等于 `generation`，或资源消失）；地址取自 `--api-url` / `FORGEMESH_API_URL`（默认网关 `http://127.0.0.1:8081`），key 取自 `--api-key-file` / `FORGEMESH_API_KEY`；错误响应（错误信封，或反向代理等返回的非信封响应）按状态码映射为按原因区分的退出码（`errors.py` 的 `ExitCode`），只有错误码为 `NOT_FOUND` 的 `404` 表示资源不存在 |
 | 运行形态 | 命令行进程，HTTP 客户端（标准库 `urllib`，不跟随重定向） |
 | 数据所有权 | 无（资源权威状态归控制平面 Registry，CLI 不在本地保存状态） |
 | 允许依赖 | 标准库、PyYAML（`pyproject.toml` 只声明 `pyyaml>=6.0.1`）；与控制平面仅经 HTTP API 交互 |
@@ -388,12 +388,12 @@ grep -rn "controlplane" packages/node-agent/src/ --include="*.py" | grep -v egg-
 
 ```bash
 ls gateway/*.go gateway/cmd/... 2>/dev/null | head   # 根级无 *.go，代码在 cmd/ 与 internal/
-find gateway -name "*.go" | wc -l                     # → 51
+find gateway -name "*.go" | wc -l                     # → 53
 find gateway -name "*.py" -o -name "requirements*.txt" | wc -l   # → 0
 cat gateway/go.mod                                     # module github.com/Mekoforge/ForgeMesh/gateway (go 1.22)
 ```
 
-**输出：** 51 个 `.go`（含 29 个 `_test.go`）、0 个 `.py`、无 Python 依赖清单；`go.mod` 无任何第三方 require（仅标准库 + go 1.22）。
+**输出：** 53 个 `.go`（含 31 个 `_test.go`）、0 个 `.py`、无 Python 依赖清单；`go.mod` 无任何第三方 require（仅标准库 + go 1.22）。
 
 **结论：✅ 符合** —— 网关与 Python 控制平面为进程边界隔离（HTTP 上游），无语言互操作。
 

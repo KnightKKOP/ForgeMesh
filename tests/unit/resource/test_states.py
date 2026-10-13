@@ -4,7 +4,8 @@
 
 * ``InferenceService`` 合法转移链（Pending→...→Ready）通过；
 * **非法转移被拒**（如 Ready→Scheduling 抛 ``InvalidStateTransition``）；
-* ``Ready`` 到 ``Degraded`` / ``Updating`` / ``Terminating`` 的双向/单向语义；
+* ``Ready`` 到 ``Degraded`` / ``Updating`` / ``Terminating`` 的双向/单向语义，
+  ``Degraded`` → ``Updating``（spec 变化）；
 * 所有非终态（含 ``Failed`` / ``Unknown``，人工清理入口）→ ``Terminating``；
 * ``Terminating`` 唯一终态无出边（finalizer 清空后由注册表物理删除）；
 * ``Allocation`` 的 ``Active → {Released, Expired}`` 单向语义；
@@ -44,6 +45,7 @@ pytestmark = pytest.mark.unit
         (InferencePhase.READY, InferencePhase.DEGRADED),
         (InferencePhase.DEGRADED, InferencePhase.READY),
         (InferencePhase.READY, InferencePhase.UPDATING),
+        (InferencePhase.DEGRADED, InferencePhase.UPDATING),
         (InferencePhase.UPDATING, InferencePhase.READY),
         (InferencePhase.READY, InferencePhase.TERMINATING),
     ],

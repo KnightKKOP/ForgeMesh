@@ -10,6 +10,8 @@
   ``Failed``；补偿没能停止的实例在删除资源时停止；
 * 部署过程中 spec 变化：上一代 spec 的运行被取消，服务以新的 spec 进入 ``Ready``；加速器
   申请变化、持有的设备不再满足时释放分配、重新分配；
+* ``Ready`` 的服务 spec 变化：经 ``Updating`` 停止旧实例、部署新的 spec 后回到 ``Ready``；
+  更新失败时进入 ``Failed``；策略拒绝更新时服务保持原样；
 * 部署中途或 ``Ready`` 之后删除资源：取消运行、停止实例、释放分配、物理删除；
 * 在后台运行的控制器自行完成部署与删除。
 
@@ -52,6 +54,7 @@ from forgemesh.controlplane.sqlite import workflow_db_path
 from forgemesh.core.errors import ConflictError, NotFoundError
 from forgemesh.core.objects import ObjectMeta
 from forgemesh.core.scheduler import AllocatedDevice
+from forgemesh.policy.api import PolicyAction, PolicyDecision, PolicyEngine
 from forgemesh.policy.engine import DefaultPolicyEngine
 from forgemesh.policy.rules import AuthzRule
 from forgemesh.resource.inference import (
@@ -203,16 +206,24 @@ class _ControlPlane:
     """
 
     def __init__(
-        self, db: str, launcher: RuntimeLauncher, inventory: Inventory | None = None
+        self,
+        db: str,
+        launcher: RuntimeLauncher,
+        inventory: Inventory | None = None,
+        policy: PolicyEngine | None = None,
     ) -> None:
         self.launcher = launcher
         self.registry = SQLiteRegistry(db)
         self.processed = ProcessedKeyStore(db)
         self.workflow_store = WorkflowStore(workflow_db_path(db))
         self.runtime = _runtime(launcher, self.workflow_store)
+        if policy is None:
+            policy = DefaultPolicyEngine(
+                authz_rules=[AuthzRule(action="reconcile", effect="allow")]
+            )
         reconciler = ReconciliationController(
             self.registry,
-            DefaultPolicyEngine(authz_rules=[AuthzRule(action="reconcile", effect="allow")]),
+            policy,
             scheduler=FirstFitScheduler(self.registry, inventory or _inventory()),
             workflow_runtime=self.runtime,
             release_provider=DeploymentReleaser(self.runtime, launcher),
@@ -537,6 +548,201 @@ def test_an_accelerator_change_during_the_deployment_moves_the_service_to_a_fitt
             }
             assert launcher.launches[-1].devices == (LARGE_GPU,)
             assert (await plane.service()).status.endpoints == [instance.endpoint()]
+
+    asyncio.run(scenario())
+
+
+# ---------------------------------------------------------------------- #
+# 更新已部署的服务
+# ---------------------------------------------------------------------- #
+
+
+class _SwitchablePolicy(PolicyEngine):
+    """按 :attr:`decision` 判定的策略引擎（测试中途切换）。"""
+
+    def __init__(self) -> None:
+        self.decision = "allow"
+
+    async def check(self, ctx: Any, action: PolicyAction) -> PolicyDecision:
+        return PolicyDecision(decision=self.decision, reason=f"{action.action}: {self.decision}")
+
+
+@pytest.mark.unit
+def test_updating_a_ready_service_redeploys_it_with_the_new_spec_on_the_same_allocation():
+    """Ready 的服务 spec 变化：第一轮进入 Updating、endpoint 标记为未就绪，没有副作用（旧
+    实例仍在运行）；下一轮停止旧实例，以同一分配启动新的 generation，服务以新的 spec 进入
+    Ready（``observedGeneration`` 即新的 generation），登记新 generation 的去重键。"""
+    launcher = _ScriptedLauncher()
+    new_spec = _spec(model="models/mistral")
+
+    async def scenario() -> None:
+        async with _ControlPlane(":memory:", launcher) as plane:
+            await plane.registry.put(_service())
+            await plane.deploy()
+            [old] = launcher.running.values()
+            [allocation] = await plane.registry.list_allocations(TENANT)
+
+            assert await plane.update(new_spec) == 2
+            await plane.manager.process(KEY)
+            service = await plane.service()
+            assert service.status.phase.value == "Updating"
+            assert service.status.endpoints == [old.endpoint().model_copy(update={"ready": False})]
+            assert _ready(service) == ("False", "Updating", "deploying generation 2")
+            assert (launcher.stops, list(launcher.running)) == ([], [old.instance_id])
+
+            assert await plane.deploy() == ["Updating", "Ready"]
+            service = await plane.service()
+            [new] = launcher.running.values()
+            request = launcher.launches[-1]
+            assert launcher.stops == [old.instance_id]
+            assert (request.instance_key, request.spec, request.allocation_id) == (
+                deployment_run_key(UID, 2),
+                new_spec,
+                allocation["id"],
+            )
+            assert service.status.endpoints == [new.endpoint()]
+            assert (service.metadata.generation, service.metadata.observed_generation) == (2, 2)
+            assert await plane.registry.list_allocations(TENANT) == [allocation]
+            assert await plane.processed.seen(
+                compute_dedup_key(KIND, NAMESPACE, NAME, UID, 2, "reconcile").key
+            )
+
+            await plane.manager.process(KEY)
+            assert len(launcher.launches) == 2
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.unit
+def test_an_accelerator_change_moves_a_ready_service_to_a_fitting_device():
+    """Ready 的服务加速器申请变大，持有的 24 GiB 卡不再满足：旧实例停止、分配释放，新的
+    分配取得 80 GiB 卡，服务以新的 spec 在那张卡上回到 Ready。"""
+    launcher = _ScriptedLauncher()
+
+    async def scenario() -> None:
+        async with _ControlPlane(":memory:", launcher, _two_gpu_inventory()) as plane:
+            await plane.registry.put(_service())
+            await plane.deploy()
+            [old] = launcher.running.values()
+
+            await plane.update(_spec(min_memory_gib=40))
+            assert await plane.deploy() == ["Updating", "Ready"]
+
+            allocations = {
+                record["idempotency_key"]: (record["status"], record["devices"])
+                for record in await plane.registry.list_allocations(TENANT)
+            }
+            [new] = launcher.running.values()
+            assert allocations == {
+                f"{UID}:1": ("Released", [GPU.model_dump()]),
+                f"{UID}:2": ("Active", [LARGE_GPU.model_dump()]),
+            }
+            assert old.instance_id in launcher.stops
+            assert launcher.launches[-1].devices == (LARGE_GPU,)
+            assert (await plane.service()).status.endpoints == [new.endpoint()]
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.unit
+def test_a_spec_change_during_an_update_deploys_the_latest_spec():
+    """更新进行中 spec 再次变化：仍是 Updating，进行中的运行被取消（补偿停止它启动的实例），
+    最新的 generation 启动自己的运行，服务以最新的 spec 进入 Ready，只留下一个实例。"""
+    launcher = _ScriptedLauncher()
+    latest = _spec(model="models/qwen")
+
+    async def scenario() -> None:
+        async with _ControlPlane(":memory:", launcher) as plane:
+            await plane.registry.put(_service())
+            await plane.deploy()
+            launcher.block.add("verify")
+            launcher.entered.clear()
+            await plane.update(_spec(model="models/mistral"))
+            await plane.manager.process(KEY)
+            await plane.manager.process(KEY)
+            await launcher.wait_entered("verify")
+
+            assert await plane.update(latest) == 3
+            launcher.block.clear()
+            await plane.manager.process(KEY)
+            service = await plane.service()
+            [updating] = await find_deployment_runs(plane.runtime, UID, 2)
+            [run] = await find_deployment_runs(plane.runtime, UID, 3)
+            assert service.status.phase.value == "Updating"
+            assert _ready(service) == (
+                "False",
+                "Updating",
+                f"deployment workflow run {run.run.run_id} deploys generation 3",
+            )
+            assert updating.run.status is WorkflowStatus.CANCELLED
+            assert launcher.cancelled == ["verify"]
+
+            assert (await plane.deploy())[-1] == "Ready"
+            service = await plane.service()
+            [instance] = launcher.running.values()
+            assert (launcher.launches[-1].instance_key, launcher.launches[-1].spec) == (
+                deployment_run_key(UID, 3),
+                latest,
+            )
+            assert service.status.endpoints == [instance.endpoint()]
+            assert (service.metadata.generation, service.metadata.observed_generation) == (3, 3)
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.unit
+def test_a_failed_update_fails_the_service_and_releases_its_allocation():
+    """更新的运行失败（验证用尽重试）：旧实例已经停止，补偿停止新实例，服务进入 Failed
+    （``WorkflowFailed``），``status.endpoints`` 为空，分配释放。"""
+    launcher = _ScriptedLauncher()
+
+    async def scenario() -> None:
+        async with _ControlPlane(":memory:", launcher) as plane:
+            await plane.registry.put(_service())
+            await plane.deploy()
+            launcher.fail.add("verify")
+            await plane.update(_spec(model="models/mistral"))
+            assert await plane.deploy() == ["Updating", "Failed"]
+
+            service = await plane.service()
+            assert _ready(service) == (
+                "False",
+                "WorkflowFailed",
+                "step 'verify-instance' failed: verify broke",
+            )
+            assert service.status.endpoints == []
+            assert launcher.running == {}
+            assert len(launcher.stops) == 2
+            assert await plane.registry.get_active_allocation(UID, TENANT) is None
+            assert await plane.registry.allocated_devices() == frozenset()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.unit
+def test_an_update_the_policy_denies_leaves_the_service_serving_until_it_is_allowed():
+    """策略拒绝更新：服务保持 Ready、status 不变（``observedGeneration`` 仍是之前的
+    generation，实例继续服务）；策略放行后，下一轮照常开始更新。"""
+    launcher = _ScriptedLauncher()
+    policy = _SwitchablePolicy()
+
+    async def scenario() -> None:
+        async with _ControlPlane(":memory:", launcher, policy=policy) as plane:
+            await plane.registry.put(_service())
+            await plane.deploy()
+            before = await plane.service()
+
+            policy.decision = "deny"
+            await plane.update(_spec(model="models/mistral"))
+            await plane.manager.process(KEY)
+            service = await plane.service()
+            assert service.status == before.status
+            assert service.metadata.observed_generation == 1
+            assert len(launcher.launches) == 1
+
+            policy.decision = "allow"
+            assert await plane.deploy() == ["Updating", "Ready"]
+            assert (await plane.service()).metadata.observed_generation == 2
 
     asyncio.run(scenario())
 

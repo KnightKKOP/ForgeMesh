@@ -9,7 +9,8 @@
 -------------------------
 ``Pending → Scheduling``
     DecisionProvider 生成候选（建议，非授权），PolicyEngine.check() 授权这次部署；deny /
-    require_approval 时停在 ``Pending``。策略只在这里评估，之后各轮执行已授权的部署。
+    require_approval 时停在 ``Pending``。策略只在部署（这里）与更新（见下文）开始时评估，
+    之后各轮执行已授权的部署。
 ``Scheduling → Preparing``
     Scheduler.allocate()（唯一授权分配点）。请求携带资源身份（kind/namespace/name/uid）、
     幂等键（uid + generation，见
@@ -30,15 +31,29 @@
 只有进入 ``Ready`` 或 ``Failed`` 的一轮返回 ``done=True``（登记去重键）；其余各轮返回
 ``done=False``，同一 generation 的去重键不会挡住下一轮。
 
-部署过程中 spec 变化
---------------------
+更新已部署的服务
+----------------
+``Ready`` / ``Degraded → Updating``
+    spec 变化（``generation`` 大于 ``observedGeneration``）时 PolicyEngine.check() 授权这次
+    更新，然后进入 ``Updating``，endpoint 标记为未就绪；这一轮没有副作用。被策略拦下或缺少
+    调度器 / 工作流运行时的一轮不写 status、只记日志（任何写入都会把 ``observedGeneration``
+    推进到新的 generation，这次更新便不会再被处理），策略拒绝或等待审批时 30 秒后重新评估。
+``Updating → Ready``
+    停止之前的部署，按新的 generation 取得分配（见下文）并启动这一代 spec 的部署运行，清空
+    ``status.endpoints``；之后像 ``Verifying`` 一样跟踪运行，成功后进入 ``Ready``，写入新实例
+    的地址。先停后起：从进入 ``Updating``（网关只向 ``Ready`` 的服务转发）到新实例通过验证，
+    服务不可用。更新的运行失败时进入 ``Failed``（之前的实例已经停止）。
+
+部署或更新过程中 spec 变化
+--------------------------
 新的 generation 有自己的分配幂等键与部署运行。资源已持有的分配（为之前的 generation 建立）
 满足新的加速器申请时直接复用；不满足时调度器拒绝复用（``ConflictError``），协调器先停止
-资源的实例、释放这个分配，再重新分配。启动部署运行之前总是先经 release provider 停止资源
-之前的部署（取消进行中的运行、停止实例），同一时刻只有一个实例占用分配的设备。
-``Deploying`` / ``Verifying`` 时没有当前 generation 的运行（spec 在部署过程中变化，或运行来自
-1.1.0 之前、幂等键不含 generation）：停止之前的部署、取得分配并启动当前 generation 的运行，
-phase 不变，之后跟踪新的运行，旧的运行不会让服务以旧的 spec 进入 ``Ready``。
+资源的实例、释放这个分配，再重新分配（新的申请放不下时停在当前 phase，``AllocationFailed``）。
+启动部署运行之前总是先经 release provider 停止资源之前的部署（取消进行中的运行、停止实例），
+同一时刻只有一个实例占用分配的设备。``Deploying`` / ``Verifying`` / ``Updating`` 时没有当前
+generation 的运行（spec 在部署过程中变化，或运行来自 1.1.0 之前、幂等键不含 generation）：
+停止之前的部署、取得分配并启动当前 generation 的运行，phase 不变，之后跟踪新的运行，旧的
+运行不会让服务以旧的 spec 进入 ``Ready``。
 
 失败
 ----
@@ -58,9 +73,8 @@ phase 不变，之后跟踪新的运行，旧的运行不会让服务以旧的 s
 
 需要分配或执行工作流、却未注入对应组件时，在任何副作用之前返回 ``Ready=False``
 （``SchedulerUnavailable`` / ``WorkflowRuntimeUnavailable``）。没有 ``metadata.uid`` 的
-资源报告 ``MissingUid``，不是 ``InferenceService`` 的资源报告 ``NotDeployable``。处于
-``Ready`` / ``Degraded`` / ``Updating`` / ``Failed`` / ``Unknown`` 的资源没有可做的事：还
-没有更新已部署服务的流程，``spec`` 变化（新 generation）不会重新部署。
+资源报告 ``MissingUid``，不是 ``InferenceService`` 的资源报告 ``NotDeployable``。spec 没有
+变化的 ``Ready`` / ``Degraded``，以及 ``Failed`` / ``Unknown`` 的资源没有可做的事。
 
 终止协调（Terminating，对齐 architecture.md §5.3/§12.4 与 development-plan
 第 7 章删除闭环）
@@ -112,7 +126,7 @@ logger = logging.getLogger(__name__)
 #: 启动或查询部署运行失败后重试间隔的上限（秒）。
 MAX_RETRY_DELAY_SECONDS = 60.0
 
-#: 部署过程中的 phase（``None`` 为尚未观测到 phase）；其余 phase 没有可做的事。
+#: 部署或更新过程中的 phase（``None`` 为尚未观测到 phase），每一轮都要协调。
 _DEPLOYMENT_PHASES: frozenset[str | None] = frozenset(
     {
         None,
@@ -121,12 +135,15 @@ _DEPLOYMENT_PHASES: frozenset[str | None] = frozenset(
         InferencePhase.PREPARING,
         InferencePhase.DEPLOYING,
         InferencePhase.VERIFYING,
+        InferencePhase.UPDATING,
     }
 )
 #: 本轮或之后的轮次还要调用调度器的 phase（``Preparing`` 以同一幂等键取回分配）。
 _ALLOCATION_PHASES: frozenset[str | None] = frozenset(
     {None, InferencePhase.PENDING, InferencePhase.SCHEDULING, InferencePhase.PREPARING}
 )
+#: 服务中的 phase：spec 变化（``generation`` 大于 ``observedGeneration``）时开始更新。
+_SERVING_PHASES: frozenset[str | None] = frozenset({InferencePhase.READY, InferencePhase.DEGRADED})
 
 
 def _scheduling_requirements(resource: Resource) -> dict[str, Any]:
@@ -326,6 +343,10 @@ class ReconciliationController(Reconciler):
             blocked = await self._authorize(ctx, diff)
             if blocked is not None:
                 return blocked
+        if phase in _SERVING_PHASES:
+            held = await self._update_blocked(ctx, diff)
+            if held is not None:
+                return held
 
         # 必须先于任何副作用检查：否则可能分配了资源却没有运行时部署它。
         missing = self._missing_executor(diff)
@@ -347,6 +368,8 @@ class ReconciliationController(Reconciler):
             return _progress(
                 InferencePhase.SCHEDULING, "allocating accelerators", requeue_after=0.0
             )
+        if phase in _SERVING_PHASES:
+            return self._begin_update(resource)
         if phase == InferencePhase.SCHEDULING:
             return await self._schedule(ctx, resource)
         if phase == InferencePhase.PREPARING:
@@ -399,6 +422,41 @@ class ReconciliationController(Reconciler):
                 },
             )
         return None
+
+    async def _update_blocked(
+        self, ctx: ReconcileContext, diff: dict[str, Any]
+    ) -> ReconcileResult | None:
+        """更新开始之前的策略校验与执行组件检查；可以开始时返回 ``None``。
+
+        被拦下的一轮不写 status、只记日志：任何 status 写入都会把 ``observedGeneration``
+        推进到新的 generation，服务中的资源之后就不会再处理这次更新。策略拒绝或等待审批
+        时稍后重新评估；缺少执行组件时等资源变更或全量同步。
+        """
+        blocked = await self._authorize(ctx, diff)
+        if blocked is not None:
+            [condition] = blocked.status_patch["conditions"]
+            reason, message = condition["reason"], condition["message"]
+            requeue_after = blocked.requeue_after
+        else:
+            missing = self._missing_executor(diff)
+            if missing is None:
+                return None
+            (reason, message), requeue_after = missing, None
+        meta = ctx.resource.metadata
+        logger.warning(
+            "update not started: reason=%s message=%s kind=%s namespace=%s name=%s uid=%s "
+            "generation=%s tenant_id=%s correlation_id=%s",
+            reason,
+            message,
+            ctx.resource.kind,
+            meta.namespace,
+            meta.name,
+            meta.uid,
+            meta.generation,
+            ctx.tenant_id,
+            ctx.correlation_id,
+        )
+        return ReconcileResult(done=False, requeue_after=requeue_after)
 
     def _missing_executor(self, diff: dict[str, Any]) -> tuple[str, str] | None:
         """返回本轮所需但未注入的执行组件对应的 ``(reason, message)``；齐备时返回 ``None``。"""
@@ -587,15 +645,57 @@ class ReconciliationController(Reconciler):
             requeue_after=self._poll_interval,
         )
 
+    @staticmethod
+    def _begin_update(service: InferenceService) -> ReconcileResult:
+        """``Ready`` / ``Degraded`` 且 spec 已变化：进入 ``Updating``，endpoint 标记为未就绪。
+
+        这一轮没有副作用，下一轮停止之前的部署、部署新的 spec。
+        """
+        endpoints = [
+            endpoint.model_copy(update={"ready": False}).model_dump(mode="json")
+            for endpoint in service.status.endpoints
+        ]
+        message = f"deploying generation {service.metadata.generation}"
+        return ReconcileResult(
+            done=False,
+            requeue_after=0.0,
+            status_patch={
+                "phase": InferencePhase.UPDATING.value,
+                "endpoints": endpoints,
+                "conditions": [_ready_condition("False", InferencePhase.UPDATING.value, message)],
+            },
+        )
+
+    async def _redeploy(self, ctx: ReconcileContext, service: InferenceService) -> ReconcileResult:
+        """``Updating`` 且没有当前 generation 的运行：停止之前的部署，部署当前的 spec。"""
+        started = await self._deploy(ctx, service)
+        if isinstance(started, ReconcileResult):
+            return started
+        message = (
+            f"deployment workflow run {started.run_id} deploys generation "
+            f"{service.metadata.generation}"
+        )
+        return ReconcileResult(
+            done=False,
+            requeue_after=self._poll_interval,
+            status_patch={
+                "endpoints": [],
+                "conditions": [_ready_condition("False", InferencePhase.UPDATING.value, message)],
+            },
+        )
+
     async def _follow_deployment(
         self, ctx: ReconcileContext, service: InferenceService, phase: str
     ) -> ReconcileResult:
-        """``Deploying`` / ``Verifying`` 一轮：查询当前 generation 的部署运行并推进。"""
+        """``Deploying`` / ``Verifying`` / ``Updating`` 一轮：查询当前 generation 的部署运行并
+        推进。"""
         meta = service.metadata
         runs = await self._lookup(service, meta.generation)
         if isinstance(runs, ReconcileResult):
             return runs
         if not runs:
+            if phase == InferencePhase.UPDATING:
+                return await self._redeploy(ctx, service)
             return await self._replace_deployment(ctx, service, phase)
         self._retry_counts.pop(meta.uid, None)
         run = runs[-1].run
@@ -908,10 +1008,12 @@ class ReconciliationController(Reconciler):
 
         判定逻辑：
 
-        * phase 尚未观测到（``None``）或处于部署过程中（``Pending`` 到 ``Verifying``）时
-          需要协调；其余 phase 没有可做的事（``generation`` 变化也一样，还没有更新流程）。
-        * ``needs_allocation``：本轮或之后的轮次要调用调度器（``Preparing`` 及之前）；
-          ``needs_workflow``：部署过程中的每一轮都要用到工作流运行时；``requirements``
+        * phase 尚未观测到（``None``）或处于部署 / 更新过程中（``Pending`` 到 ``Verifying``、
+          ``Updating``）时需要协调；
+        * ``Ready`` / ``Degraded`` 只在 spec 变化（``generation`` 大于 ``observedGeneration``）
+          时需要协调（开始更新）；其余 phase（``Failed`` / ``Unknown``）没有可做的事。
+        * ``needs_allocation``：本轮或之后的轮次要调用调度器（``Preparing`` 及之前，以及开始
+          更新的一轮）；``needs_workflow``：每一轮都要用到工作流运行时；``requirements``
           为传给调度器的需求（见 :func:`_scheduling_requirements`）。
 
         Args:
@@ -923,12 +1025,17 @@ class ReconciliationController(Reconciler):
             ``needs_allocation`` / ``needs_workflow`` / ``requirements`` 等字段。
         """
         observed_phase = _observed_phase(resource, observed)
-        if observed_phase not in _DEPLOYMENT_PHASES:
+        meta = resource.metadata
+        if observed_phase in _SERVING_PHASES and meta.generation > meta.observed_generation:
+            needs_allocation = True
+        elif observed_phase in _DEPLOYMENT_PHASES:
+            needs_allocation = observed_phase in _ALLOCATION_PHASES
+        else:
             return {"needs_reconcile": False, "operation": "noop"}
         return {
             "needs_reconcile": True,
             "operation": "reconcile",
-            "needs_allocation": observed_phase in _ALLOCATION_PHASES,
+            "needs_allocation": needs_allocation,
             "needs_workflow": True,
             "requirements": _scheduling_requirements(resource),
             "desired_generation": resource.metadata.generation,

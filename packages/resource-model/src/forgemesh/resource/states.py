@@ -14,6 +14,7 @@
 
     Pending → Scheduling → Preparing → Deploying → Verifying → Ready
     Ready ↔ Degraded / Updating
+    Degraded → Updating（降级的服务 spec 变化时同样经 Updating 重新部署）
     任意非终态（含 Failed / Unknown）→ Terminating（删除入口，受控释放）
     任意非终态 → Failed / Unknown
     Terminating → ∅（唯一终态，无出边；finalizer 清空后由注册表物理删除）
@@ -156,6 +157,7 @@ INFERENCE_TRANSITIONS: dict[str, set[str]] = {
     },
     InferencePhase.DEGRADED.value: {
         InferencePhase.READY.value,
+        InferencePhase.UPDATING.value,
         InferencePhase.TERMINATING.value,
         InferencePhase.FAILED.value,
         InferencePhase.UNKNOWN.value,

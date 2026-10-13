@@ -13,7 +13,7 @@
 - 新增契约 / 混沌 / 兼容测试 122 项（1115 vs 993）：Registry CAS 并发 / 租户过滤 / 重启恢复（19）、Workflow 恢复版本固定 / 取消补偿 + Outbox 事务 / 幂等 / 死信（12）、10 插件发布链路 conformance——manifest/isolation 一致性 + 四类 Provider 契约 + 卸载安全（91）。
 - 控制平面可运行入口：`control-plane` 包新增控制台脚本 `forgemesh-control-plane`（`forgemesh.controlplane.app:main`）；权威存储路径取自 `FORGEMESH_DB_PATH`（默认 `forgemesh.db`），监听地址取自 `FORGEMESH_HOST` / `FORGEMESH_PORT`（默认 `127.0.0.1:8080`），启动方式见 README「运行控制平面」。
 - 新增 `tests/contract/test_registry_hardening.py`：并发创建全部持久化、空 namespace 身份唯一、删除 / 释放 CAS、标签过滤与分页等 Registry 回归测试。
-- 新增 [ADR-014](docs/design-decisions/adr-014.md)（Proposed）：对外 API 采用绑定租户的 API Key 认证。
+- 新增 [ADR-014](docs/design-decisions/adr-014.md)（Accepted）：对外 API 采用绑定租户的 API Key 认证。
 - API Key 认证（ADR-014）：网关（`GATEWAY_AUTH_MODE` / `GATEWAY_API_KEYS_FILE`）与控制平面（`FORGEMESH_AUTH_MODE` / `FORGEMESH_API_KEYS_FILE`）各自校验 `Authorization: Bearer <key>`；key 文件只保存 SHA-256 摘要，每个 key 绑定租户、主体与 scope（`read` / `write` / `*`）；`python -m forgemesh.controlplane.keygen --tenant <租户> --subject <主体>` 生成 key 与对应的 key 文件条目。
 - 网关 `make run-dev`：以 `dev` 认证模式在 `127.0.0.1:8081` 启动，仅供本地开发。
 - OpenAPI：新增 `apiKey`（HTTP bearer）安全方案并设为全局 `security`（探针豁免），全部 `/api/v1` 端点声明 `401` / `403`。
@@ -32,6 +32,7 @@
 
 - README 策略引擎描述修正：`allow/deny/degraded` 三态改为 `allow/deny/require_approval` 三态（对齐 v1.0.1 已交付语义），并补充说明 Decision Router 的 `OK/FALLBACK_REQUIRED/FAILED` 为决策路由层状态、与 Policy 三态不混用。
 - [docs/releases/v1.0.md](docs/releases/v1.0.md) 插入"勘误与现状（2026-10-11）"节：澄清 v1.0.0 发布记录中 PostgreSQL 相关表述与 ADR-013 不一致，当前权威存储为 SQLite、PostgreSQL 为目标态，文档中 PostgreSQL 备份/迁移命令不可用。
+- API 稳定性标注由 `stable` 更正为 `beta`：OpenAPI `info.x-stability` 改为 `beta`，`info.version` 改为 `1.1.0`；README、SECURITY.md 与 v1.0 发布记录同步更正。v1.0.0 宣称的「首个稳定版本、major 版本内保证兼容」与实际不符：1.0.x 可运行入口的业务端点仍返回 `501`、没有认证，1.1.0 也包含多项破坏性变更。[弃用政策](docs/governance/deprecation-policy.md)新增 1.4 节：beta 阶段的 minor 版本可以包含破坏性变更，但必须以「**破坏性**」标注；改回 `stable` 之前应满足架构验收标准（architecture.md 第 20 节）。
 - 包元数据事实统一：全部 10 个子包 `requires-python` 从 `>=3.9` 校准为 `>=3.12`（对齐 README/CI/Ruff 的 Python 3.12 基线）；`control-plane` 与 `workflow-runtime` 包描述去除过时的 skeleton/placeholder 表述，`cli` 与 `node-agent` 包描述同步移除 skeleton 字样。
 - [.github/workflows/ci.yml](.github/workflows/ci.yml)：ADR 检查由硬编码 001–012 改为索引驱动动态校验；architecture-docs job 新增 manifest / OpenAPI 语义 / 元数据一致 / 插件冒烟四道步骤。
 - 修正 `plugins/runtime-tgi`（移除 schema 未定义的 spec.capabilities）与 `plugins/workflow-temporal`（category 改为 provider 并移除 capabilities）manifest 至 schema 合规。
@@ -59,6 +60,14 @@
 
 ### Fixed
 
+- 勘误：1.0.0 变更日志中以下条目与 v1.0.x 的实际交付不符（原文保留作历史记录；README「功能概览」已逐条注明现状）：
+  - 「gRPC 通信层：控制平面 ↔ Node Agent 双向流」：`api/protobuf/agent.proto` 没有生成代码，Node Agent 与控制平面之间只有进程内调用。
+  - 「执行平面 E2E 测试：控制平面 → Node Agent → GPU → 推理全链路」：没有这样的测试；`tests/e2e/` 中只有各步骤为模拟实现的 GPU 上线工作流测试。
+  - 「混沌测试 Chaos：网络分区、节点宕机、GPU 故障注入」：混沌测试以 mock 与内存存储模拟节点离线、控制平面重启、重复事件与工作流恢复，没有网络分区与 GPU 故障注入。
+  - 「可观测性 Observability：metrics（Prometheus）、tracing（OpenTelemetry）」：指标与追踪只记录在内存中，没有 Prometheus / OTLP 导出。
+  - 「插件安全沙箱（ADR-006）：按信任级别隔离执行」与 Security 中的「插件 manifest 签名验证」：隔离只是信任级别到隔离模式的映射，没有进程级隔离；签名为 HMAC 对称签名，注册插件时不验签。
+  - 「Temporal 工作流插件 `workflow-temporal`：生产级工作流编排引擎集成」：只有抽象客户端与内存实现，没有接入 temporalio。
+  - Changed 中的「所有端点从 501 Not Implemented 占位升级为正式实现」，以及 Security 中的「所有 API 端点强制认证与租户隔离」「SSRF 防护：外部 URL 请求经白名单校验」：在 v1.0.x 中均不成立，分别自 1.1.0 起提供（可运行入口挂载真实 API、API Key 认证、网关实例地址策略，见本节与 Security）。
 - 控制平面唯一的可运行应用仍注册阶段 0 占位路由，全部业务端点返回 `501`，已实现的 API 路由只在测试中挂载：现挂载真实路由；SQLite 在应用启动（lifespan）时打开，导入模块不再产生文件副作用；`/readyz` 探测权威存储可用性。
 - `control-plane` 包补齐 `forgemesh-policy-engine` 与 `forgemesh-plugin-sdk` 依赖声明（此前独立安装后导入即失败）。
 - `POST /api/v1/inference-services` 丢弃请求体中的 `spec`、接受任意 `kind`、不分配 `uid` 且返回 `200`：现按 `InferenceService` 强类型校验（`uid`、租户与 `status` 由服务端维护），成功返回 `201`，请求体不合法返回 `400` 错误信封，同名冲突返回 `409`。

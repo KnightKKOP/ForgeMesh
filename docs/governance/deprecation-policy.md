@@ -20,7 +20,7 @@ ForgeMesh 遵循[语义化版本（SemVer）](https://semver.org/lang/zh-CN/)：
 
 ### 1.2 Major 版本内 API 稳定
 
-- 在同一 `MAJOR` 版本内，所有已发布的公共接口保持**向后兼容**。
+- 在同一 `MAJOR` 版本内，所有已发布的公共接口保持**向后兼容**。本节承诺自 API 标注为 `stable` 起生效；`beta` 阶段的规则见 1.4 节。
 - 破坏性变更（删除字段、改类型、改语义、收紧校验、新增必需字段）**仅在 `MAJOR` 版本升级时**允许。
 - `v1alpha1` / `v1beta1` 等 API 版本前缀在**对应阶段内**遵循同样规则；阶段升级（alpha → beta → GA）视为 MAJOR 级变更，须走完整弃用流程。
 
@@ -32,6 +32,14 @@ ForgeMesh 遵循[语义化版本（SemVer）](https://semver.org/lang/zh-CN/)：
 - **实验性功能**：标注 `@experimental` 或 `EXPERIMENTAL` 的接口，可在任何版本变更。
 - **配置默认值**：默认配置值调整（但须在 Release Notes 中说明）。
 - **错误消息文本**：错误消息的措辞调整（错误类型与错误码保持稳定）。
+
+### 1.4 预览阶段（beta）
+
+API 的稳定性以 OpenAPI 的 `info.x-stability` 为准，当前为 `beta`。v1.0.0 发布时标注为 `stable`，这一标注与实现不符，已经更正（见 [`CHANGELOG.md`](../../CHANGELOG.md) 1.1.0）。
+
+- `beta` 阶段的 `MINOR` 版本可以包含破坏性变更，但必须在 `CHANGELOG.md` 中以「**破坏性**」标注，并写明影响范围与迁移方式。
+- 弃用仍按第 2 节声明，并在声明中写明计划移除的版本；警告期可以短于第 3.2 节的要求。
+- `x-stability` 改为 `stable` 之前，应当满足 [架构验收标准](../architecture/architecture.md)（第 20 节）；改为 `stable` 之后，适用 1.1 至 1.3 节的全部承诺。
 
 ---
 

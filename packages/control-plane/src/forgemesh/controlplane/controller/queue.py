@@ -65,6 +65,17 @@ class WorkQueue[K: Hashable]:
         """可立即取出的键数量（不含延迟中的键）。"""
         return len(self._ready)
 
+    def depth(self) -> dict[str, int]:
+        """各状态的键数：``ready`` 可立即取出，``delayed`` 等待延迟到期，``processing`` 处理中。
+
+        同一键可能同时计入 ``ready`` 与 ``delayed``（已排队，另有一次延迟加入未到期）。
+        """
+        return {
+            "ready": len(self._ready),
+            "delayed": len(self._due),
+            "processing": len(self._processing),
+        }
+
     def add(self, key: K) -> None:
         """加入键；已在队列中则忽略，正在处理则在 :meth:`done` 后重新排队。"""
         if self._shutting_down or key in self._dirty:

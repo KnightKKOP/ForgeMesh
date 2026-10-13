@@ -362,6 +362,18 @@ def test_file_database_uses_wal_and_old_files_gain_the_error_column(tmp_path) ->
     check.close()
 
 
+@pytest.mark.unit
+def test_count_runs_by_status() -> None:
+    """按状态统计运行数；没有运行的状态不出现。"""
+    store = WorkflowStore()
+    defn = _make_definition()
+    first = asyncio_run(store.create_run(defn, {}, "key-1"))
+    asyncio_run(store.create_run(defn, {}, "key-2"))
+    asyncio_run(store.update_run_status(first.run_id, WorkflowStatus.RUNNING.value))
+
+    assert asyncio_run(store.count_runs_by_status()) == {"Pending": 1, "Running": 1}
+
+
 # --------------------------------------------------------------------------- #
 # 辅助
 # --------------------------------------------------------------------------- #

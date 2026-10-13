@@ -97,7 +97,7 @@ from .publishers import publisher_from_env
 from .reconciler import ProcessedKeyStore, ReconciliationController
 from .scheduler import INVENTORY_FILE_ENV, FirstFitScheduler, inventory_from_env
 from .sqlite import workflow_db_path
-from .telemetry import ControlPlaneMetrics
+from .telemetry import ControllerMetrics, ControlPlaneMetrics
 from .version import CONTROL_PLANE_VERSION
 
 if TYPE_CHECKING:  # pragma: no cover - 仅静态类型检查使用
@@ -201,6 +201,7 @@ def _build_controller(
     runtime: LocalWorkflowRuntime | None = None,
     launcher: RuntimeLauncher | None = None,
     instance_check_interval: float = DEFAULT_INSTANCE_CHECK_INTERVAL_SECONDS,
+    metrics: ControllerMetrics | None = None,
 ) -> ControllerManager:
     # 没有授权规则的 DefaultPolicyEngine 拒绝一切操作。资源的创建和删除已经由 API 的
     # 认证与 scope 把关，协调只是推进这些已被接受的期望状态，因此放行 reconcile。
@@ -237,6 +238,7 @@ def _build_controller(
         instance_check=instance_check,
         instance_check_interval=instance_check_interval,
         reclaim=reclaim,
+        metrics=metrics,
     )
 
 
@@ -310,6 +312,7 @@ if _FASTAPI_AVAILABLE:
                 processed_store = ProcessedKeyStore(path)
                 cleanup.push_async_callback(processed_store.close)
                 runtime: LocalWorkflowRuntime | None = None
+                workflow_store: WorkflowStore | None = None
                 if launcher is not None:
                     workflow_path = workflow_db_path(path)
                     workflow_store = WorkflowStore(workflow_path)
@@ -334,9 +337,16 @@ if _FASTAPI_AVAILABLE:
                         len(checked),
                     )
                 controller = _build_controller(
-                    registry, processed_store, inventory, runtime, launcher, instance_check_interval
+                    registry,
+                    processed_store,
+                    inventory,
+                    runtime,
+                    launcher,
+                    instance_check_interval,
+                    metrics.controller,
                 )
                 cleanup.push_async_callback(controller.stop)
+                cleanup.callback(metrics.watch(registry, controller, inventory, workflow_store))
                 await controller.start()
                 yield
 

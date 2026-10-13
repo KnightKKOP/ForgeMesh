@@ -27,6 +27,7 @@ import asyncio
 import contextlib
 import sqlite3
 import threading
+import time
 from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any, TypeVar
@@ -69,6 +70,12 @@ class Database:
         self.conn = connect(db_path)
         self.conn.row_factory = sqlite3.Row
         self.lock = threading.RLock()
+        self._lock_wait_observer: Callable[[float], None] | None = None
+
+    def set_lock_wait_observer(self, observer: Callable[[float], None] | None) -> None:
+        """登记锁等待的观测函数：:meth:`call` 与 :meth:`transaction` 每次取得锁后，以等待的
+        秒数调用它（指标使用）；``None`` 取消登记。"""
+        self._lock_wait_observer = observer
 
     def call(self, fn: Callable[..., _T], /, *args: Any, **kwargs: Any) -> _T:
         """持锁执行 ``fn``，由 ``fn`` 自行提交；``fn`` 抛出异常时回滚它未提交的写入。
@@ -76,7 +83,7 @@ class Database:
         Raises:
             RuntimeError: ``fn`` 正常返回，却留下了它开启的未提交事务（已回滚）。
         """
-        with self.lock:
+        with self._locked():
             already_open = self.conn.in_transaction
             try:
                 result = fn(*args, **kwargs)
@@ -102,7 +109,7 @@ class Database:
         Raises:
             RuntimeError: 进入时连接上已有未提交的事务。
         """
-        with self.lock:
+        with self._locked():
             if self.conn.in_transaction:
                 raise RuntimeError("a transaction is already open on this connection")
             self.conn.execute("BEGIN IMMEDIATE")
@@ -117,6 +124,15 @@ class Database:
         """关闭连接（等待持锁的操作结束）。"""
         with self.lock:
             self.conn.close()
+
+    @contextlib.contextmanager
+    def _locked(self) -> Iterator[None]:
+        observer = self._lock_wait_observer
+        waiting = time.perf_counter()
+        with self.lock:
+            if observer is not None:
+                observer(time.perf_counter() - waiting)
+            yield
 
     def _rollback(self) -> None:
         with contextlib.suppress(sqlite3.ProgrammingError):  # 连接已关闭

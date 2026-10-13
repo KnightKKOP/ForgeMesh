@@ -2,8 +2,12 @@
 
 from __future__ import annotations
 
+import json
+import time
+
 import pytest
 from fastapi.testclient import TestClient
+from forgemesh.controlplane import app as app_module
 from forgemesh.controlplane.api.dependencies import get_registry, reset_runtime_components
 from forgemesh.controlplane.app import create_app
 from forgemesh.controlplane.auth import (
@@ -13,6 +17,7 @@ from forgemesh.controlplane.auth import (
     hash_api_key,
 )
 from forgemesh.controlplane.deployment import RUNTIME_LAUNCHER_ENV
+from forgemesh.controlplane.deployment.config import FAKE_ADVERTISE_HOST_ENV, FAKE_BIND_HOST_ENV
 from forgemesh.controlplane.metrics import CONTENT_TYPE
 from forgemesh.controlplane.scheduler import INVENTORY_FILE_ENV
 
@@ -110,3 +115,51 @@ def test_unhandled_errors_are_counted_as_500(tmp_path, monkeypatch) -> None:
 
     requests = parse(text)["forgemesh_http_requests_total"]
     assert requests.value(method="GET", route="/api/v1/inference-services", status="500") == 1
+
+
+@pytest.mark.unit
+def test_a_deployment_shows_up_in_the_controller_and_state_metrics(tmp_path, monkeypatch) -> None:
+    inventory = tmp_path / "inventory.json"
+    gpus = [{"id": f"gpu-{index}", "type": "nvidia-gpu", "memoryGiB": 80} for index in range(2)]
+    inventory.write_text(json.dumps({"nodes": [{"id": "node-hidden", "devices": gpus}]}))
+    monkeypatch.setenv(INVENTORY_FILE_ENV, str(inventory))
+    monkeypatch.setenv(RUNTIME_LAUNCHER_ENV, "fake")
+    monkeypatch.delenv(FAKE_BIND_HOST_ENV, raising=False)
+    monkeypatch.delenv(FAKE_ADVERTISE_HOST_ENV, raising=False)
+    monkeypatch.setattr(app_module, "CONTROLLER_POLL_INTERVAL_SECONDS", 0.05)
+    monkeypatch.setattr(app_module, "WORKFLOW_POLL_INTERVAL_SECONDS", 0.05)
+
+    done = 'forgemesh_reconcile_total{operation="reconcile",outcome="done"}'
+    with TestClient(_dev_app(tmp_path)) as client:
+        created = client.post("/api/v1/inference-services", json=BODY, headers=HEADERS)
+        assert created.status_code == 201
+        deadline = time.monotonic() + 10
+        while done not in (text := client.get("/metrics").text):
+            assert time.monotonic() < deadline, "the deployment did not finish"
+            time.sleep(0.02)
+        service = client.get(
+            "/api/v1/inference-services/secret-llama",
+            params={"namespace": NAMESPACE},
+            headers=HEADERS,
+        ).json()
+
+    assert service["status"]["phase"] == "Ready"
+    families = parse(text)
+    assert families["forgemesh_inference_services"].value(phase="Ready") == 1
+    assert families["forgemesh_allocations_active"].value(accelerator_type="nvidia-gpu") == 1
+    devices = families["forgemesh_accelerator_devices"]
+    assert devices.value(accelerator_type="nvidia-gpu", state="allocated") == 1
+    assert devices.value(accelerator_type="nvidia-gpu", state="free") == 1
+    assert families["forgemesh_workflow_runs"].value(status="Succeeded") == 1
+    deployments = families["forgemesh_deployments_total"]
+    assert deployments.value(outcome="ready", reason="Reconciled") == 1
+    lock_wait = families["forgemesh_database_lock_wait_seconds"]
+    assert lock_wait.value("forgemesh_database_lock_wait_seconds_count") > 0
+    assert {s.labels["state"] for s in families["forgemesh_controller_queue_depth"].samples} == {
+        "ready",
+        "delayed",
+        "processing",
+    }
+    endpoint = service["status"]["endpoints"][0]["url"]
+    for tenant_data in (TENANT, NAMESPACE, "secret-llama", "node-hidden", "gpu-", endpoint):
+        assert tenant_data not in text

@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from collections.abc import Awaitable, Callable, Collection, Iterable
 from typing import Any
 from uuid import uuid4
@@ -45,6 +46,7 @@ from forgemesh.core.reconciler import ReconcileContext
 from ..deployment import DEFAULT_INSTANCE_CHECK_INTERVAL_SECONDS
 from ..reconciler import ReconciliationController, compute_dedup_key
 from ..registry import ChangeType, ResourceKey, SQLiteRegistry
+from ..telemetry import ControllerMetrics, ReconcileOutcome
 from .queue import WorkQueue
 
 logger = logging.getLogger(__name__)
@@ -97,6 +99,7 @@ class ControllerManager:
         instance_check_interval: 两次核对实例之间的秒数。
         reclaim: 可选，回收孤立分配的协程函数（返回值不使用）。
         queue: 工作队列；为空时新建（测试可注入）。
+        metrics: 协调与队列的指标；为空时新建（不会被导出）。
     """
 
     def __init__(
@@ -114,6 +117,7 @@ class ControllerManager:
         instance_check_interval: float = DEFAULT_INSTANCE_CHECK_INTERVAL_SECONDS,
         reclaim: Callable[[], Awaitable[object]] | None = None,
         queue: WorkQueue[ResourceKey] | None = None,
+        metrics: ControllerMetrics | None = None,
     ) -> None:
         if reconciler.records_dedup_keys:
             raise ValueError(
@@ -136,6 +140,7 @@ class ControllerManager:
         self._instance_check_interval = instance_check_interval
         self._reclaim = reclaim
         self._queue: WorkQueue[ResourceKey] = queue if queue is not None else WorkQueue()
+        self._metrics = metrics if metrics is not None else ControllerMetrics()
         self._cursor = 0
         self._started = False
         self._watchers: list[asyncio.Task[None]] = []
@@ -231,6 +236,17 @@ class ControllerManager:
             self._queue.forget(key)
             return
         operation = _operation(phase)
+        started = time.perf_counter()
+        outcome = ReconcileOutcome.ERROR
+        try:
+            outcome = await self._reconcile(key, resource, phase, operation)
+        finally:
+            self._metrics.reconciled(operation, outcome, time.perf_counter() - started)
+
+    async def _reconcile(
+        self, key: ResourceKey, resource: Resource, phase: str | None, operation: str
+    ) -> ReconcileOutcome:
+        """协调、回写 status、登记去重键并安排下一次，返回这次协调的结果。"""
         meta = resource.metadata
         dedup_key = compute_dedup_key(
             key.kind, key.namespace, key.name, meta.uid, meta.generation, operation
@@ -245,16 +261,23 @@ class ControllerManager:
                 dedup_key=dedup_key,
             )
         )
-        if result.status_patch and not await self._write_status(
-            key, resource, operation, result.status_patch, correlation_id
-        ):
-            self._queue.add(key)
-            return
+        if result.status_patch:
+            if not await self._write_status(
+                key, resource, operation, result.status_patch, correlation_id
+            ):
+                self._queue.add(key)
+                return ReconcileOutcome.CONFLICT
+            self._metrics.status_written(phase, result.status_patch)
         if result.done:
             await self._reconciler.mark_processed(dedup_key)
         self._queue.forget(key)
         if result.requeue_after is not None:
             self._queue.add_after(key, result.requeue_after)
+        return ReconcileOutcome.of(result)
+
+    def queue_depth(self) -> dict[str, int]:
+        """工作队列中各状态的键数（见 :meth:`WorkQueue.depth`）。"""
+        return self._queue.depth()
 
     async def _write_status(
         self,
@@ -302,6 +325,7 @@ class ControllerManager:
             try:
                 await self.process(key)
             except Exception:  # noqa: BLE001 - 单个资源失败不得影响其他资源
+                self._metrics.retried()
                 delay = self._queue.add_rate_limited(key)
                 logger.exception(
                     "reconcile failed for %s; retrying in %.1fs", _describe(key), delay

@@ -91,6 +91,8 @@ Outbox，信封与事件类型见 :mod:`forgemesh.controlplane.events`）；API 
 是例外：它们跨租户返回资源键，仅供控制平面内部的控制器使用，不得暴露给 API；
 :meth:`SQLiteRegistry.get_allocation` 与 :meth:`SQLiteRegistry.allocated_devices`
 同样跨租户读取，仅供调度器使用（设备由全部租户共享）。
+:meth:`SQLiteRegistry.count_by_phase` 与 :meth:`SQLiteRegistry.active_allocation_devices`
+跨租户读取，仅供 ``/metrics`` 输出聚合计数。
 """
 
 from __future__ import annotations
@@ -340,6 +342,11 @@ class SQLiteRegistry(ResourceRegistry):
         self._page_tokens = PageTokenSigner(load_page_token_key(self._conn))
         self._outbox = Outbox(database=self._db)
         self._audit = AuditLog(database=self._db)
+
+    @property
+    def database(self) -> Database:
+        """注册表的数据库（连接与锁），它的 Outbox 与审计记录共用同一个。"""
+        return self._db
 
     @property
     def outbox(self) -> Outbox:
@@ -1856,6 +1863,40 @@ class SQLiteRegistry(ResourceRegistry):
             return [self._allocation_record(row) for row in rows]
 
         return await self._run(_list_allocations)
+
+    # ------------------------------------------------------------------ #
+    # 指标（跨租户聚合）
+    # ------------------------------------------------------------------ #
+
+    async def count_by_phase(self, kind: str) -> dict[str | None, int]:
+        """按 phase 统计 ``kind`` 的资源数（跨租户，仅供指标使用）。"""
+
+        def _count() -> dict[str | None, int]:
+            rows = self._conn.execute(
+                "SELECT phase, COUNT(*) AS n FROM resources WHERE kind=? GROUP BY phase",
+                (kind,),
+            ).fetchall()
+            return {row["phase"]: row["n"] for row in rows}
+
+        return await self._run(_count)
+
+    async def active_allocation_devices(self) -> dict[str, frozenset[AllocatedDevice]]:
+        """每个 Active 分配（键为分配 id）的设备，没有设备的分配对应空集合（跨租户，仅供指标使用）。"""
+
+        def _active() -> dict[str, frozenset[AllocatedDevice]]:
+            rows = self._conn.execute(
+                "SELECT a.id, d.node_id, d.device_id FROM allocations AS a "
+                "LEFT JOIN allocation_devices AS d ON d.allocation_id = a.id WHERE a.status=?",
+                (AllocationStatus.ACTIVE.value,),
+            ).fetchall()
+            held: dict[str, set[AllocatedDevice]] = {}
+            for row in rows:
+                devices = held.setdefault(row["id"], set())
+                if row["node_id"] is not None:
+                    devices.add(AllocatedDevice(node_id=row["node_id"], device_id=row["device_id"]))
+            return {allocation_id: frozenset(devices) for allocation_id, devices in held.items()}
+
+        return await self._run(_active)
 
     # ------------------------------------------------------------------ #
     # 生命周期

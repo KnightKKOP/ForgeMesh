@@ -53,6 +53,7 @@ from .dependencies import (
     require_write,
 )
 from .errors import ApiError, validation_details
+from .risk import RiskLevel, effective_risk_level
 from .updates import (
     MERGE_PATCH_MEDIA_TYPE,
     SERVER_OWNED_METADATA,
@@ -532,6 +533,7 @@ class DecisionCallRequest(BaseModel):
         context: 决策上下文。
         required_capabilities: 期望的 Provider 能力列表；并入内部 ``context``
             传递（内部模型 ``extra="forbid"``，无对应字段）。
+        risk_level: 客户端期望的风险等级；只能调高服务端推导的等级（见 :mod:`.risk`）。
     """
 
     model_config = ConfigDict(populate_by_name=True)
@@ -539,6 +541,7 @@ class DecisionCallRequest(BaseModel):
     question: str = Field(min_length=1)
     context: dict[str, Any] = Field(default_factory=dict)
     required_capabilities: list[str] | None = Field(default=None, alias="requiredCapabilities")
+    risk_level: RiskLevel | None = Field(default=None, alias="riskLevel")
 
 
 @router.post("/decisions", dependencies=[Depends(require_write)])
@@ -553,14 +556,18 @@ async def request_decision(
 
     * 请求体以 OpenAPI ``DecisionRequest`` 为 API 层形状，内部转换为
       ``forgemesh.decision.DecisionRequest``（租户取自请求头）；
+    * 风险等级由服务端按 ``question`` 推导，请求中的 ``riskLevel`` 只能调高（见
+      :mod:`.risk`）；
     * 调用注入的 ``DecisionRouter.route``，按序降级直至产出有效候选；
     * 响应体为 OpenAPI ``DecisionResponse``（``decisionId`` / ``outcome`` /
-      ``rationale`` / ``trace`` / ``degraded``），``trace.attempts`` 提供降级
-      路径摘要（可解释性）。
+      ``rationale`` / ``trace`` / ``degraded`` / ``riskLevel``），``trace.attempts``
+      提供降级路径摘要（可解释性）。
 
-    错误映射：校验失败 400；全部 Provider 失败 503（**绝不默认放行**，
-    ``DecisionResult.success=False`` 交人工处理）；``DecisionRouter`` 未注入
-    503；其余内部错误 500（统一错误信封）。
+    错误映射：校验失败 400；``DecisionRouter`` 未注入 503
+    ``DECISION_ROUTER_UNAVAILABLE``；全部 Provider 失败，或高风险请求没有备用 Provider
+    503 ``DECISION_NO_CANDIDATE``；高风险请求的候选来自备用 Provider 503
+    ``DECISION_FALLBACK_REQUIRED``（候选在 ``details.candidates`` 中供人工审批，不自动
+    采用）。两种 503 都**绝不默认放行**。其余内部错误 500（统一错误信封）。
     """
     correlation_id = x_correlation_id or uuid4().hex
     try:
@@ -584,11 +591,13 @@ async def request_decision(
     context = dict(req.context)
     if req.required_capabilities is not None:
         context["requiredCapabilities"] = list(req.required_capabilities)
+    risk_level = effective_risk_level(req.question, req.risk_level)
     internal = InternalDecisionRequest(
         request_id=request_id,
         tenant_id=tenant_id,
         operation=req.question,
         context=context,
+        risk_level=risk_level,
     )
 
     try:
@@ -596,6 +605,19 @@ async def request_decision(
     except Exception as exc:  # noqa: BLE001 - Router 任意故障统一转错误信封
         return _error_response(500, "INTERNAL_ERROR", f"决策路由失败: {exc}", correlation_id)
 
+    attempts = [a.model_dump() for a in result.attempts]
+    if result.status == "FALLBACK_REQUIRED":
+        return _error_response(
+            503,
+            "DECISION_FALLBACK_REQUIRED",
+            "高风险决策的候选来自备用 Provider，不自动采用，需人工审批",
+            correlation_id,
+            {
+                "riskLevel": risk_level,
+                "attempts": attempts,
+                "candidates": [c.model_dump() for c in result.candidates],
+            },
+        )
     if not result.success or result.chosen is None:
         # 全部 Provider 失败：绝不默认放行，503 交人工处理（5.5 降级决策表）。
         return _error_response(
@@ -603,7 +625,7 @@ async def request_decision(
             "DECISION_NO_CANDIDATE",
             result.error or "所有决策 Provider 均未返回有效候选（禁止默认放行）",
             correlation_id,
-            {"attempts": [a.model_dump() for a in result.attempts]},
+            {"riskLevel": risk_level, "attempts": attempts},
         )
 
     chosen = result.chosen
@@ -614,10 +636,11 @@ async def request_decision(
         "rationale": rationale,
         "trace": {
             "requestId": request_id,
-            "attempts": [a.model_dump() for a in result.attempts],
+            "attempts": attempts,
             "candidates": [c.model_dump() for c in result.candidates],
         },
         "degraded": any(not a.ok for a in result.attempts),
+        "riskLevel": risk_level,
     }
 
 

@@ -7,7 +7,8 @@
   请求校验失败 400 错误信封、缺租户头 400、组件未注入 503、定义不存在 404；
 * decisions：成功候选（200 + DecisionResponse 形状）、降级标记 degraded、
   全部 Provider 失败 503 错误信封（绝不默认放行）、Router 异常 500、
-  租户头注入内部模型、缺租户头 400、校验失败 400。
+  租户头注入内部模型、缺租户头 400、校验失败 400；风险等级由服务端按操作推导、
+  客户端只能调高，高风险请求的备用候选不自动采用（503 DECISION_FALLBACK_REQUIRED）。
 
 ``WorkflowRuntime`` / ``DecisionRouter`` 以 stub 注入（不依赖真实 Provider），
 沿用 ``test_api.py`` 的 TestClient 模式。
@@ -28,7 +29,7 @@ from forgemesh.controlplane.api.dependencies import (
     reset_runtime_components,
 )
 from forgemesh.core.errors import NotFoundError
-from forgemesh.decision import Attempt, DecisionCandidate, DecisionResult
+from forgemesh.decision import Attempt, DecisionCandidate, DecisionResult, DecisionRouter
 from forgemesh.workflow.runtime import RunRef, WorkflowDefinition
 
 TENANT_HEADERS = {"X-Tenant-Id": "tenant-a"}
@@ -277,6 +278,7 @@ def test_decision_no_candidate(client: TestClient) -> None:
     assert error["code"] == "DECISION_NO_CANDIDATE"
     assert error["correlationId"]
     assert "attempts" in error["details"]
+    assert error["details"]["riskLevel"] == "low"
 
 
 def test_decision_router_exception(client: TestClient) -> None:
@@ -306,3 +308,157 @@ def test_decision_validation_error(client: TestClient) -> None:
     error = resp.json()["error"]
     assert error["code"] == "BAD_REQUEST"
     assert error["details"]["errors"]
+
+
+# ------------------------------------------------------------------ #
+# 决策风险等级（服务端推导，客户端只能调高）
+# ------------------------------------------------------------------ #
+
+
+@pytest.mark.parametrize(
+    ("question", "expected"),
+    [
+        ("inference.schedule", "low"),
+        ("gpu.force-release", "high"),
+        ("Node.Restart", "high"),
+        ("  driver.upgrade  ", "high"),
+        ("mig.reconfigure", "high"),
+        ("plugin.install", "high"),
+        ("model.change-source", "high"),
+        ("tenant.quota.update", "high"),
+        ("system", "high"),
+        ("workflow.compensate", "medium"),
+        ("inferences.schedule", "medium"),
+        ("Which node should host svc-1?", "medium"),
+    ],
+)
+def test_decision_risk_level_is_derived_from_the_operation(
+    client: TestClient, question: str, expected: str
+) -> None:
+    router = StubDecisionRouter(result=_ok_result())
+    init_decision_router(router)
+
+    resp = client.post("/api/v1/decisions", json={"question": question}, headers=TENANT_HEADERS)
+
+    assert resp.status_code == 200, resp.text
+    assert router.calls[0].risk_level == expected
+    assert resp.json()["riskLevel"] == expected
+
+
+@pytest.mark.parametrize(
+    ("question", "requested", "expected"),
+    [
+        ("inference.schedule", "medium", "medium"),
+        ("inference.schedule", "high", "high"),
+        ("workflow.compensate", "low", "medium"),
+        ("gpu.force-release", "low", "high"),
+        ("gpu.force-release", "medium", "high"),
+    ],
+)
+def test_clients_may_raise_but_never_lower_the_risk_level(
+    client: TestClient, question: str, requested: str, expected: str
+) -> None:
+    router = StubDecisionRouter(result=_ok_result())
+    init_decision_router(router)
+
+    resp = client.post(
+        "/api/v1/decisions",
+        json={"question": question, "riskLevel": requested},
+        headers=TENANT_HEADERS,
+    )
+
+    assert resp.status_code == 200, resp.text
+    assert router.calls[0].risk_level == expected
+    assert resp.json()["riskLevel"] == expected
+
+
+def test_decision_rejects_an_unknown_risk_level(client: TestClient) -> None:
+    router = StubDecisionRouter(result=_ok_result())
+    init_decision_router(router)
+
+    resp = client.post(
+        "/api/v1/decisions",
+        json={"question": "inference.schedule", "riskLevel": "critical"},
+        headers=TENANT_HEADERS,
+    )
+
+    assert resp.status_code == 400, resp.text
+    error = resp.json()["error"]
+    assert error["code"] == "BAD_REQUEST"
+    assert error["details"]["errors"]
+    assert router.calls == []
+
+
+def test_decision_fallback_required_is_not_adopted(client: TestClient) -> None:
+    """高风险请求的候选来自备用 Provider：503 交人工审批，候选只出现在 details 中。"""
+    candidate = DecisionCandidate(candidate_id="c1", action="gpu.release")
+    result = DecisionResult(
+        candidates=[candidate],
+        success=False,
+        status="FALLBACK_REQUIRED",
+        attempts=[
+            Attempt(provider="p1", ok=False, error="TimeoutError"),
+            Attempt(provider="p2", ok=True),
+        ],
+    )
+    init_decision_router(StubDecisionRouter(result=result))
+
+    resp = client.post(
+        "/api/v1/decisions", json={"question": "gpu.force-release"}, headers=TENANT_HEADERS
+    )
+
+    assert resp.status_code == 503, resp.text
+    error = resp.json()["error"]
+    assert error["code"] == "DECISION_FALLBACK_REQUIRED"
+    assert error["details"]["riskLevel"] == "high"
+    assert [c["candidate_id"] for c in error["details"]["candidates"]] == ["c1"]
+    assert [a["provider"] for a in error["details"]["attempts"]] == ["p1", "p2"]
+
+
+class _Provider:
+    """最小 DecisionProvider：返回预置候选或抛出预置异常。"""
+
+    provider_version = "1"
+
+    def __init__(self, provider_id: str, *, fails: bool = False) -> None:
+        self.provider_id = provider_id
+        self._fails = fails
+
+    async def decide(self, req: Any) -> list[DecisionCandidate]:
+        if self._fails:
+            raise RuntimeError(f"{self.provider_id} is down")
+        return [DecisionCandidate(candidate_id=f"{self.provider_id}-1", action="act")]
+
+
+@pytest.mark.parametrize(
+    ("question", "status", "code"),
+    [
+        ("inference.schedule", 200, None),
+        ("gpu.force-release", 503, "DECISION_FALLBACK_REQUIRED"),
+    ],
+)
+def test_the_router_high_risk_protection_applies_to_api_requests(
+    client: TestClient, question: str, status: int, code: str | None
+) -> None:
+    """真实 DecisionRouter：首选失败、备用成功时，低风险请求降级采用，高风险请求不自动采用。"""
+    init_decision_router(DecisionRouter([_Provider("primary", fails=True), _Provider("fallback")]))
+
+    resp = client.post("/api/v1/decisions", json={"question": question}, headers=TENANT_HEADERS)
+
+    assert resp.status_code == status, resp.text
+    if code is None:
+        assert resp.json()["degraded"] is True
+    else:
+        assert resp.json()["error"]["code"] == code
+
+
+def test_high_risk_requests_need_a_fallback_provider(client: TestClient) -> None:
+    init_decision_router(DecisionRouter([_Provider("only")]))
+
+    resp = client.post(
+        "/api/v1/decisions", json={"question": "node.restart"}, headers=TENANT_HEADERS
+    )
+
+    assert resp.status_code == 503, resp.text
+    error = resp.json()["error"]
+    assert (error["code"], error["details"]["riskLevel"]) == ("DECISION_NO_CANDIDATE", "high")

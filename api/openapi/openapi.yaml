@@ -312,6 +312,14 @@ paths:
       tags: [decisions]
       summary: 请求一次结构化决策（决策≠授权；授权由 Scheduler/Policy 完成）
       operationId: requestDecision
+      description: >-
+        风险等级由服务端按 question 推导：question 是形如 <域>.<动作> 的操作标识（如
+        inference.schedule），只看第一个 "." 之前的域（忽略大小写与首尾空白）。driver、node、mig、
+        gpu、device、plugin、model、quota、tenant、policy、system、platform 为 high（architecture
+        14.2 列出的高风险操作），inference 为 low，其他（含自由文本）为 medium。请求中的
+        riskLevel 只能调高，低于推导值时被忽略。高风险请求没有备用 Provider 时返回 503
+        DECISION_NO_CANDIDATE；候选来自备用 Provider 时不自动采用，返回 503
+        DECISION_FALLBACK_REQUIRED，候选在 details.candidates 中供人工审批。
       requestBody:
         required: true
         content:
@@ -331,6 +339,8 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/Forbidden"
+        "503":
+          $ref: "#/components/responses/DecisionUnavailable"
 
 
   /api/v1/resources:
@@ -665,20 +675,30 @@ components:
           type: integer
     DecisionRequest:
       type: object
-      required: [question, context]
+      required: [question]
       properties:
         question:
           type: string
+          minLength: 1
+          description: 操作标识，形如 <域>.<动作>（如 inference.schedule），决定推导的风险等级。
         context:
           type: object
           additionalProperties: true
+          default: {}
         requiredCapabilities:
           type: array
           items:
             type: string
+        riskLevel:
+          $ref: "#/components/schemas/RiskLevel"
+    RiskLevel:
+      type: string
+      enum: [low, medium, high]
+      description: >-
+        风险等级。请求中的值只能调高服务端按 question 推导的等级；响应中是实际采用的等级。
     DecisionResponse:
       type: object
-      required: [decisionId, outcome, rationale]
+      required: [decisionId, outcome, rationale, riskLevel]
       properties:
         decisionId:
           type: string
@@ -693,6 +713,8 @@ components:
         degraded:
           type: boolean
           description: 是否走了 Provider 降级路径。
+        riskLevel:
+          $ref: "#/components/schemas/RiskLevel"
   responses:
     BadRequest:
       description: 请求不合法
@@ -750,6 +772,17 @@ components:
       description: >-
         所依赖的组件未就绪（错误码 AUTHENTICATOR_UNAVAILABLE、REGISTRY_UNAVAILABLE 等）：
         控制平面未完成组装或正在关闭，不会以临时内存库或放行兜底。
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    DecisionUnavailable:
+      description: >-
+        没有可以自动采用的决策，绝不默认放行。错误码：DECISION_ROUTER_UNAVAILABLE（决策路由器
+        未注入）；DECISION_NO_CANDIDATE（全部 Provider 失败，或高风险请求没有备用 Provider；
+        details.attempts、details.riskLevel）；DECISION_FALLBACK_REQUIRED（高风险请求的候选
+        来自备用 Provider，不自动采用；details.candidates 供人工审批，另有 details.attempts、
+        details.riskLevel）。所依赖的组件未就绪时同 ServiceUnavailable。
       content:
         application/json:
           schema:

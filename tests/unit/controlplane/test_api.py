@@ -6,9 +6,10 @@
 * 重复创建返回 409；
 * 查询不存在返回 404；
 * 删除：无副作用且没有分配的资源 204 直接物理删除；有副作用态（Ready）或持有
-  加速器分配的资源 202 Terminating；
+  加速器分配的资源 202 Terminating；与并发写入冲突 409；
 * 列表返回多个资源；
-* 缺失 ``X-Tenant-Id`` 头返回 401（dev 认证模式）。
+* 缺失 ``X-Tenant-Id`` 头返回 401（dev 认证模式）；
+* 错误信封回显请求的 ``X-Correlation-Id``。
 
 使用 FastAPI ``TestClient``（同步驱动），不依赖 pytest-asyncio。
 """
@@ -28,6 +29,7 @@ from forgemesh.controlplane.api.dependencies import (
     reset_registry,
 )
 from forgemesh.controlplane.api.errors import install_exception_handlers
+from forgemesh.core.errors import ConflictError
 from forgemesh.core.objects import ObjectMeta
 from forgemesh.core.scheduler import AllocatedDevice, ResourceRef
 from forgemesh.resource.inference import (
@@ -301,9 +303,31 @@ def test_routes_report_an_uninitialised_registry(method: str, path: str) -> None
 @pytest.mark.parametrize("path", ["/api/v1/inference-services", "/api/v1/resources"])
 @pytest.mark.parametrize("limit", [-1, 0, 1001])
 def test_list_rejects_out_of_range_limit(client: TestClient, path: str, limit: int) -> None:
-    """limit 超出 [1, 1000] 返回 400（SQLite 中 LIMIT -1 表示不限条数）。"""
+    """limit 超出 [1, 1000] 返回 400（SQLite 中 LIMIT -1 表示不限条数），回显关联 ID。"""
     resp = client.get(
-        path, headers=TENANT_HEADERS, params={"limit": limit, "kind": "InferenceService"}
+        path,
+        headers={**TENANT_HEADERS, "X-Correlation-Id": "corr-1"},
+        params={"limit": limit, "kind": "InferenceService"},
     )
     assert resp.status_code == 400, resp.text
-    assert resp.json()["error"]["code"] == "BAD_REQUEST"
+    error = resp.json()["error"]
+    assert (error["code"], error["correlationId"]) == ("BAD_REQUEST", "corr-1")
+
+
+def test_delete_race_returns_409_with_the_correlation_id(client: TestClient, monkeypatch) -> None:
+    """受控删除与并发写入冲突返回 409 错误信封，回显请求的关联 ID。"""
+    client.post("/api/v1/inference-services", json=_payload(), headers=TENANT_HEADERS)
+
+    async def racing_delete(*args, **kwargs):
+        raise ConflictError("request_delete raced with concurrent write")
+
+    monkeypatch.setattr(get_registry(), "request_delete", racing_delete)
+    resp = client.delete(
+        "/api/v1/inference-services/svc-1",
+        headers={**TENANT_HEADERS, "X-Correlation-Id": "corr-1"},
+        params={"namespace": "default"},
+    )
+
+    assert resp.status_code == 409, resp.text
+    error = resp.json()["error"]
+    assert (error["code"], error["correlationId"]) == ("CONFLICT", "corr-1")

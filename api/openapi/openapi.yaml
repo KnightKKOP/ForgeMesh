@@ -68,6 +68,8 @@ paths:
                 $ref: "#/components/schemas/Error"
 
   /api/v1/inference-services:
+    parameters:
+      - $ref: "#/components/parameters/CorrelationId"
     get:
       tags: [inference-services]
       summary: 列出推理服务
@@ -147,6 +149,7 @@ paths:
         description: 资源所在的命名空间；省略时指不带命名空间的资源。
         schema:
           type: string
+      - $ref: "#/components/parameters/CorrelationId"
     get:
       tags: [inference-services]
       summary: 获取推理服务
@@ -282,6 +285,8 @@ paths:
 
 
   /api/v1/workflows:
+    parameters:
+      - $ref: "#/components/parameters/CorrelationId"
     post:
       tags: [workflows]
       summary: 启动工作流运行
@@ -308,6 +313,8 @@ paths:
 
 
   /api/v1/decisions:
+    parameters:
+      - $ref: "#/components/parameters/CorrelationId"
     post:
       tags: [decisions]
       summary: 请求一次结构化决策（决策≠授权；授权由 Scheduler/Policy 完成）
@@ -344,6 +351,8 @@ paths:
 
 
   /api/v1/resources:
+    parameters:
+      - $ref: "#/components/parameters/CorrelationId"
     get:
       tags: [resources]
       summary: 按 kind 列出资源
@@ -379,6 +388,15 @@ paths:
 
 components:
   parameters:
+    CorrelationId:
+      name: X-Correlation-Id
+      in: header
+      required: false
+      description: >-
+        全链路关联 ID（大小写不敏感，与网关的 X-Correlation-ID 相同）：错误响应在
+        error.correlationId 中回显该值；省略时由服务端生成。经网关访问时网关总会补上它。
+      schema:
+        type: string
     NamespaceFilter:
       name: namespace
       in: query

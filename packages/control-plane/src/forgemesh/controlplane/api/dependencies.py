@@ -18,8 +18,9 @@ from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
 from typing import TYPE_CHECKING
+from uuid import uuid4
 
-from fastapi import Depends, Request
+from fastapi import Depends, Header, Request
 from forgemesh.controlplane.auth import (
     SCOPE_READ,
     SCOPE_WRITE,
@@ -30,7 +31,7 @@ from forgemesh.controlplane.auth import (
 )
 from forgemesh.controlplane.registry import SQLiteRegistry
 
-from .errors import ApiError
+from .errors import CORRELATION_HEADER, ApiError
 
 if TYPE_CHECKING:  # pragma: no cover - 仅静态类型检查使用，运行时不导入
     from forgemesh.decision.router import DecisionRouter
@@ -190,6 +191,13 @@ async def get_principal(request: Request) -> Principal:
         ) from exc
     except PermissionDeniedError as exc:
         raise ApiError(403, "FORBIDDEN", str(exc)) from exc
+
+
+async def get_correlation_id(
+    correlation_id: str | None = Header(default=None, alias=CORRELATION_HEADER),
+) -> str:
+    """本次请求的关联 ID：取 ``X-Correlation-Id`` 请求头，缺失时生成；错误信封回显该值。"""
+    return correlation_id or uuid4().hex
 
 
 async def get_tenant_id(principal: Principal = Depends(get_principal)) -> str:

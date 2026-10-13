@@ -45,6 +45,7 @@ from ..app import error_envelope
 from ..registry import ConflictReason, InvalidPageTokenError, SQLiteRegistry
 from .dependencies import (
     ComponentNotReadyError,
+    get_correlation_id,
     get_decision_router,
     get_tenant_id,
     get_workflow_runtime,
@@ -65,7 +66,8 @@ from .updates import (
     unknown_fields,
 )
 
-router = APIRouter(prefix="/api/v1")
+#: 所有端点都在错误信封中回显 ``X-Correlation-Id``，路由器级依赖让每个端点都声明这个请求头。
+router = APIRouter(prefix="/api/v1", dependencies=[Depends(get_correlation_id)])
 
 _KIND = "InferenceService"
 
@@ -114,14 +116,14 @@ def _build_inference_service(body: dict[str, Any], tenant_id: str) -> InferenceS
     )
 
 
-def _invalid_limit(limit: int) -> JSONResponse | None:
+def _invalid_limit(limit: int, correlation_id: str) -> JSONResponse | None:
     if 1 <= limit <= MAX_LIST_LIMIT:
         return None
     return _error_response(
         400,
         "BAD_REQUEST",
         f"limit must be between 1 and {MAX_LIST_LIMIT}, got {limit}",
-        uuid4().hex,
+        correlation_id,
     )
 
 
@@ -179,14 +181,13 @@ async def create_inference_service(
     body: dict[str, Any],
     tenant_id: str = Depends(get_tenant_id),
     registry: SQLiteRegistry = Depends(require_registry),
-    x_correlation_id: str | None = Header(default=None, alias="X-Correlation-Id"),
+    correlation_id: str = Depends(get_correlation_id),
 ) -> Any:
     """创建推理服务（201，附 ``ETag``）。
 
     请求体不合法（缺少 ``spec``、kind 不匹配、未知的顶层字段等）返回 400；同名资源已存在
     返回 409。
     """
-    correlation_id = x_correlation_id or uuid4().hex
     try:
         resource = _build_inference_service(body, tenant_id)
     except ValidationError as exc:
@@ -213,6 +214,7 @@ async def list_inference_services(
     namespace: str | None = None,
     limit: int = 100,
     page_token: str | None = Query(default=None, alias="pageToken"),
+    correlation_id: str = Depends(get_correlation_id),
 ) -> Any:
     """列出推理服务（可选按 namespace 过滤），按 ``(namespace, name)`` 升序分页。
 
@@ -220,7 +222,7 @@ async def list_inference_services(
     传回（``limit`` 可以不同）；无效、被篡改或签发给另一租户 / 另一组过滤条件的
     ``pageToken`` 返回 400。
     """
-    if (invalid := _invalid_limit(limit)) is not None:
+    if (invalid := _invalid_limit(limit, correlation_id)) is not None:
         return invalid
     return await _list_response(registry, _KIND, tenant_id, namespace, page_token, limit)
 
@@ -357,6 +359,7 @@ async def delete_inference_service(
     tenant_id: str = Depends(get_tenant_id),
     registry: SQLiteRegistry = Depends(require_registry),
     namespace: str | None = None,
+    correlation_id: str = Depends(get_correlation_id),
 ) -> Any:
     """删除推理服务（受控删除语义，对齐 development-plan 第 7 章除闭环）。
 
@@ -374,7 +377,7 @@ async def delete_inference_service(
     except NotFoundError as exc:
         raise HTTPException(status_code=404, detail=f"InferenceService '{name}' not found") from exc
     except ConflictError as exc:
-        return _error_response(409, "CONFLICT", str(exc), uuid4().hex)
+        return _error_response(409, "CONFLICT", str(exc), correlation_id)
     if result.deleted:
         return Response(status_code=204)
     return JSONResponse(status_code=202, content={"name": name, "phase": "Terminating"})
@@ -393,13 +396,14 @@ async def list_resources(
     namespace: str | None = None,
     limit: int = 100,
     page_token: str | None = Query(default=None, alias="pageToken"),
+    correlation_id: str = Depends(get_correlation_id),
 ) -> Any:
     """列出某个 kind 的资源（可选按 namespace 过滤），分页规则同推理服务列表。
 
     未指定 ``kind`` 时返回空列表（P1 简化：避免全表扫描）；这时不会签发 ``nextPageToken``，
     带 ``pageToken`` 返回 400。
     """
-    if (invalid := _invalid_limit(limit)) is not None:
+    if (invalid := _invalid_limit(limit, correlation_id)) is not None:
         return invalid
     if not kind:
         if page_token:
@@ -464,7 +468,7 @@ def _error_response(
 async def start_workflow(
     body: dict[str, Any],
     tenant_id: str = Depends(get_tenant_id),
-    x_correlation_id: str | None = Header(default=None, alias="X-Correlation-Id"),
+    correlation_id: str = Depends(get_correlation_id),
 ) -> Any:
     """启动工作流运行（202 已受理）。
 
@@ -480,7 +484,6 @@ async def start_workflow(
     错误映射：校验失败 400；定义不存在 404（``NotFoundError``）；
     ``WorkflowRuntime`` 未注入 503；其余内部错误 500（统一错误信封）。
     """
-    correlation_id = x_correlation_id or uuid4().hex
     try:
         req = WorkflowStartRequest.model_validate(body)
     except ValidationError as exc:
@@ -548,7 +551,7 @@ class DecisionCallRequest(BaseModel):
 async def request_decision(
     body: dict[str, Any],
     tenant_id: str = Depends(get_tenant_id),
-    x_correlation_id: str | None = Header(default=None, alias="X-Correlation-Id"),
+    correlation_id: str = Depends(get_correlation_id),
 ) -> Any:
     """请求一次结构化决策（决策≠授权；授权由 Scheduler/Policy 完成）。
 
@@ -569,7 +572,6 @@ async def request_decision(
     ``DECISION_FALLBACK_REQUIRED``（候选在 ``details.candidates`` 中供人工审批，不自动
     采用）。两种 503 都**绝不默认放行**。其余内部错误 500（统一错误信封）。
     """
-    correlation_id = x_correlation_id or uuid4().hex
     try:
         req = DecisionCallRequest.model_validate(body)
     except ValidationError as exc:

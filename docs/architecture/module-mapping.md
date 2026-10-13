@@ -322,8 +322,8 @@
 | 数据所有权 | 无；控制平面的 SQLite 库（叠加 `docker-compose.fake-runtime.yaml` 时还有工作流存储 `forgemesh.workflows.db`）位于 compose 卷 `control-plane-data` / k8s PVC `forgemesh-control-plane-data`（pgdata 卷属目标态预置，仅 `postgres` profile 使用） |
 | 允许依赖 | — |
 | 禁止依赖 | —（约束：部署不得暗示多副本写同一 SQLite） |
-| 测试路径 | `scripts/compose_smoke.sh`（CI `compose-smoke` job：构建镜像，以两个 compose 文件启动，经网关验证无 key 返回 401，创建 `InferenceService` → `Ready` → 经网关流式对话 → 不带凭证抓取两边的 `/metrics`，带 `traceparent` 的请求在控制平面的错误信封与两边的日志中带同一个 trace-id → 删除（实例端口关闭）→ 同名重新创建并再次对话 → `PUT` 修改 `spec` → `Updating` → 以新实例回到 `Ready` 并再次对话 → 让假实例退出 → `Degraded`（`InstanceLost`）→ 重新部署、回到 `Ready` 并再次对话，控制平面的 `/metrics` 计入定期核对发现的丢失与重新部署 → 重启控制平面：资源仍在，服务经 `Degraded`（`InstanceLost`）重新部署、回到 `Ready` 并再次对话，`/metrics` 计入启动时核对发现的丢失与重新部署 → 删除）；k8s 清单无自动化测试，2026-10-13 在 kind（Calico nftables 模式）上人工验证：经网关的认证请求、网络策略的放行与拒绝、`fake` 启动器经网关的流式对话；备份恢复有人工演练清单 |
-| 状态 | compose 已实现且有测试覆盖；k8s 清单（控制平面、网关、ServiceAccount、NetworkPolicy、`fake` 启动器补丁）已人工验证、无自动化测试，`vllm-process` / `tgi-process` 启动器在 k8s 上未验证；运维文档已交付 |
+| 测试路径 | `scripts/compose_smoke.sh`（CI `compose-smoke` job：构建镜像，以两个 compose 文件启动，经网关验证无 key 返回 401，创建 `InferenceService` → `Ready` → 经网关流式对话 → 不带凭证抓取两边的 `/metrics`，带 `traceparent` 的请求在控制平面的错误信封与两边的日志中带同一个 trace-id → 删除（实例端口关闭）→ 同名重新创建并再次对话 → `PUT` 修改 `spec` → `Updating` → 以新实例回到 `Ready` 并再次对话 → 让假实例退出 → `Degraded`（`InstanceLost`）→ 重新部署、回到 `Ready` 并再次对话，控制平面的 `/metrics` 计入定期核对发现的丢失与重新部署 → 重启控制平面：资源仍在，服务经 `Degraded`（`InstanceLost`）重新部署、回到 `Ready` 并再次对话，`/metrics` 计入启动时核对发现的丢失与重新部署 → 删除）；k8s 清单无自动化测试，2026-10-13 在 kind（Calico nftables 模式）上人工验证：经网关的认证请求、网络策略的放行与拒绝、Prometheus 抓取两边 `/metrics` 的策略（只放行带标签的 Prometheus Pod）与 README 中的抓取配置、`fake` 启动器经网关的闭环（流式对话、`PATCH` 更新、`/fake/exit` 演练实例丢失、Pod 重建后重新部署）、事件 webhook 的补丁与出站策略；`tgi-process` 只以替身命令验证了启动器在 Pod 中的机制（实例记录、私有目录、控制平面被杀死后重新部署）；备份恢复有人工演练清单 |
+| 状态 | compose 已实现且有测试覆盖；k8s 清单（控制平面、网关、ServiceAccount、NetworkPolicy、`fake` 启动器补丁、指标抓取与事件 webhook 的可选清单）已人工验证、无自动化测试，`vllm-process` / `tgi-process` 启动器在 k8s 上未以真实的 vLLM / TGI 验证；运维文档已交付 |
 | 演进动作 | k8s 清单的自动化验证（如 CI 中的 kind 集群）与镜像发布；A1.5 已核对部署文档含单实例约束；目标态 PostgreSQL 部署属阶段 F |
 
 ### 2.19 命令行工具（cli）

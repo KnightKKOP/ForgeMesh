@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -35,6 +36,8 @@ type Limiter struct {
 	buckets map[string]*bucket
 	now     func() time.Time // 注入式时钟，便于单元测试与时间推进
 	lastGC  time.Time
+
+	rejected atomic.Uint64
 }
 
 // bucket 表示单个 key 的令牌桶状态。
@@ -92,6 +95,7 @@ func (l *Limiter) Allow(key string) (allowed bool, retryAfter time.Duration) {
 		return true, 0
 	}
 
+	l.rejected.Add(1)
 	// 令牌不足：计算补足到 1 个令牌所需的等待时长。
 	deficit := 1 - b.tokens
 	retry := time.Duration(deficit / l.rps * float64(time.Second))
@@ -101,6 +105,9 @@ func (l *Limiter) Allow(key string) (allowed bool, retryAfter time.Duration) {
 	}
 	return false, retry
 }
+
+// Rejected 返回 Allow 累计拒绝的次数（供 /metrics 的 rate_limited_total）。
+func (l *Limiter) Rejected() uint64 { return l.rejected.Load() }
 
 // maybeGC 惰性回收长时间空闲的桶。调用方必须持有锁。
 func (l *Limiter) maybeGC(now time.Time) {

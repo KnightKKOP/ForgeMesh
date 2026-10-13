@@ -4,6 +4,8 @@
 //
 //	GET  /healthz                              存活探针（无中间件）
 //	GET  /readyz                               就绪探针（请求控制平面 /readyz，无中间件）
+//	GET  /metrics                              Prometheus 指标（无认证/限流，只含聚合数据，
+//	                                          见 metrics.Gateway）
 //	ANY  /api/v1/resources[/...]               反代到 Python 控制平面
 //	ANY  /api/v1/inference-services[/...]      反代到 Python 控制平面
 //	ANY  /api/v1/workflows[/...]               反代到 Python 控制平面
@@ -15,9 +17,10 @@
 //	                                          路径；要求 read 作用域）
 //	ANY  /api/v1/inference/{svc}/chat          同上，用于不带命名空间的服务
 //
-// 中间件链（执行顺序）：Recovery → Correlation → Authenticate → RateLimit →
+// 中间件链（执行顺序）：Observe → Recovery → Correlation → Authenticate → RateLimit →
 // LimitRequestBody → Route。
-// Recovery 作为最外层兜底全量请求；探针刻意不经过认证/限流，保证健康检查可用。
+// Observe 与 Recovery 包住全量请求（Observe 按路由类别记录请求数与耗时，Recovery 兜底
+// panic）；探针与 /metrics 刻意不经过认证/限流，保证健康检查与抓取可用。
 // 认证模式见 config.AuthModeAPIKey / config.AuthModeDev 与 ADR-014。
 package router
 
@@ -30,6 +33,7 @@ import (
 
 	"github.com/Mekoforge/ForgeMesh/gateway/internal/config"
 	"github.com/Mekoforge/ForgeMesh/gateway/internal/health"
+	"github.com/Mekoforge/ForgeMesh/gateway/internal/metrics"
 	"github.com/Mekoforge/ForgeMesh/gateway/internal/middleware"
 	"github.com/Mekoforge/ForgeMesh/gateway/internal/stream"
 	"github.com/Mekoforge/ForgeMesh/gateway/internal/upstream"
@@ -37,6 +41,13 @@ import (
 
 // apiPrefix 是所有对外 API 的版本前缀。
 const apiPrefix = "/api/v1/"
+
+// 不经过 API 中间件链的顶层路由。
+const (
+	healthzPath = "/healthz"
+	readyzPath  = "/readyz"
+	metricsPath = "/metrics"
+)
 
 // proxyRoutes 是需要反代到 Python 控制平面的资源类路由前缀。
 var proxyRoutes = []string{
@@ -118,14 +129,51 @@ func New(cfg config.Config, logger *log.Logger) (*Router, error) {
 		middleware.LimitRequestBody(maxBody),
 	)
 
-	// 顶层路由：探针不经过鉴权/限流。
+	m := metrics.NewGateway()
+	proxy.SetMetrics(m)
+	resolver.SetMetrics(m)
+	streamProxy.SetMetrics(m)
+	m.WatchRateLimiter(limiter.Rejected)
+	m.WatchInstances(resolver.InstanceStates)
+
+	// 顶层路由：探针与 /metrics 不经过鉴权/限流。
 	root := http.NewServeMux()
-	root.HandleFunc("/healthz", hc.Live)
-	root.HandleFunc("/readyz", hc.Ready)
+	root.HandleFunc(healthzPath, hc.Live)
+	root.HandleFunc(readyzPath, hc.Ready)
+	root.Handle(metricsPath, m)
 	root.Handle(apiPrefix, apiHandler)
 
-	// Recovery 作为最外层，兜底全量请求的 panic。
-	return &Router{handler: middleware.Recovery(logger)(root)}, nil
+	// Recovery 兜底全量请求的 panic；Observe 在它外层，兜底返回的 500 也被计入。
+	return &Router{handler: middleware.Chain(root,
+		middleware.Observe(m, classifier(root, apiMux)),
+		middleware.Recovery(logger),
+	)}, nil
+}
+
+// classifier 返回按路由表确定请求路由类别的函数。ServeMux.Handler 只查找、不执行，与实际
+// 分发的匹配规则一致；没有匹配的请求（含 /api/v1/ 下的未知路径）归为 unmatched。
+func classifier(root, api *http.ServeMux) func(*http.Request) metrics.Route {
+	routes := map[string]metrics.Route{
+		healthzPath:                   metrics.RouteProbe,
+		readyzPath:                    metrics.RouteProbe,
+		metricsPath:                   metrics.RouteMetrics,
+		streamRoutePattern:            metrics.RouteInference,
+		streamWithoutNamespacePattern: metrics.RouteInference,
+	}
+	for _, p := range proxyRoutes {
+		routes[p] = metrics.RouteControlPlane
+		routes[p+"/"] = metrics.RouteControlPlane
+	}
+	return func(r *http.Request) metrics.Route {
+		_, pattern := root.Handler(r)
+		if pattern == apiPrefix {
+			_, pattern = api.Handler(r)
+		}
+		if route, ok := routes[pattern]; ok {
+			return route
+		}
+		return metrics.RouteUnmatched
+	}
 }
 
 // newAuthenticator 按配置构造入口认证器；未知模式视为配置错误，绝不退化为信任请求头。

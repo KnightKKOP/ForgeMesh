@@ -13,6 +13,7 @@ import (
 	"net/url"
 	"time"
 
+	"github.com/Mekoforge/ForgeMesh/gateway/internal/metrics"
 	"github.com/Mekoforge/ForgeMesh/gateway/internal/middleware"
 )
 
@@ -35,6 +36,7 @@ type Client struct {
 	proxy             *httputil.ReverseProxy
 	correlationHeader string
 	tenantHeader      string
+	metrics           *metrics.Gateway
 }
 
 // New 构造反向代理客户端。
@@ -76,12 +78,22 @@ func New(target *url.URL, correlationHeader, tenantHeader string, logger *log.Lo
 				}
 			}
 		},
+		ModifyResponse: func(resp *http.Response) error {
+			if resp.StatusCode >= 500 {
+				c.metrics.UpstreamError(metrics.UpstreamControlPlane, metrics.ErrorStatus)
+			}
+			return nil
+		},
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
 			var tooLarge *http.MaxBytesError
 			if errors.As(err, &tooLarge) {
 				middleware.WriteError(w, r, http.StatusRequestEntityTooLarge, "REQUEST_TOO_LARGE",
 					fmt.Sprintf("request body exceeds %d bytes", tooLarge.Limit))
 				return
+			}
+			// 客户端已断开时请求随之取消，不是控制平面的问题。
+			if r.Context().Err() == nil {
+				c.metrics.UpstreamError(metrics.UpstreamControlPlane, metrics.ErrorConnect)
 			}
 			logger.Printf("upstream proxy error: corr=%s path=%s err=%v", r.Header.Get(c.correlationHeader), r.URL.Path, err)
 			http.Error(w, http.StatusText(http.StatusBadGateway), http.StatusBadGateway)
@@ -90,6 +102,9 @@ func New(target *url.URL, correlationHeader, tenantHeader string, logger *log.Lo
 
 	return c
 }
+
+// SetMetrics 设置记录控制平面错误（5xx 响应与连接失败）的指标，须在开始处理请求前调用。
+func (c *Client) SetMetrics(m *metrics.Gateway) { c.metrics = m }
 
 // ServeHTTP 实现 http.Handler，将请求反代到上游。
 func (c *Client) ServeHTTP(w http.ResponseWriter, r *http.Request) {

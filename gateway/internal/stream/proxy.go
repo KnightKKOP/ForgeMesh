@@ -31,6 +31,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/Mekoforge/ForgeMesh/gateway/internal/metrics"
 	"github.com/Mekoforge/ForgeMesh/gateway/internal/upstream"
 )
 
@@ -62,6 +63,7 @@ type Proxy struct {
 	tenantHeader string
 	client       *http.Client
 	logger       *log.Logger
+	metrics      *metrics.Gateway
 	rr           atomic.Uint64 // 轮询计数器
 }
 
@@ -105,8 +107,12 @@ func New(resolver Resolver, tenantHeader string, policy AddressPolicy, logger *l
 	}
 }
 
+// SetMetrics 设置记录首字节时间与实例错误的指标，须在开始处理请求前调用。
+func (p *Proxy) SetMetrics(m *metrics.Gateway) { p.metrics = m }
+
 // ServeHTTP 解析 {ns}/{svc} → 选择实例 → 转发单个流式请求。
 func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	start := time.Now()
 	svc := upstream.ServiceRef{Namespace: r.PathValue("ns"), Name: r.PathValue("svc")}
 	if svc.Name == "" {
 		writeJSONError(w, http.StatusBadRequest, "MISSING_SERVICE", "路径缺少推理服务名 {svc}")
@@ -137,16 +143,17 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		p.logger.Printf("stream invalid endpoint: corr=%s svc=%s endpoint=%q protocol=%q err=%v",
 			r.Header.Get("X-Correlation-ID"), svc, endpoint.URL, endpoint.Protocol, err)
 		p.resolver.ReportFailure(endpoint.URL)
+		p.metrics.UpstreamError(metrics.UpstreamInstance, metrics.ErrorInvalidEndpoint)
 		writeJSONError(w, http.StatusBadGateway, "INVALID_UPSTREAM",
 			"实例地址或协议非法: "+endpoint.URL)
 		return
 	}
 
-	p.forward(w, r, buildUpstreamURL(target, path, r.URL.RawQuery), endpoint.URL)
+	p.forward(w, r, buildUpstreamURL(target, path, r.URL.RawQuery), endpoint.URL, start)
 }
 
-// forward 执行单次流式转发，并依据结果向 Resolver 上报健康度。
-func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, upstreamURL, endpoint string) {
+// forward 执行单次流式转发，并依据结果向 Resolver 上报健康度；start 是开始处理请求的时间。
+func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, upstreamURL, endpoint string, start time.Time) {
 	// 使用客户端请求的 context：客户端断开时，Go 运行时会取消该 context，
 	// 进而取消这里的上游请求，实现“断连即取消上游”。
 	ctx := r.Context()
@@ -174,9 +181,13 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, upstreamURL, end
 			r.Header.Get("X-Correlation-ID"), r.URL.Path, endpoint, err)
 		p.resolver.ReportFailure(endpoint)
 		if errors.Is(err, ErrAddressNotAllowed) {
+			p.metrics.UpstreamError(metrics.UpstreamInstance, metrics.ErrorAddressNotAllowed)
 			writeJSONError(w, http.StatusBadGateway, "INSTANCE_ADDRESS_NOT_ALLOWED",
 				"实例地址不在允许连接的范围内: "+endpoint)
 			return
+		}
+		if ctx.Err() == nil {
+			p.metrics.UpstreamError(metrics.UpstreamInstance, metrics.ErrorConnect)
 		}
 		http.Error(w, http.StatusText(http.StatusBadGateway), http.StatusBadGateway)
 		return
@@ -188,7 +199,7 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, upstreamURL, end
 	upstreamFailed := resp.StatusCode >= 500
 	if upstreamFailed {
 		p.resolver.ReportFailure(endpoint)
-
+		p.metrics.UpstreamError(metrics.UpstreamInstance, metrics.ErrorStatus)
 	}
 
 	// 透传上游头，但剔除 hop-by-hop 头，避免连接语义污染。
@@ -200,7 +211,8 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, upstreamURL, end
 		dst[k] = append([]string(nil), vs...)
 	}
 	// 成功响应强制流式语义；错误响应保留实例的 Content-Type，客户端才能按格式解析错误体。
-	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+	succeeded := resp.StatusCode >= 200 && resp.StatusCode < 300
+	if succeeded {
 		dst.Set("Content-Type", "text/event-stream")
 	}
 	dst.Set("Cache-Control", "no-cache")
@@ -215,6 +227,8 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, upstreamURL, end
 		flusher.Flush() // 尽早把响应头推给客户端，建立流通道
 	}
 
+	// 首字节时间只统计成功的流：错误响应体不是推理输出。
+	awaitingFirstByte := succeeded
 	buf := make([]byte, readBufferSize)
 	for {
 		n, readErr := resp.Body.Read(buf)
@@ -227,6 +241,10 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, upstreamURL, end
 			if flusher != nil {
 				flusher.Flush()
 			}
+			if awaitingFirstByte {
+				awaitingFirstByte = false
+				p.metrics.ObserveFirstByte(time.Since(start))
+			}
 		}
 		if readErr != nil {
 			// 客户端断开导致上游请求被取消：属客户端行为，不计实例健康度。
@@ -238,6 +256,7 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, upstreamURL, end
 				p.logger.Printf("stream read error: corr=%s path=%s endpoint=%s err=%v",
 					r.Header.Get("X-Correlation-ID"), r.URL.Path, endpoint, readErr)
 				p.resolver.ReportFailure(endpoint)
+				p.metrics.UpstreamError(metrics.UpstreamInstance, metrics.ErrorBody)
 				return
 			}
 			// 流完整读尽：实例工作正常（5xx 响应已单独计失败，不覆盖）。

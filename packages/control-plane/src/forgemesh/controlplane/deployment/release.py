@@ -1,5 +1,5 @@
-"""清理资源的部署：取消进行中的部署运行并停止实例（删除资源时、重新部署之前，以及释放
-分配之前）。"""
+"""清理资源的部署：取消进行中的部署运行并停止实例（删除资源时、重新部署之前，以及释放或
+回收分配之前）。"""
 
 from __future__ import annotations
 
@@ -28,7 +28,9 @@ class DeploymentReleaser:
     * 之后实例仍可能在运行（服务已 ``Ready``，或补偿失败）：调用 ``launcher.stop``。
 
     没有部署运行（资源没有进入过 ``Preparing``）时什么也不做。任何一步失败都抛出异常，
-    协调器保持当前 phase 并稍后重试；取消与停止都是幂等的。
+    协调器保持当前 phase 并稍后重试；取消与停止都是幂等的。:meth:`release_uid` 只凭 uid
+    做同样的清理，供回收归属资源已不存在的分配（见
+    :func:`~forgemesh.controlplane.deployment.recovery.reclaim_orphaned_allocations`）。
 
     Args:
         runtime: 执行部署工作流的运行时（须实现 ``find_runs``，``get_run`` 须返回步骤输出）。
@@ -42,12 +44,20 @@ class DeploymentReleaser:
     async def release(self, resource: Resource) -> None:
         """取消 ``resource`` 的全部部署运行并停止它们的实例；失败时抛出异常。"""
         meta = resource.metadata
-        if not meta.uid:
-            return
-        for deployment in await find_deployment_runs(self._runtime, meta.uid):
-            await self._release_run(resource, deployment.run)
+        if meta.uid:
+            owner = f"kind={resource.kind} namespace={meta.namespace} name={meta.name}"
+            await self._release(meta.uid, f"{owner} uid={meta.uid}")
 
-    async def _release_run(self, resource: Resource, run: RunInfo) -> None:
+    async def release_uid(self, uid: str) -> None:
+        """取消 uid 为 ``uid`` 的资源的全部部署运行并停止它们的实例（资源本身可以已经不存在）；
+        失败时抛出异常。"""
+        await self._release(uid, f"uid={uid}")
+
+    async def _release(self, uid: str, owner: str) -> None:
+        for deployment in await find_deployment_runs(self._runtime, uid):
+            await self._release_run(owner, deployment.run)
+
+    async def _release_run(self, owner: str, run: RunInfo) -> None:
         if not run.terminal:
             await self._runtime.cancel(run.run_id, cleanup=True)
             run = await self._runtime.get_run(run.run_id)
@@ -56,18 +66,13 @@ class DeploymentReleaser:
             return
         running = await self._launcher.is_running(instance.instance_id)
         await self._launcher.stop(instance.instance_id)
-        if not running:
-            return
-        meta = resource.metadata
-        logger.info(
-            "instance stopped: instance_id=%s kind=%s namespace=%s name=%s uid=%s run_id=%s",
-            instance.instance_id,
-            resource.kind,
-            meta.namespace,
-            meta.name,
-            meta.uid,
-            run.run_id,
-        )
+        if running:
+            logger.info(
+                "instance stopped: instance_id=%s %s run_id=%s",
+                instance.instance_id,
+                owner,
+                run.run_id,
+            )
 
 
 __all__ = ["DeploymentReleaser"]

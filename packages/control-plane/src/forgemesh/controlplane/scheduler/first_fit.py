@@ -14,7 +14,8 @@
   需求的 Active 分配时直接复用（例如 spec 其他字段变更产生的新 generation），不满足
   时报冲突，须先释放；
 * 不设租约（``lease_until`` 为 ``None``）：协调器在删除资源、部署失败（停止实例之后）与
-  加速器申请变化时释放分配。
+  加速器申请变化时释放分配，归属资源已不存在的分配由控制器回收（见
+  :func:`~forgemesh.controlplane.deployment.reclaim_orphaned_allocations`）。
 """
 
 from __future__ import annotations

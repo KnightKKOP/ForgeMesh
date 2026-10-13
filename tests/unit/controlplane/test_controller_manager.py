@@ -2,8 +2,8 @@
 
 覆盖改进计划 4.10 的验收项：新资源在有限时间内得到带原因的 status；重启后
 从注册中心重建工作队列；同一 generation 不重复产生副作用。另覆盖 status 回写
-的 CAS 冲突处理、去重键的登记时机、受控删除、重新排队、失败退避、定期核对实例
-与优雅停止。
+的 CAS 冲突处理、去重键的登记时机、受控删除、重新排队、失败退避、定期核对实例、
+回收孤立的分配与优雅停止。
 """
 
 from __future__ import annotations
@@ -549,6 +549,46 @@ def test_a_running_manager_checks_instances_periodically_until_it_stops(caplog) 
     assert added and set(added) == {_key()}
     [failure] = [r for r in caplog.records if r.getMessage() == "controller instance check failed"]
     assert str(failure.exc_info[1]) == "launcher unavailable"
+
+
+@pytest.mark.unit
+def test_a_manager_reclaims_allocations_when_it_starts_and_after_every_resync(caplog) -> None:
+    """启动时回收一次孤立的分配，失败时记日志、照常启动；之后每次周期性全量同步之后再回收
+    一次，停止之后不再回收。"""
+    calls = 0
+
+    async def reclaim() -> list[str]:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("database is locked")
+        return []
+
+    async def scenario() -> tuple[int, int]:
+        registry = SQLiteRegistry()
+        manager = _manager(registry, reclaim=reclaim, resync_period=0.01)
+        await manager.start()
+        at_start = calls
+        try:
+
+            async def reclaimed_again() -> bool:
+                return calls >= 3
+
+            await _eventually(reclaimed_again)
+        finally:
+            await manager.stop()
+        stopped_after = calls
+        await asyncio.sleep(0.05)
+        await registry.close()
+        return at_start, stopped_after
+
+    at_start, stopped_after = _run(scenario())
+    assert at_start == 1
+    assert calls == stopped_after
+    [failure] = [
+        r for r in caplog.records if r.getMessage() == "controller allocation reclaim failed"
+    ]
+    assert str(failure.exc_info[1]) == "database is locked"
 
 
 @pytest.mark.unit

@@ -8,6 +8,7 @@
 * 同一资源至多一个 Active 分配、同一设备至多属于一个 Active 分配，冲突时不写库；
 * 同名资源在不同命名空间 / 租户中各自持有分配；
 * 释放后设备回到空闲；约束由数据库强制（直接写库、独立连接并发、重启后依然成立）；
+* 归属资源已不存在的 Active 分配列为孤立的分配，只在归属资源仍不存在时标记为 ``Expired``；
 * 打开存量库时以按租户的唯一索引取代旧索引；
 * 持有 Active 分配的资源无论处于哪个 phase，删除都先进入 ``Terminating``。
 
@@ -19,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import sqlite3
 from collections.abc import Iterator
+from typing import Any
 
 import pytest
 from forgemesh.controlplane.registry import DEFAULT_RELEASE_FINALIZER, SQLiteRegistry
@@ -74,6 +76,14 @@ def _put(registry: SQLiteRegistry, **kwargs) -> ResourceRef:
     service = _service(**kwargs)
     asyncio.run(registry.put(service))
     return _ref(service)
+
+
+def _allocate(registry: SQLiteRegistry, device_id: str, **kwargs) -> dict[str, Any]:
+    """创建一个推理服务，为它建立持有 ``device_id`` 的 Active 分配，返回分配记录。"""
+    owner = _put(registry, **kwargs)
+    device = AllocatedDevice(node_id="node-a", device_id=device_id)
+    tenant_id = kwargs.get("tenant_id", TENANT)
+    return asyncio.run(registry.create_allocation(tenant_id, owner, f"{owner.uid}:1", [device]))
 
 
 @pytest.fixture
@@ -222,6 +232,57 @@ def test_release_active_allocation_releases_by_owner_uid_within_the_tenant(regis
     [released] = asyncio.run(registry.list_allocations(TENANT))
     assert released["status"] == "Released"
     assert released["released_at"] is not None
+
+
+@pytest.mark.unit
+def test_active_allocations_whose_owner_no_longer_exists_are_orphaned(registry):
+    """跨租户列出归属资源（同租户、同 uid）已不存在的 Active 分配：资源仍存在（无论 phase）
+    或分配已释放时不列出；同名资源以新 uid 重建时，原资源的分配仍是孤立的。"""
+    _allocate(registry, "gpu-0", phase=InferencePhase.FAILED)
+    deleted = _allocate(registry, "gpu-1", name="svc-2", uid="uid-2")
+    foreign = _allocate(registry, "gpu-2", name="svc-3", uid="uid-3", tenant_id=OTHER_TENANT)
+    replaced = _allocate(registry, "gpu-3", name="svc-4", uid="uid-4")
+    released = _allocate(registry, "gpu-4", name="svc-5", uid="uid-5")
+    asyncio.run(registry.release_allocation(released["id"], TENANT))
+    for name, tenant_id in (
+        ("svc-2", TENANT),
+        ("svc-3", OTHER_TENANT),
+        ("svc-4", TENANT),
+        ("svc-5", TENANT),
+    ):
+        asyncio.run(registry.delete(KIND, "team-a", name, tenant_id))
+    _put(registry, name="svc-4", uid="uid-6")
+
+    orphaned = asyncio.run(registry.list_orphaned_allocations())
+
+    by_id = sorted([deleted, foreign, replaced], key=lambda record: record["id"])
+    assert sorted(orphaned, key=lambda record: record["id"]) == by_id
+
+
+@pytest.mark.unit
+def test_an_allocation_expires_as_an_orphan_only_while_its_owner_is_gone(registry):
+    """孤立的分配标记为 Expired（记下时间），设备随之空闲，重复调用不再修改；归属资源仍存在
+    的分配与已释放的分配不修改。"""
+    held = _allocate(registry, "gpu-0")
+    orphan = _allocate(registry, "gpu-1", name="svc-2", uid="uid-2")
+    released = _allocate(registry, "gpu-2", name="svc-3", uid="uid-3")
+    asyncio.run(registry.release_allocation(released["id"], TENANT))
+    for name in ("svc-2", "svc-3"):
+        asyncio.run(registry.delete(KIND, "team-a", name, TENANT))
+
+    assert asyncio.run(registry.expire_orphaned_allocation(orphan["id"])) is True
+    assert asyncio.run(registry.expire_orphaned_allocation(orphan["id"])) is False
+    assert asyncio.run(registry.expire_orphaned_allocation(held["id"])) is False
+    assert asyncio.run(registry.expire_orphaned_allocation(released["id"])) is False
+
+    records = {record["id"]: record for record in asyncio.run(registry.list_allocations(TENANT))}
+    assert {allocation_id: record["status"] for allocation_id, record in records.items()} == {
+        held["id"]: "Active",
+        orphan["id"]: "Expired",
+        released["id"]: "Released",
+    }
+    assert records[orphan["id"]]["released_at"] is not None
+    assert asyncio.run(registry.allocated_devices()) == {GPU0}
 
 
 @pytest.mark.unit

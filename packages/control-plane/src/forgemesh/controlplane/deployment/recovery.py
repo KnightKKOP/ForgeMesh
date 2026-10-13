@@ -1,4 +1,5 @@
-"""核对已部署的实例：不再对外宣告已不在运行的实例，交给协调器重新部署。
+"""核对已部署的实例：不再对外宣告已不在运行的实例，交给协调器重新部署；回收归属资源已不
+存在的分配。
 
 实例随控制平面进程结束的启动器（本进程内的假实例、子进程）在重启之后不认识重启之前的
 实例；实例也可能在运行中退出。``Ready`` 服务的 ``status.endpoints`` 却仍指向它们，网关会
@@ -11,6 +12,15 @@
 
 核对只问启动器实例是否在运行（``is_running``），不探测实例能否服务请求：进程仍在、却
 不再响应的实例不会被发现。
+
+经 ``request_delete`` 删除的资源在物理删除之前释放分配；绕过受控删除的 ``delete()``，或
+之前的版本，可能留下归属资源已不存在的 Active 分配，它的设备再也分不出去。
+:func:`reclaim_orphaned_allocations` 停止这些分配所属 uid 的部署，再把分配标记为
+``Expired``；控制器管理器在启动时与每次全量同步之后调用它。回收不用租约
+（``lease_until``）：控制器是唯一的写者（ADR-013），没有需要别的进程接管的租约，续约只会
+增加写入，控制平面停机较久之后租约到期的却是仍在服务的部署，回收前同样要确认归属资源。
+资源仍存在的分配不在回收之列，``Failed`` 服务的分配由协调器在停止实例之后释放（见
+:mod:`forgemesh.controlplane.reconciler.core`）。
 """
 
 from __future__ import annotations
@@ -25,6 +35,7 @@ from .launcher import RuntimeLauncher
 
 if TYPE_CHECKING:  # pragma: no cover - 仅静态类型检查使用
     from ..registry import ResourceKey, SQLiteRegistry
+    from .release import DeploymentReleaser
 
 logger = logging.getLogger(__name__)
 
@@ -139,4 +150,51 @@ async def check_instances(
     return found
 
 
-__all__ = ["DEFAULT_INSTANCE_CHECK_INTERVAL_SECONDS", "INSTANCE_LOST_REASON", "check_instances"]
+async def reclaim_orphaned_allocations(
+    registry: SQLiteRegistry, releaser: DeploymentReleaser
+) -> list[str]:
+    """回收归属资源（同租户、同 uid）已不存在的 Active 分配，返回回收的分配 id。
+
+    逐个分配：先经 ``releaser`` 取消这个 uid 的部署运行、停止实例，再把分配标记为
+    ``Expired``，设备随之空闲。停止失败时保留分配，下次回收时重试；uid 的部署运行也已不在
+    （如工作流数据库被重置）时无从停止实例，分配照样回收。标记与再次确认归属资源不存在在同一
+    条语句中完成。
+    """
+    reclaimed: list[str] = []
+    for allocation in await registry.list_orphaned_allocations():
+        allocation_id = allocation["id"]
+        tenant_id = allocation["tenant_id"]
+        uid = allocation["resource_id"]
+        try:
+            await releaser.release_uid(uid)
+        except Exception as exc:  # noqa: BLE001 - 保留分配，下次回收时重试
+            logger.warning(
+                "orphaned allocation kept, its deployment could not be stopped: "
+                "allocation_id=%s tenant_id=%s uid=%s error=%s",
+                allocation_id,
+                tenant_id,
+                uid,
+                exc,
+            )
+            continue
+        if not await registry.expire_orphaned_allocation(allocation_id):
+            continue
+        devices = ", ".join(f"{d['node_id']}/{d['device_id']}" for d in allocation["devices"])
+        logger.warning(
+            "orphaned allocation reclaimed, its owner no longer exists: allocation_id=%s "
+            "tenant_id=%s uid=%s devices=%s",
+            allocation_id,
+            tenant_id,
+            uid,
+            devices or "none",
+        )
+        reclaimed.append(allocation_id)
+    return reclaimed
+
+
+__all__ = [
+    "DEFAULT_INSTANCE_CHECK_INTERVAL_SECONDS",
+    "INSTANCE_LOST_REASON",
+    "check_instances",
+    "reclaim_orphaned_allocations",
+]

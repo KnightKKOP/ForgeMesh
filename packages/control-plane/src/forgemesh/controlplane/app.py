@@ -29,7 +29,8 @@
   中。启动时先恢复未完成的部署，再把实例已不在运行的 ``Ready`` 服务转为 ``Degraded``
   （控制器随后重新部署它们），然后才启动控制器；控制器运行中每隔
   ``FORGEMESH_INSTANCE_CHECK_INTERVAL_SECONDS`` 秒（默认 10，不论是否选择启动器都校验）
-  再核对一次实例。关闭时依次停止控制器、工作流运行时、启动器（其实例随之停止）。
+  再核对一次实例，启动时与每次全量同步之后停止归属资源已不存在的分配所属的部署、让这些
+  分配过期。关闭时依次停止控制器、工作流运行时、启动器（其实例随之停止）。
   ``POST /workflows`` 不使用这个运行时（仍返回 503）。未设置时不部署，协调器在分配之前
   即报告 ``WorkflowRuntimeUnavailable``。
 * **无导入副作用**：数据库在应用启动（lifespan）时才打开，导入本模块不会
@@ -78,6 +79,7 @@ from .deployment import (
     check_instances,
     instance_check_interval_from_env,
     launcher_from_env,
+    reclaim_orphaned_allocations,
 )
 from .reconciler import ProcessedKeyStore, ReconciliationController
 from .scheduler import INVENTORY_FILE_ENV, FirstFitScheduler, inventory_from_env
@@ -208,12 +210,18 @@ def _build_controller(
     instance_check = (
         functools.partial(check_instances, registry, launcher) if launcher is not None else None
     )
+    reclaim = (
+        functools.partial(reclaim_orphaned_allocations, registry, release)
+        if release is not None
+        else None
+    )
     return ControllerManager(
         registry,
         reconciler,
         poll_interval=CONTROLLER_POLL_INTERVAL_SECONDS,
         instance_check=instance_check,
         instance_check_interval=instance_check_interval,
+        reclaim=reclaim,
     )
 
 

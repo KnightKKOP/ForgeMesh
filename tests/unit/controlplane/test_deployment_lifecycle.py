@@ -15,7 +15,8 @@
   申请变化、持有的设备不再满足时释放分配、重新分配；
 * ``Ready`` 的服务 spec 变化：经 ``Updating`` 停止旧实例、部署新的 spec 后回到 ``Ready``；
   更新失败时进入 ``Failed``；策略拒绝更新时服务保持原样；
-* 部署中途或 ``Ready`` 之后删除资源：取消运行、停止实例、释放分配、物理删除；
+* 部署中途或 ``Ready`` 之后删除资源：取消运行、停止实例、释放分配、物理删除；绕过受控
+  删除的资源，回收时停止它的实例、让分配过期；
 * 在后台运行的控制器自行完成部署与删除，定期核对实例时发现实例退出，自行重新部署。
 
 测试以 ``asyncio.run`` 驱动异步方法，不依赖 pytest-asyncio。“重启”在同一个事件循环中
@@ -48,6 +49,7 @@ from forgemesh.controlplane.deployment import (
     deployment_run_key,
     find_deployment_runs,
     launched_instance,
+    reclaim_orphaned_allocations,
 )
 from forgemesh.controlplane.reconciler import (
     REDEPLOY_BACKOFF_RESET_SECONDS,
@@ -246,12 +248,13 @@ class _ControlPlane:
             policy = DefaultPolicyEngine(
                 authz_rules=[AuthzRule(action="reconcile", effect="allow")]
             )
+        release = DeploymentReleaser(self.runtime, launcher)
         reconciler = ReconciliationController(
             self.registry,
             policy,
             scheduler=FirstFitScheduler(self.registry, inventory or _inventory()),
             workflow_runtime=self.runtime,
-            release_provider=DeploymentReleaser(self.runtime, launcher),
+            release_provider=release,
             processed_store=self.processed,
             record_dedup_keys=False,
             workflow_poll_interval=POLL_SECONDS,
@@ -264,6 +267,7 @@ class _ControlPlane:
             poll_interval=POLL_SECONDS,
             instance_check=functools.partial(check_instances, self.registry, launcher),
             instance_check_interval=instance_check_interval,
+            reclaim=functools.partial(reclaim_orphaned_allocations, self.registry, release),
         )
         self.recovered: list[str] = []
         self.lost: list[ResourceKey] = []
@@ -1332,6 +1336,38 @@ def test_deleting_a_ready_service_stops_its_instance_and_releases_its_allocation
             assert launcher.running == {}
             assert (await plane.registry.get_allocation(allocation["id"]))["status"] == "Released"
             await _assert_gone(plane)
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("stop_failures", [0, 1])
+def test_the_allocation_of_a_service_removed_without_its_release_is_reclaimed(stop_failures):
+    """资源绕过受控删除被物理删除（``delete()``）：回收孤立的分配先停止它的实例，再让分配
+    过期（设备空闲）；停止失败时保留分配，下一次回收重试。资源仍存在时回收不触碰它的分配。"""
+    launcher = _ScriptedLauncher()
+
+    async def scenario() -> None:
+        async with _ControlPlane(":memory:", launcher) as plane:
+            await plane.registry.put(_service())
+            await plane.deploy()
+            [instance] = launcher.running.values()
+            [allocation] = await plane.registry.list_allocations(TENANT)
+            await plane.manager.reclaim()
+            assert launcher.running == {instance.instance_id: instance}
+            assert await plane.registry.list_allocations(TENANT) == [allocation]
+
+            await plane.registry.delete(KIND, NAMESPACE, NAME, TENANT)
+            launcher.stop_failures = stop_failures
+            for _ in range(stop_failures):
+                await plane.manager.reclaim()
+                assert await plane.registry.get_active_allocation(UID, TENANT) is not None
+            await plane.manager.reclaim()
+
+            assert launcher.stops == [instance.instance_id]
+            assert launcher.running == {}
+            assert (await plane.registry.get_allocation(allocation["id"]))["status"] == "Expired"
+            assert await plane.registry.allocated_devices() == frozenset()
 
     asyncio.run(scenario())
 

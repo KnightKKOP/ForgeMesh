@@ -6,7 +6,8 @@
 * :mod:`.release` —— 删除资源或部署新的 spec 之前取消部署、停止实例的
   :class:`DeploymentReleaser`；
 * :mod:`.recovery` —— 把实例已不在运行的 ``Ready`` 服务转为 ``Degraded`` 的
-  :func:`check_instances`（控制平面启动时与运行中定期调用）；
+  :func:`check_instances`（控制平面启动时与运行中定期调用），以及回收归属资源已不存在的
+  分配的 :func:`reclaim_orphaned_allocations`；
 * :mod:`.fake` —— 在控制平面进程内为每个实例提供 OpenAI 兼容桩服务的
   :class:`FakeLauncher`（CI 与本地开发）；
 * :mod:`.vllm_process` —— 把每个实例作为本机 vLLM 子进程运行的 :class:`VLLMProcessLauncher`；
@@ -30,7 +31,12 @@ from .config import (
 from .fake import FakeLauncher
 from .launcher import LaunchedInstance, LaunchRequest, RuntimeLauncher
 from .memory import InMemoryLauncher
-from .recovery import DEFAULT_INSTANCE_CHECK_INTERVAL_SECONDS, INSTANCE_LOST_REASON, check_instances
+from .recovery import (
+    DEFAULT_INSTANCE_CHECK_INTERVAL_SECONDS,
+    INSTANCE_LOST_REASON,
+    check_instances,
+    reclaim_orphaned_allocations,
+)
 from .release import DeploymentReleaser
 from .vllm_process import VLLMProcessLauncher
 from .workflow import (
@@ -76,4 +82,5 @@ __all__ = [
     "instance_check_interval_from_env",
     "launched_instance",
     "launcher_from_env",
+    "reclaim_orphaned_allocations",
 ]

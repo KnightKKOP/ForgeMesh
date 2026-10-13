@@ -1,6 +1,6 @@
 """控制平面应用入口测试：真实路由已挂载、存储可配置、探针反映存储状态、控制器随应用运行、
-配置加速器清单时启用调度器、配置启动器时启用部署并定期核对实例（完整闭环见
-``tests/e2e/test_closed_loop.py``）。"""
+配置加速器清单时启用调度器、配置启动器时启用部署、定期核对实例并回收孤立的分配（完整闭环
+见 ``tests/e2e/test_closed_loop.py``）。"""
 
 from __future__ import annotations
 
@@ -28,6 +28,7 @@ from forgemesh.controlplane.deployment import FakeLauncher, LauncherConfigError
 from forgemesh.controlplane.deployment import config as launcher_config
 from forgemesh.controlplane.registry import SQLiteRegistry
 from forgemesh.controlplane.scheduler import INVENTORY_FILE_ENV, InventoryConfigError
+from forgemesh.core.scheduler import AllocatedDevice, ResourceRef
 from forgemesh.resource.inference import InferenceService
 from forgemesh.workflowruntime.runtime import LocalWorkflowRuntime
 from forgemesh.workflowruntime.store import WorkflowStore
@@ -118,6 +119,22 @@ async def _allocations(db_file: Path) -> list[dict[str, Any]]:
         return await registry.list_allocations("acme")
     finally:
         await registry.close()
+
+
+async def _store_orphaned_allocation(db_file: Path) -> str:
+    """存入持有 ``node-a/gpu-0`` 的 ``llama``，再绕过受控删除删掉它，返回留下的分配 id。"""
+    await _store_service(db_file)
+    registry = SQLiteRegistry(str(db_file))
+    try:
+        owner = ResourceRef(
+            kind="InferenceService", namespace="default", name="llama", uid="uid-llama"
+        )
+        gpu = AllocatedDevice(node_id="node-a", device_id="gpu-0")
+        record = await registry.create_allocation("acme", owner, "uid-llama:1", [gpu])
+        await registry.delete("InferenceService", "default", "llama", "acme")
+    finally:
+        await registry.close()
+    return record["id"]
 
 
 @pytest.mark.unit
@@ -367,6 +384,24 @@ def test_the_controller_deploys_a_service_again_once_its_instance_exits(
 
         second = _wait_for_instance(client, other_than=first["instanceId"])
         assert client.portal.call(launcher.is_running, second["instanceId"])
+
+
+@pytest.mark.unit
+def test_the_controller_reclaims_an_orphaned_allocation_before_it_serves(
+    tmp_path, monkeypatch
+) -> None:
+    """配置启动器时，控制器启动时回收归属资源已不存在的分配：应用开始服务时分配已过期，
+    设备空闲。"""
+    db_file = tmp_path / "cp.db"
+    allocation_id = asyncio.run(_store_orphaned_allocation(db_file))
+    monkeypatch.setenv(INVENTORY_FILE_ENV, str(_write_inventory(tmp_path)))
+    monkeypatch.setenv(launcher_config.RUNTIME_LAUNCHER_ENV, "fake")
+
+    with TestClient(create_app(db_path=str(db_file))) as client:
+        registry = get_registry()
+        allocation = client.portal.call(registry.get_allocation, allocation_id)
+        assert allocation["status"] == "Expired"
+        assert client.portal.call(registry.allocated_devices) == frozenset()
 
 
 @pytest.mark.unit

@@ -14,6 +14,11 @@
   :func:`~forgemesh.controlplane.deployment.check_instances`：实例已不在运行的 ``Ready``
   服务由它转为 ``Degraded``，实例回来了的 ``Degraded`` 服务由它报告）；核对失败时记日志，
   下一个周期重试。
+* **回收分配**：注入 ``reclaim`` 时，启动时与每次周期性全量同步之后各调用一次（应用注入
+  绑定了注册表与 :class:`~forgemesh.controlplane.deployment.DeploymentReleaser` 的
+  :func:`~forgemesh.controlplane.deployment.reclaim_orphaned_allocations`：停止归属资源已
+  不存在的分配所属的部署，再让分配过期）；失败时记日志，下一次全量同步之后重试，启动照常
+  继续。
 * **并发**：``workers`` 个 worker 协程；同一资源同一时刻只由一个 worker 处理。
 * **status 回写**：以协调前读到的 ``resource_version`` 做 CAS。冲突时重读：
   ``uid``、``generation`` 与操作（reconcile / recover / reclaim / terminate）都没变就以新
@@ -90,6 +95,7 @@ class ControllerManager:
         status_write_attempts: status 写入遇到版本冲突时的最多尝试次数。
         instance_check: 可选，核对已部署实例的协程函数，返回要协调的资源键。
         instance_check_interval: 两次核对实例之间的秒数。
+        reclaim: 可选，回收孤立分配的协程函数（返回值不使用）。
         queue: 工作队列；为空时新建（测试可注入）。
     """
 
@@ -106,6 +112,7 @@ class ControllerManager:
         status_write_attempts: int = 3,
         instance_check: Callable[[], Awaitable[Iterable[ResourceKey]]] | None = None,
         instance_check_interval: float = DEFAULT_INSTANCE_CHECK_INTERVAL_SECONDS,
+        reclaim: Callable[[], Awaitable[object]] | None = None,
         queue: WorkQueue[ResourceKey] | None = None,
     ) -> None:
         if reconciler.records_dedup_keys:
@@ -127,6 +134,7 @@ class ControllerManager:
         self._status_write_attempts = status_write_attempts
         self._instance_check = instance_check
         self._instance_check_interval = instance_check_interval
+        self._reclaim = reclaim
         self._queue: WorkQueue[ResourceKey] = queue if queue is not None else WorkQueue()
         self._cursor = 0
         self._started = False
@@ -134,12 +142,14 @@ class ControllerManager:
         self._workers: list[asyncio.Task[None]] = []
 
     async def start(self) -> None:
-        """重建工作队列，然后启动变更轮询、全量同步、实例核对与 worker 任务。"""
+        """重建工作队列并回收一次孤立的分配，然后启动变更轮询、全量同步、实例核对与 worker
+        任务。"""
         if self._started:
             raise RuntimeError("a controller manager can only be started once")
         self._started = True
         self._cursor = await self._registry.latest_change_seq()
         await self.resync()
+        await self._reclaim_logging_failures()
         self._watchers = [
             asyncio.create_task(self._watch_changes(), name="forgemesh-controller-changes"),
             asyncio.create_task(self._resync_periodically(), name="forgemesh-controller-resync"),
@@ -187,6 +197,17 @@ class ControllerManager:
         for key in await self._instance_check():
             if key.kind in self._kinds:
                 self._queue.add(key)
+
+    async def reclaim(self) -> None:
+        """回收一次孤立的分配；没有注入 ``reclaim`` 时什么都不做。"""
+        if self._reclaim is not None:
+            await self._reclaim()
+
+    async def _reclaim_logging_failures(self) -> None:
+        try:
+            await self.reclaim()
+        except Exception:  # noqa: BLE001 - 下一次全量同步之后重试
+            logger.exception("controller allocation reclaim failed")
 
     async def poll_changes(self) -> int:
         """读取一批新的变更记录，把相关资源加入队列并清理已读记录，返回读到的条数。"""
@@ -305,6 +326,7 @@ class ControllerManager:
                 await self.resync()
             except Exception:  # noqa: BLE001 - 下一个周期重试
                 logger.exception("controller resync failed")
+            await self._reclaim_logging_failures()
 
     async def _check_instances_periodically(self) -> None:
         while True:

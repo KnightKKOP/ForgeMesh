@@ -17,6 +17,9 @@
 * :meth:`SQLiteRegistry.update_status` → **status 子资源**：只修改状态条件、
   phase 与 ``observedGeneration``，不递增 ``generation``，可选 CAS；合并后
   没有变化时不写库。
+* :meth:`SQLiteRegistry.update_spec` → **期望状态**：整体替换 ``spec`` / labels /
+  annotations，可选 uid 与版本 CAS；只有 ``spec`` 变化时递增 ``generation``，
+  ``Terminating`` 的资源拒绝更新；没有变化时不写库。
 
 受控删除（finalizer 语义，对齐 architecture.md §5.3/§12.4 与 development-plan
 第 7 章）
@@ -187,6 +190,14 @@ class ChangeType(StrEnum):
     STATUS = "status"
     TERMINATING = "terminating"
     DELETED = "deleted"
+
+
+class ConflictReason(StrEnum):
+    """:meth:`SQLiteRegistry.update_spec` 拒绝写入的原因（``ConflictError.details["reason"]``）。"""
+
+    RESOURCE_VERSION = "ResourceVersionMismatch"
+    UID = "UidMismatch"
+    TERMINATING = "Terminating"
 
 
 @dataclass(frozen=True)
@@ -983,6 +994,122 @@ class SQLiteRegistry(ResourceRegistry):
 
         return await self._run(_update_status)
 
+    async def update_spec(
+        self,
+        kind: str,
+        namespace: str | None,
+        name: str,
+        tenant_id: str,
+        spec: dict[str, Any],
+        *,
+        labels: dict[str, str],
+        annotations: dict[str, str],
+        expected_version: str | None = None,
+        expected_uid: str | None = None,
+    ) -> Resource:
+        """期望状态写入：整体替换 ``spec``、``metadata.labels`` 与 ``metadata.annotations``。
+
+        只适用于登记了强类型模型的 kind（:data:`_KIND_MODELS`），写入结果须满足该模型；
+        status、条件、finalizer、uid 与 ``observedGeneration`` 原样保留。规则：
+
+        * ``spec`` 按模型规范化（补齐默认值）后与当前值比较，变化时 ``generation`` 加 1；
+          只有 labels / annotations 变化时 ``generation`` 不变；
+        * 有变化时 ``resource_version`` 加 1，并追加 ``updated`` 变更记录（控制器据此
+          重新协调）；没有任何变化时不写库，返回当前资源；
+        * 资源处于 ``Terminating`` 时拒绝，先于 uid / 版本检查（重新读取后重试也不会成功）；
+        * ``expected_uid`` / ``expected_version`` 非空时须与当前 uid / 版本相同（版本按
+          字符串比较）；同名资源被删除后重建时版本会从 0 重新计数，uid 可以识别这种情况。
+
+        检查与写入在同一个 ``BEGIN IMMEDIATE`` 事务中完成。
+
+        Returns:
+            写入后的资源；没有变化时为当前资源。
+
+        Raises:
+            NotFoundError: 资源不存在（或跨租户不可见）。
+            ConflictError: 资源处于 ``Terminating``，或 uid / 版本与预期不同；
+                ``details["reason"]`` 为 :class:`ConflictReason` 的取值。
+            ValueError: kind 没有登记强类型模型。
+            pydantic.ValidationError: 替换后的资源不满足模型约束（``ValueError`` 的子类）。
+        """
+        model = _KIND_MODELS.get(kind)
+        if model is None:
+            raise ValueError(f"spec updates are not supported for kind {kind!r}")
+        target = f"kind={kind} namespace={namespace!r} name={name}"
+
+        def _update_spec() -> Resource:
+            with self._immediate_transaction() as cur:
+                row = cur.execute(
+                    "SELECT body, phase, uid, generation, resource_version FROM resources "
+                    "WHERE tenant_id=? AND kind=? AND namespace IS ? AND name=?",
+                    (tenant_id, kind, namespace, name),
+                ).fetchone()
+                if row is None:
+                    raise NotFoundError(f"resource not found: {target} tenant_id={tenant_id}")
+                if row["phase"] == "Terminating":
+                    raise ConflictError(
+                        f"resource is terminating and no longer accepts updates: {target}",
+                        details={"reason": ConflictReason.TERMINATING.value},
+                    )
+                if expected_uid is not None and expected_uid != row["uid"]:
+                    raise ConflictError(
+                        f"uid {expected_uid!r} does not match the current resource: {target}",
+                        details={"reason": ConflictReason.UID.value},
+                    )
+                read_version = row["resource_version"]
+                if expected_version is not None and expected_version != str(read_version):
+                    raise ConflictError(
+                        f"resourceVersion {expected_version!r} does not match the current "
+                        f"version {read_version}: {target}",
+                        details={"reason": ConflictReason.RESOURCE_VERSION.value},
+                    )
+                body = json.loads(row["body"])
+                metadata = body["metadata"]
+                replaced = model.model_validate(
+                    {
+                        **body,
+                        "spec": spec,
+                        "metadata": {**metadata, "labels": labels, "annotations": annotations},
+                    }
+                )
+                new_spec = replaced.model_dump(mode="json", by_alias=True)["spec"]
+                new_labels = dict(replaced.metadata.labels)
+                new_annotations = dict(replaced.metadata.annotations)
+                spec_changed = new_spec != self._normalised_spec(model, body)
+                if (
+                    not spec_changed
+                    and new_labels == metadata.get("labels", {})
+                    and new_annotations == metadata.get("annotations", {})
+                ):
+                    return self._body_to_resource(row["body"])
+
+                generation = row["generation"] + 1 if spec_changed else row["generation"]
+                new_version = read_version + 1
+                body["spec"] = new_spec
+                metadata["labels"] = new_labels
+                metadata["annotations"] = new_annotations
+                metadata["generation"] = generation
+                metadata["resourceVersion"] = str(new_version)
+                new_body = json.dumps(body, ensure_ascii=False)
+                cur.execute(
+                    "UPDATE resources SET body=?, generation=?, resource_version=?, "
+                    " updated_at=datetime('now') "
+                    "WHERE tenant_id=? AND kind=? AND namespace IS ? AND name=?",
+                    (new_body, generation, new_version, tenant_id, kind, namespace, name),
+                )
+                self._record_change(cur, tenant_id, kind, namespace, name, ChangeType.UPDATED)
+                return self._body_to_resource(new_body)
+
+        return await self._run(_update_spec)
+
+    @staticmethod
+    def _normalised_spec(model: type[Resource], body: dict[str, Any]) -> Any:
+        """payload 中 ``spec`` 按模型规范化后的 JSON；payload 不满足模型时取原值。"""
+        try:
+            return model.model_validate(body).model_dump(mode="json", by_alias=True).get("spec")
+        except ValidationError:
+            return body.get("spec")
+
     # ------------------------------------------------------------------ #
     # 控制器读取（跨租户，仅供控制平面内部使用）
     # ------------------------------------------------------------------ #
@@ -1445,6 +1572,7 @@ __all__ = [
     "DEFAULT_RELEASE_FINALIZER",
     "SIDE_EFFECT_PHASES",
     "ChangeType",
+    "ConflictReason",
     "RequestDeleteResult",
     "ResourceChange",
     "ResourceKey",

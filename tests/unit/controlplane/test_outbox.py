@@ -2,7 +2,7 @@
 
 覆盖事务性 Outbox 与 Dispatcher 的核心语义：
 
-* 事件写入与查询（put / get_pending）；
+* 事件写入与查询（put / get / get_pending）；
 * 标记已发布（mark_published）与重复标记抛错；
 * 发布失败：指数退避（RetryPolicy）、到期查询（due）、达到上限进入 dead、
   重新投递（redrive）、错误截断；
@@ -90,6 +90,19 @@ def test_put_and_get_pending() -> None:
     assert pending[0].status == "pending"
     assert pending[0].event_type == "Created"
     assert pending[0].payload == {"name": "demo"}
+
+
+@pytest.mark.unit
+def test_get_returns_an_event_in_any_state() -> None:
+    """get 按 event_id 取事件，不论状态；不存在时返回 None。"""
+    outbox = Outbox()
+    _put(outbox, _make_event("evt-1"), _make_event("evt-2"))
+    outbox.mark_published("evt-1", now=100.0)
+
+    published, pending = outbox.get("evt-1"), outbox.get("evt-2")
+    assert (published.status, published.published_at) == (OutboxStatus.PUBLISHED, 100.0)
+    assert (pending.status, pending.payload) == (OutboxStatus.PENDING, {"name": "demo"})
+    assert outbox.get("missing") is None
 
 
 @pytest.mark.unit

@@ -321,19 +321,19 @@ def test_api_writes_are_audited_with_the_principal(api_client) -> None:
     assert (created.status_code, deleted.status_code) == (201, 204)
     registry = get_registry()
     records = sorted(registry.audit_log.query_by_tenant("tenant-a"), key=lambda e: e.timestamp)
-    events = registry.outbox.get_pending()
     assert [(r.action, r.correlation_id) for r in records] == [
         ("create", "corr-create"),
         ("delete", "corr-delete"),
     ]
-    for record, event in zip(records, events, strict=True):
+    for record in records:
         assert (record.tenant_id, record.actor, record.key_id) == ("tenant-a", "alice", "a")
         assert (record.resource_type, record.namespace, record.resource_id) == (
             "InferenceService",
             "default",
             "llama",
         )
-        assert record.details["eventId"] == event.event_id
+        event = registry.outbox.get(record.details["eventId"])
+        assert event is not None
         assert event.payload["correlationId"] == record.correlation_id
     assert registry.audit_log.query_by_tenant("tenant-b") == []
 

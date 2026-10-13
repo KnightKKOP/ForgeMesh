@@ -239,6 +239,11 @@ class Outbox:
             ),
         )
 
+    def get(self, event_id: str) -> OutboxEvent | None:
+        """按 ``event_id`` 获取任意状态的事件；不存在（或已发布并被清理）时返回 None。"""
+        rows = self._query("SELECT * FROM outbox_events WHERE event_id = ?", (event_id,))
+        return self._row_to_event(rows[0]) if rows else None
+
     def get_pending(self, limit: int = 100) -> list[OutboxEvent]:
         """获取 pending 事件（含尚在退避中的），按创建时间升序排列。"""
         rows = self._query(

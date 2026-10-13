@@ -115,6 +115,39 @@ jobs:
       - name: Go test (race detector)
         run: go test -race ./...
 
+  dependency-audit:
+    name: Dependencies · vulnerability audit
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      # setup-go 的缓存键只取决于 Go 版本与 go.sum，会与 go job 争用同一个缓存。
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: false
+
+      # 审计 make install 实际安装的第三方依赖。工具版本与忽略列表在根 Makefile 中，
+      # 已知漏洞的处理规则见 SECURITY.md 3.1。
+      - name: pip-audit (make install environment)
+        run: |
+          make install
+          make audit
+
+      # pip-audit 失败时同样运行，两边的结果都要看到。
+      - name: govulncheck (gateway)
+        if: ${{ !cancelled() }}
+        run: make -C gateway vulncheck
+
   compose-smoke:
     name: Compose · end-to-end smoke
     runs-on: ubuntu-latest

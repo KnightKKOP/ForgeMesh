@@ -336,7 +336,7 @@ ForgeMesh 目前处于预览阶段，API 稳定性标注为 `beta`：minor 版�
 
 ### 核心控制平面（M2）
 - **资源注册中心**：SQLite 持久化，乐观并发 CAS，租户隔离，分页游标（现状：自 1.1.0 起列表接口返回签名的分页游标 `nextPageToken`）
-- **协调控制器**：9 步声明式闭环（获取→查询→比较→生成候选→策略校验→调度分配→执行→重观察→更新状态）（现状：自 1.1.0 起由控制器自动驱动；同时设置 `FORGEMESH_INVENTORY_FILE` 与 `FORGEMESH_RUNTIME_LAUNCHER` 后，调度、部署、写入 `status.endpoints` 与受控删除形成完整闭环，见[部署推理服务](#部署推理服务)；未设置启动器时，新建的推理服务停在 `Pending`，并报告 `Ready=False`（`SchedulerUnavailable` 或 `WorkflowRuntimeUnavailable`）。控制平面重启后实例不会自动重新启动）
+- **协调控制器**：9 步声明式闭环（获取→查询→比较→生成候选→策略校验→调度分配→执行→重观察→更新状态）（现状：自 1.1.0 起由控制器自动驱动；同时设置 `FORGEMESH_INVENTORY_FILE` 与 `FORGEMESH_RUNTIME_LAUNCHER` 后，调度、部署、写入 `status.endpoints`、`spec` 变化之后的重新部署、实例丢失（包括控制平面重启之后）时的重新部署与受控删除形成完整闭环，见[部署推理服务](#部署推理服务)；未设置启动器时，新建的推理服务停在 `Pending`，并报告 `Ready=False`（`SchedulerUnavailable` 或 `WorkflowRuntimeUnavailable`）。每个服务只部署一个实例；核对实例只看实例是否还在运行，不探测它能否回答请求）
 - **策略引擎**：allow/deny/require_approval 三态决策，配额规则，高风险审批触发
   - 说明：Decision Router 的 `OK/FALLBACK_REQUIRED/FAILED` 是决策路由层的另一组状态，与 Policy 三态不混用
 - **插件管理器**：Manifest 解析校验，生命周期状态机，能力发现，权限授予（现状：自 1.1.0 起注册时验证 Ed25519 签名，权限按管理员的授予判定；控制平面应用尚未加载插件）
@@ -369,7 +369,7 @@ ForgeMesh 目前处于预览阶段，API 稳定性标注为 `beta`：minor 版�
 - **MIG 支持**：NVIDIA MIG 实例管理（创建/销毁/发现/健康检查/能力报告），并发安全，资源不超分
 - **异构 GPU**：非 NVIDIA 能力差异显式报告（差异不隐藏）
 - **Temporal Provider**：WorkflowRuntime 契约适配，补偿注册，信号投递（现状：只有内存客户端，没有接入 temporalio）
-- **TGI Runtime**：HuggingFace TGI 推理 Runtime Provider（deploy→verify→release 闭环）（现状：默认 launcher 抛出 `NotImplementedError`，控制平面也还没有 TGI 启动器）
+- **TGI Runtime**：HuggingFace TGI 推理 Runtime Provider（deploy→verify→release 闭环）（现状：插件中的默认 launcher 仍抛出 `NotImplementedError`；控制平面部署推理服务时不使用这个插件，而是使用自带的 TGI 进程启动器 `FORGEMESH_RUNTIME_LAUNCHER=tgi-process`）
 - **插件 SDK**：脚手架生成，Manifest 校验，打包发布，开放契约测试套件
 - **治理文档**：GOVERNANCE / SECURITY / CONTRIBUTING / CODE_OF_CONDUCT 完善，弃用政策
 - **API 版本管理**：OpenAPI 版本号与稳定性标注（当前为 1.1.0、`beta`），CHANGELOG，发布记录，CI 架构文档检查
@@ -378,7 +378,7 @@ ForgeMesh 目前处于预览阶段，API 稳定性标注为 `beta`：minor 版�
 
 | 类型 | 数量 |
 |------|------|
-| Python 测试 | **2066** |
+| Python 测试 | **2207** |
 | Go 测试 | 134 个测试函数，全部通过 |
 | ruff 检查 | All checks passed |
 

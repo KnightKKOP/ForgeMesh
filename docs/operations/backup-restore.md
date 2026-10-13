@@ -415,7 +415,7 @@ Kubernetes 上先 `kubectl -n forgemesh scale deploy/forgemesh-control-plane --r
 
 - [ ] **租户隔离**：跨租户 `get` 返回 `NotFoundError`（IVT-7）
 - [ ] **审计可追溯**：`query_by_correlation` 返回完整调用链
-- [ ] **correlation_id 贯计贯穿**：审计事件与决策记录的 correlation_id 一致
+- [ ] **correlation_id 贯穿**：审计事件与决策记录的 correlation_id 一致
 - [ ] **密钥脱敏**：日志中敏感字段均为 `"***"`，无明文泄露
 - [ ] **资源版本连续**：`resourceVersion` 无跳跃（除已知 CAS 冲突）
 

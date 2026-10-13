@@ -10,7 +10,7 @@ ForgeMesh 控制平面（`forgemesh-control-plane`）把权威状态存放在**�
 
 | 表 | 模块 | 内容 |
 |----|------|------|
-| `resources` / `allocations` / `resource_changes` | `forgemesh.controlplane.registry.SQLiteRegistry` | 资源对象（spec/status/conditions）、资源分配记录、控制器读取的变更记录 |
+| `resources` / `allocations` / `allocation_devices` / `resource_changes` | `forgemesh.controlplane.registry.SQLiteRegistry` | 资源对象（spec/status/conditions）、资源分配记录及其占用的设备、控制器读取的变更记录 |
 | `processed_dedup_keys` | `forgemesh.controlplane.reconciler.dedup.ProcessedKeyStore` | 控制器已处理的去重键 |
 
 审计日志（`forgemesh.controlplane.audit.AuditLog`）、决策记录（`forgemesh.decision.records.DecisionRecordStore`）等其他 SQLite 存储默认使用内存库，控制平面进程不会打开它们；嵌入方把它们指向文件时，按本文同样的方法逐个备份。
@@ -302,7 +302,7 @@ Kubernetes 上先 `kubectl -n forgemesh scale deploy/forgemesh-control-plane --r
 - [ ] 控制平面运行且有写入时，执行 `forgemesh-backup.sh` 生成一份备份（容器部署按 2.5 节）
 - [ ] 验证备份文件摘要：`sha256sum -c <backup>.db.sha256` 通过
 - [ ] 验证备份完整性：`PRAGMA integrity_check` 返回 `ok`
-- [ ] 验证备份可打开：`sqlite3 <backup>.db ".tables"` 列出 `allocations`、`processed_dedup_keys`、`resource_changes`、`resources`
+- [ ] 验证备份可打开：`sqlite3 <backup>.db ".tables"` 列出 `allocation_devices`、`allocations`、`processed_dedup_keys`、`resource_changes`、`resources`
 - [ ] 验证备份数据行数与源库一致（抽样表）
 
 ### 4.3 恢复验证

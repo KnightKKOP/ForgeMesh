@@ -2,9 +2,11 @@
 
 覆盖：幂等去重键、差异计算、Policy 三态
 （allow/deny/require_approval——degraded 已按 architecture 7.5 移除）、
-Scheduler 分配成功与失败、缺少调度器/工作流运行时时如实报告 ``Ready=False``、
+Scheduler 分配成功与失败、分配请求的资源身份与幂等键（uid + generation）、
+调度需求取自 ``spec.resources.accelerator``、
+缺少调度器/工作流运行时时如实报告 ``Ready=False``、
 幂等性，以及 Terminating 受控删除闭环
-（ReleaseProvider 释放 → 移除 finalizer → 释放 Allocation → 物理删除）。
+（ReleaseProvider 释放 → 移除 finalizer → 按 uid 释放 Allocation → 物理删除）。
 """
 
 from __future__ import annotations
@@ -17,14 +19,15 @@ import pytest
 from forgemesh.controlplane.reconciler import (
     ProcessedKeyStore,
     ReconciliationController,
+    allocation_idempotency_key,
     compute_dedup_key,
 )
 from forgemesh.controlplane.registry import SQLiteRegistry
 from forgemesh.core.errors import NotFoundError
 from forgemesh.core.objects import ObjectMeta, Resource
 from forgemesh.core.reconciler import ReconcileContext
+from forgemesh.core.scheduler import AllocatedDevice, ResourceRef, ScheduleRequest
 from forgemesh.policy.api import PolicyDecision
-from forgemesh.resource.allocation import Allocation
 from forgemesh.resource.inference import (
     AcceleratorSpec,
     InferencePhase,
@@ -47,12 +50,16 @@ def make_resource(
     generation: int = 1,
     observed_generation: int = 0,
     tenant_id: str = "tenant-1",
+    uid: str | None = "uid-1",
+    namespace: str | None = None,
 ) -> Resource:
     """构造测试用 Resource。"""
     return Resource(
         kind=kind,
         metadata=ObjectMeta(
             name=name,
+            namespace=namespace,
+            uid=uid,
             generation=generation,
             observed_generation=observed_generation,
             tenant_id=tenant_id,
@@ -94,10 +101,12 @@ class MockScheduler:
         self._fail = fail
         self.allocate_called = False
         self.allocate_count = 0
+        self.requests: list[ScheduleRequest] = []
 
     async def allocate(self, req):  # noqa: ANN001
         self.allocate_called = True
         self.allocate_count += 1
+        self.requests.append(req)
         if self._fail:
             raise RuntimeError("allocation failed")
         from forgemesh.core.scheduler import AllocationRef
@@ -164,6 +173,29 @@ def test_compute_diff_pending_needs_reconcile():
     assert diff["needs_reconcile"] is True
     assert diff["needs_allocation"] is True
     assert diff["needs_workflow"] is True
+
+
+@pytest.mark.unit
+def test_compute_diff_takes_requirements_from_the_accelerator_request():
+    """调度需求取自 spec.resources.accelerator（type / count / minMemoryGiB）。"""
+    service = make_inference_service(
+        phase=InferencePhase.PENDING,
+        accelerator=AcceleratorSpec(type="nvidia-gpu", count=2, minMemoryGiB=40),
+    )
+
+    diff = ReconciliationController._compute_diff(service, {"phase": "Pending"})
+
+    assert diff["requirements"] == {
+        "accelerator": {"type": "nvidia-gpu", "count": 2, "minMemoryGiB": 40}
+    }
+
+
+@pytest.mark.unit
+def test_compute_diff_without_an_accelerator_request_has_no_requirements():
+    """没有强类型 spec 的资源（基类 Resource）没有调度需求。"""
+    diff = ReconciliationController._compute_diff(make_resource(), {"phase": "Pending"})
+
+    assert diff["requirements"] == {}
 
 
 # ---------------------------------------------------------------------- #
@@ -363,6 +395,95 @@ def test_reconcile_with_allocation():
     assert scheduler.allocate_count == 1
 
 
+def _allocating_controller(scheduler: MockScheduler) -> ReconciliationController:
+    return ReconciliationController(
+        registry=None,
+        policy_engine=MockPolicyEngine(PolicyDecision(decision="allow", reason="ok")),
+        scheduler=scheduler,
+        workflow_runtime=StubWorkflowRuntime(),
+    )
+
+
+@pytest.mark.unit
+def test_allocation_request_identifies_the_resource_and_its_generation():
+    """分配请求携带资源身份（含 uid）与由 uid + generation 派生的幂等键。"""
+    resource = make_resource(generation=3, namespace="team-a")
+    scheduler = MockScheduler()
+
+    asyncio.run(_allocating_controller(scheduler).reconcile(make_context(resource)))
+
+    [req] = scheduler.requests
+    assert req.tenant_id == "tenant-1"
+    assert req.resource_ref == ResourceRef(
+        kind="InferenceService", namespace="team-a", name="svc-1", uid="uid-1"
+    )
+    assert req.idempotency_key == allocation_idempotency_key("uid-1", 3) == "uid-1:3"
+
+
+@pytest.mark.unit
+def test_allocation_request_carries_the_accelerator_request():
+    """调度器收到的需求即 InferenceService 的加速器申请。"""
+    service = make_inference_service(
+        phase=InferencePhase.PENDING,
+        accelerator=AcceleratorSpec(type="nvidia-gpu", count=1, minMemoryGiB=24),
+    )
+    scheduler = MockScheduler()
+
+    asyncio.run(
+        _allocating_controller(scheduler).reconcile(make_context(service, {"phase": "Pending"}))
+    )
+
+    [req] = scheduler.requests
+    assert req.requirements == {
+        "accelerator": {"type": "nvidia-gpu", "count": 1, "minMemoryGiB": 24}
+    }
+
+
+@pytest.mark.unit
+def test_replaying_a_generation_requests_the_same_allocation():
+    """去重键丢失后（如未持久化的进程重启）重放同一 generation 使用同一幂等键；
+    新 generation 与同名重建的资源（新 uid）得到新键。"""
+    scheduler = MockScheduler()
+    for resource in (
+        make_resource(generation=1),
+        make_resource(generation=1),
+        make_resource(generation=2),
+        make_resource(generation=1, uid="uid-2"),
+    ):
+        asyncio.run(_allocating_controller(scheduler).reconcile(make_context(resource)))
+
+    assert [req.idempotency_key for req in scheduler.requests] == [
+        "uid-1:1",
+        "uid-1:1",
+        "uid-1:2",
+        "uid-2:1",
+    ]
+
+
+@pytest.mark.unit
+def test_resource_without_uid_is_not_allocated():
+    """没有 uid 就无法幂等分配：Ready=False（MissingUid），不分配、不启动工作流、不登记去重键。"""
+    ctx = make_context(make_resource(uid=None), {"phase": "Pending"})
+    scheduler = MockScheduler()
+    workflow = StubWorkflowRuntime()
+    controller = ReconciliationController(
+        registry=None,
+        policy_engine=MockPolicyEngine(PolicyDecision(decision="allow", reason="ok")),
+        scheduler=scheduler,
+        workflow_runtime=workflow,
+    )
+
+    result = asyncio.run(controller.reconcile(ctx))
+
+    assert result.done is False
+    assert result.requeue_after is None
+    [condition] = result.status_patch["conditions"]
+    assert (condition["status"], condition["reason"]) == ("False", "MissingUid")
+    assert scheduler.allocate_called is False
+    assert workflow.idempotency_keys == []
+    assert ctx.dedup_key not in controller._processed_keys
+
+
 @pytest.mark.unit
 def test_reconcile_allocation_failure():
     """scheduler.allocate 抛异常 → done=False, conditions 有 AllocationFailed。"""
@@ -488,15 +609,21 @@ def make_inference_service(
     name: str = "svc-1",
     tenant_id: str = "tenant-1",
     phase: InferencePhase = InferencePhase.READY,
+    accelerator: AcceleratorSpec | None = None,
+    uid: str = "uid-1",
+    namespace: str | None = None,
 ) -> InferenceService:
     """构造带 spec/status 的 InferenceService（phase 由 status 携带）。"""
     return InferenceService(
-        metadata=ObjectMeta(name=name, tenant_id=tenant_id, generation=1),
+        metadata=ObjectMeta(
+            name=name, namespace=namespace, uid=uid, tenant_id=tenant_id, generation=1
+        ),
         spec=InferenceServiceSpec(
             model=ModelRef(reference="models/llama"),
             runtime=RuntimeRef(provider="vllm"),
             resources=ResourcesSpec(
-                accelerator=AcceleratorSpec(type="nvidia-gpu", count=1, minMemoryGiB=16)
+                accelerator=accelerator
+                or AcceleratorSpec(type="nvidia-gpu", count=1, minMemoryGiB=16)
             ),
         ),
         status=InferenceServiceStatus(phase=phase),
@@ -508,9 +635,10 @@ def _terminating_context(
     name: str = "svc-1",
     tenant_id: str = "tenant-1",
     dedup_key: str = "term-1",
+    namespace: str | None = None,
 ) -> ReconcileContext:
     """构造 Terminating 资源的协调上下文（resource 以注册表读回为准注入）。"""
-    resource = asyncio.run(registry.get("InferenceService", None, name, tenant_id))
+    resource = asyncio.run(registry.get("InferenceService", namespace, name, tenant_id))
     return ReconcileContext(
         resource=resource,
         observed={"phase": "Terminating"},
@@ -532,22 +660,22 @@ def _make_controller(
     )
 
 
+def _allocate(registry: SQLiteRegistry, service: InferenceService, device_id: str = "gpu-0"):
+    """为 ``service`` 建立持有一个设备的 Active 分配（归属其 uid）。"""
+    meta = service.metadata
+    owner = ResourceRef(kind=service.kind, namespace=meta.namespace, name=meta.name, uid=meta.uid)
+    device = AllocatedDevice(node_id="node-a", device_id=device_id)
+    return asyncio.run(registry.create_allocation(meta.tenant_id, owner, f"{meta.uid}:1", [device]))
+
+
 @pytest.mark.unit
 def test_terminating_full_delete_closure():
     """删除闭环：Ready → DELETE(Terminating) → reconcile 释放 → finalizer 清空
-    → Allocation Released → 物理删除。"""
+    → Allocation Released（设备回到空闲）→ 物理删除。"""
     reg = SQLiteRegistry()
-    asyncio.run(reg.put(make_inference_service()))
-    # 建立关联 Allocation（P1 约定：resource_id = "{kind}/{name}"）
-    asyncio.run(
-        reg.put_allocation(
-            Allocation(
-                resource_id="InferenceService/svc-1",
-                tenant_id="tenant-1",
-                idempotency_key="alloc-key-1",
-            )
-        )
-    )
+    service = make_inference_service()
+    asyncio.run(reg.put(service))
+    _allocate(reg, service)
     # DELETE 受理：Ready 有副作用 → 自动加 finalizer → Terminating
     delete_result = asyncio.run(reg.request_delete("InferenceService", None, "svc-1", "tenant-1"))
     assert delete_result.deleted is False
@@ -571,6 +699,51 @@ def test_terminating_full_delete_closure():
     assert len(allocs) == 1
     assert allocs[0]["status"] == "Released"
     assert allocs[0]["released_at"] is not None
+    assert asyncio.run(reg.allocated_devices()) == frozenset()
+
+
+@pytest.mark.unit
+def test_terminating_releases_only_the_allocation_of_the_deleted_uid():
+    """释放按 uid、限本租户：同名资源在其他命名空间 / 租户中的分配不受影响。"""
+    reg = SQLiteRegistry()
+    services = [
+        make_inference_service(namespace="team-a", uid="uid-a"),
+        make_inference_service(namespace="team-b", uid="uid-b"),
+        make_inference_service(namespace="team-a", uid="uid-c", tenant_id="tenant-2"),
+    ]
+    for index, service in enumerate(services):
+        asyncio.run(reg.put(service))
+        _allocate(reg, service, device_id=f"gpu-{index}")
+    asyncio.run(reg.request_delete("InferenceService", "team-a", "svc-1", "tenant-1"))
+    ctx = _terminating_context(reg, namespace="team-a")
+
+    result = asyncio.run(_make_controller(reg).reconcile(ctx))
+
+    assert result.done is True
+    assert asyncio.run(reg.get_active_allocation("uid-a", "tenant-1")) is None
+    assert asyncio.run(reg.get_active_allocation("uid-b", "tenant-1")) is not None
+    assert asyncio.run(reg.get_active_allocation("uid-c", "tenant-2")) is not None
+
+
+@pytest.mark.unit
+def test_terminating_resource_replaced_by_a_new_uid_is_left_alone():
+    """协调前原资源已被删除、同名资源以新 uid 重建：只释放原资源的分配，新资源不动。"""
+    reg = SQLiteRegistry()
+    original = make_inference_service()
+    asyncio.run(reg.put(original))
+    _allocate(reg, original)
+    asyncio.run(reg.request_delete("InferenceService", None, "svc-1", "tenant-1"))
+    ctx = _terminating_context(reg)
+    asyncio.run(reg.delete("InferenceService", None, "svc-1", "tenant-1"))
+    asyncio.run(reg.put(make_inference_service(phase=InferencePhase.PENDING, uid="uid-2")))
+
+    result = asyncio.run(_make_controller(reg).reconcile(ctx))
+
+    assert result.done is True
+    survivor = asyncio.run(reg.get("InferenceService", None, "svc-1", "tenant-1"))
+    assert survivor.metadata.uid == "uid-2"
+    assert asyncio.run(reg.get_active_allocation("uid-1", "tenant-1")) is None
+    assert asyncio.run(reg.allocated_devices()) == frozenset()
 
 
 @pytest.mark.unit

@@ -75,7 +75,8 @@ check "create through the gateway" 201 "${auth[@]}" -H "Content-Type: applicatio
   -X POST -d "$body" "$service"
 check "read through the gateway" 200 "${auth[@]}" "$service/smoke-svc?namespace=default"
 
-# 仓库没有调度器实现，控制器把新服务协调为 Ready=False（SchedulerUnavailable）。
+# compose 没有配置加速器清单（FORGEMESH_INVENTORY_FILE），控制器把新服务协调为
+# Ready=False（SchedulerUnavailable）。
 reconciled=""
 for _ in $(seq 1 20); do
   if curl -sf "${auth[@]}" "$service/smoke-svc?namespace=default" | grep -q SchedulerUnavailable; then

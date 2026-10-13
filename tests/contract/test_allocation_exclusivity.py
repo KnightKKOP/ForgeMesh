@@ -1,8 +1,9 @@
 """Allocation 唯一 Active 契约测试（任务 61 / WP-C1，v1.1 §9.2/§9.3 阶段 C）。
 
 验证 ``allocations`` 表部分唯一索引
-``idx_allocations_one_active_per_resource``（``WHERE status = 'Active'``，
-``registry/store.py`` DDL）兜底的「同一 ``resource_id`` 至多一个 Active 分配」：
+``idx_allocations_one_active_per_tenant_resource``（``WHERE status = 'Active'``，
+``registry/store.py`` DDL）兜底的「同一租户内同一 ``resource_id``（归属资源 uid）
+至多一个 Active 分配」：
 
 * 并发创建同一 resource_id 的两个 Active Allocation：恰好一个成功，另一个
   因唯一索引失败（实现包装为 :class:`ConflictError`）；
@@ -77,7 +78,7 @@ def test_concurrent_put_allocation_single_active_winner(tmp_path) -> None:
         writer1 = SQLiteRegistry(str(db_file))
         writer2 = SQLiteRegistry(str(db_file))
         try:
-            # 两写入方并发为同一 GPU 创建 Active 分配（不同幂等键）
+            # 两写入方并发为同一资源创建 Active 分配（不同幂等键）
             results = await asyncio.gather(
                 writer1.put_allocation(
                     _make_allocation("gpu-0", idempotency_key="idem-a")
@@ -191,7 +192,7 @@ def test_distinct_resource_ids_independent(tmp_path) -> None:
             )
             assert all(isinstance(i, str) and i for i in ids)
 
-            # 两个设备的 Active 分配各自成立，唯一索引不跨 resource_id 约束
+            # 两个资源的 Active 分配各自成立，唯一索引不跨 resource_id 约束
             for resource_id in ("gpu-0", "gpu-1"):
                 active = await writer1.get_active_allocation(resource_id, TENANT)
                 assert active is not None

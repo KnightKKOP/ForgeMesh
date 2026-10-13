@@ -89,7 +89,12 @@ def _make_resource(index: int) -> Resource:
     """构造第 ``index`` 个测试资源（独立 name/generation → 独立 dedup_key）。"""
     return Resource(
         kind="Widget",
-        metadata=ObjectMeta(name=f"bench-{index:03d}", generation=1, tenant_id="tenant-bench"),
+        metadata=ObjectMeta(
+            name=f"bench-{index:03d}",
+            uid=f"uid-bench-{index:03d}",
+            generation=1,
+            tenant_id="tenant-bench",
+        ),
     )
 
 

@@ -5,7 +5,8 @@
 * 创建 → 查询往返；
 * 重复创建返回 409；
 * 查询不存在返回 404；
-* 删除：无副作用资源 204 直接物理删除；有副作用态（Ready）202 Terminating；
+* 删除：无副作用且没有分配的资源 204 直接物理删除；有副作用态（Ready）或持有
+  加速器分配的资源 202 Terminating；
 * 列表返回多个资源；
 * 缺失 ``X-Tenant-Id`` 头返回 401（dev 认证模式）。
 
@@ -22,6 +23,7 @@ from fastapi.testclient import TestClient
 from forgemesh.controlplane.api import create_api_router
 from forgemesh.controlplane.api.dependencies import get_registry, init_registry
 from forgemesh.core.objects import ObjectMeta
+from forgemesh.core.scheduler import AllocatedDevice, ResourceRef
 from forgemesh.resource.inference import (
     AcceleratorSpec,
     InferencePhase,
@@ -147,6 +149,24 @@ def test_delete_terminating_returns_202(client: TestClient) -> None:
     # 资源仍存在（等待协调器受控释放后物理删除）
     row = registry._conn.execute("SELECT phase FROM resources WHERE name='svc-ready'").fetchone()
     assert row is not None and row["phase"] == "Terminating"
+
+
+def test_delete_pending_service_holding_an_allocation_returns_202(client: TestClient) -> None:
+    """Pending 资源持有加速器分配 → 202 Terminating：分配由协调器释放后才物理删除。"""
+    created = client.post("/api/v1/inference-services", json=_payload(), headers=TENANT_HEADERS)
+    uid = created.json()["metadata"]["uid"]
+    owner = ResourceRef(kind="InferenceService", namespace="default", name="svc-1", uid=uid)
+    device = AllocatedDevice(node_id="node-a", device_id="gpu-0")
+    asyncio.run(get_registry().create_allocation("tenant-a", owner, f"{uid}:1", [device]))
+
+    resp = client.delete(
+        "/api/v1/inference-services/svc-1",
+        headers=TENANT_HEADERS,
+        params={"namespace": "default"},
+    )
+
+    assert resp.status_code == 202, resp.text
+    assert resp.json() == {"name": "svc-1", "phase": "Terminating"}
 
 
 def test_list_inference_services(client: TestClient) -> None:

@@ -10,7 +10,11 @@
 3. **比较差异**：desired vs observed，判断是否需要协调。
 4. **生成候选**：调用 DecisionProvider 产出候选动作（建议，非授权）。
 5. **Policy 校验**：PolicyEngine.check()，deny 则停止（不可绕过，INV-3）。
-6. **Scheduler 分配**：如需分配资源，Scheduler.allocate()（唯一授权分配点）。
+6. **Scheduler 分配**：如需分配资源，Scheduler.allocate()（唯一授权分配点）。请求携带
+   资源身份（kind/namespace/name/uid）、幂等键（uid + generation，见
+   :func:`~forgemesh.controlplane.reconciler.dedup.allocation_idempotency_key`）与取自
+   ``spec.resources.accelerator`` 的调度需求：同一 generation 的重放得到同一分配；
+   没有 ``metadata.uid`` 的资源报告 ``Ready=False``（``MissingUid``），不分配。
 7. **WorkEngine 执行**：如需执行工作流，WorkflowRuntime.start()。
 8. **重观察**：收集执行后的新观测状态（P1 简化为标记完成）。
 9. **更新 status + 安排下次**：写回 status patch，返回 requeue_after。
@@ -28,8 +32,9 @@
    租约等；未注入时为 Noop 语义，仅移除 finalizer）；失败 → 保持
    ``Terminating`` 并 requeue 重试；
 2. 移除默认 release finalizer（``forgemesh.io/resource-release``）并 CAS 写回；
-3. finalizers 全部清空后：释放关联 Allocation（若存在 Active）→ 物理 DELETE
-   → 记审计日志。
+3. finalizers 全部清空后：释放归属该资源的 Active Allocation 及其设备（按
+   ``metadata.uid`` 查找，限本租户）→ 物理 DELETE → 记审计日志。资源已被删除、
+   或同名资源已以新 uid 重建时，只释放原资源的分配，不触碰新资源。
 """
 
 from __future__ import annotations
@@ -42,11 +47,25 @@ from forgemesh.core.errors import ConflictError, NotFoundError
 from forgemesh.core.objects import Resource
 from forgemesh.core.reconciler import ReconcileContext, Reconciler, ReconcileResult
 from forgemesh.policy.api import PolicyAction, PolicyEngine
+from forgemesh.resource.inference import AcceleratorSpec
 
 from ..registry.store import DEFAULT_RELEASE_FINALIZER
-from .dedup import ProcessedKeyStore
+from .dedup import ProcessedKeyStore, allocation_idempotency_key
 
 logger = logging.getLogger(__name__)
+
+
+def _scheduling_requirements(resource: Resource) -> dict[str, Any]:
+    """提取资源的调度需求 ``{"accelerator": {"type", "count", "minMemoryGiB"}}``。
+
+    取自强类型 spec 的 ``spec.resources.accelerator``；没有加速器申请的资源（基类
+    ``Resource``、未登记的 kind）返回 ``{}``。
+    """
+    spec = getattr(resource, "spec", None)
+    accelerator = getattr(getattr(spec, "resources", None), "accelerator", None)
+    if not isinstance(accelerator, AcceleratorSpec):
+        return {}
+    return {"accelerator": accelerator.model_dump(mode="json")}
 
 
 class ReleaseProvider(Protocol):
@@ -239,11 +258,33 @@ class ReconciliationController(Reconciler):
         # 步骤 6：Scheduler 分配（如果需要且调度器可用）
         allocation_ref = None
         if self._scheduler is not None and diff.get("needs_allocation"):
-            from forgemesh.core.scheduler import ScheduleRequest
+            from forgemesh.core.scheduler import ResourceRef, ScheduleRequest
 
+            meta = resource.metadata
+            if not meta.uid:
+                return ReconcileResult(
+                    done=False,
+                    requeue_after=None,
+                    status_patch={
+                        "conditions": [
+                            {
+                                "type": "Ready",
+                                "status": "False",
+                                "reason": "MissingUid",
+                                "message": "metadata.uid is required to allocate resources",
+                            }
+                        ]
+                    },
+                )
             sched_req = ScheduleRequest(
                 tenant_id=ctx.tenant_id,
-                resource_kind=resource.kind,
+                resource_ref=ResourceRef(
+                    kind=resource.kind,
+                    namespace=meta.namespace,
+                    name=meta.name,
+                    uid=meta.uid,
+                ),
+                idempotency_key=allocation_idempotency_key(meta.uid, meta.generation),
                 requirements=diff.get("requirements", {}),
             )
             try:
@@ -361,10 +402,11 @@ class ReconciliationController(Reconciler):
         1. ``release_provider.release(resource)``（未注入 → Noop）；异常 →
            保持 ``Terminating`` + requeue 重试（不物理删除，GPU 不误删）；
         2. 读取最新资源，移除默认 release finalizer 后 CAS 写回；仍有其他
-           finalizer → 等待（requeue）；
-        3. finalizers 清空 → 释放关联 Allocation（P1 约定：以
-           ``{kind}/{name}`` 作为 ``allocations.resource_id`` 关联键，由
-           Scheduler 装配方对齐）→ 物理 DELETE → 记审计日志。
+           finalizer → 等待（requeue）；资源已不存在、或 uid 已不同（同名重建）
+           → 释放原资源的分配后完成；
+        3. finalizers 清空 → 释放归属该资源 uid 的 Active Allocation
+           （``allocations.resource_id`` 即资源 uid，限本租户）→ 物理 DELETE
+           → 记审计日志。
 
         失败路径**不**登记 ``_processed_keys``，保证 requeue 后可重试。
         """
@@ -406,7 +448,10 @@ class ReconciliationController(Reconciler):
                 resource.kind, meta.namespace, meta.name, ctx.tenant_id
             )
         except NotFoundError:
-            # 已被并发删除：视为完成。
+            current = None
+        if current is None or current.metadata.uid != meta.uid:
+            # 已被并发删除，或同名资源已以新 uid 重建：只释放原资源的分配。
+            await self._release_allocation(ctx)
             await self._mark_processed(ctx.dedup_key)
             return ReconcileResult(done=True)
 
@@ -433,19 +478,8 @@ class ReconciliationController(Reconciler):
                 },
             )
 
-        # 步骤 3：finalizers 已清空 → 释放关联 Allocation → 物理 DELETE。
-        allocation_key = f"{resource.kind}/{meta.name}"
-        get_active = getattr(self._registry, "get_active_allocation", None)
-        if callable(get_active):
-            active = await get_active(allocation_key, ctx.tenant_id)
-            if active is not None:
-                release = getattr(self._registry, "release_allocation", None)
-                if callable(release):
-                    await release(
-                        active["id"],
-                        ctx.tenant_id,
-                        reason=f"resource {allocation_key} deleted",
-                    )
+        # 步骤 3：finalizers 已清空 → 释放归属该资源的 Allocation → 物理 DELETE。
+        await self._release_allocation(ctx)
         with contextlib.suppress(NotFoundError):
             # 已被并发删除：幂等完成
             await self._registry.delete(
@@ -467,6 +501,26 @@ class ReconciliationController(Reconciler):
         )
         return ReconcileResult(done=True, requeue_after=None)
 
+    async def _release_allocation(self, ctx: ReconcileContext) -> None:
+        """释放归属 ``ctx.resource``（按 uid，限本租户）的 Active 分配；没有则跳过。"""
+        meta = ctx.resource.metadata
+        release_active = getattr(self._registry, "release_active_allocation", None)
+        if not meta.uid or not callable(release_active):
+            return
+        allocation_id = await release_active(meta.uid, ctx.tenant_id, reason="resource deleted")
+        if allocation_id is not None:
+            logger.info(
+                "allocation released: allocation_id=%s kind=%s namespace=%s name=%s "
+                "uid=%s tenant_id=%s correlation_id=%s",
+                allocation_id,
+                ctx.resource.kind,
+                meta.namespace,
+                meta.name,
+                meta.uid,
+                ctx.tenant_id,
+                ctx.correlation_id,
+            )
+
     @staticmethod
     def _compute_diff(resource: Resource, observed: dict[str, Any]) -> dict[str, Any]:
         """计算期望状态与观测状态的差异（步骤 2-3）。
@@ -476,7 +530,8 @@ class ReconciliationController(Reconciler):
         * 若 ``observed_generation >= desired_generation`` 且 phase 为 ``Ready``
           或 ``Degraded``，认为已收敛，无需协调。
         * 否则需要协调；根据 phase 判断是否需要分配（Pending/None）和
-          是否需要工作流（None/Pending/Scheduling）。
+          是否需要工作流（None/Pending/Scheduling）；``requirements`` 为传给
+          调度器的需求（见 :func:`_scheduling_requirements`）。
 
         Args:
             resource: 目标资源（含期望状态与元数据）。
@@ -484,7 +539,7 @@ class ReconciliationController(Reconciler):
 
         Returns:
             差异描述字典，含 ``needs_reconcile`` / ``operation`` /
-            ``needs_allocation`` / ``needs_workflow`` 等字段。
+            ``needs_allocation`` / ``needs_workflow`` / ``requirements`` 等字段。
         """
         observed_phase = observed.get("phase")
         desired_generation = resource.metadata.generation
@@ -505,7 +560,7 @@ class ReconciliationController(Reconciler):
             "operation": operation,
             "needs_allocation": needs_allocation,
             "needs_workflow": needs_workflow,
-            "requirements": {},
+            "requirements": _scheduling_requirements(resource),
             "desired_generation": desired_generation,
             "observed_generation": observed_generation,
             "observed_phase": observed_phase,

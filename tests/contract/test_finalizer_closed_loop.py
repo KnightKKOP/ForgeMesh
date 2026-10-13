@@ -13,8 +13,8 @@
 * 无 finalizer 且无外部副作用的资源走直接物理删除路径（向后兼容）；
 * 已 ``Terminating`` 的重复删除请求幂等（版本不重复递增）。
 
-关联 Allocation 的 P1 约定：``allocations.resource_id = "{kind}/{name}"``
-（``reconciler/core.py`` 步骤 3）。
+关联 Allocation 以归属资源 uid 记录：``allocations.resource_id = metadata.uid``
+（``reconciler/core.py`` 步骤 3 按 uid、限本租户释放）。
 """
 
 from __future__ import annotations
@@ -62,6 +62,7 @@ def _make_inference_service(
         metadata=ObjectMeta(
             name=name,
             namespace=NAMESPACE,
+            uid=f"uid-{name}",
             tenant_id=TENANT,
             generation=1,
         ),
@@ -159,11 +160,11 @@ def test_happy_path_full_closure_with_allocation() -> None:
     reg = SQLiteRegistry()
     try:
         _run(reg.put(_make_inference_service(phase=InferencePhase.READY)))
-        # 建立关联 Allocation（P1 约定 resource_id = "{kind}/{name}"）
+        # 建立归属该资源的 Allocation（resource_id 为资源 uid）
         _run(
             reg.put_allocation(
                 Allocation(
-                    resource_id=f"{KIND}/svc-1",
+                    resource_id="uid-svc-1",
                     tenant_id=TENANT,
                     idempotency_key="alloc-key-1",
                 )
@@ -197,7 +198,7 @@ def test_happy_path_full_closure_with_allocation() -> None:
         assert len(allocs) == 1
         assert allocs[0]["status"] == "Released"
         assert allocs[0]["released_at"] is not None
-        assert _run(reg.get_active_allocation(f"{KIND}/svc-1", TENANT)) is None
+        assert _run(reg.get_active_allocation("uid-svc-1", TENANT)) is None
     finally:
         _run(reg.close())
 

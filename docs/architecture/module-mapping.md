@@ -91,12 +91,12 @@
 |---|---|
 | 架构模块 | 微内核契约（architecture.md 第 4 章） |
 | 当前代码路径 | `packages/core-contracts/src/forgemesh/core/{objects,errors,registry,reconciler,scheduler,secrets}.py`（发行名 `forgemesh-core`，PEP 420 命名空间包） |
-| 核心契约 | `ObjectMeta` / `Condition` / `Resource`（objects.py）；`ResourceRegistry(ABC)`（registry.py）；`Reconciler(ABC)` + `ReconcileResult`（reconciler.py）；`Scheduler(ABC)` + `AllocationRef`（scheduler.py）；errors 异常体系；secrets 接口 |
+| 核心契约 | `ObjectMeta` / `Condition` / `Resource`（objects.py）；`ResourceRegistry(ABC)`（registry.py）；`Reconciler(ABC)` + `ReconcileResult`（reconciler.py）；`Scheduler(ABC)` + `ScheduleRequest`（`ResourceRef` 归属身份 + 幂等键）/ `FeasibilityResult` / `AllocationRef`（含 `AllocatedDevice`）（scheduler.py）；errors 异常体系；secrets 接口 |
 | 运行形态 | 进程内库（被控制平面、runtime、Agent 侧共同依赖的稳定抽象层） |
 | 数据所有权 | 无（仅定义接口与值对象） |
 | 允许依赖 | `pydantic`、标准库 |
 | 禁止依赖 | 插件、DB 驱动、Web 框架、LLM SDK（扫描一验证 ✅，见 3.1） |
-| 测试路径 | `tests/unit/core/test_objects.py` |
+| 测试路径 | `tests/unit/core/test_objects.py`、`tests/unit/core/test_scheduler_contract.py` |
 | 状态 | 已实现且有测试覆盖 |
 | 演进动作 | 保留 |
 
@@ -120,13 +120,13 @@
 | 字段 | 内容 |
 |---|---|
 | 架构模块 | L2 Core Control Plane（权威状态、协调、插件管理、审计） |
-| 当前代码路径 | `packages/control-plane/src/forgemesh/controlplane/`：`registry/{models,store}.py`、`reconciler/{core,dedup}.py`、`controller/{manager,queue}.py`、`api/{routes,dependencies,errors}.py`、`plugin_manager.py`、`outbox.py`、`audit.py`、`tasks.py`、`heartbeat.py`、`observability.py`、`diagnostics.py`、`app.py`、`auth.py`、`keygen.py`（共 24 个 `.py`；其中 `auth.py` / `keygen.py` / `api/errors.py` 为 API 认证与错误信封，见 ADR-014；`controller/` 驱动协调器并回写 status；其余与任务书的 9 个子模块一一对应） |
-| 核心契约 | 实现 `core-contracts` 的 `ResourceRegistry` / `Reconciler` / `Scheduler`；`app.py` 提供 HTTP 服务（FastAPI，未安装时回退纯标准库占位——生产必须 FastAPI/ASGI），并在 lifespan 中运行控制器；控制器按序号增量读取 `resource_changes` 变更记录，经 `update_status`（status 子资源，CAS）回写协调结果；Outbox 事务性事件（architecture.md 3.3 规则 7）；`ProcessedKeyStore` 去重（reconciler/dedup.py） |
+| 当前代码路径 | `packages/control-plane/src/forgemesh/controlplane/`：`registry/{models,store}.py`、`reconciler/{core,dedup}.py`、`controller/{manager,queue}.py`、`scheduler/{inventory,first_fit}.py`、`api/{routes,dependencies,errors}.py`、`plugin_manager.py`、`outbox.py`、`audit.py`、`tasks.py`、`heartbeat.py`、`observability.py`、`diagnostics.py`、`app.py`、`auth.py`、`keygen.py`、`sqlite.py`（共 28 个 `.py`；其中 `auth.py` / `keygen.py` / `api/errors.py` 为 API 认证与错误信封，见 ADR-014；`controller/` 驱动协调器并回写 status；`scheduler/` 按静态加速器清单首次适配分配；`sqlite.py` 统一 SQLite 连接设置（WAL、外键）；其余与任务书的 9 个子模块一一对应） |
+| 核心契约 | 实现 `core-contracts` 的 `ResourceRegistry` / `Reconciler` / `Scheduler`（`FirstFitScheduler`：清单来自 `FORGEMESH_INVENTORY_FILE`，设置时才注入控制器；分配与设备占用经 `SQLiteRegistry.create_allocation` 在同一事务中写入，设备独占由 `allocation_devices` 部分唯一索引保证）；`app.py` 提供 HTTP 服务（FastAPI，未安装时回退纯标准库占位——生产必须 FastAPI/ASGI），并在 lifespan 中运行控制器；控制器按序号增量读取 `resource_changes` 变更记录，经 `update_status`（status 子资源，CAS）回写协调结果；Outbox 事务性事件（architecture.md 3.3 规则 7）；`ProcessedKeyStore` 去重（reconciler/dedup.py） |
 | 运行形态 | 单实例控制平面进程（模块化单体，architecture.md 3.3 规则 8）；ADR-013 约束：仅允许单写方写同一 SQLite 权威库；控制器与 API 同进程运行，不得以多个 worker 进程启动 |
 | 数据所有权 | **全部业务资源权威状态**（registry/store.py）、审计事件（audit.py，默认内存库，控制平面应用尚未接入）、Outbox 事件、任务与心跳状态 |
 | 允许依赖 | `forgemesh.core` / `forgemesh.resource` / `forgemesh.policy` / `forgemesh.decision` / `forgemesh.workflow*` / `forgemesh.plugin`（plugin-sdk）、标准库 `sqlite3`、FastAPI |
 | 禁止依赖 | 任何插件私有模块（`decision_rules` / `gpu_nvidia` 等，扫描二验证 ✅，见 3.2） |
-| 测试路径 | `tests/unit/controlplane/`：`test_api.py`、`test_routes.py`、`test_registry.py`、`test_reconciler.py`、`test_dedup_store.py`、`test_plugin_manager.py`、`test_outbox.py`、`test_audit.py`、`test_tasks.py`、`test_heartbeat.py`、`test_observability.py`、`test_diagnostics.py`、`test_app.py`、`test_auth.py`、`test_controller_manager.py`、`test_controller_queue.py`、`test_registry_changes.py`、`test_registry_status.py`（18 个文件，glob 核对） |
+| 测试路径 | `tests/unit/controlplane/`：`test_api.py`、`test_routes.py`、`test_registry.py`、`test_reconciler.py`、`test_dedup_store.py`、`test_plugin_manager.py`、`test_outbox.py`、`test_audit.py`、`test_tasks.py`、`test_heartbeat.py`、`test_observability.py`、`test_diagnostics.py`、`test_app.py`、`test_auth.py`、`test_controller_manager.py`、`test_controller_queue.py`、`test_registry_changes.py`、`test_registry_status.py`、`test_registry_allocations.py`、`test_sqlite.py`、`test_scheduler.py`、`test_scheduler_inventory.py`、`test_allocation_lifecycle.py`（23 个文件，glob 核对） |
 | 状态 | 已实现且有测试覆盖 |
 | 演进动作 | 保留；WP-C1 补故障路径（CAS 并发、重启恢复、finalizer 闭环、Allocation 唯一性） |
 
@@ -285,13 +285,13 @@
 | 字段 | 内容 |
 |---|---|
 | 架构模块 | L6 权威存储（过渡态：SQLite；目标态：PostgreSQL） |
-| 当前代码路径 | `packages/control-plane/src/forgemesh/controlplane/registry/store.py`（`SQLiteRegistry`，权威资源状态，CAS 乐观并发 `resource_version`）；`packages/decision-api/src/forgemesh/decision/records.py`（`DecisionRecordStore`）；`packages/workflow-runtime/src/forgemesh/workflowruntime/store.py`（工作流运行存储）；审计 `audit.py` |
+| 当前代码路径 | `packages/control-plane/src/forgemesh/controlplane/registry/store.py`（`SQLiteRegistry`，权威资源状态，CAS 乐观并发 `resource_version`；分配 `allocations` 与设备占用 `allocation_devices`，部分唯一索引保证每个资源 uid 在其租户内至多一个 Active 分配、每个设备（跨租户）至多属于一个 Active 分配）；`packages/decision-api/src/forgemesh/decision/records.py`（`DecisionRecordStore`）；`packages/workflow-runtime/src/forgemesh/workflowruntime/store.py`（工作流运行存储）；审计 `audit.py` |
 | 核心契约 | ADR-013：**SQLite 为权威存储、单控制平面实例写、禁止扩展 replicas；PostgreSQL 为目标态**（迁移由真实 SLO/基准触发）；Registry 对齐 `core-contracts.ResourceRegistry` 契约 |
 | 运行形态 | 进程内嵌入式：控制平面应用只打开 `FORGEMESH_DB_PATH` 一个 SQLite 文件（Registry 与去重键，WAL 模式），审计、决策记录、工作流存储默认使用内存库；备份见 docs/operations/backup-restore.md |
 | 数据所有权 | 权威写方：控制平面**唯一实例**（registry/audit/outbox）；决策记录写方为 Decision 链路（D1 关联） |
 | 允许依赖 | 标准库 `sqlite3`（仅控制平面实现层；API 层现状见 D1） |
 | 禁止依赖 | 第三方 DB 驱动（v1.x）、多实例并发写同一库文件 |
-| 测试路径 | `tests/unit/controlplane/test_registry.py`、`tests/unit/decision/test_records.py`、`tests/unit/workflowruntime/test_store.py`；恢复/并发：`tests/performance/test_restart_recovery.py`、`test_conflict_correctness.py`、`tests/chaos/test_cp_restart.py`；备份恢复演练见 `docs/operations/backup-restore.md` |
+| 测试路径 | `tests/unit/controlplane/test_registry.py`、`tests/unit/controlplane/test_registry_allocations.py`、`tests/unit/decision/test_records.py`、`tests/unit/workflowruntime/test_store.py`；恢复/并发：`tests/performance/test_restart_recovery.py`、`test_conflict_correctness.py`、`tests/chaos/test_cp_restart.py`；备份恢复演练见 `docs/operations/backup-restore.md` |
 | 状态 | 已实现且有测试覆盖 |
 | 演进动作 | 保留；WP-C1 补 CAS 并发冲突/重启恢复/备份恢复的故障路径测试；PostgreSQL 迁移属阶段 F（有证据后） |
 
@@ -321,7 +321,7 @@
 | 数据所有权 | 无；控制平面的 SQLite 库位于 compose 卷 `control-plane-data` / k8s PVC `forgemesh-control-plane-data`（pgdata 卷属目标态预置，仅 `postgres` profile 使用） |
 | 允许依赖 | — |
 | 禁止依赖 | —（约束：部署不得暗示多副本写同一 SQLite） |
-| 测试路径 | `scripts/compose_smoke.sh`（CI `compose-smoke` job：构建镜像，经网关验证无 key 返回 401、创建与读取 `InferenceService`、控制器写入 `SchedulerUnavailable`，重启控制平面后数据仍在）；k8s 清单无自动化测试；备份恢复有人工演练清单 |
+| 测试路径 | `scripts/compose_smoke.sh`（CI `compose-smoke` job：构建镜像，经网关验证无 key 返回 401、创建与读取 `InferenceService`、控制器写入 `SchedulerUnavailable`（compose 未配置 `FORGEMESH_INVENTORY_FILE`），重启控制平面后数据仍在）；k8s 清单无自动化测试；备份恢复有人工演练清单 |
 | 状态 | compose 已实现且有测试覆盖；k8s 清单实现待核验（无自动化测试，尚未提供网关清单、ServiceAccount、NetworkPolicy）；运维文档已交付 |
 | 演进动作 | k8s 补网关清单、ServiceAccount 与 NetworkPolicy；A1.5 已核对部署文档含单实例约束；目标态 PostgreSQL 部署属阶段 F |
 
@@ -342,7 +342,7 @@ grep -rn "import sqlite3\|from fastapi\|import requests\|plugins\." \
 **输出（命中 1 条）：**
 
 ```
-packages/decision-api/src/forgemesh/decision/records.py:18:import sqlite3
+packages/decision-api/src/forgemesh/decision/records.py:16:import sqlite3
 ```
 
 **结论：⚠️ 违规需处理（1 处）** —— `core-contracts` 与 `workflow-api` 干净（零命中）；`decision-api` 的 `records.py` 导入标准库 `sqlite3`：该文件同时含契约模型 `DecisionRecord` 与 SQLite 存储实现 `DecisionRecordStore`，即"决策记录契约"与"默认存储实现"未分包。sqlite3 为标准库而非第三方驱动，属**边界设计偏差**而非外部依赖泄漏，处置见 D1。
@@ -422,7 +422,7 @@ grep -rn "decision_rules\|gpu_nvidia\|runtime_vllm\|workflow_temporal" \
 
 | 编号 | 偏差 | 证据 | 影响 | 建议处置 |
 |---|---|---|---|---|
-| **D1** | 决策记录的契约与 SQLite 存储实现共存于 API 包：`decision-api` 导入 `sqlite3`，违反"契约包不依赖 DB 驱动"的边界规则 | 扫描一命中：`packages/decision-api/src/forgemesh/decision/records.py:18`（`DecisionRecord` + `DecisionRecordStore` 同文件） | 边界纯度受损；存储演进（如 PostgreSQL 迁移）将波及 API 包；属标准库依赖，无外部供应链风险 | **有证据后重构**：将 `DecisionRecordStore` 迁至控制平面实现层（与 `SQLiteRegistry` 同域），API 包仅保留 `DecisionRecord` 模型与存储接口；需 ADR 评审与迁移测试，不属 v1.1 强制项 |
+| **D1** | 决策记录的契约与 SQLite 存储实现共存于 API 包：`decision-api` 导入 `sqlite3`，违反"契约包不依赖 DB 驱动"的边界规则 | 扫描一命中：`packages/decision-api/src/forgemesh/decision/records.py:16`（`DecisionRecord` + `DecisionRecordStore` 同文件） | 边界纯度受损；存储演进（如 PostgreSQL 迁移）将波及 API 包；属标准库依赖，无外部供应链风险 | **有证据后重构**：将 `DecisionRecordStore` 迁至控制平面实现层（与 `SQLiteRegistry` 同域），API 包仅保留 `DecisionRecord` 模型与存储接口；需 ADR 评审与迁移测试，不属 v1.1 强制项 |
 
 > 备注（不计入偏差）：`agent.proto` 为 `v1alpha1` 草案（timestamp 用 RFC 3339 字符串），正式化时机由演进决定。
 

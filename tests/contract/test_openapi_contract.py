@@ -571,6 +571,27 @@ def _page_token_without_kind(api: Api) -> httpx.Response:
     return api(params={"pageToken": "not-a-page-token"})
 
 
+@scenario("listAuditEvents", 200)
+def _audit_records_of_the_creates(api: Api) -> httpx.Response:
+    api.create("svc-1")
+    api.create("svc-2")
+    return api(params={"limit": 1})
+
+
+@scenario("listAuditEvents", 400, "BAD_REQUEST")
+def _resource_page_token_for_the_audit_list(api: Api) -> httpx.Response:
+    api.create("svc-1")
+    api.create("svc-2")
+    listed = Api(api.harness, "listInferenceServices")(params={"limit": 1})
+    return api(params={"pageToken": listed.json()["nextPageToken"]})
+
+
+@scenario("listAuditEvents", 503, "REGISTRY_UNAVAILABLE")
+def _audit_log_without_a_registry(api: Api) -> httpx.Response:
+    reset_registry()
+    return api()
+
+
 def _without_credentials(api: Api) -> httpx.Response:
     return api(authenticated=False)
 

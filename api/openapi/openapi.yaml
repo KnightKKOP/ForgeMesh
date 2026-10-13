@@ -32,6 +32,8 @@ tags:
     description: 结构化决策请求（决策≠授权；授权由 Scheduler/Policy 完成）
   - name: resources
     description: 按 kind 列出资源（只读）
+  - name: audit
+    description: 审计记录查询（只读，限定在凭证绑定的租户内）
   - name: probes
     description: 存活与就绪探针
 
@@ -408,6 +410,52 @@ paths:
           $ref: "#/components/responses/ServiceUnavailable"
 
 
+  /api/v1/audit-events:
+    parameters:
+      - $ref: "#/components/parameters/CorrelationId"
+    get:
+      tags: [audit]
+      summary: 列出审计记录
+      operationId: listAuditEvents
+      description: >-
+        列出凭证所属租户的审计记录，最新的在前。API 创建、更新（PUT / PATCH）与受理删除资源时，
+        在写入资源的同一个事务中写入一条审计记录，记录调用主体与关联 ID；被拒绝的请求、没有任何
+        变化的更新、对已在 Terminating 的资源重复的删除请求以及控制器的内部写入不产生审计记录。
+        分页：nextPageToken 只在还有下一页时出现，原样作为 pageToken 传入即取下一页；翻页期间
+        写入的新记录不会让后面的页重复或遗漏记录。Go 网关尚未转发此路径（返回 404），需直接访问
+        控制平面（使用同一个 API key）。
+      parameters:
+        - name: correlationId
+          in: query
+          description: 只列出该关联 ID 的记录；省略或为空时不过滤。
+          schema:
+            type: string
+        - $ref: "#/components/parameters/Limit"
+        - name: pageToken
+          in: query
+          description: >-
+            上一页响应中的 nextPageToken（不透明字符串），空字符串等同于省略（从最新的记录开始）。
+            只对签发它的租户与同一个 correlationId 有效，limit 可以逐页变化；格式不对、被修改、
+            用于其他租户 / correlationId 或取自资源列表时返回 400。控制平面重启后仍然有效。
+          schema:
+            type: string
+      responses:
+        "200":
+          description: 一页审计记录
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AuditEventList"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+
+
 components:
   parameters:
     CorrelationId:
@@ -758,6 +806,79 @@ components:
           description: 是否走了 Provider 降级路径。
         riskLevel:
           $ref: "#/components/schemas/RiskLevel"
+    AuditEvent:
+      type: object
+      description: 一条审计记录：调用主体在什么时间对哪个资源执行了什么操作。
+      required:
+        - auditId
+        - occurredAt
+        - tenantId
+        - actor
+        - keyId
+        - correlationId
+        - action
+        - resourceType
+        - namespace
+        - resourceId
+        - outcome
+        - details
+      additionalProperties: false
+      properties:
+        auditId:
+          type: string
+        occurredAt:
+          type: string
+          format: date-time
+          description: 写入时间（UTC），与同一次写入产生的资源变更事件的 occurredAt 相同。
+        tenantId:
+          type: string
+        actor:
+          type: [string, "null"]
+          description: 调用主体：API key 的 subject；dev 认证模式下为 dev:<租户>。
+        keyId:
+          type: [string, "null"]
+          description: 调用者使用的 API key 的 id；dev 认证模式下为 null。
+        correlationId:
+          type: string
+          description: >-
+            请求的 X-Correlation-Id（未携带时由服务端生成），与同一次写入产生的资源变更事件的
+            correlationId 相同。
+        action:
+          type: string
+          description: >-
+            操作：create（创建资源）、update（PUT / PATCH 更新资源）或 delete（受理删除，含置为
+            Terminating）。
+        resourceType:
+          type: string
+          description: 资源的 kind，如 InferenceService。
+        namespace:
+          type: [string, "null"]
+        resourceId:
+          type: string
+          description: 资源名。
+        outcome:
+          type: string
+          description: 操作结果；当前只记录成功的写入（success）。
+        details:
+          type: [object, "null"]
+          additionalProperties: true
+          description: >-
+            资源写入的记录含 change（created / updated / terminating / deleted）、resourceUid、
+            resourceVersion 与 eventId（同一次写入产生的资源变更事件）。
+    AuditEventList:
+      type: object
+      required: [items, count]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/AuditEvent"
+        count:
+          $ref: "#/components/schemas/PageCount"
+        nextPageToken:
+          type: string
+          description: >-
+            还有更早的记录时出现，最后一页不带此字段：作为 pageToken 传回即得下一页。
   responses:
     BadRequest:
       description: 请求不合法

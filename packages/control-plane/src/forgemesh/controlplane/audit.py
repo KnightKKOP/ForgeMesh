@@ -5,7 +5,9 @@ correlation_id 全链路贯穿，支持调用链查询。
 
 资源注册表在 API 写入资源的同一个事务中写入审计记录（:meth:`AuditLog.put`），记录调用
 主体（租户、主体、凭证 id）与关联 ID：资源写入失败时不会留下审计记录。
-:meth:`AuditLog.record` 单独写入并提交一条记录。
+:meth:`AuditLog.record` 单独写入并提交一条记录。:meth:`AuditLog.list_page` 按租户分页
+列出记录（``GET /api/v1/audit-events``），游标与资源列表的游标一样签名
+（:mod:`forgemesh.controlplane.pagetokens`）。
 """
 
 from __future__ import annotations
@@ -19,6 +21,7 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from .pagetokens import PageTokenSigner, load_page_token_key, page_scope
 from .sqlite import Database
 
 logger = logging.getLogger(__name__)
@@ -40,6 +43,8 @@ CREATE TABLE IF NOT EXISTS audit_events (
 );
 CREATE INDEX IF NOT EXISTS idx_audit_correlation ON audit_events(correlation_id);
 CREATE INDEX IF NOT EXISTS idx_audit_tenant ON audit_events(tenant_id, timestamp);
+CREATE INDEX IF NOT EXISTS idx_audit_tenant_correlation
+    ON audit_events(tenant_id, correlation_id, timestamp);
 """
 
 #: v1.0.0 的 ``audit_events`` 没有的列（打开存量库时补齐）。
@@ -47,6 +52,9 @@ _ADDED_COLUMNS = (
     ("key_id", "key_id TEXT"),
     ("namespace", "namespace TEXT"),
 )
+
+#: 审计记录列表的游标位置：上一页最后一条记录的时间戳与 ``audit_id``。
+_PAGE_POSITION = {"ts": float, "id": str}
 
 
 class AuditEvent(BaseModel):
@@ -83,8 +91,25 @@ class AuditEvent(BaseModel):
     timestamp: float = Field(default_factory=time.time)
 
 
+class AuditPage(BaseModel):
+    """一页审计记录。
+
+    Attributes:
+        items: 本页的记录，最新的在前。
+        next_page_token: 取下一页的令牌；没有下一页时为 None。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    items: list[AuditEvent]
+    next_page_token: str | None = None
+
+
 class AuditLog:
     """审计日志（SQLite 后端）。
+
+    分页游标的签名密钥取自数据库的 ``registry_meta`` 表（没有时生成），与资源注册表共用
+    数据库时即注册表的密钥。
 
     Args:
         db_path: SQLite 数据库路径，默认 :memory:。
@@ -97,6 +122,7 @@ class AuditLog:
         self._db = database if database is not None else Database(db_path)
         self._conn = self._db.conn
         self._init_schema()
+        self._page_tokens = PageTokenSigner(self._db.call(load_page_token_key, self._conn))
 
     def _init_schema(self) -> None:
         """创建表与索引（幂等），并为存量库补齐新增的列。"""
@@ -169,6 +195,55 @@ class AuditLog:
             (tenant_id, limit),
         )
 
+    def list_page(
+        self,
+        tenant_id: str,
+        *,
+        limit: int = 100,
+        page_token: str | None = None,
+        correlation_id: str | None = None,
+    ) -> AuditPage:
+        """按租户分页列出审计记录：最新的在前，时间相同时按 ``audit_id`` 降序。
+
+        下一页从上一页最后一条记录的位置继续，翻页期间写入的新记录排在已经取过的位置之前，
+        不会让后面的页重复或遗漏记录。游标（格式见 :mod:`forgemesh.controlplane.pagetokens`）
+        记录这个位置并绑定这组查询条件（``limit`` 每页可以不同），不是访问凭据：查询始终
+        限定在 ``tenant_id`` 内。
+
+        Args:
+            tenant_id: 只列出该租户的记录。
+            limit: 单页最多返回的条数（至少为 1）。
+            page_token: 上一页的 ``next_page_token``；为空时从最新的记录开始。
+            correlation_id: 给出时只列出该关联 ID 的记录。
+
+        Raises:
+            ValueError: ``limit`` 小于 1。
+            InvalidPageTokenError: 游标无法解析、被篡改，或签发给了另一个列表、另一个租户或
+                另一个 ``correlation_id``（见 :mod:`forgemesh.controlplane.pagetokens`）。
+        """
+        if limit < 1:
+            raise ValueError(f"limit must be at least 1, got {limit}")
+        scope = page_scope(
+            {"list": "audit-events", "tenant": tenant_id, "correlationId": correlation_id}
+        )
+        sql = "SELECT * FROM audit_events WHERE tenant_id = ?"
+        params: list[Any] = [tenant_id]
+        if correlation_id is not None:
+            sql += " AND correlation_id = ?"
+            params.append(correlation_id)
+        if page_token is not None:
+            timestamp, audit_id = self._page_tokens.decode(page_token, scope, _PAGE_POSITION)
+            sql += " AND timestamp <= ? AND (timestamp < ? OR audit_id < ?)"
+            params += [timestamp, timestamp, audit_id]
+        sql += " ORDER BY timestamp DESC, audit_id DESC LIMIT ?"
+        params.append(limit + 1)
+        events = self._query(sql, tuple(params))
+        if len(events) <= limit:
+            return AuditPage(items=events)
+        items = events[:limit]
+        position = {"ts": items[-1].timestamp, "id": items[-1].audit_id}
+        return AuditPage(items=items, next_page_token=self._page_tokens.encode(position, scope))
+
     @staticmethod
     def _row_to_event(row: sqlite3.Row) -> AuditEvent:
         """将数据库行反序列化为 AuditEvent。"""
@@ -193,4 +268,4 @@ class AuditLog:
             self._db.close()
 
 
-__all__ = ["AuditEvent", "AuditLog"]
+__all__ = ["AuditEvent", "AuditLog", "AuditPage"]

@@ -68,6 +68,7 @@ Allocation 持久化
 （``limit`` 每页可以不同），被篡改或用于另一租户 / kind / 另一组过滤条件时抛
 :class:`InvalidPageTokenError`；密钥随数据库保存，控制平面重启后游标仍然有效。游标记录
 位置而不是快照：翻页期间新建或删除的资源可能出现也可能缺席，全程存在的资源恰好出现一次。
+签发与校验见 :mod:`forgemesh.controlplane.pagetokens`，审计记录列表的游标使用同一个密钥。
 
 变更记录
 --------
@@ -95,14 +96,10 @@ Outbox，信封与事件类型见 :mod:`forgemesh.controlplane.events`）；API 
 from __future__ import annotations
 
 import asyncio
-import base64
 import builtins
 import contextlib
-import hashlib
-import hmac
 import json
 import logging
-import secrets
 import sqlite3
 from collections.abc import Callable, Collection, Iterator, Sequence
 from dataclasses import dataclass, field
@@ -124,6 +121,7 @@ from ..audit import AuditEvent, AuditLog
 from ..auth import Principal
 from ..events import ResourceEventChange, resource_event
 from ..outbox import Outbox
+from ..pagetokens import InvalidPageTokenError, PageTokenSigner, load_page_token_key, page_scope
 from ..sqlite import Database
 
 logger = logging.getLogger(__name__)
@@ -206,34 +204,10 @@ CREATE TABLE IF NOT EXISTS resource_changes (
     change TEXT NOT NULL,
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
-CREATE TABLE IF NOT EXISTS registry_meta (
-    name TEXT PRIMARY KEY,
-    value TEXT NOT NULL
-);
 """
 
-#: ``registry_meta`` 中保存分页游标签名密钥（hex）的行。
-_PAGE_TOKEN_KEY_NAME = "page_token_key"
-
-#: 分页游标载荷的格式版本。
-_PAGE_TOKEN_VERSION = 1
-
-_INVALID_PAGE_TOKEN = (
-    "invalid page token: it is malformed, was modified, or was issued for "
-    "a different tenant, kind or filter set"
-)
-
-
-def _b64encode(data: bytes) -> str:
-    return base64.urlsafe_b64encode(data).rstrip(b"=").decode("ascii")
-
-
-def _b64decode(text: str) -> bytes:
-    return base64.urlsafe_b64decode(text + "=" * (-len(text) % 4))
-
-
-class InvalidPageTokenError(ValueError):
-    """分页游标无效：无法解析、被篡改，或签发给了另一个租户、kind 或另一组过滤条件。"""
+#: 资源列表的游标位置：本页最后一个资源的 namespace 排序键与 name。
+_PAGE_POSITION = {"ns": str, "name": str}
 
 
 class ChangeType(StrEnum):
@@ -363,7 +337,7 @@ class SQLiteRegistry(ResourceRegistry):
         self._conn = self._db.conn
         self._lock = self._db.lock
         self._init_schema()
-        self._page_token_key = self._load_page_token_key()
+        self._page_tokens = PageTokenSigner(load_page_token_key(self._conn))
         self._outbox = Outbox(database=self._db)
         self._audit = AuditLog(database=self._db)
 
@@ -498,23 +472,6 @@ class SQLiteRegistry(ResourceRegistry):
         self._ensure_identity_index()
         self._conn.commit()
 
-    def _load_page_token_key(self) -> bytes:
-        """读取分页游标的签名密钥；库中还没有时生成并持久化。
-
-        多个进程同时打开同一个新库时，``INSERT OR IGNORE`` 保证只有先写入的密钥生效，
-        各方随后读到的都是同一个值。
-        """
-        query = "SELECT value FROM registry_meta WHERE name=?"
-        row = self._conn.execute(query, (_PAGE_TOKEN_KEY_NAME,)).fetchone()
-        if row is None:
-            self._conn.execute(
-                "INSERT OR IGNORE INTO registry_meta (name, value) VALUES (?, ?)",
-                (_PAGE_TOKEN_KEY_NAME, secrets.token_hex(32)),
-            )
-            self._conn.commit()
-            row = self._conn.execute(query, (_PAGE_TOKEN_KEY_NAME,)).fetchone()
-        return bytes.fromhex(row["value"])
-
     def _migrate_legacy_allocations(self) -> None:
         """删除存量库中不分租户的旧索引 ``idx_allocations_one_active_per_resource``。
 
@@ -630,29 +587,18 @@ class SQLiteRegistry(ResourceRegistry):
         tenant_id: str, kind: str, namespace: str | None, labels: dict[str, str] | None
     ) -> str:
         """分页游标绑定的上下文：租户、kind 与过滤条件（不含 ``limit``）。"""
-        return json.dumps(
+        return page_scope(
             {
                 "tenant": tenant_id,
                 "kind": kind,
                 "namespace": namespace,
                 "labels": sorted((labels or {}).items()),
-            },
-            sort_keys=True,
-            separators=(",", ":"),
-            ensure_ascii=False,
+            }
         )
-
-    def _sign_page_token(self, payload: str, scope: str) -> str:
-        message = f"{payload}.{scope}".encode()
-        return _b64encode(hmac.new(self._page_token_key, message, hashlib.sha256).digest())
 
     def _encode_page_token(self, scope: str, namespace_key: str, name: str) -> str:
         """把本页最后一个资源的位置编码为签名游标。"""
-        position = {"v": _PAGE_TOKEN_VERSION, "ns": namespace_key, "name": name}
-        payload = _b64encode(
-            json.dumps(position, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
-        )
-        return f"{payload}.{self._sign_page_token(payload, scope)}"
+        return self._page_tokens.encode({"ns": namespace_key, "name": name}, scope)
 
     def _decode_page_token(self, token: str, scope: str) -> tuple[str, str]:
         """校验签名并解码游标，返回 ``(namespace 排序键, name)``。
@@ -660,24 +606,8 @@ class SQLiteRegistry(ResourceRegistry):
         Raises:
             InvalidPageTokenError: 游标无法解析、被篡改，或属于另一个上下文 ``scope``。
         """
-        # 签发的游标只含 base64url 字符与 "."；先排除非 ASCII 输入，compare_digest 才能比较 str
-        if not token.isascii():
-            raise InvalidPageTokenError(_INVALID_PAGE_TOKEN)
-        payload, _, signature = token.partition(".")
-        if not hmac.compare_digest(signature, self._sign_page_token(payload, scope)):
-            raise InvalidPageTokenError(_INVALID_PAGE_TOKEN)
-        try:
-            position = json.loads(_b64decode(payload))
-        except ValueError as exc:
-            raise InvalidPageTokenError(_INVALID_PAGE_TOKEN) from exc
-        if not (
-            isinstance(position, dict)
-            and position.get("v") == _PAGE_TOKEN_VERSION
-            and isinstance(position.get("ns"), str)
-            and isinstance(position.get("name"), str)
-        ):
-            raise InvalidPageTokenError(_INVALID_PAGE_TOKEN)
-        return position["ns"], position["name"]
+        namespace_key, name = self._page_tokens.decode(token, scope, _PAGE_POSITION)
+        return namespace_key, name
 
     @staticmethod
     def _row_to_resource(row: sqlite3.Row) -> Resource:

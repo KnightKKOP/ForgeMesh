@@ -452,7 +452,7 @@ kubectl -n forgemesh patch deployment forgemesh-control-plane \
 - 推理实例运行在控制平面的 Pod 内，监听内核挑选的临时端口（Linux 默认 32768–60999），网关直接连接 Pod IP：启动器的监听地址设为 `0.0.0.0`，写进 `status.endpoints` 的主机用 Downward API 取 Pod IP（Service 只转发 8080，不能写 Service 名）。同时应用 `launcher/network-policy.yaml`，允许网关访问这些端口；修改了 Pod 的 `net.ipv4.ip_local_port_range` 时相应修改端口范围。
 - 实例随 Pod 结束：更新 Deployment、Pod 被驱逐或节点故障之后，新的 Pod 启动时 `Ready` 的服务转为 `Degraded`（`InstanceLost`），随后以新实例重新部署（见「部署推理服务」）。
 
-不需要 GPU 的试用，与 `docker-compose.fake-runtime.yaml` 对应（一块虚构设备的清单与 `fake` 启动器）：
+不需要 GPU 的试用，与 `docker-compose.fake-runtime.yaml` 对应（一块虚构设备的清单与 `fake` 启动器，每秒核对一次实例）：
 
 ```bash
 kubectl -n forgemesh create configmap forgemesh-inventory \
@@ -461,6 +461,10 @@ kubectl apply -f deploy/kubernetes/launcher/network-policy.yaml
 kubectl -n forgemesh patch deployment forgemesh-control-plane \
   --patch-file deploy/kubernetes/launcher/fake-runtime-patch.yaml
 # 之后按「部署推理服务」经网关创建服务、对话、删除，以 Authorization 头代替 X-Tenant-Id
+# 演练实例丢失：在控制平面的容器内向实例的端口（status.endpoints 中地址的端口）发出 POST /fake/exit，
+# 服务在下一次核对时转为 Degraded（InstanceLost），随后以新实例重新部署、回到 Ready
+kubectl -n forgemesh exec deployment/forgemesh-control-plane -- python -c \
+  "import urllib.request as r; r.urlopen(r.Request('http://127.0.0.1:<端口>/fake/exit', method='POST'))"
 ```
 
 `vllm-process` 启动器在控制平面的容器内以子进程运行 vLLM。仓库没有为它提供清单，也没有在 Kubernetes 上验证过；使用它需要：

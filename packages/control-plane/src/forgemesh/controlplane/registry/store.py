@@ -229,11 +229,11 @@ _EVENT_CHANGES = {
     ChangeType.DELETED: ResourceEventChange.DELETED,
 }
 
-#: 变更记录类型 → 审计记录的 ``action``（受理的删除请求与物理删除都是 ``delete``）。
+#: 变更记录类型 → 审计记录的 ``action``（受理的删除请求与物理删除都是 ``delete``）。status
+#: 写入不带调用主体，不产生审计记录。取值须与 OpenAPI ``AuditEvent.action`` 的枚举一致。
 _AUDIT_ACTIONS = {
     ChangeType.CREATED: "create",
     ChangeType.UPDATED: "update",
-    ChangeType.STATUS: "update_status",
     ChangeType.TERMINATING: "delete",
     ChangeType.DELETED: "delete",
 }

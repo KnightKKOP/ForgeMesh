@@ -5,9 +5,11 @@ from __future__ import annotations
 import asyncio
 import sqlite3
 from collections.abc import Callable, Coroutine
+from pathlib import Path
 from typing import Any
 
 import pytest
+import yaml
 from forgemesh.controlplane.audit import AuditEvent
 from forgemesh.controlplane.auth import Principal
 from forgemesh.controlplane.deployment import InMemoryLauncher, check_instances
@@ -128,6 +130,25 @@ def test_api_writes_record_the_principal_with_the_event(write: str) -> None:
     }
     assert event.payload["data"]["change"] == change
     assert record.timestamp == event.created_at
+
+
+@pytest.mark.unit
+def test_the_recorded_actions_are_the_openapi_enum() -> None:
+    """带调用主体的各种写入记下的 action 恰好是 OpenAPI ``AuditEvent.action`` 的枚举值。"""
+    openapi = yaml.safe_load(
+        (Path(__file__).resolve().parents[3] / "api" / "openapi" / "openapi.yaml").read_text(
+            encoding="utf-8"
+        )
+    )
+    actions = set()
+    for write in _WRITES.values():
+        reg = _registry()
+        _run(write(reg, ALICE))
+        actions.update(record.action for record in _audit(reg))
+
+    assert actions == set(
+        openapi["components"]["schemas"]["AuditEvent"]["properties"]["action"]["enum"]
+    )
 
 
 @pytest.mark.unit

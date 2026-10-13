@@ -844,6 +844,7 @@ components:
             correlationId 相同。
         action:
           type: string
+          enum: [create, update, delete]
           description: >-
             操作：create（创建资源）、update（PUT / PATCH 更新资源）或 delete（受理删除，含置为
             Terminating）。

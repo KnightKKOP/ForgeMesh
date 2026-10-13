@@ -23,7 +23,7 @@ security:
   - apiKey: []
 tags:
   - name: inference-services
-    description: 推理服务声明式生命周期管理（创建/查询/删除）
+    description: 推理服务声明式生命周期管理（创建/查询/更新/删除）
   - name: workflows
     description: 工作流运行启动与状态查询
   - name: decisions
@@ -120,7 +120,10 @@ paths:
               $ref: "#/components/schemas/InferenceService"
       responses:
         "201":
-          description: 已创建
+          description: 已创建（generation 为 1，observedGeneration 为 0）
+          headers:
+            ETag:
+              $ref: "#/components/headers/ETag"
           content:
             application/json:
               schema:
@@ -156,6 +159,9 @@ paths:
       responses:
         "200":
           description: 资源
+          headers:
+            ETag:
+              $ref: "#/components/headers/ETag"
           content:
             application/json:
               schema:
@@ -166,6 +172,90 @@ paths:
           $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/NotFound"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+    put:
+      tags: [inference-services]
+      summary: 整体替换推理服务的 spec / labels / annotations
+      operationId: replaceInferenceService
+      description: >-
+        请求体是完整的资源文档（GET 的响应修改后可直接提交）。spec、metadata.labels 与
+        metadata.annotations 整体替换（省略 labels / annotations 即清空）；只有 spec 变化时
+        generation 递增，labels / annotations 变化不递增，没有任何变化时不写入、版本不变。
+        kind、apiVersion、metadata.name、metadata.namespace 与租户不可修改：给出时必须与当前
+        资源一致，否则 400。status、conditions、finalizers、generation、observedGeneration
+        被忽略。metadata.uid / metadata.resourceVersion 给出时是前置条件，与 If-Match 一样，
+        不满足时返回 409；处于 Terminating 的资源拒绝更新（409）。
+        已经 Ready 的服务在 spec 变化后保持 generation 大于 observedGeneration，直到控制器
+        处理新的 spec。
+      parameters:
+        - $ref: "#/components/parameters/IfMatch"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/InferenceService"
+      responses:
+        "200":
+          description: 更新后的资源（没有变化时为当前资源）
+          headers:
+            ETag:
+              $ref: "#/components/headers/ETag"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/InferenceService"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+    patch:
+      tags: [inference-services]
+      summary: 以 JSON Merge Patch（RFC 7386）更新推理服务
+      operationId: patchInferenceService
+      description: >-
+        补丁合并到当前资源的 JSON 表示（与 GET 的响应相同）之后，按与 PUT 相同的规则检查并
+        写入：null 删除字段，对象逐字段合并，数组整体替换。补丁中没有给出的字段沿用当前值，
+        所以只有补丁里给出的 metadata.resourceVersion / metadata.uid 才构成前置条件。
+      parameters:
+        - $ref: "#/components/parameters/IfMatch"
+      requestBody:
+        required: true
+        content:
+          application/merge-patch+json:
+            schema:
+              $ref: "#/components/schemas/InferenceServicePatch"
+      responses:
+        "200":
+          description: 更新后的资源（没有变化时为当前资源）
+          headers:
+            ETag:
+              $ref: "#/components/headers/ETag"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/InferenceService"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "415":
+          $ref: "#/components/responses/UnsupportedMediaType"
         "503":
           $ref: "#/components/responses/ServiceUnavailable"
     delete:
@@ -249,6 +339,23 @@ paths:
 
 
 components:
+  parameters:
+    IfMatch:
+      name: If-Match
+      in: header
+      required: false
+      description: >-
+        乐观并发前置条件：取自资源响应的 ETag（强比较，弱标签永不匹配；* 表示资源存在即可）。
+        与当前 ETag 不匹配返回 409（details.reason 为 ResourceVersionMismatch）。
+      schema:
+        type: string
+  headers:
+    ETag:
+      description: >-
+        资源当前版本的强实体标签（不透明字符串，可原样用于 If-Match）：resourceVersion 变化时
+        随之变化，同名资源删除后重建也不会得到旧的 ETag。
+      schema:
+        type: string
   securitySchemes:
     apiKey:
       type: http
@@ -288,8 +395,10 @@ components:
               type: string
     InferenceService:
       type: object
-      description: "权威 Schema: api/schemas/inference-service.schema.json（此处为骨架摘要）。"
-      additionalProperties: true
+      description: >-
+        权威 Schema: api/schemas/inference-service.schema.json（此处为 API 表示的摘要）。
+        status、conditions、finalizers 由控制平面维护，请求中的值被忽略；未知的顶层字段返回 400。
+      additionalProperties: false
       required: [apiVersion, kind, metadata, spec]
       properties:
         apiVersion:
@@ -303,6 +412,24 @@ components:
           additionalProperties: true
         status:
           $ref: "#/components/schemas/InferenceServiceStatus"
+        conditions:
+          type: array
+          readOnly: true
+          items:
+            type: object
+            additionalProperties: true
+        finalizers:
+          type: array
+          readOnly: true
+          description: 受控删除的阻塞器，由控制平面维护。
+          items:
+            type: string
+    InferenceServicePatch:
+      type: object
+      description: >-
+        JSON Merge Patch 文档（RFC 7386）：合并到当前资源的 JSON 表示之后，结果须满足
+        InferenceService 与 PUT 的规则。
+      additionalProperties: true
     ObjectMeta:
       type: object
       description: >-
@@ -500,7 +627,22 @@ components:
           schema:
             $ref: "#/components/schemas/Error"
     Conflict:
-      description: 并发冲突/已存在
+      description: >-
+        冲突（错误码 CONFLICT）：同名资源已存在，或写入被拒绝。更新被拒绝时 details.reason
+        说明原因：ResourceVersionMismatch（resourceVersion 或 If-Match 与当前版本不符，重新
+        读取后重试）、UidMismatch（同名资源已被删除并重建）、Terminating（资源正在删除，不再
+        接受更新）。
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    UnsupportedMediaType:
+      description: 请求体的媒体类型不受支持（错误码 UNSUPPORTED_MEDIA_TYPE）。
+      headers:
+        Accept-Patch:
+          description: PATCH 接受的媒体类型，固定为 application/merge-patch+json。
+          schema:
+            type: string
       content:
         application/json:
           schema:

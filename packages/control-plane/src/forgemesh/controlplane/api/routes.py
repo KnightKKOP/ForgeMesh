@@ -5,6 +5,9 @@
 * ``POST   /inference-services``          —— 创建推理服务
 * ``GET    /inference-services``          —— 列出推理服务
 * ``GET    /inference-services/{name}``   —— 获取单个推理服务
+* ``PUT    /inference-services/{name}``   —— 整体替换 spec / labels / annotations
+* ``PATCH  /inference-services/{name}``   —— JSON Merge Patch（RFC 7386）更新，规则同 PUT
+  （见 :mod:`.updates`；单个资源的响应带 ``ETag``，``If-Match`` 不匹配返回 409）
 * ``DELETE /inference-services/{name}``   —— 删除推理服务（受控删除：无
   finalizer 且没有加速器分配 → 204 物理删除；有 finalizer 或分配 → 202
   ``Terminating``，协调器驱动受控释放后物理删除，见 development-plan 第 7 章）
@@ -24,19 +27,22 @@
 
 from __future__ import annotations
 
+import json
+from collections.abc import Callable
 from typing import Any
 from uuid import uuid4
 
-from fastapi import APIRouter, Depends, Header, HTTPException
+from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from fastapi.responses import JSONResponse, Response
 from forgemesh.core.errors import ConflictError, NotFoundError
+from forgemesh.core.objects import Resource
 from forgemesh.decision.provider import DecisionRequest as InternalDecisionRequest
 from forgemesh.resource.inference import InferenceService
 from forgemesh.workflow.runtime import WorkflowDefinition
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from ..app import error_envelope
-from ..registry import SQLiteRegistry
+from ..registry import ConflictReason, SQLiteRegistry
 from .dependencies import (
     ComponentNotReadyError,
     get_decision_router,
@@ -46,9 +52,21 @@ from .dependencies import (
     require_registry,
     require_write,
 )
-from .errors import validation_details
+from .errors import ApiError, validation_details
+from .updates import (
+    MERGE_PATCH_MEDIA_TYPE,
+    SERVER_OWNED_METADATA,
+    apply_merge_patch,
+    check_update,
+    conflict,
+    etag_of,
+    parse_if_match,
+    unknown_fields,
+)
 
 router = APIRouter(prefix="/api/v1")
+
+_KIND = "InferenceService"
 
 
 class ResourceListResponse(BaseModel):
@@ -58,44 +76,38 @@ class ResourceListResponse(BaseModel):
     count: int
 
 
-#: 由服务端维护、创建请求中一律忽略的元数据字段。已验证凭证中的租户是权威来源，
-#: 覆盖请求体中的租户字段，防止跨租户伪造；generation 只由服务端在 spec 变化时递增，
-#: observedGeneration 只由控制器写入。
-_SERVER_OWNED_METADATA = (
-    "tenant_id",
-    "tenantId",
-    "uid",
-    "resourceVersion",
-    "generation",
-    "observedGeneration",
-    "observed_generation",
-)
-
 #: 新建资源的 ``metadata.generation``（``observedGeneration`` 为 0：控制器尚未处理）。
 INITIAL_GENERATION = 1
 
 #: 列表接口单页条数上限。
 MAX_LIST_LIMIT = 1000
 
+#: PUT / PATCH 在读取与写入之间遇到并发写入（如控制器写 status）时重新读取并重试，
+#: 这是总尝试次数。
+_UPDATE_ATTEMPTS = 5
+
 
 def _build_inference_service(body: dict[str, Any], tenant_id: str) -> InferenceService:
     """从请求体构造强类型 :class:`InferenceService`（OpenAPI 要求必须携带 ``spec``）。
 
     租户取自已验证的凭证，``uid`` 由服务端分配，``generation`` 从
-    :data:`INITIAL_GENERATION` 开始；``status`` 属于观测状态，只能由控制器写入，
-    创建请求中的 ``status`` 与 generation 字段被忽略。
+    :data:`INITIAL_GENERATION` 开始；``status`` / ``conditions`` / ``finalizers`` 由控制
+    平面维护，创建请求中的这些字段与 generation 字段被忽略。
 
     Raises:
-        ValueError: ``kind`` 不是 ``InferenceService``，或 ``metadata`` 不是对象。
+        ValueError: 含未知的顶层字段，``kind`` 不是 ``InferenceService``，或 ``metadata``
+            不是对象。
         pydantic.ValidationError: ``metadata`` / ``spec`` 不满足模型约束。
     """
+    if unknown := unknown_fields(body):
+        raise ValueError(f"unknown top-level fields: {unknown}")
     kind = body.get("kind", "InferenceService")
     if kind != "InferenceService":
         raise ValueError(f"kind must be 'InferenceService' on this endpoint, got {kind!r}")
     metadata = body.get("metadata")
     if not isinstance(metadata, dict):
         raise ValueError("metadata must be an object")
-    metadata = {k: v for k, v in metadata.items() if k not in _SERVER_OWNED_METADATA}
+    metadata = {k: v for k, v in metadata.items() if k not in SERVER_OWNED_METADATA}
     metadata["tenantId"] = tenant_id
     metadata["uid"] = uuid4().hex
     metadata["generation"] = INITIAL_GENERATION
@@ -120,6 +132,15 @@ def _invalid_limit(limit: int) -> JSONResponse | None:
     )
 
 
+def _resource_response(resource: Resource, status_code: int = 200) -> JSONResponse:
+    """单个资源的 JSON 表示，附带当前版本的 ``ETag``。"""
+    return JSONResponse(
+        status_code=status_code,
+        content=resource.model_dump(by_alias=True, mode="json"),
+        headers={"ETag": etag_of(resource)},
+    )
+
+
 # ------------------------------------------------------------------ #
 # 推理服务 CRUD
 # ------------------------------------------------------------------ #
@@ -132,9 +153,10 @@ async def create_inference_service(
     registry: SQLiteRegistry = Depends(require_registry),
     x_correlation_id: str | None = Header(default=None, alias="X-Correlation-Id"),
 ) -> Any:
-    """创建推理服务（201）。
+    """创建推理服务（201，附 ``ETag``）。
 
-    请求体不合法（缺少 ``spec``、kind 不匹配等）返回 400；同名资源已存在返回 409。
+    请求体不合法（缺少 ``spec``、kind 不匹配、未知的顶层字段等）返回 400；同名资源已存在
+    返回 409。
     """
     correlation_id = x_correlation_id or uuid4().hex
     try:
@@ -153,7 +175,7 @@ async def create_inference_service(
         created = await registry.put(resource)
     except ConflictError as exc:
         return _error_response(409, "CONFLICT", str(exc), correlation_id)
-    return JSONResponse(status_code=201, content=created.model_dump(by_alias=True, mode="json"))
+    return _resource_response(created, status_code=201)
 
 
 @router.get("/inference-services", dependencies=[Depends(require_read)])
@@ -176,13 +198,124 @@ async def get_inference_service(
     tenant_id: str = Depends(get_tenant_id),
     registry: SQLiteRegistry = Depends(require_registry),
     namespace: str | None = None,
-) -> dict[str, Any]:
-    """获取单个推理服务；不存在时返回 HTTP 404。"""
+) -> JSONResponse:
+    """获取单个推理服务（附 ``ETag``）；不存在时返回 HTTP 404。"""
     try:
         resource = await registry.get("InferenceService", namespace, name, tenant_id)
     except NotFoundError as exc:
         raise HTTPException(status_code=404, detail=f"InferenceService '{name}' not found") from exc
-    return resource.model_dump(by_alias=True)
+    return _resource_response(resource)
+
+
+async def _update_inference_service(
+    registry: SQLiteRegistry,
+    tenant_id: str,
+    name: str,
+    namespace: str | None,
+    if_match: list[str] | None,
+    document_for: Callable[[dict[str, Any]], Any],
+) -> JSONResponse:
+    """PUT / PATCH 的共同流程：读取当前资源 → 生成更新文档 → 检查 → CAS 写入。
+
+    ``document_for`` 由当前资源的 JSON 表示得到更新文档。客户端的前置条件每一轮都对照
+    这一轮读到的资源检查，写入以读到的 uid 与版本为条件；读取之后资源被并发修改（如
+    控制器写入 status）时重新读取再来一轮，不会覆盖并发写入，也不会绕过前置条件。
+    """
+    condition = parse_if_match(if_match)
+    for _ in range(_UPDATE_ATTEMPTS):
+        try:
+            current, phase = await registry.get_with_phase(_KIND, namespace, name, tenant_id)
+        except NotFoundError as exc:
+            raise ApiError(404, "NOT_FOUND", f"InferenceService '{name}' not found") from exc
+        if phase == "Terminating":
+            raise conflict(
+                f"InferenceService '{name}' is terminating and no longer accepts updates",
+                ConflictReason.TERMINATING,
+            )
+        document = document_for(current.model_dump(by_alias=True, mode="json"))
+        desired = check_update(document, current, tenant_id=tenant_id, if_match=condition)
+        try:
+            updated = await registry.update_spec(
+                _KIND,
+                namespace,
+                name,
+                tenant_id,
+                desired.spec,
+                labels=desired.labels,
+                annotations=desired.annotations,
+                expected_version=current.metadata.resourceVersion,
+                expected_uid=current.metadata.uid,
+            )
+        except NotFoundError as exc:
+            raise ApiError(404, "NOT_FOUND", f"InferenceService '{name}' not found") from exc
+        except ConflictError as exc:
+            if (exc.details or {}).get("reason") == ConflictReason.TERMINATING:
+                raise conflict(exc.message, ConflictReason.TERMINATING) from exc
+            continue
+        return _resource_response(updated)
+    raise conflict(
+        f"InferenceService '{name}' kept changing while the update was applied; retry",
+        ConflictReason.RESOURCE_VERSION,
+    )
+
+
+@router.put("/inference-services/{name}", dependencies=[Depends(require_write)])
+async def replace_inference_service(
+    name: str,
+    body: dict[str, Any],
+    tenant_id: str = Depends(get_tenant_id),
+    registry: SQLiteRegistry = Depends(require_registry),
+    namespace: str | None = None,
+    if_match: list[str] | None = Header(default=None, alias="If-Match"),
+) -> JSONResponse:
+    """整体替换推理服务的 ``spec``、labels 与 annotations（200，附 ``ETag``）。
+
+    文档规则见 :mod:`.updates`：只有 ``spec`` 变化时 ``generation`` 递增，没有变化的请求
+    不写库。错误：文档不合法或试图修改不可变字段 400；不存在 404；资源处于 Terminating，
+    或 uid / resourceVersion / If-Match 前置条件不满足 409（``details.reason``）。
+    """
+    return await _update_inference_service(
+        registry, tenant_id, name, namespace, if_match, lambda _current: body
+    )
+
+
+@router.patch("/inference-services/{name}", dependencies=[Depends(require_write)])
+async def patch_inference_service(
+    name: str,
+    request: Request,
+    tenant_id: str = Depends(get_tenant_id),
+    registry: SQLiteRegistry = Depends(require_registry),
+    namespace: str | None = None,
+    if_match: list[str] | None = Header(default=None, alias="If-Match"),
+) -> JSONResponse:
+    """以 JSON Merge Patch（RFC 7386）更新推理服务（200，附 ``ETag``）。
+
+    补丁合并到当前资源的 JSON 表示（与 GET 的响应相同）之后，按与 PUT 相同的规则检查
+    并写入。错误：媒体类型不是 ``application/merge-patch+json`` 415；补丁不是 JSON 对象
+    400；其余同 PUT。
+    """
+    media_type = request.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+    if media_type != MERGE_PATCH_MEDIA_TYPE:
+        raise ApiError(
+            415,
+            "UNSUPPORTED_MEDIA_TYPE",
+            f"PATCH requires Content-Type: {MERGE_PATCH_MEDIA_TYPE}",
+            headers={"Accept-Patch": MERGE_PATCH_MEDIA_TYPE},
+        )
+    try:
+        patch = json.loads(await request.body())
+    except ValueError as exc:
+        raise ApiError(400, "BAD_REQUEST", "the merge patch is not valid JSON") from exc
+    if not isinstance(patch, dict):
+        raise ApiError(400, "BAD_REQUEST", "the merge patch must be a JSON object")
+    return await _update_inference_service(
+        registry,
+        tenant_id,
+        name,
+        namespace,
+        if_match,
+        lambda current: apply_merge_patch(current, patch),
+    )
 
 
 @router.delete("/inference-services/{name}", dependencies=[Depends(require_write)])

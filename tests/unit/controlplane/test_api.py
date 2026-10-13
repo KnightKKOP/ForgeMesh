@@ -270,6 +270,8 @@ def test_create_rejects_invalid_body(client: TestClient, mutate) -> None:
         ("GET", "/api/v1/inference-services"),
         ("POST", "/api/v1/inference-services"),
         ("GET", "/api/v1/inference-services/svc-1"),
+        ("PUT", "/api/v1/inference-services/svc-1"),
+        ("PATCH", "/api/v1/inference-services/svc-1"),
         ("DELETE", "/api/v1/inference-services/svc-1"),
         ("GET", "/api/v1/resources?kind=InferenceService"),
     ],
@@ -281,7 +283,7 @@ def test_routes_report_an_uninitialised_registry(method: str, path: str) -> None
     install_exception_handlers(app)
     app.include_router(create_api_router())
     client = TestClient(app)
-    body = _payload() if method == "POST" else None
+    body = _payload() if method in {"POST", "PUT", "PATCH"} else None
 
     resp = client.request(
         method, path, json=body, headers={**TENANT_HEADERS, "X-Correlation-Id": "corr-1"}

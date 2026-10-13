@@ -7,18 +7,24 @@ import (
 
 // WriteError 输出与控制平面一致的错误信封：
 //
-//	{"error":{"code":"...","message":"...","correlationId":"..."}}
+//	{"error":{"code":"...","message":"...","correlationId":"...","traceId":"..."}}
 //
-// correlationId 取自 Correlation 中间件注入的 context，缺失时省略。
+// correlationId 与 traceId 取自 Correlation 与 TraceContext 中间件注入的 context，缺失时省略。
 func WriteError(w http.ResponseWriter, r *http.Request, status int, code, message string) {
 	type errorBody struct {
 		Code          string `json:"code"`
 		Message       string `json:"message"`
 		CorrelationID string `json:"correlationId,omitempty"`
+		TraceID       string `json:"traceId,omitempty"`
 	}
 	body := struct {
 		Error errorBody `json:"error"`
-	}{errorBody{Code: code, Message: message, CorrelationID: CorrelationIDFromContext(r.Context())}}
+	}{errorBody{
+		Code:          code,
+		Message:       message,
+		CorrelationID: CorrelationIDFromContext(r.Context()),
+		TraceID:       TraceIDFromContext(r.Context()),
+	}}
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)

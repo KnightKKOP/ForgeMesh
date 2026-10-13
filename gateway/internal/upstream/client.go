@@ -95,7 +95,8 @@ func New(target *url.URL, correlationHeader, tenantHeader string, logger *log.Lo
 			if r.Context().Err() == nil {
 				c.metrics.UpstreamError(metrics.UpstreamControlPlane, metrics.ErrorConnect)
 			}
-			logger.Printf("upstream proxy error: corr=%s path=%s err=%v", r.Header.Get(c.correlationHeader), r.URL.Path, err)
+			logger.Printf("upstream proxy error: corr=%s trace=%s path=%s err=%v", r.Header.Get(c.correlationHeader),
+				middleware.TraceIDFromContext(r.Context()), r.URL.Path, err)
 			http.Error(w, http.StatusText(http.StatusBadGateway), http.StatusBadGateway)
 		},
 	}

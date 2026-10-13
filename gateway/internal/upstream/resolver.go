@@ -2,7 +2,8 @@
 //
 // 数据源：控制平面 GET /api/v1/inference-services/{svc}[?namespace={ns}]（携带
 // X-Tenant-Id 与调用方的 Authorization，控制平面据此独立校验调用方，见
-// WithAuthorization），从响应 status.endpoints[] 取就绪实例的地址与协议
+// WithAuthorization；并携带 middleware.TraceContext 确定的 traceparent），
+// 从响应 status.endpoints[] 取就绪实例的地址与协议
 // （如 {"url": "http://10.0.0.1:8000", "protocol": "openai-chat"}）。
 //
 // 设计要点：
@@ -35,6 +36,7 @@ import (
 	"time"
 
 	"github.com/Mekoforge/ForgeMesh/gateway/internal/metrics"
+	"github.com/Mekoforge/ForgeMesh/gateway/internal/middleware"
 )
 
 // 解析失败的哨兵错误，调用方通过 errors.Is 分类转成对应的 HTTP 状态码。
@@ -146,8 +148,8 @@ type cacheEntry struct {
 }
 
 // lookup 是一次进行中的控制平面查询，同一个缓存 key 的并发未命中共用它；
-// done 关闭之后 endpoints / err 只读。查询使用发起者的凭证，等待者共用结果与共用
-// 缓存的语义相同：网关已对每个调用方校验过凭证、租户与 read scope。
+// done 关闭之后 endpoints / err 只读。查询使用发起者的凭证（与 traceparent），等待者共用
+// 结果与共用缓存的语义相同：网关已对每个调用方校验过凭证、租户与 read scope。
 type lookup struct {
 	done      chan struct{}
 	endpoints []Endpoint
@@ -302,6 +304,9 @@ func (r *Resolver) fetch(ctx context.Context, svc ServiceRef, tenantID string) (
 	req.Header.Set("Accept", "application/json")
 	if auth, _ := ctx.Value(authorizationKey{}).(string); auth != "" {
 		req.Header.Set("Authorization", auth)
+	}
+	if traceparent := middleware.TraceparentFromContext(ctx); traceparent != "" {
+		req.Header.Set(middleware.TraceparentHeader, traceparent)
 	}
 
 	resp, err := r.client.Do(req)

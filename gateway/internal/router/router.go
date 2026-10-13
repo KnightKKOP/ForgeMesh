@@ -17,10 +17,10 @@
 //	                                          路径；要求 read 作用域）
 //	ANY  /api/v1/inference/{svc}/chat          同上，用于不带命名空间的服务
 //
-// 中间件链（执行顺序）：Observe → Recovery → Correlation → Authenticate → RateLimit →
-// LimitRequestBody → Route。
+// 中间件链（执行顺序）：Observe → Recovery → Correlation → TraceContext → AccessLog →
+// Authenticate → RateLimit → LimitRequestBody → Route。
 // Observe 与 Recovery 包住全量请求（Observe 按路由类别记录请求数与耗时，Recovery 兜底
-// panic）；探针与 /metrics 刻意不经过认证/限流，保证健康检查与抓取可用。
+// panic）；探针与 /metrics 刻意不经过认证/限流（也不写访问日志），保证健康检查与抓取可用。
 // 认证模式见 config.AuthModeAPIKey / config.AuthModeDev 与 ADR-014。
 package router
 
@@ -120,10 +120,13 @@ func New(cfg config.Config, logger *log.Logger) (*Router, error) {
 		maxBody = config.DefaultMaxRequestBodyBytes
 	}
 
-	// API 中间件链：Correlation → Authenticate → RateLimit → LimitRequestBody。
+	// API 中间件链：Correlation → TraceContext → AccessLog → Authenticate → RateLimit →
+	// LimitRequestBody。
 	limiter := middleware.NewRateLimiter(cfg.RateLimitRPS, cfg.RateLimitBurst)
 	apiHandler := middleware.Chain(apiMux,
 		middleware.Correlation(cfg.CorrelationHeader),
+		middleware.TraceContext(),
+		middleware.AccessLog(logger),
 		middleware.Authenticate(authn, cfg.TenantHeader),
 		middleware.RateLimit(limiter),
 		middleware.LimitRequestBody(maxBody),

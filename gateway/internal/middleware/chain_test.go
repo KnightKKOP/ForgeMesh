@@ -1,8 +1,8 @@
 // chain_test.go 验证中间件链的组合语义（WP-D1）：
 //
-// 链序（与 router.go 实际组装一致，外层 → 内层）：
+// 链序（与 router.go 实际组装一致，外层 → 内层；更外层的 Observe 见 observe_test.go）：
 //
-//		Recovery → Correlation → Authz → RateLimit → LimitRequestBody → Route
+//		Recovery → Correlation → TraceContext → AccessLog → Authz → RateLimit → LimitRequestBody → Route
 //
 //	  - Correlation 先于 Authz：认证失败的响应也携带关联 ID；
 //	  - Authz 先于 RateLimit：被拒请求不产生限流副作用（不耗令牌、不误伤）；
@@ -30,6 +30,8 @@ func newAPIChain(l *Limiter, route http.Handler) http.Handler {
 	}
 	api := Chain(route,
 		Correlation(DefaultCorrelationHeader),
+		TraceContext(),
+		AccessLog(log.New(io.Discard, "", 0)),
 		Authz(DefaultTenantHeader),
 		RateLimit(l),
 		LimitRequestBody(1<<20),

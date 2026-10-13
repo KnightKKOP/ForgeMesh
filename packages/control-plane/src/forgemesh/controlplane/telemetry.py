@@ -17,6 +17,19 @@
   （``outcome="ready"``）或 ``Failed``（``outcome="failed"``）的次数，在 status 写入成功后
   计数；``reason`` 为 ``Ready`` 条件的原因（如 ``Reconciled`` / ``WorkflowFailed``），不是
   标识符形式时记为 ``Unknown``。
+* ``forgemesh_instance_checks_total{outcome}``：控制器定期核对实例的次数，``outcome`` 见
+  :class:`InstanceCheckOutcome`，每个取值都从 0 开始输出；启动时的核对不计入（它失败时
+  控制平面不会启动）。
+* ``forgemesh_instance_check_results_total{check,result}``：核对实例得出结论的服务数，
+  ``check`` 见 :class:`InstanceCheck`，``result`` 见
+  :class:`~forgemesh.controlplane.deployment.InstanceCheckResult`，每个组合都从 0 开始输出；
+  实例回来了的服务在协调器把它转回 ``Ready`` 之前，每次核对都会计入。
+* ``forgemesh_lost_instance_redeploys_total``：为实例已不在运行的服务（``Degraded``，以及
+  运行成功之后实例丢失的 ``Verifying`` / ``Updating``）启动重新部署运行的次数，从 0 开始
+  输出；退避期间推迟的协调不计入。
+* ``forgemesh_orphaned_allocation_reclaims_total{outcome}``：回收孤立分配的次数，``outcome``
+  见 :class:`~forgemesh.controlplane.deployment.ReclaimOutcome`（``failed`` 的分配保留，
+  下一次全量同步之后重试），每个取值都从 0 开始输出。
 * ``forgemesh_inference_services{phase}``：各阶段的推理服务数，每个阶段都输出。
 * ``forgemesh_allocations_active{accelerator_type}``：Active 分配数，按其设备在加速器清单中的
   类型；设备不在清单中（或类型不一）时记为 ``unknown``，没有设备的分配记为 ``none``。
@@ -53,6 +66,7 @@ from typing import TYPE_CHECKING, Any
 from forgemesh.resource.inference import InferencePhase
 from forgemesh.workflow.states import WorkflowStatus
 
+from .deployment import InstanceCheckResult, ReclaimOutcome
 from .metrics import MetricsRegistry
 from .outbox import PublishOutcome
 
@@ -107,6 +121,25 @@ class ReconcileOutcome(StrEnum):
         return cls.REQUEUE if result.requeue_after is not None else cls.WAIT
 
 
+class InstanceCheck(StrEnum):
+    """哪一次核对实例（``forgemesh_instance_check_results_total`` 的 ``check`` 标签）。"""
+
+    #: 应用启动时、启动控制器之前的核对。
+    STARTUP = "startup"
+    #: 控制器的定期核对。
+    PERIODIC = "periodic"
+
+
+class InstanceCheckOutcome(StrEnum):
+    """控制器一次定期核对实例的结果（``forgemesh_instance_checks_total`` 的 ``outcome``
+    标签）。"""
+
+    #: 核对完成，得出结论的服务已加入工作队列。
+    COMPLETED = "completed"
+    #: 核对抛出异常（下一个周期重试）。
+    FAILED = "failed"
+
+
 def _ready_reason(patch: Mapping[str, Any]) -> str:
     for condition in patch.get("conditions") or ():
         if isinstance(condition, Mapping) and condition.get("type") == "Ready":
@@ -140,7 +173,8 @@ class HTTPMetrics:
 
 
 class ControllerMetrics:
-    """控制器的协调次数与耗时、重试、部署结果与工作队列深度。
+    """控制器的协调次数与耗时、重试、部署结果与工作队列深度，以及核对实例、重新部署实例已
+    不在运行的服务与回收孤立分配的次数。
 
     Args:
         registry: 指标所在的注册中心；为空时新建（指标不会被导出）。
@@ -167,6 +201,33 @@ class ControllerMetrics:
             "Inference services that entered Ready or Failed, by outcome and Ready reason.",
             ("outcome", "reason"),
         )
+        self._instance_checks = registry.counter(
+            "forgemesh_instance_checks_total",
+            "Periodic instance checks by the controller, by outcome.",
+            ("outcome",),
+        )
+        self._instance_check_results = registry.counter(
+            "forgemesh_instance_check_results_total",
+            "Services an instance check reached a result for, by check and result.",
+            ("check", "result"),
+        )
+        self._redeploys = registry.counter(
+            "forgemesh_lost_instance_redeploys_total",
+            "Deployment runs started to redeploy services whose instance was gone.",
+        )
+        self._reclaims = registry.counter(
+            "forgemesh_orphaned_allocation_reclaims_total",
+            "Orphaned allocations the controller tried to reclaim, by outcome.",
+            ("outcome",),
+        )
+        for check_outcome in InstanceCheckOutcome:
+            self._instance_checks.inc(check_outcome.value, amount=0)
+        for check in InstanceCheck:
+            for result in InstanceCheckResult:
+                self._instance_check_results.inc(check.value, result.value, amount=0)
+        self._redeploys.inc(amount=0)
+        for reclaim_outcome in ReclaimOutcome:
+            self._reclaims.inc(reclaim_outcome.value, amount=0)
         #: 由 :meth:`ControlPlaneMetrics.watch` 登记的采集器在抓取时更新。
         self.queue_depth = registry.gauge(
             "forgemesh_controller_queue_depth",
@@ -189,6 +250,27 @@ class ControllerMetrics:
         outcome = _DEPLOYMENT_OUTCOMES.get(target) if isinstance(target, str) else None
         if outcome is not None and target != phase:
             self._deployments.inc(outcome, _ready_reason(patch))
+
+    def instance_check_finished(self, outcome: InstanceCheckOutcome) -> None:
+        """记录控制器的一次定期核对实例。"""
+        self._instance_checks.inc(outcome.value)
+
+    def instance_check_result(self, check: InstanceCheck, result: InstanceCheckResult) -> None:
+        """记录核对实例对一个服务的结论；绑定 ``check`` 之后用作
+        :func:`~forgemesh.controlplane.deployment.check_instances` 的 ``on_result``。"""
+        self._instance_check_results.inc(check.value, result.value)
+
+    def lost_instance_redeployed(self) -> None:
+        """记录一次为实例已不在运行的服务启动的重新部署运行；用作
+        :class:`~forgemesh.controlplane.reconciler.ReconciliationController` 的
+        ``on_redeploy``。"""
+        self._redeploys.inc()
+
+    def reclaim_attempted(self, outcome: ReclaimOutcome) -> None:
+        """记录一个孤立分配的回收结果；用作
+        :func:`~forgemesh.controlplane.deployment.reclaim_orphaned_allocations` 的
+        ``on_result``。"""
+        self._reclaims.inc(outcome.value)
 
 
 class OutboxMetrics:
@@ -363,6 +445,8 @@ __all__ = [
     "ControlPlaneMetrics",
     "ControllerMetrics",
     "HTTPMetrics",
+    "InstanceCheck",
+    "InstanceCheckOutcome",
     "OutboxMetrics",
     "ReconcileOutcome",
 ]

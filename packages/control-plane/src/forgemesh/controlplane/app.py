@@ -101,7 +101,7 @@ from .publishers import publisher_from_env
 from .reconciler import ProcessedKeyStore, ReconciliationController
 from .scheduler import INVENTORY_FILE_ENV, FirstFitScheduler, inventory_from_env
 from .sqlite import workflow_db_path
-from .telemetry import ControllerMetrics, ControlPlaneMetrics
+from .telemetry import ControllerMetrics, ControlPlaneMetrics, InstanceCheck
 from .tracecontext import current_correlation_id, current_trace_id
 from .version import CONTROL_PLANE_VERSION
 
@@ -225,6 +225,7 @@ def _build_controller(
         if runtime is not None and launcher is not None
         else None
     )
+    metrics = metrics if metrics is not None else ControllerMetrics()
     reconciler = ReconciliationController(
         registry,
         policy,
@@ -235,12 +236,22 @@ def _build_controller(
         record_dedup_keys=False,
         workflow_poll_interval=WORKFLOW_POLL_INTERVAL_SECONDS,
         launcher=launcher,
+        on_redeploy=metrics.lost_instance_redeployed,
     )
     instance_check = (
-        functools.partial(check_instances, registry, launcher) if launcher is not None else None
+        functools.partial(
+            check_instances,
+            registry,
+            launcher,
+            on_result=functools.partial(metrics.instance_check_result, InstanceCheck.PERIODIC),
+        )
+        if launcher is not None
+        else None
     )
     reclaim = (
-        functools.partial(reclaim_orphaned_allocations, registry, release)
+        functools.partial(
+            reclaim_orphaned_allocations, registry, release, on_result=metrics.reclaim_attempted
+        )
         if release is not None
         else None
     )
@@ -345,7 +356,14 @@ if _FASTAPI_AVAILABLE:
                     )
                     await launcher.start()
                     resumed = await runtime.recover()
-                    checked = await check_instances(registry, launcher, after_restart=True)
+                    checked = await check_instances(
+                        registry,
+                        launcher,
+                        after_restart=True,
+                        on_result=functools.partial(
+                            metrics.controller.instance_check_result, InstanceCheck.STARTUP
+                        ),
+                    )
                     logger.info(
                         "deployments recovered: %d unfinished run(s) resumed, %d service(s) "
                         "whose instance is gone or back handed to the controller",

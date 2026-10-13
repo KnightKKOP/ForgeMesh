@@ -419,6 +419,10 @@ curl -s http://127.0.0.1:8081/metrics   # 网关
 | `forgemesh_controller_retries_total` | counter | 协调抛出异常、按退避重新排队的次数 |
 | `forgemesh_controller_queue_depth{state}` | gauge | 工作队列中的键数：`ready`（可立即处理）/ `delayed`（等待延迟到期）/ `processing` |
 | `forgemesh_deployments_total{outcome,reason}` | counter | 推理服务进入 `Ready`（`outcome="ready"`）或 `Failed`（`outcome="failed"`）的次数，`reason` 为 `Ready` 条件的原因 |
+| `forgemesh_instance_checks_total{outcome}` | counter | 控制器定期核对实例的次数：`completed` / `failed`（下一个周期重试）；启动时的核对不计入（它失败时控制平面不会启动） |
+| `forgemesh_instance_check_results_total{check,result}` | counter | 核对实例得出结论的服务数：`check` 为 `startup`（启动时）/ `periodic`（定期）；`result` 为 `lost`（实例已不在运行，服务转为 `Degraded`）/ `back`（`Degraded` 服务的实例全部又在运行，交给协调器转回 `Ready`，转回之前每次核对都计入）/ `conflict`（服务在核对期间被修改或删除，没有报告） |
+| `forgemesh_lost_instance_redeploys_total` | counter | 为实例已不在运行的服务启动重新部署运行的次数；退避期间推迟的协调不计入 |
+| `forgemesh_orphaned_allocation_reclaims_total{outcome}` | counter | 回收孤立分配的次数：`reclaimed`（实例已停止，分配已过期）/ `failed`（没能停止实例，分配保留，下一次全量同步之后重试） |
 | `forgemesh_inference_services{phase}` | gauge | 各阶段的推理服务数 |
 | `forgemesh_allocations_active{accelerator_type}` | gauge | Active 分配数，按其设备在清单中的类型 |
 | `forgemesh_accelerator_devices{accelerator_type,state}` | gauge | 清单中的设备数，`state` 为 `free` / `allocated`；未配置清单时没有样本 |
@@ -426,6 +430,8 @@ curl -s http://127.0.0.1:8081/metrics   # 网关
 | `forgemesh_outbox_events{state}` | gauge | 未发布的资源变更事件数：`pending`（尚未发布失败过）/ `retrying`（发布失败过，等待重试）/ `dead`（失败次数达到上限，不再自动重试，重新投递见[备份与恢复](docs/operations/backup-restore.md)第 5 节） |
 | `forgemesh_outbox_publish_attempts_total{outcome}` | counter | 发布事件的尝试次数，在结果写入数据库之后计数：`published` / `failed`（将重试）/ `dead`（最后一次失败）；三个取值都从 0 开始输出 |
 | `forgemesh_database_lock_wait_seconds` | histogram | 控制平面数据库的一次操作等待连接锁的时间：注册中心、Outbox（含事件发布）与审计记录共用这个连接与锁（不含 SQLite 内部的忙等待） |
+
+核对实例、重新部署与回收孤立分配的四个计数器的每个标签组合都从 0 开始输出，未设置启动器时保持为 0。
 
 **追踪上下文与日志**：网关沿用请求中合法的 W3C `traceparent`，否则生成一个，随请求转发给控制平面与推理实例。控制平面按同样的规则读取 `traceparent`（直连控制平面的请求同样适用），并沿用 `X-Correlation-Id`（缺失时生成，审计记录与资源变更事件使用同一个关联 ID），这个请求的日志与错误信封（`{"error": {"code", "message", "correlationId", "traceId", …}}`）都带上 trace-id 与关联 ID，一次请求在网关与控制平面的日志里可以按 trace-id 对上。控制平面的日志写到标准错误，默认每行一个 JSON 对象，uvicorn 的访问日志也是如此：
 

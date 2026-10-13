@@ -46,7 +46,7 @@ from forgemesh.core.reconciler import ReconcileContext
 from ..deployment import DEFAULT_INSTANCE_CHECK_INTERVAL_SECONDS
 from ..reconciler import ReconciliationController, compute_dedup_key
 from ..registry import ChangeType, ResourceKey, SQLiteRegistry
-from ..telemetry import ControllerMetrics, ReconcileOutcome
+from ..telemetry import ControllerMetrics, InstanceCheckOutcome, ReconcileOutcome
 from .queue import WorkQueue
 
 logger = logging.getLogger(__name__)
@@ -99,7 +99,7 @@ class ControllerManager:
         instance_check_interval: 两次核对实例之间的秒数。
         reclaim: 可选，回收孤立分配的协程函数（返回值不使用）。
         queue: 工作队列；为空时新建（测试可注入）。
-        metrics: 协调与队列的指标；为空时新建（不会被导出）。
+        metrics: 协调、队列与定期核对实例的指标；为空时新建（不会被导出）。
     """
 
     def __init__(
@@ -364,7 +364,10 @@ class ControllerManager:
             try:
                 await self.check_instances()
             except Exception:  # noqa: BLE001 - 下一个周期重试
+                self._metrics.instance_check_finished(InstanceCheckOutcome.FAILED)
                 logger.exception("controller instance check failed")
+            else:
+                self._metrics.instance_check_finished(InstanceCheckOutcome.COMPLETED)
 
 
 __all__ = ["DEFAULT_KINDS", "ControllerManager"]

@@ -1,4 +1,5 @@
-"""控制平面的指标：协调结果与耗时、重试、部署结果、Outbox 的发布尝试，以及抓取时读取的状态类指标。"""
+"""控制平面的指标：协调结果与耗时、重试、部署结果、核对实例、重新部署与回收、Outbox 的发布
+尝试，以及抓取时读取的状态类指标。"""
 
 from __future__ import annotations
 
@@ -11,11 +12,17 @@ from typing import Any
 
 import pytest
 from forgemesh.controlplane.controller import ControllerManager, WorkQueue
+from forgemesh.controlplane.deployment import InstanceCheckResult, ReclaimOutcome
 from forgemesh.controlplane.metrics import MetricsRegistry
 from forgemesh.controlplane.outbox import PublishOutcome, RetryPolicy
 from forgemesh.controlplane.registry import ResourceKey, SQLiteRegistry
 from forgemesh.controlplane.scheduler import Inventory
-from forgemesh.controlplane.telemetry import ControllerMetrics, ControlPlaneMetrics
+from forgemesh.controlplane.telemetry import (
+    ControllerMetrics,
+    ControlPlaneMetrics,
+    InstanceCheck,
+    InstanceCheckOutcome,
+)
 from forgemesh.core.objects import ObjectMeta
 from forgemesh.core.reconciler import ReconcileResult
 from forgemesh.core.scheduler import AllocatedDevice, ResourceRef
@@ -225,6 +232,52 @@ def test_deployments_count_transitions_into_ready_or_failed_with_bounded_reasons
         ("failed", "WorkflowFailed"): 1,
         ("failed", "Unknown"): 2,
     }
+
+
+@pytest.mark.unit
+def test_instance_checks_redeploys_and_reclaims_are_counted_from_zero() -> None:
+    """核对实例、重新部署与回收孤立分配的计数器只有固定的标签组合，全部从 0 开始输出。"""
+    registry = MetricsRegistry()
+    metrics = ControllerMetrics(registry)
+    initial = parse(registry.render())
+    metrics.instance_check_finished(InstanceCheckOutcome.COMPLETED)
+    metrics.instance_check_finished(InstanceCheckOutcome.FAILED)
+    metrics.instance_check_finished(InstanceCheckOutcome.COMPLETED)
+    metrics.instance_check_result(InstanceCheck.STARTUP, InstanceCheckResult.LOST)
+    metrics.instance_check_result(InstanceCheck.PERIODIC, InstanceCheckResult.BACK)
+    metrics.instance_check_result(InstanceCheck.PERIODIC, InstanceCheckResult.CONFLICT)
+    metrics.lost_instance_redeployed()
+    metrics.lost_instance_redeployed()
+    metrics.reclaim_attempted(ReclaimOutcome.FAILED)
+    metrics.reclaim_attempted(ReclaimOutcome.RECLAIMED)
+    counted = parse(registry.render())
+
+    def series(families: dict[str, Any], name: str) -> dict[tuple[str, ...], float]:
+        assert families[name].type == "counter"
+        return {tuple(s.labels.values()): s.value for s in families[name].samples}
+
+    checks = "forgemesh_instance_checks_total"
+    results = "forgemesh_instance_check_results_total"
+    redeploys = "forgemesh_lost_instance_redeploys_total"
+    reclaims = "forgemesh_orphaned_allocation_reclaims_total"
+    every_result = {
+        (check, result): 0
+        for check in ("startup", "periodic")
+        for result in ("lost", "back", "conflict")
+    }
+    assert series(initial, checks) == {("completed",): 0, ("failed",): 0}
+    assert series(initial, results) == every_result
+    assert series(initial, redeploys) == {(): 0}
+    assert series(initial, reclaims) == {("reclaimed",): 0, ("failed",): 0}
+    assert series(counted, checks) == {("completed",): 2, ("failed",): 1}
+    assert series(counted, results) == {
+        **every_result,
+        ("startup", "lost"): 1,
+        ("periodic", "back"): 1,
+        ("periodic", "conflict"): 1,
+    }
+    assert series(counted, redeploys) == {(): 2}
+    assert series(counted, reclaims) == {("reclaimed",): 1, ("failed",): 1}
 
 
 @pytest.mark.unit

@@ -20,8 +20,16 @@
   :mod:`forgemesh.controlplane.scheduler.inventory`）时，控制器的协调器使用
   :class:`~forgemesh.controlplane.scheduler.FirstFitScheduler`，清单不可读或非法时
   拒绝启动；未设置时需要分配加速器的资源报告 ``Ready=False``
-  （``SchedulerUnavailable``）。应用尚未注入工作流运行时，协调器在分配之前即报告
-  ``WorkflowRuntimeUnavailable``。
+  （``SchedulerUnavailable``）。
+* **部署**：``FORGEMESH_RUNTIME_LAUNCHER``（``fake`` / ``vllm-process``，只能与清单一起
+  使用，见 :mod:`forgemesh.controlplane.deployment.config`）选择推理实例的启动器，配置
+  非法时拒绝启动。此时协调器分配加速器、经部署工作流启动并验证实例，就绪后写入
+  ``status.endpoints``；删除时停止实例、释放分配。工作流运行存放在单独的数据库文件
+  （:func:`~forgemesh.controlplane.sqlite.workflow_db_path`，如 ``forgemesh.workflows.db``）
+  中。启动时先恢复未完成的部署，再把实例已不在运行的 ``Ready`` 服务转为 ``Degraded``
+  （不会自动重新部署），然后才启动控制器；关闭时依次停止控制器、工作流运行时、启动器
+  （其实例随之停止）。``POST /workflows`` 不使用这个运行时（仍返回 503）。未设置时不部署，
+  协调器在分配之前即报告 ``WorkflowRuntimeUnavailable``。
 * **无导入副作用**：数据库在应用启动（lifespan）时才打开，导入本模块不会
   创建文件。
 * **探针**：``/healthz``（存活）恒为 ok；``/readyz``（就绪）探测权威存储可用。
@@ -43,6 +51,11 @@ from typing import TYPE_CHECKING, Any
 
 from forgemesh.policy.engine import DefaultPolicyEngine
 from forgemesh.policy.rules import AuthzRule
+from forgemesh.workflowruntime.approval import ApprovalGate
+from forgemesh.workflowruntime.compensate import CompensationExecutor
+from forgemesh.workflowruntime.exec import WorkflowExecutor
+from forgemesh.workflowruntime.runtime import LocalWorkflowRuntime
+from forgemesh.workflowruntime.store import WorkflowStore
 from pydantic import BaseModel
 
 from .auth import (
@@ -54,11 +67,20 @@ from .auth import (
     authenticator_from_env,
 )
 from .controller import ControllerManager
+from .deployment import (
+    RUNTIME_LAUNCHER_ENV,
+    DeploymentReleaser,
+    DeploymentSteps,
+    launcher_from_env,
+    mark_lost_instances,
+)
 from .reconciler import ProcessedKeyStore, ReconciliationController
 from .scheduler import INVENTORY_FILE_ENV, FirstFitScheduler, inventory_from_env
+from .sqlite import workflow_db_path
 
 if TYPE_CHECKING:  # pragma: no cover - 仅静态类型检查使用
     from .auth import Authenticator
+    from .deployment import RuntimeLauncher
     from .registry import SQLiteRegistry
     from .scheduler import Inventory
 
@@ -87,6 +109,10 @@ HOST_ENV = "FORGEMESH_HOST"
 DEFAULT_HOST = "127.0.0.1"
 PORT_ENV = "FORGEMESH_PORT"
 DEFAULT_PORT = 8080
+#: 控制器轮询资源变更的间隔（秒）。
+CONTROLLER_POLL_INTERVAL_SECONDS = 0.5
+#: 部署进行中时协调器查询工作流运行的间隔（秒）。
+WORKFLOW_POLL_INTERVAL_SECONDS = 2.0
 
 
 class HealthResponse(BaseModel):
@@ -132,23 +158,48 @@ def resolve_db_path(db_path: str | None = None) -> str:
     return db_path or os.environ.get(DB_PATH_ENV) or DEFAULT_DB_PATH
 
 
+def _deployment_runtime(launcher: RuntimeLauncher, store: WorkflowStore) -> LocalWorkflowRuntime:
+    steps = DeploymentSteps(launcher)
+    compensation = CompensationExecutor()
+    for step_id, handler in steps.compensations().items():
+        compensation.registry.register(step_id, handler)
+    return LocalWorkflowRuntime(
+        store=store,
+        executor=WorkflowExecutor(),
+        compensation=compensation,
+        approval=ApprovalGate(),
+        handler=steps.handle,
+    )
+
+
 def _build_controller(
     registry: SQLiteRegistry,
     processed_store: ProcessedKeyStore,
     inventory: Inventory | None,
+    runtime: LocalWorkflowRuntime | None = None,
+    launcher: RuntimeLauncher | None = None,
 ) -> ControllerManager:
     # 没有授权规则的 DefaultPolicyEngine 拒绝一切操作。资源的创建和删除已经由 API 的
     # 认证与 scope 把关，协调只是推进这些已被接受的期望状态，因此放行 reconcile。
     policy = DefaultPolicyEngine(authz_rules=[AuthzRule(action="reconcile", effect="allow")])
     scheduler = FirstFitScheduler(registry, inventory) if inventory is not None else None
+    release = (
+        DeploymentReleaser(runtime, launcher)
+        if runtime is not None and launcher is not None
+        else None
+    )
     reconciler = ReconciliationController(
         registry,
         policy,
         scheduler=scheduler,
+        workflow_runtime=runtime,
+        release_provider=release,
         processed_store=processed_store,
         record_dedup_keys=False,
+        workflow_poll_interval=WORKFLOW_POLL_INTERVAL_SECONDS,
+        launcher=launcher,
     )
-    return ControllerManager(registry, reconciler)
+    return ControllerManager(registry, reconciler, poll_interval=CONTROLLER_POLL_INTERVAL_SECONDS)
 
 
 if _FASTAPI_AVAILABLE:
@@ -192,6 +243,7 @@ if _FASTAPI_AVAILABLE:
                     len(inventory.nodes),
                     sum(len(node.devices) for node in inventory.nodes),
                 )
+            launcher = launcher_from_env(inventory)
             path = resolve_db_path(db_path)
             async with AsyncExitStack() as cleanup:
                 registry = init_registry(path)
@@ -201,7 +253,32 @@ if _FASTAPI_AVAILABLE:
                 cleanup.callback(reset_authenticator)
                 processed_store = ProcessedKeyStore(path)
                 cleanup.push_async_callback(processed_store.close)
-                controller = _build_controller(registry, processed_store, inventory)
+                runtime: LocalWorkflowRuntime | None = None
+                if launcher is not None:
+                    workflow_path = workflow_db_path(path)
+                    workflow_store = WorkflowStore(workflow_path)
+                    cleanup.push_async_callback(workflow_store.close)
+                    # 运行时关闭时的补偿还会调用启动器的 stop，因此启动器在运行时之后关闭。
+                    cleanup.push_async_callback(launcher.aclose)
+                    runtime = _deployment_runtime(launcher, workflow_store)
+                    cleanup.push_async_callback(runtime.aclose)
+                    logger.info(
+                        "deployments enabled from %s: %s, workflow store %s",
+                        RUNTIME_LAUNCHER_ENV,
+                        type(launcher).__name__,
+                        workflow_path,
+                    )
+                    resumed = await runtime.recover()
+                    lost = await mark_lost_instances(registry, launcher)
+                    logger.info(
+                        "deployments recovered: %d unfinished run(s) resumed, %d Ready "
+                        "service(s) degraded because their instance is gone",
+                        len(resumed),
+                        len(lost),
+                    )
+                controller = _build_controller(
+                    registry, processed_store, inventory, runtime, launcher
+                )
                 cleanup.push_async_callback(controller.stop)
                 await controller.start()
                 yield

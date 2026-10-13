@@ -6,6 +6,10 @@
 #   2. docker compose -f deploy/docker/docker-compose.yaml up --build
 #   3. curl -H "Authorization: Bearer <key>" http://127.0.0.1:8081/api/v1/inference-services
 #
+# 只用本文件时控制平面没有加速器清单与启动器，不部署推理实例：新建的服务停在 Pending
+# （Ready=False，SchedulerUnavailable）。不需要 GPU 的完整闭环（清单 + 假启动器）见
+# docker-compose.fake-runtime.yaml，scripts/compose_smoke.sh 即用它运行。
+#
 # 两个服务都只发布在 127.0.0.1；需要从其他机器访问网关时修改 gateway 的 ports。
 # ADR-013：权威存储为 SQLite，只允许一个控制平面实例写同一个库，control-plane 不得扩展副本。
 

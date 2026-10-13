@@ -14,6 +14,7 @@ RUN /opt/forgemesh/bin/pip install \
       /src/packages/core-contracts \
       /src/packages/resource-model \
       /src/packages/workflow-api \
+      /src/packages/workflow-runtime \
       /src/packages/decision-api \
       /src/packages/policy-engine \
       /src/packages/plugin-sdk \

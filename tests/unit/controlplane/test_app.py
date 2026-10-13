@@ -1,5 +1,5 @@
 """控制平面应用入口测试：真实路由已挂载、存储可配置、探针反映存储状态、控制器随应用运行、
-配置加速器清单时启用调度器。"""
+配置加速器清单时启用调度器、配置启动器时启用部署（完整闭环见 ``tests/e2e/test_closed_loop.py``）。"""
 
 from __future__ import annotations
 
@@ -12,6 +12,7 @@ from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
+from forgemesh.controlplane import app as app_module
 from forgemesh.controlplane.api.dependencies import (
     ComponentNotReadyError,
     get_authenticator,
@@ -21,9 +22,17 @@ from forgemesh.controlplane.api.dependencies import (
 from forgemesh.controlplane.app import DB_PATH_ENV, create_app
 from forgemesh.controlplane.auth import AUTH_MODE_DEV, AUTH_MODE_ENV
 from forgemesh.controlplane.controller import ControllerManager
+from forgemesh.controlplane.deployment import FakeLauncher, LauncherConfigError
+from forgemesh.controlplane.deployment import config as launcher_config
 from forgemesh.controlplane.registry import SQLiteRegistry
 from forgemesh.controlplane.scheduler import INVENTORY_FILE_ENV, InventoryConfigError
 from forgemesh.resource.inference import InferenceService
+from forgemesh.workflowruntime.runtime import LocalWorkflowRuntime
+from forgemesh.workflowruntime.store import WorkflowStore
+
+LAUNCHER_ENVS = [
+    getattr(launcher_config, name) for name in launcher_config.__all__ if name.endswith("_ENV")
+]
 
 HEADERS = {"X-Tenant-Id": "acme"}
 BODY = {
@@ -41,9 +50,18 @@ BODY = {
 def _reset_components(monkeypatch):
     monkeypatch.setenv(AUTH_MODE_ENV, AUTH_MODE_DEV)
     monkeypatch.delenv(INVENTORY_FILE_ENV, raising=False)
+    for name in LAUNCHER_ENVS:
+        monkeypatch.delenv(name, raising=False)
     reset_runtime_components()
     yield
     reset_runtime_components()
+
+
+def _write_inventory(tmp_path: Path) -> Path:
+    inventory = tmp_path / "inventory.json"
+    gpu = {"id": "gpu-0", "type": "nvidia-gpu", "memoryGiB": 80}
+    inventory.write_text(json.dumps({"nodes": [{"id": "node-a", "devices": [gpu]}]}))
+    return inventory
 
 
 def _wait_for_ready_condition(client: TestClient, timeout: float = 5.0) -> dict[str, Any]:
@@ -203,13 +221,10 @@ def test_controller_picks_up_services_stored_while_it_was_not_running(tmp_path) 
 
 @pytest.mark.unit
 def test_controller_schedules_when_an_inventory_is_configured(tmp_path, monkeypatch) -> None:
-    """配置清单后不再报告 SchedulerUnavailable；应用尚未注入工作流运行时，协调器在分配
-    之前停在 WorkflowRuntimeUnavailable，不留下分配。"""
+    """配置清单后不再报告 SchedulerUnavailable；没有设置 FORGEMESH_RUNTIME_LAUNCHER 时不部署，
+    协调器在分配之前停在 WorkflowRuntimeUnavailable，不留下分配，也不创建工作流数据库。"""
     db_file = tmp_path / "cp.db"
-    inventory = tmp_path / "inventory.json"
-    gpu = {"id": "gpu-0", "type": "nvidia-gpu", "memoryGiB": 80}
-    inventory.write_text(json.dumps({"nodes": [{"id": "node-a", "devices": [gpu]}]}))
-    monkeypatch.setenv(INVENTORY_FILE_ENV, str(inventory))
+    monkeypatch.setenv(INVENTORY_FILE_ENV, str(_write_inventory(tmp_path)))
 
     with TestClient(create_app(db_path=str(db_file))) as client:
         created = client.post("/api/v1/inference-services", json=BODY, headers=HEADERS)
@@ -218,6 +233,110 @@ def test_controller_schedules_when_an_inventory_is_configured(tmp_path, monkeypa
 
     assert (ready["status"], ready["reason"]) == ("False", "WorkflowRuntimeUnavailable")
     assert asyncio.run(_allocations(db_file)) == []
+    assert not (tmp_path / "cp.workflows.db").exists()
+
+
+@pytest.mark.unit
+def test_a_launcher_enables_deployments_with_their_own_workflow_database(
+    tmp_path, monkeypatch
+) -> None:
+    """部署工作流存放在注册表旁的 ``cp.workflows.db``；``POST /workflows`` 不使用部署的运行时。"""
+    db_file = tmp_path / "cp.db"
+    monkeypatch.setenv(INVENTORY_FILE_ENV, str(_write_inventory(tmp_path)))
+    monkeypatch.setenv(launcher_config.RUNTIME_LAUNCHER_ENV, "fake")
+
+    with TestClient(create_app(db_path=str(db_file))) as client:
+        workflows = client.post(
+            "/api/v1/workflows",
+            json={"definition": "inference-service-deployment", "version": 1},
+            headers=HEADERS,
+        )
+
+    assert workflows.status_code == 503
+    assert workflows.json()["error"]["code"] == "WORKFLOW_RUNTIME_UNAVAILABLE"
+    assert (tmp_path / "cp.workflows.db").exists()
+
+
+@pytest.mark.unit
+def test_deployments_recover_before_the_controller_starts_and_stop_after_it(
+    tmp_path, monkeypatch
+) -> None:
+    """启动：恢复未完成的部署 → 标记实例已丢失的服务 → 控制器；关闭：控制器 → 工作流运行时
+    （其补偿还会调用启动器）→ 启动器 → 工作流存储。"""
+    calls: list[str] = []
+
+    def record(owner: Any, name: str, label: str) -> None:
+        original = getattr(owner, name)
+
+        async def wrapper(*args: Any, **kwargs: Any) -> Any:
+            calls.append(label)
+            return await original(*args, **kwargs)
+
+        monkeypatch.setattr(owner, name, wrapper)
+
+    record(LocalWorkflowRuntime, "recover", "runtime.recover")
+    record(app_module, "mark_lost_instances", "mark_lost_instances")
+    record(ControllerManager, "start", "controller.start")
+    record(ControllerManager, "stop", "controller.stop")
+    record(LocalWorkflowRuntime, "aclose", "runtime.aclose")
+    record(FakeLauncher, "aclose", "launcher.aclose")
+    record(WorkflowStore, "close", "workflow_store.close")
+    monkeypatch.setenv(INVENTORY_FILE_ENV, str(_write_inventory(tmp_path)))
+    monkeypatch.setenv(launcher_config.RUNTIME_LAUNCHER_ENV, "fake")
+
+    with TestClient(create_app(db_path=str(tmp_path / "cp.db"))):
+        started = list(calls)
+
+    assert started == ["runtime.recover", "mark_lost_instances", "controller.start"]
+    assert calls[len(started) :] == [
+        "controller.stop",
+        "runtime.aclose",
+        "launcher.aclose",
+        "workflow_store.close",
+    ]
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("settings", "with_inventory", "message"),
+    [
+        pytest.param(
+            {"FORGEMESH_RUNTIME_LAUNCHER": "fake"},
+            False,
+            "FORGEMESH_RUNTIME_LAUNCHER=fake requires FORGEMESH_INVENTORY_FILE",
+            id="no-inventory",
+        ),
+        pytest.param(
+            {"FORGEMESH_RUNTIME_LAUNCHER": "docker"},
+            True,
+            "unsupported FORGEMESH_RUNTIME_LAUNCHER='docker'",
+            id="unknown-launcher",
+        ),
+        pytest.param(
+            {"FORGEMESH_RUNTIME_LAUNCHER": "fake", "FORGEMESH_FAKE_LAUNCHER_BIND_HOST": "0.0.0.0"},
+            True,
+            "FORGEMESH_FAKE_LAUNCHER_ADVERTISE_HOST must be set",
+            id="no-advertise-host",
+        ),
+    ],
+)
+def test_app_refuses_to_start_with_an_unusable_launcher_setting(
+    tmp_path, monkeypatch, settings, with_inventory, message
+) -> None:
+    db_file = tmp_path / "cp.db"
+    if with_inventory:
+        monkeypatch.setenv(INVENTORY_FILE_ENV, str(_write_inventory(tmp_path)))
+    for name, value in settings.items():
+        monkeypatch.setenv(name, value)
+
+    with (
+        pytest.raises(LauncherConfigError, match=message),
+        TestClient(create_app(db_path=str(db_file))),
+    ):
+        pass
+
+    assert not db_file.exists()
+    assert not (tmp_path / "cp.workflows.db").exists()
 
 
 @pytest.mark.unit

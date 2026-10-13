@@ -156,10 +156,18 @@ curl -s -H "Authorization: Bearer fmk_…" http://127.0.0.1:8080/api/v1/inferenc
 | --- | --- | --- |
 | `FORGEMESH_AUTH_MODE` | `apikey` | `apikey`：校验 `Authorization: Bearer <key>`；`dev`：直接信任 `X-Tenant-Id` 请求头，只允许监听回环地址，仅供本地开发 |
 | `FORGEMESH_API_KEYS_FILE` | — | `apikey` 模式必填，缺失或格式非法时拒绝启动 |
-| `FORGEMESH_DB_PATH` | `forgemesh.db` | SQLite 权威存储文件；同一文件只允许一个控制平面实例写入（ADR-013）。以 WAL 模式打开，运行时旁边有 `-wal` / `-shm` 文件，不能直接复制文件做备份，见 [备份与灾备演练](docs/operations/backup-restore.md) |
+| `FORGEMESH_DB_PATH` | `forgemesh.db` | SQLite 权威存储文件；同一文件只允许一个控制平面实例写入（ADR-013）。以 WAL 模式打开，运行时旁边有 `-wal` / `-shm` 文件，不能直接复制文件做备份，见 [备份与灾备演练](docs/operations/backup-restore.md)。设置了 `FORGEMESH_RUNTIME_LAUNCHER` 时，部署工作流的运行记录在同目录的第二个文件中（`forgemesh.db` → `forgemesh.workflows.db`），两个文件一起备份与恢复 |
 | `FORGEMESH_HOST` | `127.0.0.1` | 监听地址 |
 | `FORGEMESH_PORT` | `8080` | 监听端口 |
 | `FORGEMESH_INVENTORY_FILE` | — | 静态加速器清单（JSON，格式见下），设置后启用首次适配调度器；文件不可读或格式非法时拒绝启动，修改后需重启。未设置时不启用调度器 |
+| `FORGEMESH_RUNTIME_LAUNCHER` | — | 推理实例启动器，设置后部署推理服务（见「部署推理服务」）：`fake`（控制平面进程内的 OpenAI 兼容桩服务，不需要 GPU，供 CI 与本地开发）或 `vllm-process`（本机上的 vLLM 子进程），不区分大小写。必须同时设置 `FORGEMESH_INVENTORY_FILE`；取值未知、缺少清单或所选启动器的配置非法时拒绝启动。未设置时不部署。下面各启动器的变量只在选中该启动器时读取，空白值视同未设置 |
+| `FORGEMESH_FAKE_LAUNCHER_BIND_HOST` | `127.0.0.1` | `fake`：实例监听的 IP 地址，`0.0.0.0` / `::` 监听全部地址 |
+| `FORGEMESH_FAKE_LAUNCHER_ADVERTISE_HOST` | 同监听地址 | `fake`：写进 `status.endpoints` 的主机名或 IP 地址，网关用它连接实例；监听全部地址时必须设置 |
+| `FORGEMESH_VLLM_COMMAND` | `<控制平面的解释器> -m vllm.entrypoints.openai.api_server` | `vllm-process`：启动 vLLM OpenAI 兼容服务的命令，按 shell 规则拆分（不经过 shell），第一个词须是可执行文件；使用默认命令时控制平面的解释器必须装有 `vllm` |
+| `FORGEMESH_VLLM_BIND_HOST` | `127.0.0.1` | `vllm-process`：实例监听的 IP 地址，`0.0.0.0` / `::` 监听全部地址 |
+| `FORGEMESH_VLLM_ADVERTISE_HOST` | 同监听地址 | `vllm-process`：写进 `status.endpoints` 的主机名或 IP 地址；监听全部地址时必须设置 |
+| `FORGEMESH_VLLM_READY_TIMEOUT_SECONDS` | `1200` | `vllm-process`：进程启动后等 `GET /health` 返回 `200` 的时限（秒），包括下载与加载模型 |
+| `FORGEMESH_VLLM_STOP_GRACE_SECONDS` | `10` | `vllm-process`：停止实例时 `SIGTERM` 之后等它退出的秒数，之后 `SIGKILL` |
 
 > 请求可以不带 `X-Tenant-Id`；带了就必须与 key 绑定的租户一致，否则返回 `403`。缺少或无效的 key 返回 `401`。
 
@@ -174,7 +182,7 @@ curl -s -H "Authorization: Bearer fmk_…" http://127.0.0.1:8080/api/v1/inferenc
 
 节点 `id` 在清单内唯一，设备 `id` 在所属节点内唯一，节点与设备都至少一个，不允许其他字段；`type` 与 `spec.resources.accelerator.type` 按字符串精确匹配，`memoryGiB` 是单卡显存（正整数，不接受 `"80"` 或 `80.0`）。调度器按清单顺序取第一个能凑齐 `count` 张卡的节点，在该节点内按顺序取类型匹配、显存不低于 `minMemoryGiB` 且未被占用的设备，不跨节点凑数。分配按资源 `uid` 记录在权威存储中（`allocations` / `allocation_devices`），同一设备同时至多属于一个生效的分配；分配不设租约，在资源删除时释放：持有分配的资源无论处于哪个 phase，`DELETE` 都返回 `202` 并先进入 `Terminating`。
 
-控制平面启动后会自动协调 `InferenceService`：新建、修改或请求删除的资源在 0.5 秒内被处理，协调结果写入 `status.conditions`（例如 `Ready=False` 及其原因）。未设置 `FORGEMESH_INVENTORY_FILE` 时，新建的服务会停在 `Pending`，并带有 `Ready=False`（`SchedulerUnavailable`）条件；设置后，由于应用尚未接入工作流运行时，条件为 `Ready=False`（`WorkflowRuntimeUnavailable`），协调器在分配之前停下，暂不占用设备。协调器本身已能完成部署：注入工作流运行时与推理实例启动器（`forgemesh.controlplane.deployment.RuntimeLauncher`）后，资源每轮推进一个 phase（`Pending` → `Scheduling` → `Preparing` → `Deploying` → `Verifying` → `Ready`），部署工作流（准备模型 → 启动实例 → 验证实例）成功后写入 `status.endpoints` 与 `Ready=True`；部署失败时资源进入 `Failed`，不自动重试，删除后重新创建即可再次部署；删除时先取消部署、停止实例，再释放分配。仓库目前只有测试用的内存启动器。控制器与 API 运行在同一个进程中，是权威存储的唯一写者（ADR-013）：请以单进程运行，不要使用 `uvicorn --workers` 或多副本。
+控制平面启动后会自动协调 `InferenceService`：新建、修改或请求删除的资源在 0.5 秒内被处理，协调结果写入 `status.conditions`（例如 `Ready=False` 及其原因）。未设置 `FORGEMESH_INVENTORY_FILE` 时，新建的服务会停在 `Pending`，并带有 `Ready=False`（`SchedulerUnavailable`）条件；只设置清单、未设置 `FORGEMESH_RUNTIME_LAUNCHER` 时，条件为 `Ready=False`（`WorkflowRuntimeUnavailable`），协调器在分配之前停下，不占用设备。两者都设置后，资源每轮推进一个 phase（`Pending` → `Scheduling` → `Preparing` → `Deploying` → `Verifying` → `Ready`）：分配设备，运行部署工作流（准备模型 → 启动实例 → 验证实例），成功后写入 `status.endpoints` 与 `Ready=True`，网关随即可以转发对话；部署失败时资源进入 `Failed`，不自动重试，删除后重新创建即可再次部署；删除时先取消部署、停止实例，再释放分配。每个服务只部署一个实例（`spec.availability.replicas` 不生效），已部署服务的 `spec` 变化不会重新部署。控制器与 API 运行在同一个进程中，是权威存储的唯一写者（ADR-013）：请以单进程运行，不要使用 `uvicorn --workers` 或多副本。设置了启动器时 `POST /api/v1/workflows` 同样返回 `503`（`WORKFLOW_RUNTIME_UNAVAILABLE`）：部署工作流的运行时只供协调器使用，不对外开放。
 
 ### Go 网关
 
@@ -188,6 +196,68 @@ make run-dev        # dev 模式：信任租户请求头，只监听 127.0.0.1:8
 
 > 网关默认不连接回环、链路本地与云元数据地址上的推理实例。实例运行在本机时设置 `GATEWAY_INSTANCE_ALLOWED_CIDRS=127.0.0.0/8,::1/128`（`make run-dev` 已设置），见 [gateway/README.md](gateway/README.md)「实例地址限制」。
 
+### 部署推理服务
+
+设置 `FORGEMESH_INVENTORY_FILE` 与 `FORGEMESH_RUNTIME_LAUNCHER` 后，控制平面为每个 `InferenceService` 启动一个推理实例，网关经 `/api/v1/namespaces/{ns}/inference/{svc}/chat` 把对话转发给它。启动器有两种：
+
+- `fake`：每个实例是控制平面进程内的 OpenAI 兼容桩服务，监听一个临时端口：`GET /health`；`POST /v1/chat/completions` 返回固定的回复，`"stream": true` 时以 SSE 返回，以 `data: [DONE]` 结束。不需要 GPU，也不加载模型，只用于 CI 与本地开发。
+- `vllm-process`：每个实例是控制平面所在主机上的一个 vLLM 进程，见下文「vLLM」。
+
+不需要 GPU 的完整闭环，控制平面与网关都以 `dev` 模式运行在本机：
+
+```bash
+# 终端 1：控制平面，使用一块虚构设备的清单与假启动器
+FORGEMESH_AUTH_MODE=dev FORGEMESH_DB_PATH=./forgemesh.db \
+  FORGEMESH_INVENTORY_FILE=deploy/docker/fake-runtime-inventory.json \
+  FORGEMESH_RUNTIME_LAUNCHER=fake .venv/bin/forgemesh-control-plane
+
+# 终端 2：网关（make run-dev 已允许连接本机上的实例）
+cd gateway && make run-dev
+
+# 终端 3：创建服务，等 status.phase 变为 Ready（几秒），经网关流式对话，最后删除
+curl -s -H "X-Tenant-Id: acme" -H "Content-Type: application/json" \
+  -d '{"kind": "InferenceService", "metadata": {"name": "llama", "namespace": "default"},
+       "spec": {"model": {"reference": "models/llama"}, "runtime": {"provider": "vllm"},
+                "resources": {"accelerator": {"type": "nvidia-gpu", "minMemoryGiB": 16}}}}' \
+  http://127.0.0.1:8081/api/v1/inference-services
+curl -s -H "X-Tenant-Id: acme" "http://127.0.0.1:8081/api/v1/inference-services/llama?namespace=default" | jq .status
+curl -sN -H "X-Tenant-Id: acme" -H "Content-Type: application/json" \
+  -d '{"model": "models/llama", "messages": [{"role": "user", "content": "Hello"}], "stream": true}' \
+  http://127.0.0.1:8081/api/v1/namespaces/default/inference/llama/chat
+curl -s -X DELETE -H "X-Tenant-Id: acme" "http://127.0.0.1:8081/api/v1/inference-services/llama?namespace=default"
+```
+
+`Ready` 的服务带有 `Ready=True`（`Reconciled`），`status.endpoints` 形如 `[{"url": "http://127.0.0.1:<端口>", "ready": true, "instanceId": "fake-…", "protocol": "openai-chat"}]`；回复拼起来是 `Hello from the ForgeMesh fake instance fake-….`。删除返回 `202`，实例停止、分配释放之后资源消失（`404`）。网关缓存服务的实例列表 5 秒（`GATEWAY_RESOLVER_TTL_SECONDS`），删除或重新创建之后的几秒内可能仍连接旧实例（`502`）。在容器中运行同样的闭环见「容器部署」。
+
+**控制平面重启**：两种启动器的实例都随控制平面进程结束（`fake` 的实例在进程内；`vllm-process` 的实例是子进程，控制平面退出时停止它们），重启之后：
+
+- 重启之前 `Ready` 的服务转为 `Degraded`：`Ready=False`（`InstanceLost`），`status.endpoints` 中的实例标记为 `ready: false`，网关不再转发（缓存的几秒内除外）。控制平面不会自动重新部署，删除后重新创建即可；`Degraded` 的服务在删除之前一直持有分配。
+- 仍在部署的服务从中断处继续（部署工作流的运行记录在 `forgemesh.workflows.db` 中，启动时继续未结束的运行）：还没有启动实例的照常完成；已经启动了实例的进入 `Failed`（实例已不在运行）。
+
+**vLLM**：`vllm-process` 以 `<FORGEMESH_VLLM_COMMAND> --model=<spec.model.reference> --host <监听地址> --port <空闲端口> --tensor-parallel-size <设备数>` 启动实例，`GET /health` 返回 `200` 后服务进入 `Ready`。它只部署 `spec.runtime.provider` 为 `vllm` 的服务，不检查 `spec.runtime.version` 与 `spec.model.digest`：运行的是命令对应的 vLLM 版本，模型由 vLLM 启动时按引用下载、加载（计入就绪时限）。
+
+- 实例只运行在控制平面所在的主机上：清单必须恰好有一个节点（就是这台主机），设备 id 是 CUDA 设备序号（`0`、`gpu-0`）或 `nvidia-smi -L` 列出的 UUID（`GPU-…`、`MIG-…`），且没有两个 id 指向同一块设备，否则拒绝启动。分配到的设备写进实例的 `CUDA_VISIBLE_DEVICES`；未设置 `CUDA_DEVICE_ORDER` 时设为 `PCI_BUS_ID`，序号与 `nvidia-smi` 一致。
+- 默认命令要求控制平面的解释器装有 vLLM（例如 `.venv/bin/pip install vllm`）；也可以用 `FORGEMESH_VLLM_COMMAND` 指向另一个环境中的 vLLM，如 `/opt/vllm/bin/python -m vllm.entrypoints.openai.api_server`。仓库的控制平面镜像不含 vLLM。
+- 实例继承控制平面的环境变量（去掉 `FORGEMESH_*`，例如 `HF_TOKEN` 会传给 vLLM），输出写到控制平面的标准输出与标准错误。
+- 实例默认监听 `127.0.0.1`：网关在同一台主机上时为它设置 `GATEWAY_INSTANCE_ALLOWED_CIDRS=127.0.0.0/8`；网关在其他主机上时设置 `FORGEMESH_VLLM_BIND_HOST=0.0.0.0` 与网关能够连接的 `FORGEMESH_VLLM_ADVERTISE_HOST`。
+- 每个实例在自己的进程组中运行，停止时整组收到 `SIGTERM`，`FORGEMESH_VLLM_STOP_GRACE_SECONDS` 秒后 `SIGKILL`。控制平面退出时并行停止全部实例，连同控制器与工作流的收尾，默认设置下最长约 40 秒，在容器或服务管理器中相应调大停止时限。控制平面被 `SIGKILL` 时实例进程不会随之结束、继续占用 GPU：请以容器或 systemd 服务（默认 `KillMode=control-group`）运行控制平面。
+
+```bash
+# 一台有两块 GPU 的主机：节点 id 任意，设备 id 为 CUDA 设备序号
+cat > inventory.json <<'EOF'
+{"nodes": [{"id": "gpu-host", "devices": [
+  {"id": "gpu-0", "type": "nvidia-gpu", "memoryGiB": 80},
+  {"id": "gpu-1", "type": "nvidia-gpu", "memoryGiB": 80}
+]}]}
+EOF
+FORGEMESH_API_KEYS_FILE=./api-keys.json FORGEMESH_DB_PATH=./forgemesh.db \
+  FORGEMESH_INVENTORY_FILE=./inventory.json FORGEMESH_RUNTIME_LAUNCHER=vllm-process \
+  .venv/bin/forgemesh-control-plane
+# 网关：cd gateway && GATEWAY_API_KEYS_FILE=../api-keys.json GATEWAY_INSTANCE_ALLOWED_CIDRS=127.0.0.0/8 make run
+# 服务：spec.runtime.provider 为 vllm，spec.model.reference 为 Hugging Face 模型 id 或本地路径，
+#       spec.resources.accelerator.count 即 --tensor-parallel-size
+```
+
 ### 容器部署
 
 ```bash
@@ -197,10 +267,16 @@ make run-dev        # dev 模式：信任租户请求头，只监听 127.0.0.1:8
 docker compose -f deploy/docker/docker-compose.yaml up --build
 curl -s -H "Authorization: Bearer fmk_…" http://127.0.0.1:8081/api/v1/inference-services
 
+# 不需要 GPU 的完整闭环：叠加一块虚构设备的清单与假启动器
+docker compose -f deploy/docker/docker-compose.yaml \
+  -f deploy/docker/docker-compose.fake-runtime.yaml up --build
+
 scripts/compose_smoke.sh   # 端到端冒烟（CI 同样执行）
 ```
 
-控制平面的 SQLite 数据库在 compose 卷 `control-plane-data` 中。Kubernetes 清单见 `deploy/kubernetes/`：数据库放在 PersistentVolumeClaim 上，key 文件来自 Secret `forgemesh-api-keys`，更新策略为 `Recreate`，保证任何时刻只有一个控制平面写数据库（ADR-013）。容器中的备份与恢复见 [备份与灾备演练](docs/operations/backup-restore.md) 2.5 / 3.4 节。
+只用 `docker-compose.yaml` 时控制平面没有清单与启动器，新建的服务停在 `Pending`（`SchedulerUnavailable`）。`docker-compose.fake-runtime.yaml` 为控制平面加上清单 `deploy/docker/fake-runtime-inventory.json`（一个节点、一块设备 `gpu-0`）与 `fake` 启动器：实例在控制平面容器内监听全部地址，写进 `status.endpoints` 的主机是服务名 `control-plane`，网关经 compose 网络连接它（私网地址默认允许），实例端口不发布到宿主机。`scripts/compose_smoke.sh` 用这两个文件经网关走完闭环：无 key 的请求返回 `401`；创建 → `Ready`（一个就绪的 `openai-chat` 端点）→ 流式对话到达实例、以 `[DONE]` 结束 → 删除后资源消失、实例停止监听 → 同名重新创建（只有一块设备，可见分配已释放）→ 再次对话到达新实例 → 重启控制平面：资源仍在，服务转为 `Degraded`（`InstanceLost`），网关返回 `503`（`NO_HEALTHY_UPSTREAM`）→ 删除。
+
+控制平面的 SQLite 数据库（部署推理服务时还有工作流存储 `forgemesh.workflows.db`）在 compose 卷 `control-plane-data` 中。Kubernetes 清单见 `deploy/kubernetes/`：数据库放在 PersistentVolumeClaim 上，key 文件来自 Secret `forgemesh-api-keys`，更新策略为 `Recreate`，保证任何时刻只有一个控制平面写数据库（ADR-013）；清单没有设置加速器清单与启动器，不部署推理实例。容器中的备份与恢复见 [备份与灾备演练](docs/operations/backup-restore.md) 2.5 / 3.4 节。
 
 ---
 
@@ -212,7 +288,7 @@ ForgeMesh 目前处于预览阶段，API 稳定性标注为 `beta`：minor 版�
 
 ### 核心控制平面（M2）
 - **资源注册中心**：SQLite 持久化，乐观并发 CAS，租户隔离，分页游标（现状：API 尚未返回分页游标）
-- **协调控制器**：9 步声明式闭环（获取→查询→比较→生成候选→策略校验→调度分配→执行→重观察→更新状态）（现状：自 1.1.0 起由控制器自动驱动；设置 `FORGEMESH_INVENTORY_FILE` 后启用 first-fit 调度器，但应用还没有接入工作流运行时，新建的推理服务停在 `Pending`，并报告 `Ready=False`：未设置清单时为 `SchedulerUnavailable`，设置后为 `WorkflowRuntimeUnavailable`）
+- **协调控制器**：9 步声明式闭环（获取→查询→比较→生成候选→策略校验→调度分配→执行→重观察→更新状态）（现状：自 1.1.0 起由控制器自动驱动；同时设置 `FORGEMESH_INVENTORY_FILE` 与 `FORGEMESH_RUNTIME_LAUNCHER` 后，调度、部署、写入 `status.endpoints` 与受控删除形成完整闭环，见[部署推理服务](#部署推理服务)；未设置启动器时，新建的推理服务停在 `Pending`，并报告 `Ready=False`（`SchedulerUnavailable` 或 `WorkflowRuntimeUnavailable`）。控制平面重启后实例不会自动重新启动）
 - **策略引擎**：allow/deny/require_approval 三态决策，配额规则，高风险审批触发
   - 说明：Decision Router 的 `OK/FALLBACK_REQUIRED/FAILED` 是决策路由层的另一组状态，与 Policy 三态不混用
 - **插件管理器**：Manifest 解析校验，生命周期状态机，能力发现，权限授予（现状：授予的权限直接取自插件清单自己的声明）
@@ -229,7 +305,7 @@ ForgeMesh 目前处于预览阶段，API 稳定性标注为 `beta`：minor 版�
 - **Node Agent**：注册认证，设备/驱动探测，本地运行时管理，断线重连，任务恢复（现状：与控制平面之间只有进程内调用，没有网络传输）
 - **gRPC 任务协议**：6 类任务枚举，心跳与离线检测，幂等键去重（现状：协议定义在 `api/protobuf/agent.proto`，尚未生成代码）
 - **gpu-nvidia 插件**：GPU 枚举，能力采集，驱动/CUDA 预检，周期性健康检查
-- **runtime-vllm 插件**：模型拉取，实例部署，冒烟验证，租约释放（现状：默认 launcher 抛出 `NotImplementedError`，部署实例需要注入 launcher）
+- **runtime-vllm 插件**：模型拉取，实例部署，冒烟验证，租约释放（现状：插件中的默认 launcher 仍抛出 `NotImplementedError`；控制平面部署推理服务时不使用这个插件，而是使用自带的 vLLM 进程启动器 `FORGEMESH_RUNTIME_LAUNCHER=vllm-process`）
 - **GPU 上线 E2E**：发现→验证→准备→部署→验收→提交 完整闭环（现状：工作流级测试，各步骤为模拟实现）
 - **故障恢复**：节点离线不误判、控制平面重启恢复、重复事件不盲目重试
 
@@ -245,7 +321,7 @@ ForgeMesh 目前处于预览阶段，API 稳定性标注为 `beta`：minor 版�
 - **MIG 支持**：NVIDIA MIG 实例管理（创建/销毁/发现/健康检查/能力报告），并发安全，资源不超分
 - **异构 GPU**：非 NVIDIA 能力差异显式报告（差异不隐藏）
 - **Temporal Provider**：WorkflowRuntime 契约适配，补偿注册，信号投递（现状：只有内存客户端，没有接入 temporalio）
-- **TGI Runtime**：HuggingFace TGI 推理 Runtime Provider（deploy→verify→release 闭环）（现状：默认 launcher 抛出 `NotImplementedError`）
+- **TGI Runtime**：HuggingFace TGI 推理 Runtime Provider（deploy→verify→release 闭环）（现状：默认 launcher 抛出 `NotImplementedError`，控制平面也还没有 TGI 启动器）
 - **插件 SDK**：脚手架生成，Manifest 校验，打包发布，开放契约测试套件
 - **治理文档**：GOVERNANCE / SECURITY / CONTRIBUTING / CODE_OF_CONDUCT 完善，弃用政策
 - **API 版本管理**：OpenAPI 版本号与稳定性标注（当前为 1.1.0、`beta`），CHANGELOG，发布记录，CI 架构文档检查
@@ -254,7 +330,7 @@ ForgeMesh 目前处于预览阶段，API 稳定性标注为 `beta`：minor 版�
 
 | 类型 | 数量 |
 |------|------|
-| Python 测试 | **1479** |
+| Python 测试 | **1623** |
 | Go 测试 | 134 个测试函数，全部通过 |
 | ruff 检查 | All checks passed |
 

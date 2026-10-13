@@ -8,6 +8,9 @@
 # 才启动新 Pod），避免滚动更新期间两个 Pod 同时写同一个库；数据卷为 ReadWriteOnce。
 # SQLite 以 WAL 模式运行，依赖共享内存文件：PVC 的 StorageClass 应是块存储，不能是 NFS 类文件系统。
 # 备份与恢复见 docs/operations/backup-restore.md 2.5 / 3.4 节。
+# 没有设置 FORGEMESH_INVENTORY_FILE 与 FORGEMESH_RUNTIME_LAUNCHER：控制平面不部署推理实例，新建的
+# 服务停在 Pending（SchedulerUnavailable）。vllm-process 启动器在控制平面的容器内运行 vLLM，需要
+# 装有 vLLM 的镜像与分配了 GPU 的 Pod，仓库没有提供。
 # 尚未提供：serviceAccount、NetworkPolicy。
 apiVersion: v1
 kind: PersistentVolumeClaim

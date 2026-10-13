@@ -12,6 +12,7 @@ dependencies = [
     "forgemesh-core",
     "forgemesh-resource-model",
     "forgemesh-workflow-api",
+    "forgemesh-workflow-runtime",
     "forgemesh-decision-api",
     "forgemesh-policy-engine",
     "forgemesh-plugin-sdk",

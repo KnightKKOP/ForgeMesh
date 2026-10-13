@@ -1337,7 +1337,8 @@ Foundation
 
 ## 20.6 已知限制
 
-- `InferenceServiceStatus.endpoints`（实例地址、`ready`、`protocol`）已进入资源模型、JSON Schema 与 OpenAPI，可经 status 子资源写入，网关按 `protocol` 映射实例上的推理路径；但目前没有调度器与运行时启动器写入真实实例地址，服务停在 `Pending`，网关对推理请求明确返回 503，不静默降级。
+- `InferenceServiceStatus.endpoints`（实例地址、`ready`、`protocol`）已进入资源模型、JSON Schema 与 OpenAPI，可经 status 子资源写入，网关按 `protocol` 映射实例上的推理路径。控制平面只在设置了加速器清单（`FORGEMESH_INVENTORY_FILE`）与启动器（`FORGEMESH_RUNTIME_LAUNCHER`）时部署实例、写入实例地址；未设置时服务停在 `Pending`（`Ready=False`），网关对推理请求明确返回 503，不静默降级。
+- 启动器只有两种：控制平面进程内的假实例（`fake`，供 CI 与本地开发）与控制平面所在主机上的 vLLM 子进程（`vllm-process`，清单只能有这一个节点）；还没有容器、Kubernetes 或经 Node Agent 的远程启动。每个服务只部署一个实例（`spec.availability.replicas` 不生效）。实例活不过控制平面的重启：重启之前 `Ready` 的服务转为 `Degraded`（`InstanceLost`），不会自动重新部署，需删除后重新创建。
 
 # 附录 A. 状态转移矩阵
 

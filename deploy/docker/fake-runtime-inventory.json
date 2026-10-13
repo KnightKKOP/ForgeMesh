@@ -1,0 +1,8 @@
+{
+  "nodes": [
+    {
+      "id": "fake-node",
+      "devices": [{"id": "gpu-0", "type": "nvidia-gpu", "memoryGiB": 80}]
+    }
+  ]
+}

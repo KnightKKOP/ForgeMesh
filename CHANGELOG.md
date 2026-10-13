@@ -73,6 +73,7 @@
 - CI 新增 `dependency-audit` job：`pip-audit` 2.10.1 审计 `make install` 装进 `.venv` 的全部第三方包（以 editable 方式安装的本仓库 `forgemesh-*` 包不审计），`govulncheck` v1.9.0 检查网关代码实际调用到的已知漏洞（含标准库）；本地为 `make audit` 与 `make -C gateway vulncheck`。尚无修复或经评估不适用的 Python 漏洞以 `--ignore-vuln` 记入根 `Makefile` 的 `PIP_AUDIT_IGNORE`（目前为空），govulncheck 没有忽略机制；处理规则见 `SECURITY.md` 3.1（同步改写，删去「依赖版本在 CI 中固定」这一并不属实的说法）。
 - pytest 总覆盖率下限：根 `pyproject.toml` 的 `[tool.coverage.report]` 设 `fail_under = 97`（引入时实测 97.20%）与 `precision = 2`（默认取整到整数，96.5% 会被当作 97% 而通过）；CI `python` job 改以 `pytest --cov` 运行，本地为 `make coverage`。下限只升不降。
 - Kubernetes 网关清单 `deploy/kubernetes/gateway-deployment.yaml`（ServiceAccount、Deployment 与 Service `forgemesh-gateway`，8081 端口）：与控制平面共用 Secret `forgemesh-api-keys`，经 Service `forgemesh-control-plane` 访问控制平面；探针为 `/readyz`（控制平面就绪之后才通过）与 `/healthz`；安全上下文与控制平面一致（非 root、只读根文件系统、去掉全部 capability、`RuntimeDefault` seccomp）；宽限期 35 秒，长于网关排空在途请求的 30 秒。启用启动器时使用 `deploy/kubernetes/launcher/`：`network-policy.yaml` 允许网关访问控制平面 Pod 上推理实例的临时端口（32768–60999），`fake-runtime-patch.yaml` 为控制平面加上来自 ConfigMap `forgemesh-inventory` 的加速器清单与 `fake` 启动器（实例监听全部地址，写进 `status.endpoints` 的主机是 Pod IP）。用法见 README「Kubernetes 部署」，包括 `vllm-process` 在 Kubernetes 上的前提与单节点限制。
+- Kubernetes 可选的网络策略 `deploy/kubernetes/monitoring/network-policy.yaml`：允许 Prometheus 的 Pod（默认为命名空间 `monitoring` 中带有 `app.kubernetes.io/name: prometheus` 标签的 Pod，按部署修改）访问控制平面的 8080 与网关的 8081 端口，抓取两边的 `/metrics`。默认的策略下从 Pod 网络抓取不到控制平面的 `/metrics`；它与网关的 `/metrics` 一样不要求认证，只输出跨租户聚合的指标。说明与抓取配置示例见 README「Kubernetes 部署」的「指标抓取」。
 
 ### Changed
 

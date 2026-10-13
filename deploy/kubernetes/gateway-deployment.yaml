@@ -4,7 +4,9 @@
 # 与控制平面共用 Secret forgemesh-api-keys 中的 key 文件（见 control-plane-deployment.yaml），
 # 经 Service forgemesh-control-plane 访问控制平面；/readyz 在控制平面就绪之后才返回 200。
 # 网关是调用方访问 API 的唯一入口：network-policies.yaml 只允许网关访问控制平面。集群外的
-# 调用方经 Ingress、LoadBalancer 等暴露 Service forgemesh-gateway 访问。
+# 调用方经 Ingress、LoadBalancer 等暴露 Service forgemesh-gateway 访问。/healthz、/readyz 与
+# /metrics（跨租户聚合的指标）不要求认证，与 API 共用 8081 端口：经 Ingress 暴露时只路由
+# /api/v1/，不要把它们暴露到公网；Prometheus 的抓取见 monitoring/network-policy.yaml。
 #
 # 网关无状态，可以增加副本；限流与服务实例的解析缓存按副本各自计算（每个副本对每个租户都
 # 允许 GATEWAY_RATE_LIMIT_RPS）。推理实例的地址默认只拒绝回环、链路本地与云元数据地址，

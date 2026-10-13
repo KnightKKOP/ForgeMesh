@@ -1,0 +1,58 @@
+# 可选：允许 Prometheus 抓取控制平面（8080）与网关（8081）的 /metrics，与 ../network-policies.yaml
+# 一起应用：
+#   kubectl apply -f deploy/kubernetes/monitoring/network-policy.yaml
+#
+# 两个 /metrics 与探针一样不要求认证，只输出跨租户聚合的计数与耗时（标签不含租户、服务名、
+# 命名空间、uid 或地址，见 README「可观测性」），但仍能反映整体负载，只应让监控组件访问。
+# 默认的策略只允许网关访问控制平面，网关又不转发 /metrics，不应用这个文件时从 Pod 网络抓取
+# 不到控制平面；网关的 8081 端口默认对任何来源开放，第二条策略在收窄了网关的入站来源之后才起作用。
+#
+# 来源是命名空间 monitoring 中带有 app.kubernetes.io/name: prometheus 标签的 Pod：应用之前把
+# 两条策略中的 namespaceSelector 与 podSelector 改成自己的 Prometheus 所在的命名空间与它的 Pod
+# 的标签（kubectl get pods -A --show-labels 查看）。NetworkPolicy 按端口而不是路径放行：这些 Pod
+# 也能直接调用控制平面的 API（仍须 API key），不经过网关的限流与请求体上限。
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: forgemesh-prometheus-control-plane
+  namespace: forgemesh
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: control-plane
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: prometheus
+      ports:
+        - protocol: TCP
+          port: 8080
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: forgemesh-prometheus-gateway
+  namespace: forgemesh
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: gateway
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: prometheus
+      ports:
+        - protocol: TCP
+          port: 8081

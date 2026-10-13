@@ -419,7 +419,22 @@ kubectl -n forgemesh port-forward service/forgemesh-gateway 8081:8081 &
 curl -s -H "Authorization: Bearer fmk_…" http://127.0.0.1:8081/api/v1/inference-services
 ```
 
-**网络策略**（`network-policies.yaml`）：默认拒绝命名空间内全部 Pod 的入站与出站流量，只放行全部 Pod 访问集群 DNS（`kube-system` 中 `k8s-app: kube-dns` 的 Pod）、网关访问控制平面的 8080 端口、任何来源访问网关的 8081 端口。集群内的其他工作负载因此不能直接访问控制平面，改为访问 `forgemesh-gateway:8081`，API 路径不变。kubelet 的探针与 `kubectl exec` / `cp` / `port-forward` 不受网络策略限制，容器中的备份与恢复照常进行。NetworkPolicy 只在执行它的 CNI（如 Calico、Cilium）上生效，其他 CNI 静默忽略。命名空间中新增的工作负载同样默认拒绝，需要为它另写策略；集群 DNS 的标签或端口不同（例如使用 NodeLocal DNSCache）时修改 `forgemesh-allow-dns`；调用方只经 Ingress 控制器访问时，可以把网关的入站来源收窄到 Ingress 控制器所在的命名空间。
+**网络策略**（`network-policies.yaml`）：默认拒绝命名空间内全部 Pod 的入站与出站流量，只放行全部 Pod 访问集群 DNS（`kube-system` 中 `k8s-app: kube-dns` 的 Pod）、网关访问控制平面的 8080 端口、任何来源访问网关的 8081 端口。集群内的其他工作负载因此不能直接访问控制平面，改为访问 `forgemesh-gateway:8081`，API 路径不变。kubelet 的探针与 `kubectl exec` / `cp` / `port-forward` 不受网络策略限制，容器中的备份与恢复照常进行。NetworkPolicy 只在执行它的 CNI（如 Calico、Cilium）上生效，其他 CNI 静默忽略。命名空间中新增的工作负载同样默认拒绝，需要为它另写策略；集群 DNS 的标签或端口不同（例如使用 NodeLocal DNSCache）时修改 `forgemesh-allow-dns`；调用方只经 Ingress 控制器访问时，可以把网关的入站来源收窄到 Ingress 控制器所在的命名空间。`kubectl apply -f deploy/kubernetes/` 不包括子目录，下文的 `launcher/` 与 `monitoring/` 按需另行应用。
+
+**指标抓取**：控制平面（8080）与网关（8081）的 `/metrics` 不要求认证，只输出跨租户聚合的指标（见「可观测性」），但仍能反映整体负载。默认的策略下只有网关能访问控制平面，而网关不转发 `/metrics`，从 Pod 网络抓取不到控制平面；网关的 `/metrics` 与探针和 API 共用对任何来源开放的 8081 端口，经 Ingress 暴露网关时只路由 `/api/v1/`，不要把整个端口暴露到公网。可选的 `monitoring/network-policy.yaml` 允许命名空间 `monitoring` 中带有 `app.kubernetes.io/name: prometheus` 标签的 Pod 访问这两个端口：应用之前把两条策略的 `namespaceSelector` 与 `podSelector` 改成自己的 Prometheus 所在的命名空间与它的 Pod 的标签。网关的那条在收窄了网关的入站来源之后才起作用。NetworkPolicy 按端口而不是路径放行，这些 Pod 也能直接调用控制平面的 API（仍须 API key），不经过网关的限流与请求体上限。Prometheus 应按 Pod 抓取，不经 Service：网关有多个副本时，经 Service 每次抓到的是不同副本的计数。例如（Prometheus 需要读取命名空间 `forgemesh` 中 EndpointSlice、Service 与 Pod 的 RBAC 权限）：
+
+```yaml
+scrape_configs:
+  - job_name: forgemesh
+    kubernetes_sd_configs:
+      - role: endpointslice
+        namespaces:
+          names: [forgemesh]
+    relabel_configs:
+      - source_labels: [__meta_kubernetes_service_name]
+        regex: forgemesh-control-plane|forgemesh-gateway
+        action: keep
+```
 
 **加速器清单与启动器**：控制平面的 Deployment 没有设置 `FORGEMESH_INVENTORY_FILE` 与 `FORGEMESH_RUNTIME_LAUNCHER`，新建的服务停在 `Pending`（`SchedulerUnavailable`）。在 Kubernetes 上启用它们（变量见「运行控制平面」与「部署推理服务」）：
 
@@ -457,7 +472,7 @@ curl -s http://127.0.0.1:8080/metrics   # 控制平面
 curl -s http://127.0.0.1:8081/metrics   # 网关
 ```
 
-两个 `/metrics` 与探针一样不要求认证，网关也不对它限流。输出只有跨租户聚合的计数与耗时：标签只取路由模板（网关为路由类别）、方法、状态码与固定的枚举值（加速器类型取自运维配置的清单），不含租户、服务名、命名空间、uid、路径或实例地址；每个指标最多 200 个标签组合，超出的计入标签全为 `overflow` 的一个序列。控制平面的 `/metrics` 不在 `/api/v1` 之下，网关不转发它。指标仍能反映整体负载，不要经公网入口暴露这两个端点，只让 Prometheus 所在的网络访问（compose 只发布在 `127.0.0.1`）。
+两个 `/metrics` 与探针一样不要求认证，网关也不对它限流。输出只有跨租户聚合的计数与耗时：标签只取路由模板（网关为路由类别）、方法、状态码与固定的枚举值（加速器类型取自运维配置的清单），不含租户、服务名、命名空间、uid、路径或实例地址；每个指标最多 200 个标签组合，超出的计入标签全为 `overflow` 的一个序列。控制平面的 `/metrics` 不在 `/api/v1` 之下，网关不转发它。指标仍能反映整体负载，不要经公网入口暴露这两个端点，只让 Prometheus 所在的网络访问（compose 只发布在 `127.0.0.1`，Kubernetes 见「Kubernetes 部署」的「指标抓取」）。
 
 控制平面的指标（网关的指标见 [gateway/README.md](gateway/README.md)「可观测性」）：
 

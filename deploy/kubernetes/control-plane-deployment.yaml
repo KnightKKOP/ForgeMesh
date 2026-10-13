@@ -10,6 +10,7 @@
 # 备份与恢复见 docs/operations/backup-restore.md 2.5 / 3.4 节。
 # 控制平面不访问 Kubernetes API：以专用的 ServiceAccount 运行，不挂载它的 token。
 # network-policies.yaml 只允许网关访问控制平面，调用方都经网关（gateway-deployment.yaml）访问 API。
+# 网关不转发 /metrics（聚合指标，不要求认证）：让 Prometheus 抓取见 monitoring/network-policy.yaml。
 # 没有设置 FORGEMESH_INVENTORY_FILE 与 FORGEMESH_RUNTIME_LAUNCHER：控制平面不部署推理实例，新建的
 # 服务停在 Pending（SchedulerUnavailable）。设置方法见 README「Kubernetes 部署」：不需要 GPU 的
 # 假启动器见 launcher/fake-runtime-patch.yaml；vllm-process / tgi-process 启动器在控制平面的容器内

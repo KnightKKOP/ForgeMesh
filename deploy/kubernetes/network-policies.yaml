@@ -5,9 +5,11 @@
 # - 全部 Pod 都可以访问集群 DNS（kube-system 中 k8s-app=kube-dns 的 Pod，53 端口）；
 # - 控制平面只接受网关对 8080 端口的访问。kubelet 的探针与 kubectl exec / cp / port-forward
 #   不受网络策略限制，容器中的备份与恢复（docs/operations/backup-restore.md 2.5 / 3.4 节）照常进行；
-# - 网关接受任何来源对 8081 端口的访问（它是 API 的入口，自行认证），出站只能访问控制平面的 8080 端口。
+# - 网关接受任何来源对 8081 端口的访问（它是 API 的入口，自行认证；/healthz、/readyz 与聚合指标
+#   /metrics 不要求认证），出站只能访问控制平面的 8080 端口。
 #
-# 启用启动器之后推理实例运行在控制平面的 Pod 内，还要应用 launcher/network-policy.yaml。
+# 启用启动器之后推理实例运行在控制平面的 Pod 内，还要应用 launcher/network-policy.yaml；
+# 让 Prometheus 抓取两边的 /metrics 见 monitoring/network-policy.yaml。
 # 集群外的调用方只经 Ingress 控制器访问网关时，可以把网关入站规则的来源收窄到 Ingress 控制器
 # 所在的命名空间；集群 DNS 的标签或端口不同（例如使用 NodeLocal DNSCache）时相应修改 DNS 规则。
 apiVersion: networking.k8s.io/v1

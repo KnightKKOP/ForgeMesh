@@ -10,6 +10,7 @@
   分配的 :func:`reclaim_orphaned_allocations`；
 * :mod:`.fake` —— 在控制平面进程内为每个实例提供 OpenAI 兼容桩服务的
   :class:`FakeLauncher`（CI 与本地开发）；
+* :mod:`.process` —— 本机进程启动器的公共部分（启动、就绪检查与停止）；
 * :mod:`.vllm_process` —— 把每个实例作为本机 vLLM 子进程运行的 :class:`VLLMProcessLauncher`；
 * :mod:`.config` —— 按环境变量（``FORGEMESH_RUNTIME_LAUNCHER`` 等）选择启动器的
   :func:`launcher_from_env` 与核对实例的间隔 :func:`instance_check_interval_from_env`；

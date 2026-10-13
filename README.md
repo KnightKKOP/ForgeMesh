@@ -404,7 +404,7 @@ ForgeMesh 目前处于预览阶段，API 稳定性标注为 `beta`：minor 版�
   - 说明：Decision Router 的 `OK/FALLBACK_REQUIRED/FAILED` 是决策路由层的另一组状态，与 Policy 三态不混用
 - **插件管理器**：Manifest 解析校验，生命周期状态机，能力发现，权限授予（现状：自 1.1.0 起注册时验证 Ed25519 签名，权限按管理员的授予判定；控制平面应用尚未加载插件）
 - **审计与 Outbox**：事务性 Outbox，异步事件发布，幂等消费，correlation_id 全链路（现状：组件已实现，尚未接入控制平面的生产路径）
-- **REST API 与 CLI**：资源 CRUD，状态查询，任务管理，租户上下文注入（现状：自 1.1.0 起提供 `PUT` / `PATCH` 更新接口（以 `resourceVersion` 或 `ETag` 做乐观并发）；控制平面应用不对外提供工作流运行时，`POST /api/v1/workflows` 返回 `503`；CLI 每条命令使用一个新的内存数据库，尚不可用）
+- **REST API 与 CLI**：资源 CRUD，状态查询，任务管理，租户上下文注入（现状：自 1.1.0 起提供 `PUT` / `PATCH` 更新接口（以 `resourceVersion` 或 `ETag` 做乐观并发），CLI 经 REST API 管理推理服务（`apply` / `get` / `list` / `describe` / `delete` / `wait`），只管理 `InferenceService`；控制平面应用不对外提供工作流运行时，`POST /api/v1/workflows` 返回 `503`）
 
 ### 工作流与决策（M3）
 - **工作流引擎**：持久化执行，幂等去重，三级超时，重试策略
@@ -441,7 +441,7 @@ ForgeMesh 目前处于预览阶段，API 稳定性标注为 `beta`：minor 版�
 
 | 类型 | 数量 |
 |------|------|
-| Python 测试 | **2207** |
+| Python 测试 | **2360** |
 | Go 测试 | 134 个测试函数，全部通过 |
 | ruff 检查 | All checks passed |
 

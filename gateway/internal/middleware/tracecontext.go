@@ -72,7 +72,8 @@ type traceInfoKey struct{}
 //   - 请求恰好带一个合法的 traceparent 时原样沿用，tracestate 一并保留；
 //   - 否则（缺失、不合法或多个）开始新的追踪：生成新的 traceparent，丢弃 tracestate；
 //   - 确定的 traceparent 写回请求头，随请求转发给控制平面与推理实例（Resolver 的查询经
-//     TraceparentFromContext 附带），trace-id 注入 context 供日志与错误信封读取。
+//     TraceparentFromContext 附带），trace-id 注入 context 供日志与错误信封读取，并记录给
+//     外层的 Recovery。
 //
 // 响应不回写 traceparent：客户端凭响应头中的关联 ID 或错误信封中的 traceId 报障。
 func TraceContext() Middleware {
@@ -88,6 +89,9 @@ func TraceContext() Middleware {
 				info.traceparent, info.traceID = newTraceparent()
 				r.Header.Set(TraceparentHeader, info.traceparent)
 				r.Header.Del(TracestateHeader)
+			}
+			if ids := requestIDsFrom(r.Context()); ids != nil {
+				ids.traceID = info.traceID
 			}
 			next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), traceInfoKey{}, info)))
 		})

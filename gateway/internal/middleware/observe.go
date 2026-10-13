@@ -8,8 +8,9 @@ import (
 )
 
 // Observe 返回记录请求数与耗时的中间件，须位于最外层（Recovery 之外），panic 兜底的 500
-// 也被计入。classify 在请求开始时按路由表确定路由类别，指标只用路由类别、不用路径；
-// m 为 nil 时不记录。流式请求的耗时是整个流的时长。
+// 也被计入；以 http.ErrAbortHandler 中止的响应按已写出的状态码计入，什么都没写出时计 500。
+// classify 在请求开始时按路由表确定路由类别，指标只用路由类别、不用路径；m 为 nil 时不记录。
+// 流式请求的耗时是整个流的时长。
 func Observe(m *metrics.Gateway, classify func(*http.Request) metrics.Route) Middleware {
 	if classify == nil {
 		panic("middleware: Observe 需要非空 classify")
@@ -19,8 +20,10 @@ func Observe(m *metrics.Gateway, classify func(*http.Request) metrics.Route) Mid
 			start := time.Now()
 			route := classify(r)
 			sw := &statusWriter{ResponseWriter: w}
+			returned := false
+			defer func() { m.ObserveRequest(route, sw.statusAfter(returned), time.Since(start)) }()
 			next.ServeHTTP(sw, r)
-			m.ObserveRequest(route, sw.Status(), time.Since(start))
+			returned = true
 		})
 	}
 }
@@ -66,4 +69,14 @@ func (s *statusWriter) Status() int {
 		return http.StatusOK
 	}
 	return s.status
+}
+
+// statusAfter 返回请求结束时记录的状态码；returned 表示处理器正常返回。处理器 panic 时
+// 什么都没写记 500：Recovery 兜底返回 500，以 http.ErrAbortHandler 中止、什么都没写出的
+// 响应同样记 500。
+func (s *statusWriter) statusAfter(returned bool) int {
+	if !returned && s.status == 0 {
+		return http.StatusInternalServerError
+	}
+	return s.Status()
 }

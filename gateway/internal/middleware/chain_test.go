@@ -103,8 +103,8 @@ func TestChain_RateLimitKeysTenantAfterAuthz(t *testing.T) {
 }
 
 // TestChain_RecoveryOutermostOpaque500 验证 Recovery 位于最外层：
-// 下游 handler panic 被兜底为 500，响应体为固定文案（无堆栈/源码路径），
-// 且仍携带关联 ID（Correlation 位于其内侧已先行写入响应头）。
+// 下游 handler panic 被兜底为 500 INTERNAL_ERROR 错误信封（固定文案，无堆栈/源码路径），
+// 响应头与信封都带关联 ID（Correlation 位于其内侧，已先行写入响应头并记录给 Recovery）。
 func TestChain_RecoveryOutermostOpaque500(t *testing.T) {
 	panicRoute := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		panic("boom: 内部敏感细节")
@@ -119,11 +119,16 @@ func TestChain_RecoveryOutermostOpaque500(t *testing.T) {
 	if rec.Code != http.StatusInternalServerError {
 		t.Fatalf("panic 应兜底 500，实际 %d", rec.Code)
 	}
-	if body := rec.Body.String(); body != "Internal Server Error\n" {
-		t.Fatalf("500 响应体应为固定文案，实际 %q", body)
+	env := readEnvelope(t, rec)
+	if env.Code != "INTERNAL_ERROR" || env.Message != "internal server error" {
+		t.Fatalf("500 应为固定文案的 INTERNAL_ERROR 错误信封，实际 %+v", env)
 	}
-	if rec.Header().Get(DefaultCorrelationHeader) == "" {
-		t.Fatal("panic 兜底响应仍应携带关联 ID（Recovery 位于 Correlation 外层）")
+	corr := rec.Header().Get(DefaultCorrelationHeader)
+	if corr == "" || env.CorrelationID != corr || len(env.TraceID) != 32 {
+		t.Fatalf("响应头与信封应带同一个关联 ID（%q）及 trace-id，实际 %+v", corr, env)
+	}
+	if strings.Contains(rec.Body.String(), "boom") {
+		t.Fatalf("500 响应体不应包含 panic 的内容: %s", rec.Body.String())
 	}
 }
 

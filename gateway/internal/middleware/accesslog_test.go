@@ -12,7 +12,8 @@ import (
 )
 
 // serveLogged 经 Correlation → TraceContext → AccessLog 处理 req（外层 Recovery 兜底 panic），
-// 返回响应与访问日志。
+// 返回响应与访问日志。响应头写出之后的 panic 由 Recovery 以 http.ErrAbortHandler 中止，这里代替
+// net/http 接住它。
 func serveLogged(t *testing.T, h http.Handler, req *http.Request) (*httptest.ResponseRecorder, string) {
 	t.Helper()
 	var buf bytes.Buffer
@@ -22,7 +23,14 @@ func serveLogged(t *testing.T, h http.Handler, req *http.Request) (*httptest.Res
 		AccessLog(log.New(&buf, "", 0)),
 	))
 	rec := httptest.NewRecorder()
-	chain.ServeHTTP(rec, req)
+	func() {
+		defer func() {
+			if v := recover(); v != nil && v != http.ErrAbortHandler {
+				panic(v)
+			}
+		}()
+		chain.ServeHTTP(rec, req)
+	}()
 	return rec, buf.String()
 }
 

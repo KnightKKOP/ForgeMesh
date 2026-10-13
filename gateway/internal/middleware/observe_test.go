@@ -139,3 +139,34 @@ func TestObserve_CountsRecoveredPanicAs500(t *testing.T) {
 		t.Fatalf("兜底的 500 应计入，实际 %v", got)
 	}
 }
+
+// TestObserve_CountsAbortedRequests 验证以 http.ErrAbortHandler 中止的请求同样计入（panic 原样
+// 交给 net/http）：已写出状态码时按它计，什么都没写出时计 500。
+func TestObserve_CountsAbortedRequests(t *testing.T) {
+	m := metrics.NewGateway()
+	handlers := []http.HandlerFunc{
+		func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusOK)
+			panic(http.ErrAbortHandler)
+		},
+		func(http.ResponseWriter, *http.Request) { panic(http.ErrAbortHandler) },
+	}
+	for _, h := range handlers {
+		func() {
+			defer func() {
+				if v := recover(); v != http.ErrAbortHandler {
+					t.Errorf("Observe 应把 panic 原样交给 net/http，实际 %v", v)
+				}
+			}()
+			Observe(m, classifyAs(metrics.RouteInference))(h).ServeHTTP(httptest.NewRecorder(),
+				httptest.NewRequest(http.MethodPost, "/api/v1/inference/svc/chat", nil))
+		}()
+	}
+
+	samples := scrapeMetrics(t, m)
+	for _, status := range []string{"200", "500"} {
+		if got := samples[requestsKey(metrics.RouteInference, status)]; got != 1 {
+			t.Errorf("中止的请求应计 %s 一次，实际 %v", status, got)
+		}
+	}
+}

@@ -21,18 +21,14 @@ func AccessLog(logger *log.Logger) Middleware {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			start := time.Now()
 			sw := &statusWriter{ResponseWriter: w}
-			completed := false
+			returned := false
 			defer func() {
-				status := sw.Status()
-				if !completed && sw.status == 0 {
-					status = http.StatusInternalServerError
-				}
 				logger.Printf("access method=%s path=%q status=%d duration=%s corr=%s trace=%s",
-					r.Method, r.URL.Path, status, time.Since(start).Round(time.Microsecond),
+					r.Method, r.URL.Path, sw.statusAfter(returned), time.Since(start).Round(time.Microsecond),
 					CorrelationIDFromContext(r.Context()), TraceIDFromContext(r.Context()))
 			}()
 			next.ServeHTTP(sw, r)
-			completed = true
+			returned = true
 		})
 	}
 }

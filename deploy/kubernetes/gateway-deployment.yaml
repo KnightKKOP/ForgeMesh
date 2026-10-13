@@ -1,0 +1,115 @@
+# ForgeMesh 网关 Kubernetes 部署
+#
+# 镜像由 deploy/docker/Dockerfile.gateway 构建；推送到自己的镜像仓库后替换 image。
+# 与控制平面共用 Secret forgemesh-api-keys 中的 key 文件（见 control-plane-deployment.yaml），
+# 经 Service forgemesh-control-plane 访问控制平面；/readyz 在控制平面就绪之后才返回 200。
+# 网关是调用方访问 API 的唯一入口：network-policies.yaml 只允许网关访问控制平面。集群外的
+# 调用方经 Ingress、LoadBalancer 等暴露 Service forgemesh-gateway 访问。
+#
+# 网关无状态，可以增加副本；限流与服务实例的解析缓存按副本各自计算（每个副本对每个租户都
+# 允许 GATEWAY_RATE_LIMIT_RPS）。推理实例的地址默认只拒绝回环、链路本地与云元数据地址，
+# 可以用 GATEWAY_INSTANCE_ALLOWED_CIDRS 限定为 Pod 网段（见 gateway/README.md「实例地址限制」）。
+# 网关不访问 Kubernetes API：以专用的 ServiceAccount 运行，不挂载它的 token。
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: forgemesh-gateway
+  namespace: forgemesh
+  labels:
+    app.kubernetes.io/name: gateway
+    app.kubernetes.io/part-of: forgemesh
+automountServiceAccountToken: false
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: forgemesh-gateway
+  namespace: forgemesh
+  labels:
+    app.kubernetes.io/name: gateway
+    app.kubernetes.io/part-of: forgemesh
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: gateway
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: gateway
+    spec:
+      serviceAccountName: forgemesh-gateway
+      automountServiceAccountToken: false
+      # 不注入同命名空间各 Service 的环境变量：名为 gateway 的 Service 会注入 GATEWAY_PORT 等
+      # 变量，与网关的 GATEWAY_* 配置混在一起（见 control-plane-deployment.yaml）。
+      enableServiceLinks: false
+      # 收到 SIGTERM 后网关最多用 30 秒排空在途请求（含 SSE 流），宽限期要比它长。
+      terminationGracePeriodSeconds: 35
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: gateway
+          image: forgemesh/gateway:0.0.1
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: GATEWAY_UPSTREAM_URL
+              value: http://forgemesh-control-plane:8080
+            - name: GATEWAY_API_KEYS_FILE
+              value: /etc/forgemesh/api-keys.json
+          ports:
+            - name: http
+              containerPort: 8081
+          # /readyz 最多等控制平面的 /readyz 2 秒（gateway/internal/health），探针的超时要比它长。
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            initialDelaySeconds: 3
+            periodSeconds: 10
+            timeoutSeconds: 3
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "64Mi"
+            limits:
+              cpu: "1"
+              memory: "256Mi"
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: api-keys
+              mountPath: /etc/forgemesh
+              readOnly: true
+      volumes:
+        - name: api-keys
+          secret:
+            secretName: forgemesh-api-keys
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: forgemesh-gateway
+  namespace: forgemesh
+  labels:
+    app.kubernetes.io/name: gateway
+spec:
+  selector:
+    app.kubernetes.io/name: gateway
+  ports:
+    - name: http
+      port: 8081
+      targetPort: http

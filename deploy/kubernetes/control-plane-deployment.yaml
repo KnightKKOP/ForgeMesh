@@ -8,10 +8,22 @@
 # 才启动新 Pod），避免滚动更新期间两个 Pod 同时写同一个库；数据卷为 ReadWriteOnce。
 # SQLite 以 WAL 模式运行，依赖共享内存文件：PVC 的 StorageClass 应是块存储，不能是 NFS 类文件系统。
 # 备份与恢复见 docs/operations/backup-restore.md 2.5 / 3.4 节。
+# 控制平面不访问 Kubernetes API：以专用的 ServiceAccount 运行，不挂载它的 token。
+# network-policies.yaml 只允许网关访问控制平面，调用方都经网关（gateway-deployment.yaml）访问 API。
 # 没有设置 FORGEMESH_INVENTORY_FILE 与 FORGEMESH_RUNTIME_LAUNCHER：控制平面不部署推理实例，新建的
-# 服务停在 Pending（SchedulerUnavailable）。vllm-process / tgi-process 启动器在控制平面的容器内
+# 服务停在 Pending（SchedulerUnavailable）。设置方法见 README「Kubernetes 部署」：不需要 GPU 的
+# 假启动器见 launcher/fake-runtime-patch.yaml；vllm-process / tgi-process 启动器在控制平面的容器内
 # 运行 vLLM / TGI，需要装有它们的镜像与分配了 GPU 的 Pod，仓库没有提供。
-# 尚未提供：serviceAccount、NetworkPolicy。
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: forgemesh-control-plane
+  namespace: forgemesh
+  labels:
+    app.kubernetes.io/name: control-plane
+    app.kubernetes.io/part-of: forgemesh
+automountServiceAccountToken: false
+---
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
@@ -47,7 +59,11 @@ spec:
       labels:
         app.kubernetes.io/name: control-plane
     spec:
+      serviceAccountName: forgemesh-control-plane
       automountServiceAccountToken: false
+      # 不注入同命名空间各 Service 的环境变量：名为 forgemesh 的 Service 会注入
+      # FORGEMESH_PORT=tcp://…，覆盖镜像中的 FORGEMESH_PORT，控制平面随即无法启动。
+      enableServiceLinks: false
       securityContext:
         runAsNonRoot: true
         runAsUser: 10001

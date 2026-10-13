@@ -11,7 +11,7 @@
 #   make test      运行全部测试（pytest）
 #   make coverage  运行全部测试并检查覆盖率下限（与 CI 相同）
 #   make audit     用 pip-audit 检查 .venv 中第三方依赖的已知漏洞（与 CI 相同）
-#   make lint      ruff 静态检查
+#   make lint      ruff 静态检查与格式检查（与 CI 相同）
 #   make fmt       ruff 自动修复 + 格式化
 #   make clean     清理构建与缓存产物
 # =============================================================================
@@ -40,7 +40,7 @@ help:
 	@echo "  make test-contract  仅运行契约测试"
 	@echo "  make coverage       运行全部测试并检查覆盖率下限（与 CI 相同）"
 	@echo "  make audit          用 pip-audit 检查 .venv 中第三方依赖的已知漏洞（与 CI 相同）"
-	@echo "  make lint           ruff 静态检查"
+	@echo "  make lint           ruff 静态检查与格式检查（与 CI 相同）"
 	@echo "  make fmt            ruff 自动修复与格式化"
 	@echo "  make clean          清理构建与缓存产物"
 
@@ -100,6 +100,7 @@ audit:
 
 lint:
 	$(VENV_PY) -m ruff check .
+	$(VENV_PY) -m ruff format --check .
 
 fmt:
 	$(VENV_PY) -m ruff check --fix .

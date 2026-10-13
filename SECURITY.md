@@ -94,7 +94,7 @@ ForgeMesh 通过插件与多组件扩展，供应链完整性是重点防护面�
 ### 3.1 依赖与构建
 
 - Python 依赖只声明版本下限（个别另有上限，如 `pydantic>=2,<3`），仓库中没有锁文件：`make install`、CI 与镜像构建都安装满足约束的最新版本。依赖变更需评审。
-- CI 门禁：Python 执行 `ruff check` 与 `pytest`（总覆盖率不得低于 `pyproject.toml` 中的 `fail_under`），并把每个包装进全新的虚拟环境、只带它声明的依赖，导入它的全部模块（`scripts/check_package_imports.py`）；Go 网关执行 `gofmt`、`go vet`、`go build` 与 `go test -race`。
+- CI 门禁：Python 执行 `ruff check`、`ruff format --check` 与 `pytest`（总覆盖率不得低于 `pyproject.toml` 中的 `fail_under`），并把每个包装进全新的虚拟环境、只带它声明的依赖，导入它的全部模块（`scripts/check_package_imports.py`）；Go 网关执行 `gofmt`、`go vet`、`go build` 与 `go test -race`。
 - 依赖漏洞扫描（CI `dependency-audit` job；本地为 `make audit` 与 `make -C gateway vulncheck`，工具版本固定在这两个 Makefile 中）：
   - `pip-audit` 审计 `make install` 装进 `.venv` 的全部第三方包（含开发工具）；本仓库的 `forgemesh-*` 包以 editable 方式安装、不在 PyPI 上，不审计。发现任何已知漏洞即失败。
   - `govulncheck` 只报告网关代码实际调用到的漏洞，包括标准库。网关只依赖标准库，标准库编译进二进制，修复随 Go 补丁版本发布：CI 与网关镜像使用同一个 Go 次版本（`.github/workflows/ci.yml` 中的 `GO_VERSION`）的最新补丁，这个次版本停止维护之前升级。本地运行时检查 go.mod 选定的工具链：默认的 go 命令比 `gateway/go.mod` 的 go 行旧时切换到其中的版本（`go1.27.0`），会报告此后的补丁已修复的漏洞；与 CI 一致可设置 `GOTOOLCHAIN` 为这个次版本的最新补丁（如 `GOTOOLCHAIN=go1.27.2`）。

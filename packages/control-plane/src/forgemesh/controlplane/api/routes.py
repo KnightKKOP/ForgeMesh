@@ -36,13 +36,14 @@ from forgemesh.workflow.runtime import WorkflowDefinition
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from ..app import error_envelope
+from ..registry import SQLiteRegistry
 from .dependencies import (
     ComponentNotReadyError,
     get_decision_router,
-    get_registry,
     get_tenant_id,
     get_workflow_runtime,
     require_read,
+    require_registry,
     require_write,
 )
 from .errors import validation_details
@@ -114,6 +115,7 @@ def _invalid_limit(limit: int) -> JSONResponse | None:
 async def create_inference_service(
     body: dict[str, Any],
     tenant_id: str = Depends(get_tenant_id),
+    registry: SQLiteRegistry = Depends(require_registry),
     x_correlation_id: str | None = Header(default=None, alias="X-Correlation-Id"),
 ) -> Any:
     """创建推理服务（201）。
@@ -134,7 +136,7 @@ async def create_inference_service(
     except ValueError as exc:
         return _error_response(400, "BAD_REQUEST", str(exc), correlation_id)
     try:
-        created = await get_registry().put(resource)
+        created = await registry.put(resource)
     except ConflictError as exc:
         return _error_response(409, "CONFLICT", str(exc), correlation_id)
     return JSONResponse(status_code=201, content=created.model_dump(by_alias=True, mode="json"))
@@ -143,13 +145,13 @@ async def create_inference_service(
 @router.get("/inference-services", dependencies=[Depends(require_read)])
 async def list_inference_services(
     tenant_id: str = Depends(get_tenant_id),
+    registry: SQLiteRegistry = Depends(require_registry),
     namespace: str | None = None,
     limit: int = 100,
 ) -> Any:
     """列出推理服务（可选按 namespace 过滤、limit 分页）。"""
     if (invalid := _invalid_limit(limit)) is not None:
         return invalid
-    registry = get_registry()
     items = await registry.list("InferenceService", tenant_id, namespace=namespace, limit=limit)
     return {"items": [r.model_dump(by_alias=True) for r in items], "count": len(items)}
 
@@ -158,10 +160,10 @@ async def list_inference_services(
 async def get_inference_service(
     name: str,
     tenant_id: str = Depends(get_tenant_id),
+    registry: SQLiteRegistry = Depends(require_registry),
     namespace: str | None = None,
 ) -> dict[str, Any]:
     """获取单个推理服务；不存在时返回 HTTP 404。"""
-    registry = get_registry()
     try:
         resource = await registry.get("InferenceService", namespace, name, tenant_id)
     except NotFoundError as exc:
@@ -173,6 +175,7 @@ async def get_inference_service(
 async def delete_inference_service(
     name: str,
     tenant_id: str = Depends(get_tenant_id),
+    registry: SQLiteRegistry = Depends(require_registry),
     namespace: str | None = None,
 ) -> Any:
     """删除推理服务（受控删除语义，对齐 development-plan 第 7 章除闭环）。
@@ -186,7 +189,6 @@ async def delete_inference_service(
 
     不存在时返回 HTTP 404（不变）。
     """
-    registry = get_registry()
     try:
         result = await registry.request_delete("InferenceService", namespace, name, tenant_id)
     except NotFoundError as exc:
@@ -206,6 +208,7 @@ async def delete_inference_service(
 @router.get("/resources", dependencies=[Depends(require_read)])
 async def list_resources(
     tenant_id: str = Depends(get_tenant_id),
+    registry: SQLiteRegistry = Depends(require_registry),
     kind: str | None = None,
     namespace: str | None = None,
     limit: int = 100,
@@ -216,7 +219,6 @@ async def list_resources(
     """
     if (invalid := _invalid_limit(limit)) is not None:
         return invalid
-    registry = get_registry()
     if kind:
         items = await registry.list(kind, tenant_id, namespace=namespace, limit=limit)
     else:

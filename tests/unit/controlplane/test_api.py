@@ -21,7 +21,13 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from forgemesh.controlplane.api import create_api_router
-from forgemesh.controlplane.api.dependencies import get_registry, init_registry
+from forgemesh.controlplane.api.dependencies import (
+    ComponentNotReadyError,
+    get_registry,
+    init_registry,
+    reset_registry,
+)
+from forgemesh.controlplane.api.errors import install_exception_handlers
 from forgemesh.core.objects import ObjectMeta
 from forgemesh.core.scheduler import AllocatedDevice, ResourceRef
 from forgemesh.resource.inference import (
@@ -231,6 +237,38 @@ def test_create_rejects_invalid_body(client: TestClient, mutate) -> None:
     assert resp.json()["error"]["code"] == "BAD_REQUEST"
     listed = client.get("/api/v1/inference-services", headers=TENANT_HEADERS).json()
     assert listed["count"] == 0
+
+
+@pytest.mark.parametrize(
+    ("method", "path"),
+    [
+        ("GET", "/api/v1/inference-services"),
+        ("POST", "/api/v1/inference-services"),
+        ("GET", "/api/v1/inference-services/svc-1"),
+        ("DELETE", "/api/v1/inference-services/svc-1"),
+        ("GET", "/api/v1/resources?kind=InferenceService"),
+    ],
+)
+def test_routes_report_an_uninitialised_registry(method: str, path: str) -> None:
+    """Registry 未初始化：返回 503 错误信封，不以内存库兜底；认证仍先于它检查。"""
+    reset_registry()
+    app = FastAPI()
+    install_exception_handlers(app)
+    app.include_router(create_api_router())
+    client = TestClient(app)
+    body = _payload() if method == "POST" else None
+
+    resp = client.request(
+        method, path, json=body, headers={**TENANT_HEADERS, "X-Correlation-Id": "corr-1"}
+    )
+    unauthenticated = client.request(method, path, json=body)
+
+    assert resp.status_code == 503, resp.text
+    error = resp.json()["error"]
+    assert (error["code"], error["correlationId"]) == ("REGISTRY_UNAVAILABLE", "corr-1")
+    assert unauthenticated.status_code == 401
+    with pytest.raises(ComponentNotReadyError):
+        get_registry()
 
 
 @pytest.mark.parametrize("path", ["/api/v1/inference-services", "/api/v1/resources"])

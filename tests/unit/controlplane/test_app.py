@@ -17,6 +17,7 @@ from forgemesh.controlplane.api.dependencies import (
     ComponentNotReadyError,
     get_authenticator,
     get_registry,
+    reset_registry,
     reset_runtime_components,
 )
 from forgemesh.controlplane.app import DB_PATH_ENV, create_app
@@ -144,6 +145,28 @@ def test_readyz_reports_unavailable_registry(tmp_path) -> None:
         not_ready = client.get("/readyz")
         assert not_ready.status_code == 503
         assert not_ready.json()["error"]["code"] == "NOT_READY"
+
+
+@pytest.mark.unit
+def test_readyz_reports_an_uninitialised_registry(tmp_path) -> None:
+    """lifespan 没有运行时 Registry 未初始化：就绪探针报告 503，而不是悄悄打开一个内存库。"""
+    reset_registry()
+    client = TestClient(create_app(db_path=str(tmp_path / "cp.db")))
+
+    response = client.get("/readyz")
+
+    assert response.status_code == 503
+    assert response.json()["error"]["code"] == "NOT_READY"
+    assert not (tmp_path / "cp.db").exists()
+
+
+@pytest.mark.unit
+def test_stopping_the_app_releases_the_registry(tmp_path) -> None:
+    with TestClient(create_app(db_path=str(tmp_path / "cp.db"))) as client:
+        assert client.get("/readyz").status_code == 200
+
+    with pytest.raises(ComponentNotReadyError):
+        get_registry()
 
 
 @pytest.mark.unit
@@ -361,7 +384,15 @@ def test_failed_controller_start_releases_the_registry_and_authenticator(
     async def failing_start(self: ControllerManager) -> None:
         raise RuntimeError("controller failed to start")
 
+    closed: list[SQLiteRegistry] = []
+    close = SQLiteRegistry.close
+
+    async def recording_close(self: SQLiteRegistry) -> None:
+        closed.append(self)
+        await close(self)
+
     monkeypatch.setattr(ControllerManager, "start", failing_start)
+    monkeypatch.setattr(SQLiteRegistry, "close", recording_close)
 
     with (
         pytest.raises(RuntimeError, match="controller failed to start"),
@@ -371,5 +402,8 @@ def test_failed_controller_start_releases_the_registry_and_authenticator(
 
     with pytest.raises(ComponentNotReadyError):
         get_authenticator()
+    with pytest.raises(ComponentNotReadyError):
+        get_registry()
+    [registry] = closed
     with pytest.raises(sqlite3.ProgrammingError):
-        asyncio.run(get_registry().ping())
+        asyncio.run(registry.ping())

@@ -106,6 +106,8 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/Forbidden"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
     post:
       tags: [inference-services]
       summary: 创建推理服务（声明式）
@@ -131,6 +133,8 @@ paths:
           $ref: "#/components/responses/Forbidden"
         "409":
           $ref: "#/components/responses/Conflict"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
 
 
   /api/v1/inference-services/{name}:
@@ -162,6 +166,8 @@ paths:
           $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/NotFound"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
     delete:
       tags: [inference-services]
       summary: 删除推理服务（受控删除：finalizer 驱动受控释放）
@@ -186,6 +192,8 @@ paths:
           $ref: "#/components/responses/NotFound"
         "409":
           $ref: "#/components/responses/Conflict"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
 
 
   /api/v1/workflows:
@@ -449,6 +457,14 @@ components:
             $ref: "#/components/schemas/Error"
     Conflict:
       description: 并发冲突/已存在
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    ServiceUnavailable:
+      description: >-
+        所依赖的组件未就绪（错误码 AUTHENTICATOR_UNAVAILABLE、REGISTRY_UNAVAILABLE 等）：
+        控制平面未完成组装或正在关闭，不会以临时内存库或放行兜底。
       content:
         application/json:
           schema:

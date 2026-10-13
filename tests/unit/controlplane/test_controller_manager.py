@@ -14,6 +14,7 @@ from typing import Any
 
 import pytest
 from forgemesh.controlplane.controller import ControllerManager, WorkQueue
+from forgemesh.controlplane.deployment import LAUNCH_INSTANCE, LaunchedInstance
 from forgemesh.controlplane.reconciler import (
     ProcessedKeyStore,
     ReconciliationController,
@@ -22,9 +23,11 @@ from forgemesh.controlplane.reconciler import (
 from forgemesh.controlplane.registry import ResourceKey, SQLiteRegistry
 from forgemesh.core.errors import NotFoundError
 from forgemesh.core.objects import Condition, ObjectMeta, Resource
+from forgemesh.core.scheduler import AllocationRef, ScheduleRequest
 from forgemesh.policy.api import PolicyDecision
 from forgemesh.resource.inference import (
     AcceleratorSpec,
+    EndpointProtocol,
     InferencePhase,
     InferenceService,
     InferenceServiceSpec,
@@ -33,10 +36,19 @@ from forgemesh.resource.inference import (
     ResourcesSpec,
     RuntimeRef,
 )
+from forgemesh.workflow.runtime import RunInfo, RunRef
+from forgemesh.workflow.states import StepStatus, WorkflowStatus
 
 KIND = "InferenceService"
 TENANT = "tenant-a"
 NAMESPACE = "default"
+
+#: 一次部署的协调轮数：Pending → Scheduling → Preparing → Deploying → Verifying → Ready。
+DEPLOYMENT_PASSES = 5
+
+INSTANCE = LaunchedInstance(
+    instance_id="instance-1", url="http://10.0.0.5:8000", protocol=EndpointProtocol.OPENAI_CHAT
+)
 
 
 def _run(coro):
@@ -111,25 +123,45 @@ class GatedPolicy:
 
 
 class CountingScheduler:
+    """同一幂等键返回同一分配（与 FirstFitScheduler 一致），记录调用次数。"""
+
     def __init__(self) -> None:
-        self.allocate_count = 0
+        self.calls = 0
+        self.allocations: dict[str, AllocationRef] = {}
 
-    async def allocate(self, req):  # noqa: ANN001
-        from forgemesh.core.scheduler import AllocationRef
+    @property
+    def allocate_count(self) -> int:
+        """建立过的分配数（同一幂等键的重放不计）。"""
+        return len(self.allocations)
 
-        self.allocate_count += 1
-        return AllocationRef(allocation_id=f"alloc-{self.allocate_count}", resource_id="node-1")
+    async def allocate(self, req: ScheduleRequest) -> AllocationRef:
+        self.calls += 1
+        if req.idempotency_key not in self.allocations:
+            self.allocations[req.idempotency_key] = AllocationRef(
+                allocation_id=f"alloc-{self.allocate_count + 1}", resource_id=req.resource_ref.uid
+            )
+        return self.allocations[req.idempotency_key]
 
 
 class RecordingWorkflow:
+    """记录启动的部署；每个运行一启动就视为成功，启动了 :data:`INSTANCE`。"""
+
     def __init__(self) -> None:
         self.idempotency_keys: list[str] = []
 
     async def start(self, defn, inputs, idempotency_key):  # noqa: ANN001
-        from forgemesh.workflow.runtime import RunRef
-
         self.idempotency_keys.append(idempotency_key)
         return RunRef(run_id=idempotency_key, definition_version=1)
+
+    async def find_run(self, idempotency_key: str) -> RunInfo | None:
+        if idempotency_key not in self.idempotency_keys:
+            return None
+        return RunInfo(
+            run_id=idempotency_key,
+            status=WorkflowStatus.SUCCEEDED,
+            steps={LAUNCH_INSTANCE: StepStatus.SUCCEEDED},
+            outputs={LAUNCH_INSTANCE: INSTANCE.model_dump(mode="json")},
+        )
 
 
 class RecordingRelease:
@@ -160,6 +192,8 @@ def _manager(
     store: ProcessedKeyStore | None = None,
     **kwargs: Any,
 ) -> ControllerManager:
+    if workflow is not None and release is None:
+        release = RecordingRelease()
     reconciler = ReconciliationController(
         registry=registry,
         policy_engine=policy or AllowPolicy(),
@@ -259,8 +293,8 @@ def test_same_generation_is_not_reconciled_twice_even_across_restarts(tmp_path) 
         store = ProcessedKeyStore(db_path)
         await registry.put(_service())
         manager = _manager(registry, scheduler=scheduler, workflow=workflow, store=store)
-        await manager.process(_key())
-        await manager.process(_key())
+        for _ in range(DEPLOYMENT_PASSES + 1):
+            await manager.process(_key())
         await store.close()
         await registry.close()
 
@@ -274,8 +308,9 @@ def test_same_generation_is_not_reconciled_twice_even_across_restarts(tmp_path) 
         return service
 
     service = _run(scenario())
-    assert scheduler.allocate_count == 1
+    assert (scheduler.allocate_count, scheduler.calls) == (1, 2)
     assert len(workflow.idempotency_keys) == 1
+    assert service.status.phase == "Ready"
     assert [condition.reason for condition in service.status.conditions] == ["Reconciled"]
 
 
@@ -294,6 +329,9 @@ def test_dedup_key_is_recorded_only_after_the_status_is_written(monkeypatch) -> 
         manager = _manager(
             registry, scheduler=CountingScheduler(), workflow=RecordingWorkflow(), store=store
         )
+        for _ in range(DEPLOYMENT_PASSES - 1):
+            await manager.process(_key())
+        assert await store.seen(dedup_key) is False
 
         monkeypatch.setattr(registry, "update_status", failing_write)
         with pytest.raises(RuntimeError):

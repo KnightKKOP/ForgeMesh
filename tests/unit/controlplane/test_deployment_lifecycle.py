@@ -1,0 +1,574 @@
+"""部署闭环测试：控制器管理器、协调器、首次适配调度器、本地工作流运行时与注册表一起运行，
+启动器使用测试替身。
+
+* 创建的资源每轮推进一个 phase（``Pending`` → ``Scheduling`` → ``Preparing`` →
+  ``Deploying`` → ``Verifying`` → ``Ready``），``status.endpoints`` 是启动器返回的实例；
+* 重启（``Ready`` 之后、启动部署的一轮被重放、启动实例的中途）不会启动第二个实例，也
+  不会再分配；
+* 部署工作流没能启动时保留分配并重试；部署失败时实例被停止、分配释放，资源停在
+  ``Failed``；补偿没能停止的实例在删除资源时停止；
+* 部署中途或 ``Ready`` 之后删除资源：取消运行、停止实例、释放分配、物理删除；
+* 在后台运行的控制器自行完成部署与删除。
+
+测试以 ``asyncio.run`` 驱动异步方法，不依赖 pytest-asyncio。“重启”在同一个事件循环中
+关闭全部组件，再以同一数据库文件重新组装；启动器对象沿用，相当于实例在控制平面重启后
+仍在运行。
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import sqlite3
+from collections import defaultdict
+from collections.abc import Collection
+from typing import Any
+
+import pytest
+from forgemesh.controlplane.controller import ControllerManager
+from forgemesh.controlplane.deployment import (
+    DeploymentReleaser,
+    DeploymentSteps,
+    InMemoryLauncher,
+    LaunchedInstance,
+    LaunchRequest,
+    RuntimeLauncher,
+    deployment_run_key,
+)
+from forgemesh.controlplane.reconciler import (
+    ProcessedKeyStore,
+    ReconciliationController,
+    compute_dedup_key,
+)
+from forgemesh.controlplane.registry import ResourceKey, SQLiteRegistry
+from forgemesh.controlplane.scheduler import FirstFitScheduler, Inventory
+from forgemesh.controlplane.sqlite import workflow_db_path
+from forgemesh.core.errors import NotFoundError
+from forgemesh.core.objects import ObjectMeta
+from forgemesh.core.scheduler import AllocatedDevice
+from forgemesh.policy.engine import DefaultPolicyEngine
+from forgemesh.policy.rules import AuthzRule
+from forgemesh.resource.inference import (
+    AcceleratorSpec,
+    InferenceService,
+    InferenceServiceSpec,
+    ModelRef,
+    ResourcesSpec,
+    RuntimeRef,
+)
+from forgemesh.workflow.runtime import RetryPolicy
+from forgemesh.workflow.states import WorkflowStatus
+from forgemesh.workflowruntime.approval import ApprovalGate
+from forgemesh.workflowruntime.compensate import CompensationExecutor
+from forgemesh.workflowruntime.exec import StepExecutor, WorkflowExecutor
+from forgemesh.workflowruntime.runtime import LocalWorkflowRuntime
+from forgemesh.workflowruntime.store import WorkflowStore
+
+KIND = "InferenceService"
+TENANT = "tenant-a"
+NAMESPACE = "team-a"
+NAME = "svc"
+UID = "uid-1"
+KEY = ResourceKey(TENANT, KIND, NAMESPACE, NAME)
+RUN_KEY = deployment_run_key(UID)
+DEDUP_KEY = compute_dedup_key(KIND, NAMESPACE, NAME, UID, 1, "reconcile").key
+GPU = AllocatedDevice(node_id="node-a", device_id="gpu-0")
+
+#: 控制器轮询变更、查询部署运行的间隔（秒）。
+POLL_SECONDS = 0.01
+#: 逐轮驱动时最多协调的轮数。
+MAX_PASSES = 10
+#: 等待后台任务到达某一点的上限（秒）：出错时测试失败而不是挂起。
+WAIT_SECONDS = 5.0
+
+
+def _inventory() -> Inventory:
+    """单节点、单卡（80 GiB）的清单：第二个分配无处可放。"""
+    node = {
+        "id": GPU.node_id,
+        "devices": [{"id": GPU.device_id, "type": "nvidia-gpu", "memoryGiB": 80}],
+    }
+    return Inventory.model_validate_json(json.dumps({"nodes": [node]}))
+
+
+def _service() -> InferenceService:
+    return InferenceService(
+        metadata=ObjectMeta(
+            name=NAME, namespace=NAMESPACE, uid=UID, tenant_id=TENANT, generation=1
+        ),
+        spec=InferenceServiceSpec(
+            model=ModelRef(reference="models/llama"),
+            runtime=RuntimeRef(provider="vllm"),
+            resources=ResourcesSpec(
+                accelerator=AcceleratorSpec(type="nvidia-gpu", minMemoryGiB=16)
+            ),
+        ),
+    )
+
+
+class _ScriptedLauncher(InMemoryLauncher):
+    """可让调用失败或在中途阻塞的启动器。
+
+    ``block`` / ``fail`` 中的名称：``launch``（创建实例之前）、``launched``（创建实例
+    之后、返回之前，模拟结果落盘前进程退出）、``verify``；``stop_failures`` 为接下来要
+    失败的 ``stop`` 调用次数。
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.block: set[str] = set()
+        self.fail: set[str] = set()
+        self.stop_failures = 0
+        self.entered: defaultdict[str, asyncio.Event] = defaultdict(asyncio.Event)
+        self.cancelled: list[str] = []
+
+    async def wait_entered(self, name: str) -> None:
+        """等到 ``name`` 对应的调用开始。"""
+        async with asyncio.timeout(WAIT_SECONDS):
+            await self.entered[name].wait()
+
+    async def _gate(self, name: str) -> None:
+        self.entered[name].set()
+        if name in self.block:
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                self.cancelled.append(name)
+                raise
+        if name in self.fail:
+            raise RuntimeError(f"{name} broke")
+
+    async def launch(self, request: LaunchRequest) -> LaunchedInstance:
+        await self._gate("launch")
+        instance = await super().launch(request)
+        await self._gate("launched")
+        return instance
+
+    async def verify(self, instance: LaunchedInstance) -> None:
+        await self._gate("verify")
+        await super().verify(instance)
+
+    async def stop(self, instance_id: str) -> None:
+        if self.stop_failures:
+            self.stop_failures -= 1
+            raise RuntimeError("stop broke")
+        await super().stop(instance_id)
+
+
+def _runtime(launcher: RuntimeLauncher, store: WorkflowStore) -> LocalWorkflowRuntime:
+    """按部署工作流模块说明组装运行时；失败的步骤立即重试一次。"""
+    steps = DeploymentSteps(launcher)
+    compensation = CompensationExecutor()
+    for step_id, handler in steps.compensations().items():
+        compensation.registry.register(step_id, handler)
+    retry = RetryPolicy(max_attempts=2, initial_backoff_seconds=0.0, max_backoff_seconds=0.0)
+    return LocalWorkflowRuntime(
+        store=store,
+        executor=WorkflowExecutor(StepExecutor(retry)),
+        compensation=compensation,
+        approval=ApprovalGate(),
+        handler=steps.handle,
+    )
+
+
+class _ControlPlane:
+    """一个控制平面进程的组件，组装方式与应用相同（在 ``async with`` 内使用）。
+
+    进入时调用 ``recover()``（返回值存于 :attr:`recovered`）；退出时按应用的顺序关闭：
+    控制器 → 工作流运行时 → 工作流存储 → 去重键存储 → 注册表。
+    """
+
+    def __init__(self, db: str, launcher: RuntimeLauncher) -> None:
+        self.registry = SQLiteRegistry(db)
+        self.processed = ProcessedKeyStore(db)
+        self.workflow_store = WorkflowStore(workflow_db_path(db))
+        self.runtime = _runtime(launcher, self.workflow_store)
+        reconciler = ReconciliationController(
+            self.registry,
+            DefaultPolicyEngine(authz_rules=[AuthzRule(action="reconcile", effect="allow")]),
+            scheduler=FirstFitScheduler(self.registry, _inventory()),
+            workflow_runtime=self.runtime,
+            release_provider=DeploymentReleaser(self.runtime, launcher),
+            processed_store=self.processed,
+            record_dedup_keys=False,
+            workflow_poll_interval=POLL_SECONDS,
+        )
+        self.manager = ControllerManager(self.registry, reconciler, poll_interval=POLL_SECONDS)
+        self.recovered: list[str] = []
+
+    async def __aenter__(self) -> _ControlPlane:
+        self.recovered = await self.runtime.recover()
+        return self
+
+    async def __aexit__(self, *exc_info: object) -> None:
+        await self.manager.stop()
+        await self.runtime.aclose()
+        await self.workflow_store.close()
+        await self.processed.close()
+        await self.registry.close()
+
+    async def service(self) -> InferenceService:
+        return await self.registry.get(KIND, NAMESPACE, NAME, TENANT)
+
+    async def phase(self) -> str | None:
+        """资源的 phase；资源已删除时为 ``None``。"""
+        try:
+            service = await self.service()
+        except NotFoundError:
+            return None
+        return service.status.phase.value
+
+    async def deploy(self, until: Collection[str] = ("Ready", "Failed")) -> list[str]:
+        """逐轮协调直到 phase 属于 ``until``，返回每轮之后变化了的 phase。
+
+        每轮之前等部署运行的后台执行结束，各轮看到的运行状态因此是确定的；运行被阻塞时
+        只能推进到启动它的那一轮（``until`` 含 ``Deploying``）。
+        """
+        phases: list[str] = []
+        for _ in range(MAX_PASSES):
+            if (run := await self.runtime.find_run(RUN_KEY)) is not None:
+                async with asyncio.timeout(WAIT_SECONDS):
+                    await self.runtime.wait(run.run_id)
+            await self.manager.process(KEY)
+            phase = (await self.service()).status.phase.value
+            if not phases or phases[-1] != phase:
+                phases.append(phase)
+            if phase in until:
+                return phases
+        raise AssertionError(f"the service did not reach {until} in {MAX_PASSES} passes: {phases}")
+
+    async def delete(self) -> bool:
+        """请求删除资源，返回它是否被直接物理删除（否则进入 ``Terminating``）。"""
+        return (await self.registry.request_delete(KIND, NAMESPACE, NAME, TENANT)).deleted
+
+
+def _ready(service: InferenceService) -> tuple[str, str | None, str | None]:
+    """``Ready`` 条件的 ``(status, reason, message)``。"""
+    [condition] = [c for c in service.status.conditions if c.type == "Ready"]
+    return condition.status, condition.reason, condition.message
+
+
+async def _assert_gone(plane: _ControlPlane) -> None:
+    """资源已物理删除，没有留下 Active 分配，设备全部空闲。"""
+    assert await plane.phase() is None
+    assert await plane.registry.get_active_allocation(UID, TENANT) is None
+    assert await plane.registry.allocated_devices() == frozenset()
+
+
+async def _wait_for_phase(plane: _ControlPlane, phase: str | None) -> None:
+    """等后台运行的控制器把资源推进到 ``phase``（``None`` 为资源已删除）。"""
+    async with asyncio.timeout(WAIT_SECONDS):
+        while await plane.phase() != phase:
+            await asyncio.sleep(POLL_SECONDS)
+
+
+async def _killed(*args: Any, **kwargs: Any) -> Any:
+    raise RuntimeError("process killed")
+
+
+# ---------------------------------------------------------------------- #
+# 部署
+# ---------------------------------------------------------------------- #
+
+
+@pytest.mark.unit
+def test_a_created_service_moves_one_phase_per_pass_until_it_serves_its_instance():
+    """每轮一个合法的 phase 转移；Ready 时 ``status.endpoints`` 是启动器返回的实例，实例
+    拿到了分配的设备。只有最后一轮登记去重键，之后的协调不再分配、不再启动。"""
+    launcher = _ScriptedLauncher()
+
+    async def scenario() -> None:
+        async with _ControlPlane(":memory:", launcher) as plane:
+            await plane.registry.put(_service())
+            phases = await plane.deploy()
+
+            service = await plane.service()
+            [instance] = launcher.running.values()
+            [allocation] = await plane.registry.list_allocations(TENANT)
+            [request] = launcher.launches
+            assert phases == ["Scheduling", "Preparing", "Deploying", "Verifying", "Ready"]
+            assert service.status.endpoints == [instance.endpoint()]
+            assert _ready(service) == (
+                "True",
+                "Reconciled",
+                f"instance {instance.instance_id} is serving at {instance.url}",
+            )
+            assert (request.allocation_id, request.devices) == (allocation["id"], (GPU,))
+            assert launcher.prepared == [request]
+            assert await plane.processed.seen(DEDUP_KEY)
+
+            await plane.manager.process(KEY)
+            assert len(launcher.launches) == 1
+            assert await plane.registry.list_allocations(TENANT) == [allocation]
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.unit
+def test_a_workflow_that_fails_to_start_is_retried_with_the_same_allocation(monkeypatch):
+    """启动部署运行失败（工作流存储被锁）：停在 Preparing、``Ready=False``、保留分配；之后
+    的一轮启动成功，资源照常进入 Ready，自始至终只有一个分配。"""
+    launcher = _ScriptedLauncher()
+
+    async def locked(*args: Any, **kwargs: Any) -> Any:
+        raise sqlite3.OperationalError("database is locked")
+
+    async def scenario() -> None:
+        async with _ControlPlane(":memory:", launcher) as plane:
+            await plane.registry.put(_service())
+            await plane.deploy(until={"Preparing"})
+            [allocation] = await plane.registry.list_allocations(TENANT)
+            with monkeypatch.context() as patch:
+                patch.setattr(plane.workflow_store, "create_run", locked)
+                await plane.manager.process(KEY)
+
+            service = await plane.service()
+            active = await plane.registry.get_active_allocation(UID, TENANT)
+            assert service.status.phase == "Preparing"
+            assert _ready(service) == ("False", "WorkflowStartFailed", "database is locked")
+            assert active["id"] == allocation["id"]
+            assert launcher.launches == []
+
+            assert await plane.deploy() == ["Deploying", "Verifying", "Ready"]
+            assert await plane.registry.list_allocations(TENANT) == [allocation]
+            assert len(launcher.launches) == 1
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.unit
+def test_a_failed_deployment_stops_its_instance_releases_its_allocation_and_stays_failed():
+    """验证用尽重试：工作流补偿停止实例，资源进入 Failed（``Ready=False``，消息是失败的
+    步骤），分配释放；Failed 是终态，之后的协调不再部署，删除时直接物理删除。"""
+    launcher = _ScriptedLauncher()
+    launcher.fail.add("verify")
+
+    async def scenario() -> None:
+        async with _ControlPlane(":memory:", launcher) as plane:
+            await plane.registry.put(_service())
+            assert await plane.deploy() == ["Scheduling", "Preparing", "Deploying", "Failed"]
+
+            service = await plane.service()
+            assert _ready(service) == (
+                "False",
+                "WorkflowFailed",
+                "step 'verify-instance' failed: verify broke",
+            )
+            assert service.status.endpoints == []
+            assert launcher.running == {}
+            assert len(launcher.stops) == 1
+            assert await plane.registry.get_active_allocation(UID, TENANT) is None
+            assert await plane.registry.allocated_devices() == frozenset()
+
+            await plane.manager.process(KEY)
+            assert await plane.phase() == "Failed"
+            assert len(launcher.launches) == 1
+            assert len(await plane.registry.list_allocations(TENANT)) == 1
+
+            assert await plane.delete() is True
+            await _assert_gone(plane)
+            assert len(launcher.stops) == 1
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.unit
+def test_an_instance_that_compensation_could_not_stop_is_stopped_when_the_service_is_deleted():
+    """补偿没能停止实例：资源进入 Failed 并保留分配（消息说明实例可能仍在运行），删除时
+    进入 Terminating，``DeploymentReleaser`` 停止实例后协调器释放分配并物理删除。"""
+    launcher = _ScriptedLauncher()
+    launcher.fail.add("verify")
+    launcher.stop_failures = 1
+
+    async def scenario() -> None:
+        async with _ControlPlane(":memory:", launcher) as plane:
+            await plane.registry.put(_service())
+            assert await plane.deploy() == ["Scheduling", "Preparing", "Deploying", "Failed"]
+            [instance] = launcher.running.values()
+            status, reason, message = _ready(await plane.service())
+            assert (status, reason) == ("False", "WorkflowFailed")
+            assert f"instance {instance.instance_id} may still be running" in message
+            assert await plane.registry.get_active_allocation(UID, TENANT) is not None
+
+            assert await plane.delete() is False
+            await plane.manager.process(KEY)
+
+            assert launcher.stops == [instance.instance_id]
+            assert launcher.running == {}
+            await _assert_gone(plane)
+
+    asyncio.run(scenario())
+
+
+# ---------------------------------------------------------------------- #
+# 重放与重启
+# ---------------------------------------------------------------------- #
+
+
+@pytest.mark.unit
+def test_restarting_a_ready_control_plane_neither_launches_nor_allocates_again(tmp_path):
+    """Ready 之后重启（文件库）：没有要恢复的运行，协调不再启动实例、不再分配；工作流存储
+    是控制平面数据库旁的 ``*.workflows.db``。"""
+    db = str(tmp_path / "cp.db")
+    launcher = _ScriptedLauncher()
+
+    async def scenario() -> None:
+        async with _ControlPlane(db, launcher) as plane:
+            await plane.registry.put(_service())
+            await plane.deploy()
+            endpoints = (await plane.service()).status.endpoints
+            allocations = await plane.registry.list_allocations(TENANT)
+
+        async with _ControlPlane(db, launcher) as plane:
+            await plane.manager.process(KEY)
+            assert plane.recovered == []
+            assert (await plane.service()).status.endpoints == endpoints
+            assert await plane.registry.list_allocations(TENANT) == allocations
+
+    asyncio.run(scenario())
+    assert (tmp_path / "cp.workflows.db").is_file()
+    assert len(launcher.launches) == 1
+    assert len(launcher.running) == 1
+
+
+@pytest.mark.unit
+def test_replaying_the_pass_that_started_the_deployment_reuses_its_run(tmp_path, monkeypatch):
+    """Preparing 一轮启动了部署运行，写入 Deploying 之前进程退出：重启后这一轮被重放，
+    分配与运行都按幂等键复用，实例只启动一次。"""
+    db = str(tmp_path / "cp.db")
+    launcher = _ScriptedLauncher()
+
+    async def scenario() -> None:
+        async with _ControlPlane(db, launcher) as plane:
+            await plane.registry.put(_service())
+            await plane.deploy(until={"Preparing"})
+            with monkeypatch.context() as patch:
+                patch.setattr(plane.registry, "update_status", _killed)
+                with pytest.raises(RuntimeError, match="process killed"):
+                    await plane.manager.process(KEY)
+            run = await plane.runtime.wait((await plane.runtime.find_run(RUN_KEY)).run_id)
+            allocations = await plane.registry.list_allocations(TENANT)
+        assert run.status is WorkflowStatus.SUCCEEDED
+
+        async with _ControlPlane(db, launcher) as plane:
+            assert await plane.phase() == "Preparing"
+            assert await plane.deploy() == ["Deploying", "Verifying", "Ready"]
+            assert (await plane.runtime.find_run(RUN_KEY)).run_id == run.run_id
+            assert await plane.registry.list_allocations(TENANT) == allocations
+
+    asyncio.run(scenario())
+    assert len(launcher.launches) == 1
+
+
+@pytest.mark.unit
+def test_a_restart_in_the_middle_of_a_launch_resumes_the_run_with_the_same_instance(tmp_path):
+    """实例已创建、``launch-instance`` 的结果落盘之前进程退出。此前看到运行未结束的一轮
+    保持 Deploying、不登记去重键；重启后 ``recover()`` 继续运行，以同一实例幂等键再执行
+    这一步，拿回原来的实例。"""
+    db = str(tmp_path / "cp.db")
+    launcher = _ScriptedLauncher()
+    launcher.block.add("launched")
+
+    async def scenario() -> None:
+        async with _ControlPlane(db, launcher) as plane:
+            await plane.registry.put(_service())
+            await plane.deploy(until={"Deploying"})
+            await launcher.wait_entered("launched")
+            await plane.manager.process(KEY)
+            assert await plane.phase() == "Deploying"
+            assert not await plane.processed.seen(DEDUP_KEY)
+            run_id = (await plane.runtime.find_run(RUN_KEY)).run_id
+
+        launcher.block.clear()
+        async with _ControlPlane(db, launcher) as plane:
+            assert plane.recovered == [run_id]
+            assert await plane.deploy() == ["Verifying", "Ready"]
+            [instance] = launcher.running.values()
+            assert (await plane.service()).status.endpoints == [instance.endpoint()]
+            assert len(await plane.registry.list_allocations(TENANT)) == 1
+
+    asyncio.run(scenario())
+    assert [request.instance_key for request in launcher.launches] == [RUN_KEY, RUN_KEY]
+    assert launcher.stops == []
+
+
+# ---------------------------------------------------------------------- #
+# 删除
+# ---------------------------------------------------------------------- #
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("blocked", "phase", "launched"),
+    [("launch", "Deploying", 0), ("verify", "Verifying", 1)],
+    ids=["while-launching", "while-verifying"],
+)
+def test_deleting_a_service_during_its_deployment_leaves_nothing_behind(blocked, phase, launched):
+    """部署进行中删除：``DeploymentReleaser`` 取消运行（中断正在执行的步骤，补偿停止已启动
+    的实例），协调器释放分配并物理删除，没有留下实例或分配。"""
+    launcher = _ScriptedLauncher()
+    launcher.block.add(blocked)
+
+    async def scenario() -> None:
+        async with _ControlPlane(":memory:", launcher) as plane:
+            await plane.registry.put(_service())
+            await plane.deploy(until={"Deploying"})
+            await launcher.wait_entered(blocked)
+            await plane.manager.process(KEY)
+            assert await plane.phase() == phase
+
+            assert await plane.delete() is False
+            await plane.manager.process(KEY)
+
+            run = await plane.runtime.find_run(RUN_KEY)
+            assert run.status is WorkflowStatus.CANCELLED
+            assert launcher.cancelled == [blocked]
+            assert len(launcher.launches) == len(launcher.stops) == launched
+            assert launcher.running == {}
+            await _assert_gone(plane)
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.unit
+def test_deleting_a_ready_service_stops_its_instance_and_releases_its_allocation():
+    launcher = _ScriptedLauncher()
+
+    async def scenario() -> None:
+        async with _ControlPlane(":memory:", launcher) as plane:
+            await plane.registry.put(_service())
+            await plane.deploy()
+            [instance] = launcher.running.values()
+            [allocation] = await plane.registry.list_allocations(TENANT)
+
+            assert await plane.delete() is False
+            await plane.manager.process(KEY)
+
+            assert launcher.stops == [instance.instance_id]
+            assert launcher.running == {}
+            assert (await plane.registry.get_allocation(allocation["id"]))["status"] == "Released"
+            await _assert_gone(plane)
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.unit
+def test_a_running_controller_deploys_and_deletes_a_service_on_its_own():
+    """控制器在后台运行，各轮由 ``requeue_after`` 与变更轮询安排（测试不逐轮驱动）：创建的
+    资源到达 Ready，删除后实例停止、分配释放、资源消失。"""
+    launcher = _ScriptedLauncher()
+
+    async def scenario() -> None:
+        async with _ControlPlane(":memory:", launcher) as plane:
+            await plane.manager.start()
+            await plane.registry.put(_service())
+            await _wait_for_phase(plane, "Ready")
+            [instance] = launcher.running.values()
+            assert (await plane.service()).status.endpoints == [instance.endpoint()]
+
+            assert await plane.delete() is False
+            await _wait_for_phase(plane, None)
+            assert launcher.stops == [instance.instance_id]
+            await _assert_gone(plane)
+
+    asyncio.run(scenario())

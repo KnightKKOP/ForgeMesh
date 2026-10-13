@@ -13,7 +13,9 @@ Temporal/Cadence 等）都必须满足同一语义，业务模型不与之耦合
 * **补偿**：失败的运行按反向补偿步骤回滚已产生的副作用。
 * **审批**：等待人工或外部事件的运行进入 ``WAITING``，由外部信号唤醒。
 * **版本固定**：运行实例固定其 ``definition_version``，升级定义不影响既有实例。
-* **结果查询**：不确定状态下应先查询真实状态，不得盲目重试不可幂等操作。
+* **结果查询**：不确定状态下应先查询真实状态，不得盲目重试不可幂等操作
+  （:meth:`WorkflowRuntime.get_run` 返回步骤状态与输出，
+  :meth:`WorkflowRuntime.find_run` 按幂等键查找而不创建运行）。
 """
 
 from __future__ import annotations
@@ -23,7 +25,7 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from .states import WorkflowStatus
+from .states import WORKFLOW_TRANSITIONS, StepStatus, WorkflowStatus
 
 
 class Step(BaseModel):
@@ -95,6 +97,32 @@ class RunRef(BaseModel):
     definition_version: int
 
 
+class RunInfo(BaseModel):
+    """运行实例快照（只读）。
+
+    Attributes:
+        run_id: 运行实例标识。
+        status: 运行状态。
+        steps: 各步骤状态，按定义中的步骤顺序。
+        outputs: 已成功步骤的输出 ``{step_id: result}``；步骤之后被补偿也保留，
+            调用方据此取回步骤创建的外部对象（如实例 id）。
+        error: 运行失败的原因（失败的步骤与错误信息）；运行没有失败时为 ``None``。
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    run_id: str
+    status: WorkflowStatus
+    steps: dict[str, StepStatus] = Field(default_factory=dict)
+    outputs: dict[str, Any] = Field(default_factory=dict)
+    error: str | None = None
+
+    @property
+    def terminal(self) -> bool:
+        """运行是否已到终态（之后不再变化）。"""
+        return not WORKFLOW_TRANSITIONS[self.status]
+
+
 class WorkflowRuntime(ABC):
     """工作流运行契约（ADR-003：可替换 Provider，语义不随引擎改变）。
 
@@ -112,6 +140,8 @@ class WorkflowRuntime(ABC):
     ) -> RunRef:
         """启动（或幂等复用）一个运行实例。
 
+        返回时运行可能仍在执行，进度经 :meth:`get_status` / :meth:`get_run` 查询。
+
         Args:
             defn: 工作流定义（运行实例将固定其当前版本）。
             inputs: 运行时输入，覆盖/补充 ``defn.inputs``。
@@ -127,6 +157,24 @@ class WorkflowRuntime(ABC):
         """查询运行实例当前状态。
 
         不确定状态下应先查询真实状态再决策，不得盲目重试不可幂等操作。
+        """
+        raise NotImplementedError
+
+    async def get_run(self, run_id: str) -> RunInfo:
+        """查询运行实例快照（状态、步骤状态、步骤输出与失败原因）。
+
+        默认实现只经 :meth:`get_status` 填充 ``status``；持久化步骤结果的实现应覆盖。
+
+        Raises:
+            NotFoundError: 运行实例不存在（与 :meth:`get_status` 一致）。
+        """
+        return RunInfo(run_id=run_id, status=await self.get_status(run_id))
+
+    async def find_run(self, idempotency_key: str) -> RunInfo | None:
+        """按幂等键查找运行实例，不创建；不存在时返回 ``None``。
+
+        与 :meth:`start` 不同，本方法没有副作用：调用方不确定运行是否存在时（如删除
+        资源前取消进行中的部署）据此查询真实状态。默认实现抛出 :class:`NotImplementedError`。
         """
         raise NotImplementedError
 
@@ -159,5 +207,6 @@ __all__ = [
     "RetryPolicy",
     "WorkflowDefinition",
     "RunRef",
+    "RunInfo",
     "WorkflowRuntime",
 ]

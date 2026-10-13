@@ -16,10 +16,24 @@ import asyncio
 import time
 
 import pytest
+from forgemesh.controlplane.deployment import LAUNCH_INSTANCE, LaunchedInstance
 from forgemesh.controlplane.reconciler import ProcessedKeyStore, ReconciliationController
 from forgemesh.core.objects import ObjectMeta, Resource
 from forgemesh.core.reconciler import ReconcileContext
 from forgemesh.policy.api import PolicyDecision
+from forgemesh.resource.inference import (
+    AcceleratorSpec,
+    EndpointProtocol,
+    InferencePhase,
+    InferenceService,
+    InferenceServiceSpec,
+    InferenceServiceStatus,
+    ModelRef,
+    ResourcesSpec,
+    RuntimeRef,
+)
+from forgemesh.workflow.runtime import RunInfo, RunRef
+from forgemesh.workflow.states import StepStatus, WorkflowStatus
 
 
 def _run(coro):
@@ -189,36 +203,63 @@ class _AllowPolicy:
         return PolicyDecision(decision="allow", reason="benchmark")
 
 
-class _CountingScheduler:
-    """计数副作用的 Scheduler 测试替身。"""
+class _SucceededWorkflowRuntime:
+    """部署运行总是已成功的 WorkflowRuntime 测试替身，记录查询次数（协调的副作用）。"""
 
     def __init__(self) -> None:
-        self.allocate_count = 0
-
-    async def allocate(self, req):  # noqa: ANN001
-        from forgemesh.core.scheduler import AllocationRef
-
-        self.allocate_count += 1
-        return AllocationRef(allocation_id=f"alloc-{self.allocate_count}", resource_id="node-1")
-
-
-class _NoopWorkflowRuntime:
-    """总是成功启动的 WorkflowRuntime 测试替身。"""
+        self.lookups = 0
 
     async def start(self, defn, inputs, idempotency_key):  # noqa: ANN001
-        from forgemesh.workflow.runtime import RunRef
-
         return RunRef(run_id=idempotency_key, definition_version=1)
+
+    async def find_run(self, idempotency_key: str) -> RunInfo:
+        self.lookups += 1
+        instance = LaunchedInstance(
+            instance_id="instance-1",
+            url="http://10.0.0.5:8000",
+            protocol=EndpointProtocol.OPENAI_CHAT,
+        )
+        return RunInfo(
+            run_id=idempotency_key,
+            status=WorkflowStatus.SUCCEEDED,
+            steps={LAUNCH_INSTANCE: StepStatus.SUCCEEDED},
+            outputs={LAUNCH_INSTANCE: instance.model_dump(mode="json")},
+        )
+
+
+class _NoopRelease:
+    async def release(self, resource: Resource) -> None:
+        return None
+
+
+def _controller(
+    workflow: _SucceededWorkflowRuntime, store: ProcessedKeyStore | None = None
+) -> ReconciliationController:
+    return ReconciliationController(
+        registry=None,
+        policy_engine=_AllowPolicy(),
+        workflow_runtime=workflow,
+        release_provider=_NoopRelease(),
+        processed_store=store,
+    )
 
 
 def _make_ctx(dedup_key: str) -> ReconcileContext:
-    resource = Resource(
-        kind="Widget",
-        metadata=ObjectMeta(name="w-1", uid="uid-w-1", generation=1, tenant_id="tenant-1"),
+    """部署最后一轮（Verifying、运行已成功）的上下文：这一轮进入 Ready 并登记去重键。"""
+    resource = InferenceService(
+        metadata=ObjectMeta(name="svc-1", uid="uid-1", generation=1, tenant_id="tenant-1"),
+        spec=InferenceServiceSpec(
+            model=ModelRef(reference="models/llama"),
+            runtime=RuntimeRef(provider="vllm"),
+            resources=ResourcesSpec(
+                accelerator=AcceleratorSpec(type="nvidia-gpu", minMemoryGiB=16)
+            ),
+        ),
+        status=InferenceServiceStatus(phase=InferencePhase.VERIFYING),
     )
     return ReconcileContext(
         resource=resource,
-        observed={},
+        observed={"phase": "Verifying"},
         correlation_id="corr-1",
         tenant_id="tenant-1",
         dedup_key=dedup_key,
@@ -235,40 +276,28 @@ def test_controller_with_processed_store_is_idempotent_across_restart(
     重复调度副作用；持久化 store 使幂等检查跨重启生效。
     """
     db_file = tmp_path / "dedup.db"
-    scheduler = _CountingScheduler()
+    workflow = _SucceededWorkflowRuntime()
 
     async def _scenario() -> None:
         store = ProcessedKeyStore(str(db_file))
-        controller = ReconciliationController(
-            registry=None,
-            policy_engine=_AllowPolicy(),
-            scheduler=scheduler,
-            workflow_runtime=_NoopWorkflowRuntime(),
-            processed_store=store,
-        )
+        controller = _controller(workflow, store)
         result = await controller.reconcile(_make_ctx("key-1"))
         assert result.done is True
-        assert scheduler.allocate_count == 1
+        assert workflow.lookups == 1
 
         # 同一控制器内重复协调：幂等短路。
         again = await controller.reconcile(_make_ctx("key-1"))
         assert again.done is True
-        assert scheduler.allocate_count == 1
+        assert workflow.lookups == 1
         await store.close()
 
         # 模拟进程重启：新 store（同一 db 文件）+ 新控制器实例。
         restarted_store = ProcessedKeyStore(str(db_file))
-        restarted_controller = ReconciliationController(
-            registry=None,
-            policy_engine=_AllowPolicy(),
-            scheduler=scheduler,
-            workflow_runtime=_NoopWorkflowRuntime(),
-            processed_store=restarted_store,
-        )
+        restarted_controller = _controller(workflow, restarted_store)
         after_restart = await restarted_controller.reconcile(_make_ctx("key-1"))
         assert after_restart.done is True
-        # 关键断言：重启后不重复分配（内存 set 方案在此会失效）。
-        assert scheduler.allocate_count == 1
+        # 关键断言：重启后不再重复协调（内存 set 方案在此会失效）。
+        assert workflow.lookups == 1
         await restarted_store.close()
 
     _run(_scenario())
@@ -281,30 +310,20 @@ def test_controller_default_keeps_memory_behavior() -> None:
     同一控制器实例内幂等；新控制器实例（无共享内存）则重新执行——
     与既有 980 项测试所依赖的行为一致。
     """
-    scheduler = _CountingScheduler()
+    workflow = _SucceededWorkflowRuntime()
 
     async def _scenario() -> None:
-        controller = ReconciliationController(
-            registry=None,
-            policy_engine=_AllowPolicy(),
-            scheduler=scheduler,
-            workflow_runtime=_NoopWorkflowRuntime(),
-        )
+        controller = _controller(workflow)
         assert controller._processed_store is None
         first = await controller.reconcile(_make_ctx("key-1"))
         assert first.done is True
         second = await controller.reconcile(_make_ctx("key-1"))
         assert second.done is True
-        assert scheduler.allocate_count == 1  # 实例内幂等
+        assert workflow.lookups == 1  # 实例内幂等
 
-        fresh = ReconciliationController(
-            registry=None,
-            policy_engine=_AllowPolicy(),
-            scheduler=scheduler,
-            workflow_runtime=_NoopWorkflowRuntime(),
-        )
+        fresh = _controller(workflow)
         third = await fresh.reconcile(_make_ctx("key-1"))
         assert third.done is True
-        assert scheduler.allocate_count == 2  # 新实例重走内存路径
+        assert workflow.lookups == 2  # 新实例重走内存路径
 
     _run(_scenario())

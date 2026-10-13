@@ -7,8 +7,8 @@
 
 本地口径与放宽理由
 ------------------
-* Python 侧无 Go 网关，以「Registry put（建立期望状态）+ 9 步 reconcile」
-  的单资源端到端耗时近似 API P99 口径；P99 阈值取计划值的 5 倍（1000ms），
+* Python 侧无 Go 网关，以「Registry put（建立期望状态）+ 逐轮协调到 Ready（每轮
+  写回 status）」的单资源端到端耗时近似 API P99 口径；P99 阈值取计划值的 5 倍（1000ms），
   吸收 CI 机器抖动与 asyncio.to_thread 线程池调度开销。
 * 吞吐阈值取计划下限 50 res/s 的 1/5（≥ 10 res/s）防 CI 抖动；本地实测
   通常远高于此，实测值随断言输出供校准参考（M4 前校准计划值）。
@@ -16,8 +16,9 @@
 * 计时用 :func:`time.perf_counter`；P99 为手写 nearest-rank 分位数，
   不引入新依赖。
 
-注意：50 个资源各自使用独立 dedup_key（generation 递增派生），避免被
-幂等去重短路，确保测得真实调和路径。
+注意：50 个资源各自使用独立 dedup_key（由各自的 name/uid 派生），避免被
+幂等去重短路，确保测得真实调和路径；同一资源的各轮共用一个 dedup_key，只有
+到达 Ready 的最后一轮才记录它。
 """
 
 from __future__ import annotations
@@ -27,16 +28,35 @@ import math
 import time
 
 import pytest
+from forgemesh.controlplane.deployment import LAUNCH_INSTANCE, LaunchedInstance
 from forgemesh.controlplane.reconciler import ReconciliationController, compute_dedup_key
 from forgemesh.controlplane.registry import SQLiteRegistry
 from forgemesh.core.objects import ObjectMeta, Resource
 from forgemesh.core.reconciler import ReconcileContext
 from forgemesh.policy.api import PolicyDecision
+from forgemesh.resource.inference import (
+    AcceleratorSpec,
+    EndpointProtocol,
+    InferenceService,
+    InferenceServiceSpec,
+    ModelRef,
+    ResourcesSpec,
+    RuntimeRef,
+)
+from forgemesh.workflow.runtime import RunInfo, RunRef
+from forgemesh.workflow.states import StepStatus, WorkflowStatus
 
 pytestmark = pytest.mark.performance
 
 #: 资源数量：对齐计划"协调吞吐 ≥ 50 resource/s"的批量口径。
 N_RESOURCES = 50
+
+#: 一个资源从 Pending 到 Ready 的协调轮数（每轮一个 phase 转移）。
+DEPLOYMENT_PASSES = 5
+
+_INSTANCE = LaunchedInstance(
+    instance_id="instance-bench", url="http://10.0.0.5:8000", protocol=EndpointProtocol.OPENAI_CHAT
+)
 
 #: P99 阈值（秒）：计划 API P99 < 200ms 的 5 倍放宽（防 CI 抖动）。
 P99_THRESHOLD_SECONDS = 1.0
@@ -77,23 +97,40 @@ class _BenchmarkScheduler:
 
 
 class _BenchmarkWorkflowRuntime:
-    """无外部副作用的 WorkflowRuntime 测试替身（排除真实工作流执行开销）。"""
+    """无外部副作用的 WorkflowRuntime 测试替身：部署运行一启动即成功（排除真实工作流执行开销）。"""
 
     async def start(self, defn, inputs, idempotency_key):  # noqa: ANN001
-        from forgemesh.workflow.runtime import RunRef
-
         return RunRef(run_id=idempotency_key, definition_version=1)
 
+    async def find_run(self, idempotency_key: str) -> RunInfo:
+        return RunInfo(
+            run_id=idempotency_key,
+            status=WorkflowStatus.SUCCEEDED,
+            steps={LAUNCH_INSTANCE: StepStatus.SUCCEEDED},
+            outputs={LAUNCH_INSTANCE: _INSTANCE.model_dump(mode="json")},
+        )
 
-def _make_resource(index: int) -> Resource:
-    """构造第 ``index`` 个测试资源（独立 name/generation → 独立 dedup_key）。"""
-    return Resource(
-        kind="Widget",
+
+class _BenchmarkRelease:
+    async def release(self, resource: Resource) -> None:
+        return None
+
+
+def _make_resource(index: int) -> InferenceService:
+    """构造第 ``index`` 个测试资源（独立 name/uid → 独立 dedup_key 与部署）。"""
+    return InferenceService(
         metadata=ObjectMeta(
             name=f"bench-{index:03d}",
             uid=f"uid-bench-{index:03d}",
             generation=1,
             tenant_id="tenant-bench",
+        ),
+        spec=InferenceServiceSpec(
+            model=ModelRef(reference="models/bench"),
+            runtime=RuntimeRef(provider="vllm"),
+            resources=ResourcesSpec(
+                accelerator=AcceleratorSpec(type="nvidia-gpu", minMemoryGiB=16)
+            ),
         ),
     )
 
@@ -113,26 +150,39 @@ def test_reconcile_throughput_and_p99() -> None:
             policy_engine=_AllowPolicy(),
             scheduler=_BenchmarkScheduler(),
             workflow_runtime=_BenchmarkWorkflowRuntime(),
+            release_provider=_BenchmarkRelease(),
         )
         latencies: list[float] = []
         loop_start = time.perf_counter()
         for index in range(N_RESOURCES):
             resource = _make_resource(index)
+            name = resource.metadata.name
             dedup = compute_dedup_key(
-                "Widget", None, resource.metadata.name, None, 1, "reconcile"
-            )
-            ctx = ReconcileContext(
-                resource=resource,
-                observed={},
-                correlation_id=f"bench-{index}",
-                tenant_id="tenant-bench",
-                dedup_key=dedup.key,
+                "InferenceService", None, name, resource.metadata.uid, 1, "reconcile"
             )
             started = time.perf_counter()
             await registry.put(resource)  # 建立期望状态（Create，v0）
-            result = await controller.reconcile(ctx)  # 9 步协调（差异收敛路径）
+            phase = "Pending"
+            for _ in range(DEPLOYMENT_PASSES):  # 逐轮推进到 Ready，像控制器一样写回 status
+                ctx = ReconcileContext(
+                    resource=resource,
+                    observed={"phase": phase},
+                    correlation_id=f"bench-{index}",
+                    tenant_id="tenant-bench",
+                    dedup_key=dedup.key,
+                )
+                result = await controller.reconcile(ctx)
+                await registry.update_status(
+                    "InferenceService",
+                    None,
+                    name,
+                    "tenant-bench",
+                    result.status_patch,
+                    observed_generation=1,
+                )
+                phase = result.status_patch.get("phase", phase)
             latencies.append(time.perf_counter() - started)
-            assert result.done is True
+            assert (result.done, phase) == (True, "Ready")
         total = time.perf_counter() - loop_start
         await registry.close()
 

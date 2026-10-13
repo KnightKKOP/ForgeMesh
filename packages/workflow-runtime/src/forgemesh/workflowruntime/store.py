@@ -13,8 +13,14 @@
   :func:`validate_workflow_transition` / :func:`validate_step_transition`，
   非法转移抛 :class:`InvalidStateTransition`。
 * **恢复**：``list_pending_runs`` 列出所有非终态运行，供进程重启后恢复。
+* **步骤结果**：``update_step_status`` 不带 ``result`` 时保留已记录的结果（步骤被补偿后
+  仍可取回它创建的外部对象）；每次进入 ``Running`` 时 ``attempt_count`` 加一。
+* **失败原因**：``workflow_runs.error`` 记录运行失败的原因（旧库打开时自动补列）。
 * **线程安全**：SQLite 以 ``check_same_thread=False`` 打开，所有异步方法通过
-  :func:`asyncio.to_thread` 在独立线程执行同步 sqlite3 调用。
+  :func:`asyncio.to_thread` 在独立线程执行同步 sqlite3 调用，并以
+  :class:`threading.Lock` 串行化，同一连接上的语句和事务不会被并发的运行交错。
+* **文件库**：与控制平面的数据库一样启用 ``journal_mode=WAL`` 与 ``foreign_keys=ON``，
+  ``synchronous`` 保持默认的 ``FULL``；文件旁会有 ``-wal`` / ``-shm`` 文件。
 """
 
 from __future__ import annotations
@@ -22,9 +28,11 @@ from __future__ import annotations
 import asyncio
 import json
 import sqlite3
+import threading
 import time
 import uuid
 import zlib
+from collections.abc import Callable
 from typing import Any
 
 from forgemesh.core.errors import NotFoundError
@@ -48,7 +56,8 @@ CREATE TABLE IF NOT EXISTS workflow_runs (
     status TEXT NOT NULL DEFAULT 'Pending',
     created_at REAL NOT NULL,
     updated_at REAL NOT NULL,
-    timeout_seconds INTEGER
+    timeout_seconds INTEGER,
+    error TEXT
 );
 CREATE TABLE IF NOT EXISTS workflow_steps (
     run_id TEXT NOT NULL,
@@ -98,6 +107,9 @@ class WorkflowStore:
         # check_same_thread=False：asyncio.to_thread 会在不同线程执行 sqlite 调用。
         self._conn = sqlite3.connect(db_path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
+        self._conn.execute("PRAGMA journal_mode=WAL")
+        self._conn.execute("PRAGMA foreign_keys=ON")
+        self._lock = threading.Lock()
         self._init_schema()
 
     # ------------------------------------------------------------------ #
@@ -105,9 +117,21 @@ class WorkflowStore:
     # ------------------------------------------------------------------ #
 
     def _init_schema(self) -> None:
-        """创建表与索引（幂等）。"""
+        """创建表与索引（幂等），并为旧库补上 ``error`` 列。"""
         self._conn.executescript(_SCHEMA)
+        columns = {row["name"] for row in self._conn.execute("PRAGMA table_info(workflow_runs)")}
+        if "error" not in columns:
+            self._conn.execute("ALTER TABLE workflow_runs ADD COLUMN error TEXT")
         self._conn.commit()
+
+    async def _call(self, fn: Callable[..., Any], *args: Any) -> Any:
+        """在工作线程中持锁执行同步方法 ``fn``。"""
+
+        def _locked() -> Any:
+            with self._lock:
+                return fn(*args)
+
+        return await asyncio.to_thread(_locked)
 
     @staticmethod
     def _now() -> float:
@@ -203,6 +227,7 @@ class WorkflowStore:
             "created_at": row["created_at"],
             "updated_at": row["updated_at"],
             "timeout_seconds": row["timeout_seconds"],
+            "error": row["error"],
             "steps": [
                 {
                     "step_id": s["step_id"],
@@ -216,8 +241,16 @@ class WorkflowStore:
             ],
         }
 
-    def _update_run_status_sync(self, run_id: str, status: str) -> None:
-        """同步更新运行状态（校验转移合法性）。"""
+    def _get_run_by_idempotency_key_sync(self, idempotency_key: str) -> dict[str, Any] | None:
+        """同步按幂等键查询运行实例；不存在时返回 ``None``。"""
+        row = self._conn.execute(
+            "SELECT run_id FROM workflow_runs WHERE idempotency_key = ?",
+            (idempotency_key,),
+        ).fetchone()
+        return None if row is None else self._get_run_sync(row["run_id"])
+
+    def _update_run_status_sync(self, run_id: str, status: str, error: str | None = None) -> None:
+        """同步更新运行状态（校验转移合法性）；``error`` 非空时一并记录失败原因。"""
         row = self._conn.execute(
             "SELECT status FROM workflow_runs WHERE run_id = ?",
             (run_id,),
@@ -231,8 +264,9 @@ class WorkflowStore:
 
         now = self._now()
         self._conn.execute(
-            "UPDATE workflow_runs SET status = ?, updated_at = ? WHERE run_id = ?",
-            (status, now, run_id),
+            "UPDATE workflow_runs SET status = ?, updated_at = ?, error = COALESCE(?, error) "
+            "WHERE run_id = ?",
+            (status, now, error, run_id),
         )
         self._conn.commit()
 
@@ -243,9 +277,9 @@ class WorkflowStore:
         status: str,
         result: Any | None = None,
     ) -> None:
-        """同步更新步骤状态（校验转移合法性）。"""
+        """同步更新步骤状态（校验转移合法性）；``result`` 为 ``None`` 时保留已有结果。"""
         row = self._conn.execute(
-            "SELECT status, started_at FROM workflow_steps "
+            "SELECT status, started_at, attempt_count, result FROM workflow_steps "
             "WHERE run_id = ? AND step_id = ?",
             (run_id, step_id),
         ).fetchone()
@@ -271,15 +305,20 @@ class WorkflowStore:
             StepStatus.COMPENSATION_FAILED.value,
         ) else None
 
-        result_json = json.dumps(result, ensure_ascii=False) if result is not None else None
+        attempt_count = row["attempt_count"]
+        if status == StepStatus.RUNNING.value:
+            attempt_count += 1
+        result_json = (
+            json.dumps(result, ensure_ascii=False) if result is not None else row["result"]
+        )
 
         self._conn.execute(
             """
             UPDATE workflow_steps
-            SET status = ?, started_at = ?, finished_at = ?, result = ?
+            SET status = ?, started_at = ?, finished_at = ?, result = ?, attempt_count = ?
             WHERE run_id = ? AND step_id = ?
             """,
-            (status, started_at, finished_at, result_json, run_id, step_id),
+            (status, started_at, finished_at, result_json, attempt_count, run_id, step_id),
         )
         self._conn.commit()
 
@@ -349,26 +388,33 @@ class WorkflowStore:
         Returns:
             指向新建或既有运行实例的 :class:`RunRef`。
         """
-        return await asyncio.to_thread(
-            self._create_run_sync, defn, inputs, idempotency_key
-        )
+        return await self._call(self._create_run_sync, defn, inputs, idempotency_key)
 
     async def get_run(self, run_id: str) -> dict[str, Any]:
-        """查询运行实例（含步骤状态）。
+        """查询运行实例（含步骤状态与结果、失败原因 ``error``）。
 
         Raises:
             NotFoundError: 运行实例不存在。
         """
-        return await asyncio.to_thread(self._get_run_sync, run_id)
+        return await self._call(self._get_run_sync, run_id)
 
-    async def update_run_status(self, run_id: str, status: str) -> None:
+    async def get_run_by_idempotency_key(self, idempotency_key: str) -> dict[str, Any] | None:
+        """按幂等键查询运行实例（格式同 :meth:`get_run`）；不存在时返回 ``None``。"""
+        return await self._call(self._get_run_by_idempotency_key_sync, idempotency_key)
+
+    async def update_run_status(self, run_id: str, status: str, error: str | None = None) -> None:
         """更新运行状态（校验转移合法性）。
+
+        Args:
+            run_id: 运行实例标识。
+            status: 目标状态。
+            error: 失败原因；为 ``None`` 时保留已记录的原因。
 
         Raises:
             NotFoundError: 运行实例不存在。
             InvalidStateTransition: 状态转移不合法。
         """
-        await asyncio.to_thread(self._update_run_status_sync, run_id, status)
+        await self._call(self._update_run_status_sync, run_id, status, error)
 
     async def update_step_status(
         self,
@@ -377,19 +423,17 @@ class WorkflowStore:
         status: str,
         result: Any | None = None,
     ) -> None:
-        """更新步骤状态（校验转移合法性）。
+        """更新步骤状态（校验转移合法性）；``result`` 为 ``None`` 时保留已有结果。
 
         Raises:
             NotFoundError: 步骤不存在。
             InvalidStateTransition: 状态转移不合法。
         """
-        await asyncio.to_thread(
-            self._update_step_status_sync, run_id, step_id, status, result
-        )
+        await self._call(self._update_step_status_sync, run_id, step_id, status, result)
 
     async def list_pending_runs(self) -> list[dict[str, Any]]:
         """列出非终态运行（用于进程重启后恢复）。"""
-        return await asyncio.to_thread(self._list_pending_runs_sync)
+        return await self._call(self._list_pending_runs_sync)
 
     async def get_step_statuses(self, run_id: str) -> dict[str, StepStatus]:
         """获取所有步骤状态。
@@ -397,11 +441,11 @@ class WorkflowStore:
         Raises:
             NotFoundError: 运行实例不存在。
         """
-        return await asyncio.to_thread(self._get_step_statuses_sync, run_id)
+        return await self._call(self._get_step_statuses_sync, run_id)
 
     async def close(self) -> None:
         """关闭数据库连接。"""
-        await asyncio.to_thread(self._close_sync)
+        await self._call(self._close_sync)
 
 
 __all__ = [

@@ -581,7 +581,11 @@ def _make_workflow_definition() -> WorkflowDefinition:
 
 
 def _make_reference_runtime() -> WorkflowRuntime:
-    """组装 workflow-reference 插件的 ReferenceWorkflowRuntime（内存存储）。"""
+    """组装 workflow-reference 插件的 ReferenceWorkflowRuntime（内存存储）。
+
+    步骤 handler 一直阻塞，运行在被取消前保持 ``Running``（与只记录状态、不执行步骤的
+    temporal 内存客户端可比）。
+    """
     _ensure_plugin_module("workflow_reference_provider", "workflow-reference")
     from forgemesh.workflowruntime.approval import ApprovalGate
     from forgemesh.workflowruntime.compensate import CompensationExecutor
@@ -590,6 +594,7 @@ def _make_reference_runtime() -> WorkflowRuntime:
     from workflow_reference_provider import ReferenceWorkflowRuntime
 
     async def handler(step: Step, inputs: dict[str, Any]) -> dict[str, Any]:
+        await asyncio.Event().wait()
         return {"step_id": step.id, "status": "ok"}
 
     return ReferenceWorkflowRuntime(
@@ -618,12 +623,33 @@ _WORKFLOW_FACTORIES: dict[str, Callable[[], WorkflowRuntime]] = {
 }
 
 
+def _run_workflow_scenario(
+    plugin_dir: str, scenario: Callable[[WorkflowRuntime], Awaitable[None]]
+) -> None:
+    """在单个事件循环中对插件的运行时执行场景。
+
+    运行在后台执行的实现（workflow-reference）必须在同一事件循环中使用；实现提供
+    ``aclose`` 时最后调用它，不遗留后台任务。
+    """
+    runtime = _WORKFLOW_FACTORIES[plugin_dir]()
+
+    async def main() -> None:
+        try:
+            await scenario(runtime)
+        finally:
+            aclose = getattr(runtime, "aclose", None)
+            if aclose is not None:
+                await aclose()
+
+    _run(main())
+
+
 class TestWorkflowProviderConformance:
     """按 WorkflowRuntime 契约对 2 个工作流 Provider 注入测试。
 
     契约要点（forgemesh.workflow.runtime）：start 返回 RunRef 且幂等；
-    get_status 查询状态；cancel 后状态终结（状态机终态）；未知 run_id
-    抛 NotFoundError（引擎映射为实现内统一异常）。
+    get_status / get_run 查询状态；cancel 后状态终结（状态机终态）；未知 run_id
+    抛 NotFoundError（引擎映射为实现内统一异常）。每个场景在单个事件循环中执行。
     """
 
     @_compat
@@ -635,18 +661,22 @@ class TestWorkflowProviderConformance:
         ],
     )
     def test_start_then_get_status_queryable(self, plugin_dir: str) -> None:
-        """start → get_status 可查询：两实现 start 后均为 Running。"""
-        runtime = _WORKFLOW_FACTORIES[plugin_dir]()
-        defn = _make_workflow_definition()
+        """start → get_status / get_run 可查询：两实现 start 后均为 Running。"""
 
-        ref = _run(runtime.start(defn, {"model": "m"}, "key-status"))
+        async def scenario(runtime: WorkflowRuntime) -> None:
+            ref = await runtime.start(_make_workflow_definition(), {"model": "m"}, "key-status")
 
-        assert ref.run_id, "RunRef.run_id 不得为空"
-        assert ref.definition_version >= 1, "版本固定字段应为正整数"
-        status = _run(runtime.get_status(ref.run_id))
-        assert status == WorkflowStatus.RUNNING, (
-            f"{plugin_dir}: start 后状态应为 Running，实际 {status}"
-        )
+            assert ref.run_id, "RunRef.run_id 不得为空"
+            assert ref.definition_version >= 1, "版本固定字段应为正整数"
+            status = await runtime.get_status(ref.run_id)
+            assert status == WorkflowStatus.RUNNING, (
+                f"{plugin_dir}: start 后状态应为 Running，实际 {status}"
+            )
+            info = await runtime.get_run(ref.run_id)
+            assert (info.run_id, info.status) == (ref.run_id, WorkflowStatus.RUNNING)
+            assert not info.terminal
+
+        _run_workflow_scenario(plugin_dir, scenario)
 
     @_compat
     @pytest.mark.parametrize(
@@ -658,13 +688,16 @@ class TestWorkflowProviderConformance:
     )
     def test_cancel_reaches_terminal_state(self, plugin_dir: str) -> None:
         """cancel 后状态终结为 Cancelled（契约状态机终态，无出边）。"""
-        runtime = _WORKFLOW_FACTORIES[plugin_dir]()
-        ref = _run(runtime.start(_make_workflow_definition(), {}, "key-cancel"))
 
-        _run(runtime.cancel(ref.run_id, cleanup=False))
+        async def scenario(runtime: WorkflowRuntime) -> None:
+            ref = await runtime.start(_make_workflow_definition(), {}, "key-cancel")
 
-        status = _run(runtime.get_status(ref.run_id))
-        assert status == WorkflowStatus.CANCELLED
+            await runtime.cancel(ref.run_id, cleanup=False)
+
+            assert await runtime.get_status(ref.run_id) == WorkflowStatus.CANCELLED
+            assert (await runtime.get_run(ref.run_id)).terminal
+
+        _run_workflow_scenario(plugin_dir, scenario)
         # 终态断言：CANCELLED 在契约状态机中无出边（不可再转移）。
         from forgemesh.workflow.states import WORKFLOW_TRANSITIONS
 
@@ -682,19 +715,20 @@ class TestWorkflowProviderConformance:
     )
     def test_idempotency_key_reuses_same_run(self, plugin_dir: str) -> None:
         """幂等键：同 idempotency_key 重复 start 返回同一 run（不重复建副作用）。"""
-        runtime = _WORKFLOW_FACTORIES[plugin_dir]()
-        defn = _make_workflow_definition()
 
-        ref1 = _run(runtime.start(defn, {}, "key-idem"))
-        ref2 = _run(runtime.start(defn, {}, "key-idem"))
+        async def scenario(runtime: WorkflowRuntime) -> None:
+            defn = _make_workflow_definition()
+            ref1 = await runtime.start(defn, {}, "key-idem")
+            ref2 = await runtime.start(defn, {}, "key-idem")
 
-        assert ref1.run_id == ref2.run_id, (
-            f"{plugin_dir}: 同幂等键应复用同一 run，"
-            f"got {ref1.run_id} / {ref2.run_id}"
-        )
-        # 不同幂等键应产生不同 run。
-        ref3 = _run(runtime.start(defn, {}, "key-idem-other"))
-        assert ref3.run_id != ref1.run_id
+            assert ref1.run_id == ref2.run_id, (
+                f"{plugin_dir}: 同幂等键应复用同一 run，got {ref1.run_id} / {ref2.run_id}"
+            )
+            # 不同幂等键应产生不同 run。
+            ref3 = await runtime.start(defn, {}, "key-idem-other")
+            assert ref3.run_id != ref1.run_id
+
+        _run_workflow_scenario(plugin_dir, scenario)
 
     @_compat
     @pytest.mark.parametrize(
@@ -706,9 +740,14 @@ class TestWorkflowProviderConformance:
     )
     def test_unknown_run_raises_not_found(self, plugin_dir: str) -> None:
         """未知 run_id 查询抛契约定义的 NotFoundError（不静默返回默认状态）。"""
-        runtime = _WORKFLOW_FACTORIES[plugin_dir]()
-        with pytest.raises(NotFoundError):
-            _run(runtime.get_status("run-does-not-exist"))
+
+        async def scenario(runtime: WorkflowRuntime) -> None:
+            with pytest.raises(NotFoundError):
+                await runtime.get_status("run-does-not-exist")
+            with pytest.raises(NotFoundError):
+                await runtime.get_run("run-does-not-exist")
+
+        _run_workflow_scenario(plugin_dir, scenario)
 
     @_compat
     def test_temporal_cancel_cleanup_runs_compensations_in_reverse(self) -> None:

@@ -120,13 +120,13 @@
 | 字段 | 内容 |
 |---|---|
 | 架构模块 | L2 Core Control Plane（权威状态、协调、插件管理、审计） |
-| 当前代码路径 | `packages/control-plane/src/forgemesh/controlplane/`：`registry/{models,store}.py`、`reconciler/{core,dedup}.py`、`controller/{manager,queue}.py`、`scheduler/{inventory,first_fit}.py`、`api/{routes,dependencies,errors}.py`、`plugin_manager.py`、`outbox.py`、`audit.py`、`tasks.py`、`heartbeat.py`、`observability.py`、`diagnostics.py`、`app.py`、`auth.py`、`keygen.py`、`sqlite.py`（共 28 个 `.py`；其中 `auth.py` / `keygen.py` / `api/errors.py` 为 API 认证与错误信封，见 ADR-014；`controller/` 驱动协调器并回写 status；`scheduler/` 按静态加速器清单首次适配分配；`sqlite.py` 统一 SQLite 连接设置（WAL、外键）；其余与任务书的 9 个子模块一一对应） |
-| 核心契约 | 实现 `core-contracts` 的 `ResourceRegistry` / `Reconciler` / `Scheduler`（`FirstFitScheduler`：清单来自 `FORGEMESH_INVENTORY_FILE`，设置时才注入控制器；分配与设备占用经 `SQLiteRegistry.create_allocation` 在同一事务中写入，设备独占由 `allocation_devices` 部分唯一索引保证）；`app.py` 提供 HTTP 服务（FastAPI，未安装时回退纯标准库占位——生产必须 FastAPI/ASGI），并在 lifespan 中运行控制器；控制器按序号增量读取 `resource_changes` 变更记录，经 `update_status`（status 子资源，CAS）回写协调结果；Outbox 事务性事件（architecture.md 3.3 规则 7）；`ProcessedKeyStore` 去重（reconciler/dedup.py） |
+| 当前代码路径 | `packages/control-plane/src/forgemesh/controlplane/`：`registry/{models,store}.py`、`reconciler/{core,dedup}.py`、`controller/{manager,queue}.py`、`scheduler/{inventory,first_fit}.py`、`deployment/{launcher,workflow,release,memory}.py`、`api/{routes,dependencies,errors}.py`、`plugin_manager.py`、`outbox.py`、`audit.py`、`tasks.py`、`heartbeat.py`、`observability.py`、`diagnostics.py`、`app.py`、`auth.py`、`keygen.py`、`sqlite.py`（共 33 个 `.py`；其中 `auth.py` / `keygen.py` / `api/errors.py` 为 API 认证与错误信封，见 ADR-014；`controller/` 驱动协调器并回写 status；`scheduler/` 按静态加速器清单首次适配分配；`deployment/` 为部署工作流（准备模型 → 启动实例 → 验证实例）、启动器契约 `RuntimeLauncher`、删除时的清理 `DeploymentReleaser` 与测试替身 `InMemoryLauncher`；`sqlite.py` 统一 SQLite 连接设置（WAL、外键），并由 `workflow_db_path` 给出工作流存储文件；其余与任务书的 9 个子模块一一对应） |
+| 核心契约 | 实现 `core-contracts` 的 `ResourceRegistry` / `Reconciler` / `Scheduler`（`FirstFitScheduler`：清单来自 `FORGEMESH_INVENTORY_FILE`，设置时才注入控制器；分配与设备占用经 `SQLiteRegistry.create_allocation` 在同一事务中写入，设备独占由 `allocation_devices` 部分唯一索引保证）；协调器按 phase 逐轮推进 `InferenceService`（`Pending` → `Scheduling` → `Preparing` → `Deploying` → `Verifying` → `Ready`），以 `deployment:{uid}` 为幂等键启动并查询部署工作流，成功后写入 `status.endpoints`，删除时经 `DeploymentReleaser` 取消部署、停止实例（部署包只依赖工作流契约，运行时与启动器由组装方注入；应用尚未注入，协调器在分配之前报告 `WorkflowRuntimeUnavailable`）；`app.py` 提供 HTTP 服务（FastAPI，未安装时回退纯标准库占位——生产必须 FastAPI/ASGI），并在 lifespan 中运行控制器；控制器按序号增量读取 `resource_changes` 变更记录，经 `update_status`（status 子资源，CAS）回写协调结果；Outbox 事务性事件（architecture.md 3.3 规则 7）；`ProcessedKeyStore` 去重（reconciler/dedup.py） |
 | 运行形态 | 单实例控制平面进程（模块化单体，architecture.md 3.3 规则 8）；ADR-013 约束：仅允许单写方写同一 SQLite 权威库；控制器与 API 同进程运行，不得以多个 worker 进程启动 |
 | 数据所有权 | **全部业务资源权威状态**（registry/store.py）、审计事件（audit.py，默认内存库，控制平面应用尚未接入）、Outbox 事件、任务与心跳状态 |
 | 允许依赖 | `forgemesh.core` / `forgemesh.resource` / `forgemesh.policy` / `forgemesh.decision` / `forgemesh.workflow*` / `forgemesh.plugin`（plugin-sdk）、标准库 `sqlite3`、FastAPI |
 | 禁止依赖 | 任何插件私有模块（`decision_rules` / `gpu_nvidia` 等，扫描二验证 ✅，见 3.2） |
-| 测试路径 | `tests/unit/controlplane/`：`test_api.py`、`test_routes.py`、`test_registry.py`、`test_reconciler.py`、`test_dedup_store.py`、`test_plugin_manager.py`、`test_outbox.py`、`test_audit.py`、`test_tasks.py`、`test_heartbeat.py`、`test_observability.py`、`test_diagnostics.py`、`test_app.py`、`test_auth.py`、`test_controller_manager.py`、`test_controller_queue.py`、`test_registry_changes.py`、`test_registry_status.py`、`test_registry_allocations.py`、`test_sqlite.py`、`test_scheduler.py`、`test_scheduler_inventory.py`、`test_allocation_lifecycle.py`（23 个文件，glob 核对） |
+| 测试路径 | `tests/unit/controlplane/`：`test_api.py`、`test_routes.py`、`test_registry.py`、`test_reconciler.py`、`test_dedup_store.py`、`test_plugin_manager.py`、`test_outbox.py`、`test_audit.py`、`test_tasks.py`、`test_heartbeat.py`、`test_observability.py`、`test_diagnostics.py`、`test_app.py`、`test_auth.py`、`test_controller_manager.py`、`test_controller_queue.py`、`test_registry_changes.py`、`test_registry_status.py`、`test_registry_allocations.py`、`test_sqlite.py`、`test_scheduler.py`、`test_scheduler_inventory.py`、`test_allocation_lifecycle.py`、`test_deployment.py`、`test_deployment_lifecycle.py`（25 个文件，glob 核对；`test_deployment_lifecycle.py` 以控制器、调度器、本地工作流运行时与内存启动器覆盖部署、重启、失败与删除闭环） |
 | 状态 | 已实现且有测试覆盖 |
 | 演进动作 | 保留；WP-C1 补故障路径（CAS 并发、重启恢复、finalizer 闭环、Allocation 唯一性） |
 
@@ -181,12 +181,12 @@
 |---|---|
 | 架构模块 | WorkEngine API（architecture.md 第 6 章，ADR-003） |
 | 当前代码路径 | `packages/workflow-api/src/forgemesh/workflow/{runtime,states}.py` |
-| 核心契约 | `WorkflowRuntime(ABC)` + `WorkflowDefinition` / `Step` / `RetryPolicy` / `RunRef`（runtime.py）；`WorkflowStatus` / `StepStatus` 状态机与 `validate_workflow_transition`（states.py） |
+| 核心契约 | `WorkflowRuntime(ABC)` + `WorkflowDefinition` / `Step` / `RetryPolicy` / `RunRef` / `RunInfo`（运行快照：状态、步骤状态、步骤输出、失败原因；`get_run` / `find_run` 为非抽象方法，默认分别只返回状态、抛 `NotImplementedError`）（runtime.py）；`WorkflowStatus` / `StepStatus` 状态机与 `validate_workflow_transition`（states.py） |
 | 运行形态 | 进程内库（抽象层，实现见 2.10） |
 | 数据所有权 | 无 |
 | 允许依赖 | `forgemesh.core`、pydantic |
 | 禁止依赖 | 插件、DB 驱动（`sqlite3` 等）、Web 框架、LLM SDK（扫描一验证 ✅，见 3.1） |
-| 测试路径 | `tests/unit/workflow/test_states.py` |
+| 测试路径 | `tests/unit/workflow/test_states.py`、`test_runtime_contract.py` |
 | 状态 | 已实现且有测试覆盖 |
 | 演进动作 | 保留 |
 
@@ -195,13 +195,13 @@
 | 字段 | 内容 |
 |---|---|
 | 架构模块 | 工作流执行引擎（ADR-003 内部结构：DSL / 执行 / 存储 / 审批 / 补偿） |
-| 当前代码路径 | `packages/workflow-runtime/src/forgemesh/workflowruntime/{dsl,exec,store,approval,compensate,gpu_onboarding}.py` |
-| 核心契约 | 实现 `WorkflowRuntime(ABC)`；DSL 解析（dsl.py）、步骤执行与重试（exec.py）、运行存储（store.py）、审批集成（approval.py）、补偿语义（compensate.py）；GPU onboarding 内置工作流（gpu_onboarding.py） |
+| 当前代码路径 | `packages/workflow-runtime/src/forgemesh/workflowruntime/{dsl,exec,store,approval,compensate,gpu_onboarding,runtime}.py` |
+| 核心契约 | `LocalWorkflowRuntime`（runtime.py）实现 `WorkflowRuntime(ABC)`：在后台执行运行、失败时反向补偿、`recover()` 让重启前未结束的运行继续、`aclose()` 结束全部后台任务；DSL 解析（dsl.py）、步骤执行与重试（exec.py）、运行存储（store.py）、审批集成（approval.py）、补偿语义（compensate.py）；GPU onboarding 内置工作流（gpu_onboarding.py） |
 | 运行形态 | 进程内模块（被控制平面编排调用） |
-| 数据所有权 | 工作流运行实例状态（store.py；恢复/重启语义见 performance 测试） |
+| 数据所有权 | 工作流运行实例状态（store.py，含步骤结果与失败原因；恢复/重启语义见 performance 测试与 `test_runtime.py`）；部署工作流的存储文件由控制平面的 `workflow_db_path` 给出（应用尚未打开） |
 | 允许依赖 | `forgemesh.workflow`（API）、`forgemesh.core`、`forgemesh.resource`、标准库 |
 | 禁止依赖 | Workflow Provider 插件私有模块（扫描六验证 ✅，见 3.5）、直连插件 |
-| 测试路径 | `tests/unit/workflowruntime/test_{dsl,exec,store,approval,compensate}.py`；端到端 `tests/e2e/test_gpu_onboarding.py`；恢复语义 `tests/performance/test_restart_recovery.py` |
+| 测试路径 | `tests/unit/workflowruntime/test_{dsl,exec,store,approval,compensate,runtime}.py`；端到端 `tests/e2e/test_gpu_onboarding.py`；恢复语义 `tests/performance/test_restart_recovery.py` |
 | 状态 | 已实现且有测试覆盖 |
 | 演进动作 | 保留；WP-C2 补长步骤超时/断联/取消补偿/版本固定等混沌场景 |
 
@@ -211,7 +211,7 @@
 |---|---|
 | 架构模块 | L4 工作流能力插件 |
 | 当前代码路径 | `plugins/workflow-reference/{provider.py,manifest.yaml}`；`plugins/workflow-temporal/{provider.py,manifest.yaml,__init__.py}` |
-| 核心契约 | 实现 `WorkflowRuntime(ABC)`（作为可插拔后端）；manifest 同 2.8 |
+| 核心契约 | 实现 `WorkflowRuntime(ABC)`（作为可插拔后端）：`workflow-reference` 是 `LocalWorkflowRuntime` 的子类；`workflow-temporal` 沿用 `get_run` / `find_run` 的默认实现（快照不含步骤输出、不能按幂等键查找），不能执行部署工作流；manifest 同 2.8 |
 | 运行形态 | 插件（进程内加载；temporal 为本地语义实现，生产 Temporal 集群对接待核验） |
 | 数据所有权 | 无（运行权威状态在 runtime/store 或其自身后端内） |
 | 允许依赖 | `forgemesh.workflow`、plugin-sdk |
@@ -287,11 +287,11 @@
 | 架构模块 | L6 权威存储（过渡态：SQLite；目标态：PostgreSQL） |
 | 当前代码路径 | `packages/control-plane/src/forgemesh/controlplane/registry/store.py`（`SQLiteRegistry`，权威资源状态，CAS 乐观并发 `resource_version`；分配 `allocations` 与设备占用 `allocation_devices`，部分唯一索引保证每个资源 uid 在其租户内至多一个 Active 分配、每个设备（跨租户）至多属于一个 Active 分配）；`packages/decision-api/src/forgemesh/decision/records.py`（`DecisionRecordStore`）；`packages/workflow-runtime/src/forgemesh/workflowruntime/store.py`（工作流运行存储）；审计 `audit.py` |
 | 核心契约 | ADR-013：**SQLite 为权威存储、单控制平面实例写、禁止扩展 replicas；PostgreSQL 为目标态**（迁移由真实 SLO/基准触发）；Registry 对齐 `core-contracts.ResourceRegistry` 契约 |
-| 运行形态 | 进程内嵌入式：控制平面应用只打开 `FORGEMESH_DB_PATH` 一个 SQLite 文件（Registry 与去重键，WAL 模式），审计、决策记录、工作流存储默认使用内存库；备份见 docs/operations/backup-restore.md |
+| 运行形态 | 进程内嵌入式：控制平面应用只打开 `FORGEMESH_DB_PATH` 一个 SQLite 文件（Registry 与去重键，WAL 模式），审计、决策记录、工作流存储默认使用内存库；部署工作流的存储应使用 `workflow_db_path(FORGEMESH_DB_PATH)` 给出的同目录独立文件（`*.workflows.db`，步骤写入不必等待 Registry 的写锁），应用尚未接入；备份见 docs/operations/backup-restore.md |
 | 数据所有权 | 权威写方：控制平面**唯一实例**（registry/audit/outbox）；决策记录写方为 Decision 链路（D1 关联） |
 | 允许依赖 | 标准库 `sqlite3`（仅控制平面实现层；API 层现状见 D1） |
 | 禁止依赖 | 第三方 DB 驱动（v1.x）、多实例并发写同一库文件 |
-| 测试路径 | `tests/unit/controlplane/test_registry.py`、`tests/unit/controlplane/test_registry_allocations.py`、`tests/unit/decision/test_records.py`、`tests/unit/workflowruntime/test_store.py`；恢复/并发：`tests/performance/test_restart_recovery.py`、`test_conflict_correctness.py`、`tests/chaos/test_cp_restart.py`；备份恢复演练见 `docs/operations/backup-restore.md` |
+| 测试路径 | `tests/unit/controlplane/test_registry.py`、`tests/unit/controlplane/test_registry_allocations.py`、`tests/unit/decision/test_records.py`、`tests/unit/workflowruntime/test_store.py`；恢复/并发：`tests/performance/test_restart_recovery.py`、`test_conflict_correctness.py`、`tests/chaos/test_cp_restart.py`、`tests/unit/workflowruntime/test_runtime.py`、`tests/unit/controlplane/test_deployment_lifecycle.py`；备份恢复演练见 `docs/operations/backup-restore.md` |
 | 状态 | 已实现且有测试覆盖 |
 | 演进动作 | 保留；WP-C1 补 CAS 并发冲突/重启恢复/备份恢复的故障路径测试；PostgreSQL 迁移属阶段 F（有证据后） |
 

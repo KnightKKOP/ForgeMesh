@@ -1,8 +1,12 @@
 """API 错误：统一错误信封与全局异常处理。
 
-所有错误响应都使用 ``{"error": {"code", "message", "correlationId", "details"}}``
+所有错误响应都使用 ``{"error": {"code", "message", "correlationId", "traceId", "details"}}``
 信封（对齐 OpenAPI ``Error`` schema），包括框架层面的 404/405、请求校验失败
 （FastAPI 默认的 422 统一改为 400）以及未捕获的异常（500，不向客户端暴露内部细节）。
+
+关联 ID 与 trace-id 取自请求头：
+:class:`~forgemesh.controlplane.api.middleware.RequestContextMiddleware` 已把确定的取值写回
+请求头。``500`` 处理器运行在该中间件之外（此时请求上下文已解除绑定），因此也只能从请求头读取。
 """
 
 from __future__ import annotations
@@ -19,6 +23,7 @@ from pydantic import ValidationError
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from ..app import error_envelope
+from ..tracecontext import TRACEPARENT_HEADER, parse_traceparent
 
 logger = logging.getLogger(__name__)
 
@@ -73,6 +78,12 @@ def correlation_id_of(request: Request) -> str:
     return request.headers.get(CORRELATION_HEADER) or uuid4().hex
 
 
+def trace_id_of(request: Request) -> str | None:
+    """取请求 ``traceparent`` 中的 trace-id；缺失或不合法时为 ``None``。"""
+    context = parse_traceparent(request.headers.get(TRACEPARENT_HEADER, ""))
+    return None if context is None else context.trace_id
+
+
 def validation_details(exc: ValidationError | RequestValidationError) -> list[dict[str, Any]]:
     """提取校验错误摘要（loc/msg/type），剥离不可 JSON 序列化的 ``ctx``。"""
     return [
@@ -91,7 +102,11 @@ async def _http_exception_handler(request: Request, exc: StarletteHTTPException)
     return JSONResponse(
         status_code=exc.status_code,
         content=error_envelope(
-            code, message, correlation_id_of(request), getattr(exc, "details", None)
+            code,
+            message,
+            correlation_id_of(request),
+            getattr(exc, "details", None),
+            trace_id_of(request),
         ),
         headers=exc.headers,
     )
@@ -107,22 +122,27 @@ async def _validation_exception_handler(
             "request validation failed",
             correlation_id_of(request),
             {"errors": validation_details(exc)},
+            trace_id_of(request),
         ),
     )
 
 
 async def _unhandled_exception_handler(request: Request, exc: Exception) -> JSONResponse:
     correlation_id = correlation_id_of(request)
+    trace_id = trace_id_of(request)
     logger.error(
         "unhandled error: correlation_id=%s method=%s path=%s",
         correlation_id,
         request.method,
         request.url.path,
         exc_info=exc,
+        extra={"correlation_id": correlation_id, "trace_id": trace_id},
     )
     return JSONResponse(
         status_code=500,
-        content=error_envelope("INTERNAL_ERROR", "internal server error", correlation_id),
+        content=error_envelope(
+            "INTERNAL_ERROR", "internal server error", correlation_id, trace_id=trace_id
+        ),
     )
 
 

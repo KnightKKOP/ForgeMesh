@@ -4,7 +4,7 @@
 --------
 * **真实路由**：挂载 :func:`forgemesh.controlplane.api.create_api_router`
   （资源 CRUD / 工作流 / 决策），错误统一使用
-  ``{"error": {"code", "message", "correlationId"}}`` 信封，与
+  ``{"error": {"code", "message", "correlationId", "traceId"}}`` 信封，与
   ``api/openapi/openapi.yaml`` 一致。
 * **配置**：权威存储路径取自环境变量 ``FORGEMESH_DB_PATH``（默认
   ``forgemesh.db``）；监听地址取自 ``FORGEMESH_HOST`` / ``FORGEMESH_PORT``
@@ -45,6 +45,9 @@
 * **探针与指标**：``/healthz``（存活）恒为 ok；``/readyz``（就绪）探测权威存储可用；
   ``/metrics`` 以 Prometheus 文本格式输出聚合指标（见 :mod:`forgemesh.controlplane.telemetry`）。
   三者都不要求认证。
+* **追踪上下文与日志**：每个请求沿用合法的 W3C ``traceparent``（否则开始新的追踪）与
+  ``X-Correlation-Id``（缺失时生成），日志与错误信封都带上 trace-id 与关联 ID（见
+  :mod:`forgemesh.controlplane.tracecontext`）；日志格式与级别见 :mod:`forgemesh.controlplane.logs`。
 * **FastAPI 可选兜底**：若运行环境未安装 FastAPI，回退到纯标准库
   ``http.server``，仅提供探针与 501 占位。
 
@@ -91,6 +94,7 @@ from .deployment import (
     reclaim_orphaned_allocations,
     record_file_path,
 )
+from .logs import LogConfigError, configure_logging, log_settings_from_env
 from .metrics import CONTENT_TYPE
 from .outbox import Dispatcher
 from .publishers import publisher_from_env
@@ -98,6 +102,7 @@ from .reconciler import ProcessedKeyStore, ReconciliationController
 from .scheduler import INVENTORY_FILE_ENV, FirstFitScheduler, inventory_from_env
 from .sqlite import workflow_db_path
 from .telemetry import ControllerMetrics, ControlPlaneMetrics
+from .tracecontext import current_correlation_id, current_trace_id
 from .version import CONTROL_PLANE_VERSION
 
 if TYPE_CHECKING:  # pragma: no cover - 仅静态类型检查使用
@@ -150,18 +155,26 @@ def error_envelope(
     message: str,
     correlation_id: str | None = None,
     details: dict[str, Any] | None = None,
+    trace_id: str | None = None,
 ) -> dict[str, Any]:
     """构造统一错误信封。
 
     Args:
         code: 机器可读错误码（如 ``NOT_IMPLEMENTED`` / ``CONFLICT``）。
         message: 人类可读说明。
-        correlation_id: 全链路关联 ID（INV-4），可为空。
+        correlation_id: 全链路关联 ID（INV-4）；为空时取当前请求的关联 ID，不在请求中时省略。
         details: 附加结构化信息，可为空。
+        trace_id: W3C trace-id；为空时取当前请求的 trace-id，不在请求中时省略。
     """
     error: dict[str, Any] = {"code": code, "message": message}
+    if correlation_id is None:
+        correlation_id = current_correlation_id()
     if correlation_id is not None:
         error["correlationId"] = correlation_id
+    if trace_id is None:
+        trace_id = current_trace_id()
+    if trace_id is not None:
+        error["traceId"] = trace_id
     if details is not None:
         error["details"] = details
     return {"error": error}
@@ -270,7 +283,7 @@ if _FASTAPI_AVAILABLE:
             reset_registry,
         )
         from .api.errors import install_exception_handlers
-        from .api.middleware import TelemetryMiddleware
+        from .api.middleware import RequestContextMiddleware, TelemetryMiddleware
 
         metrics = ControlPlaneMetrics()
 
@@ -356,6 +369,7 @@ if _FASTAPI_AVAILABLE:
             lifespan=lifespan,
         )
         application.add_middleware(TelemetryMiddleware, metrics=metrics.http)
+        application.add_middleware(RequestContextMiddleware)
 
         @application.get("/healthz", response_model=HealthResponse, tags=["probes"])
         async def healthz() -> HealthResponse:
@@ -448,23 +462,27 @@ def _is_loopback(host: str) -> bool:
 def main() -> None:
     """命令行入口：监听地址取自 ``FORGEMESH_HOST`` / ``FORGEMESH_PORT``。
 
-    ``FORGEMESH_AUTH_MODE=dev`` 时只允许监听回环地址，否则拒绝启动。
+    ``FORGEMESH_AUTH_MODE=dev`` 时只允许监听回环地址，否则拒绝启动。日志按
+    ``FORGEMESH_LOG_FORMAT`` / ``FORGEMESH_LOG_LEVEL`` 配置（见 :mod:`forgemesh.controlplane.logs`），
+    uvicorn 不再另行配置日志。
     """
     host = os.environ.get(HOST_ENV, DEFAULT_HOST)
     port = int(os.environ.get(PORT_ENV, str(DEFAULT_PORT)))
     try:
         mode = auth_mode_from_env()
-    except AuthConfigError as exc:
+        log_settings = log_settings_from_env()
+    except (AuthConfigError, LogConfigError) as exc:
         raise SystemExit(str(exc)) from exc
     if mode == AUTH_MODE_DEV and not _is_loopback(host):
         raise SystemExit(
             f"{AUTH_MODE_ENV}={AUTH_MODE_DEV} trusts the X-Tenant-Id header and may only listen "
             f"on a loopback address, but {HOST_ENV}={host}"
         )
+    configure_logging(log_settings)
     if _FASTAPI_AVAILABLE:  # pragma: no cover - 依赖运行时环境
         import uvicorn
 
-        uvicorn.run(app, host=host, port=port)
+        uvicorn.run(app, host=host, port=port, log_config=None)
         return
     run_fallback_server(host, port)  # pragma: no cover
 

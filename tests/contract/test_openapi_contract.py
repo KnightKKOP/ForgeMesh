@@ -7,8 +7,8 @@
   每个路由都进入生成的 Schema（框架自带的文档页除外），没有路由能绕过比较；
 * 动态：按场景表调用每个操作（方法与路径取自契约），响应的状态码必须是契约为该操作声明的，
   响应体符合声明的 Schema（声明无正文时必须为空），声明的响应头存在，错误信封回显请求的
-  ``X-Correlation-Id``，成功请求的请求体符合声明的请求体 Schema；契约为每个操作声明的每个
-  状态码都至少有一个场景。
+  ``X-Correlation-Id`` 与 ``traceparent`` 中的 trace-id，成功请求的请求体符合声明的请求体
+  Schema；契约为每个操作声明的每个状态码都至少有一个场景。
 
 响应只做动态检查：FastAPI 生成的响应声明不含错误响应，比较它没有意义。
 """
@@ -60,6 +60,8 @@ API_KEY = "fmk_contract-tests"
 TENANT = "tenant-a"
 ENTRY = ApiKeyEntry(id="contract", sha256=hash_api_key(API_KEY), tenantId=TENANT, subject="ci")
 CORRELATION_ID = "corr-contract"
+TRACE_ID = "4bf92f3577b34da6a3ce929d0e0e4736"
+TRACEPARENT = f"00-{TRACE_ID}-00f067aa0ba902b7-01"
 NAMESPACE = {"namespace": "default"}
 MERGE_PATCH = {"Content-Type": "application/merge-patch+json"}
 
@@ -245,7 +247,8 @@ class Harness:
 
 
 class Api:
-    """绑定到一个契约操作的客户端：方法与路径模板取自契约；默认带凭证与关联 ID。"""
+    """绑定到一个契约操作的客户端：方法与路径模板取自契约；默认带凭证、关联 ID 与
+    ``traceparent``。"""
 
     def __init__(self, harness: Harness, operation_id: str) -> None:
         self.harness = harness
@@ -261,7 +264,7 @@ class Api:
         content: bytes | None = None,
         authenticated: bool = True,
     ) -> httpx.Response:
-        request_headers = {"X-Correlation-Id": CORRELATION_ID}
+        request_headers = {"X-Correlation-Id": CORRELATION_ID, "traceparent": TRACEPARENT}
         if authenticated:
             request_headers["Authorization"] = f"Bearer {API_KEY}"
         request_headers.update(headers or {})
@@ -667,6 +670,7 @@ def _check_response(operation: Operation, response: httpx.Response) -> None:
     _assert_valid(payload, content[media_type]["schema"], "the response body")
     if response.status_code >= 400:
         assert payload["error"]["correlationId"] == CORRELATION_ID
+        assert payload["error"]["traceId"] == TRACE_ID
 
 
 def _check_request(operation: Operation, request: httpx.Request) -> None:

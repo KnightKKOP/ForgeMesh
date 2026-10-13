@@ -48,6 +48,7 @@
 | 16 | 持久化 | `control-plane/registry/store.py` 等（SQLite-first） | 进程内（SQLite 文件） | 已实现且有测试覆盖 |
 | 17 | 开发与 CI | `Makefile`、根 `pyproject.toml`、`.github/workflows/ci.yml` | 开发工具链 | 已实现（细节见小节） |
 | 18 | 部署与运维 | `deploy/`、`docs/operations/` | 部署工件 + 运维文档 | compose 已实现且有测试覆盖；k8s 清单实现待核验（见 2.18） |
+| 19 | 命令行工具 | `packages/cli/` | 命令行进程（REST API 客户端） | 已实现且有测试覆盖 |
 
 > 插件共 **10 个**（含 `decision-typesafe-jev`，PR #3 已合入 main），全部在 `plugins/` 平铺目录，每个目录都是 Python 包（`__init__.py` + `manifest.yaml` + 实现模块），由 `api/schemas/plugin-manifest.schema.json` 约束。清单 `spec.entrypoint`（`<模块>:<类>`，如 `provider:RulesProvider`、`deploy:VLLMDeployer`）由 `forgemesh.plugin.loader` 在当前进程内加载；插件都在宿主进程内运行，没有进程隔离（`isolation` 只能声明 `in-process`，见偏差 D3）。
 
@@ -325,6 +326,21 @@
 | 状态 | compose 已实现且有测试覆盖；k8s 清单实现待核验（无自动化测试，尚未提供网关清单、ServiceAccount、NetworkPolicy）；运维文档已交付 |
 | 演进动作 | k8s 补网关清单、ServiceAccount 与 NetworkPolicy；A1.5 已核对部署文档含单实例约束；目标态 PostgreSQL 部署属阶段 F |
 
+### 2.19 命令行工具（cli）
+
+| 字段 | 内容 |
+|---|---|
+| 架构模块 | L1 Access Layer 的命令行入口（architecture.md 3.1 L1） |
+| 当前代码路径 | `packages/cli/src/forgemesh/cli/{main,commands,client,config,documents,errors,output}.py`（共 7 个 `.py`，glob 核对；发行名 `forgemesh-cli`，控制台脚本 `forgemesh`） |
+| 核心契约 | 经 `/api/v1/inference-services` 管理 `InferenceService`：`apply`（`GET` 之后 `POST`，或以读到的 `resourceVersion` / `uid` 为前置条件 `PUT`，`409` 时重新读取再试）、`get`、`describe`、`list`（跟随 `nextPageToken`）、`delete`（受控删除，区分 `204` / `202`）、`wait`（`Ready` 且 `observedGeneration` 不小于 `generation`，或资源消失）；地址取自 `--api-url` / `FORGEMESH_API_URL`（默认网关 `http://127.0.0.1:8081`），key 取自 `--api-key-file` / `FORGEMESH_API_KEY`；错误信封与网关的纯文本 `429` / `502` 映射为按原因区分的退出码（`errors.py` 的 `ExitCode`） |
+| 运行形态 | 命令行进程，HTTP 客户端（标准库 `urllib`，不跟随重定向） |
+| 数据所有权 | 无（资源权威状态归控制平面 Registry，CLI 不在本地保存状态） |
+| 允许依赖 | 标准库、PyYAML（`pyproject.toml` 只声明 `pyyaml>=6.0.1`）；与控制平面仅经 HTTP API 交互 |
+| 禁止依赖 | `forgemesh.controlplane` 及其他 ForgeMesh 包、直接打开 SQLite（扫描七验证 ✅，见 3.7） |
+| 测试路径 | `tests/unit/cli/`：`test_commands.py`、`test_client.py`、`test_config.py`、`test_documents.py`、`test_packaging.py`（5 个测试文件，glob 核对；`fakes.py` 以本地 HTTP 服务器模拟 API，`conftest.py` 提供夹具）；端到端 `tests/e2e/test_cli.py`（uvicorn 运行的控制平面应用 + API key + 假启动器：`apply` → `wait` → `list` → `get` → `delete` → `wait --for delete`，以及 API 错误的退出码） |
+| 状态 | 已实现且有测试覆盖 |
+| 演进动作 | 保留；只管理 `InferenceService`，其他 kind 待 API 提供写接口后再加 |
+
 ---
 
 ## 3. 依赖边界证据（import 扫描循证）
@@ -403,7 +419,21 @@ grep -rn "decision_rules\|gpu_nvidia\|runtime_vllm\|workflow_temporal" \
 
 **结论：✅ 符合** —— 运行时与资源模型层亦无插件私有耦合。
 
-### 3.7 依赖边界结论汇总
+### 3.7 补充扫描七：CLI 只经 HTTP API 访问控制平面
+
+2026-10-13 于本分支执行（Linux/bash）：
+
+```bash
+grep -rnE "^\s*(from|import)\s+forgemesh\b" packages/cli/src/ --include="*.py" | grep -v egg-info
+grep -rhoE "^\s*(from|import)\s+[A-Za-z_][A-Za-z0-9_.]*" packages/cli/src/ --include="*.py" \
+  | sed -E 's/^\s*(from|import)\s+//' | cut -d. -f1 | sort -u
+```
+
+**输出：** 第一条未命中（EXIT=1，包内模块之间只用相对导入）；第二条只列出标准库模块与 `yaml`：`argparse`、`collections`、`copy`、`dataclasses`、`email`、`enum`、`__future__`、`http`、`json`、`math`、`os`、`pathlib`、`re`、`sys`、`time`、`typing`、`urllib`、`uuid`、`yaml`。
+
+**结论：✅ 符合** —— CLI 是 REST API 的客户端，不导入控制平面或其他 ForgeMesh 包，与控制平面之间只有 HTTP 边界。`tests/unit/cli/test_packaging.py` 在新的解释器中导入 CLI 入口，核对新导入的第三方发行包与 `pyproject.toml` 声明的依赖完全一致（`pyyaml`），且没有导入其他 ForgeMesh 包。
+
+### 3.8 依赖边界结论汇总
 
 | # | 边界规则 | 结果 |
 |---|---|---|
@@ -413,8 +443,9 @@ grep -rn "decision_rules\|gpu_nvidia\|runtime_vllm\|workflow_temporal" \
 | 4 | gateway 纯 Go、零 Python 依赖 | ✅ 符合 |
 | 5 | 插件不反向依赖控制平面内部实现 | ✅ 符合 |
 | 6 | workflow-runtime / resource-model 不导入插件私有模块 | ✅ 符合 |
+| 7 | cli 不导入控制平面或其他 ForgeMesh 包，只经 HTTP API 访问 | ✅ 符合 |
 
-**总计：6 条边界规则中 5 条完全符合，1 条存在 1 处偏差（D1，记录不修复）。**
+**总计：7 条边界规则中 6 条完全符合，1 条存在 1 处偏差（D1，记录不修复）。**
 
 ---
 
@@ -435,7 +466,7 @@ grep -rn "decision_rules\|gpu_nvidia\|runtime_vllm\|workflow_temporal" \
 
 | 层次 | 包含的映射模块（本文编号） |
 |---|---|
-| L1 Access Layer | 1（外部 API 契约）、2（Go 网关） |
+| L1 Access Layer | 1（外部 API 契约）、2（Go 网关）、19（命令行工具） |
 | L2 Core Control Plane | 3（核心契约）、4（资源模型）、5（控制平面）、6（Policy）、16（持久化） |
 | L3 Orchestration & Decision | 7（Decision API）、8（Decision Providers）、9（Workflow API）、10（Workflow Runtime）、11（Workflow Providers） |
 | L4 Plugin Capability Layer | 8、11、13（GPU）、14（Runtime）、15（QoS/Metering） |

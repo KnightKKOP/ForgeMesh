@@ -11,6 +11,8 @@ info:
     认证（ADR-014）：除探针外的全部端点要求 Authorization: Bearer <API key>，
     租户取自 key 绑定的租户；X-Tenant-Id 请求头可以省略，携带时必须与之一致，
     否则返回 403。读接口要求 read scope，写接口要求 write scope。
+    任何端点遇到未预期的内部错误都返回 500（错误码 INTERNAL_ERROR，不含内部细节），
+    各操作只列出设计中的响应。
   x-stability: beta
   x-deprecation-policy: >-
     端点或字段弃用时使用 x-deprecated: true 扩展字段标记，并附带 x-deprecated-since
@@ -291,6 +293,9 @@ paths:
       tags: [workflows]
       summary: 启动工作流运行
       operationId: startWorkflow
+      description: >-
+        需要注入的工作流运行时。控制平面目前不为这个端点注入运行时（部署工作流由控制器在内部
+        启动），因此返回 503 WORKFLOW_RUNTIME_UNAVAILABLE。
       requestBody:
         required: true
         content:
@@ -310,6 +315,16 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/Forbidden"
+        "404":
+          description: 工作流定义不存在（错误码 NOT_FOUND）
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "500":
+          $ref: "#/components/responses/InternalError"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
 
 
   /api/v1/decisions:
@@ -326,7 +341,8 @@ paths:
         14.2 列出的高风险操作），inference 为 low，其他（含自由文本）为 medium。请求中的
         riskLevel 只能调高，低于推导值时被忽略。高风险请求没有备用 Provider 时返回 503
         DECISION_NO_CANDIDATE；候选来自备用 Provider 时不自动采用，返回 503
-        DECISION_FALLBACK_REQUIRED，候选在 details.candidates 中供人工审批。
+        DECISION_FALLBACK_REQUIRED，候选在 details.candidates 中供人工审批。需要注入的决策
+        路由器：控制平面目前不注入，因此返回 503 DECISION_ROUTER_UNAVAILABLE。
       requestBody:
         required: true
         content:
@@ -346,6 +362,8 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/Forbidden"
+        "500":
+          $ref: "#/components/responses/InternalError"
         "503":
           $ref: "#/components/responses/DecisionUnavailable"
 
@@ -786,10 +804,17 @@ components:
         application/json:
           schema:
             $ref: "#/components/schemas/Error"
+    InternalError:
+      description: 内部错误（错误码 INTERNAL_ERROR）。
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
     ServiceUnavailable:
       description: >-
-        所依赖的组件未就绪（错误码 AUTHENTICATOR_UNAVAILABLE、REGISTRY_UNAVAILABLE 等）：
-        控制平面未完成组装或正在关闭，不会以临时内存库或放行兜底。
+        所依赖的组件未就绪（错误码 AUTHENTICATOR_UNAVAILABLE、REGISTRY_UNAVAILABLE、
+        WORKFLOW_RUNTIME_UNAVAILABLE 等）：控制平面未完成组装或正在关闭，不会以临时内存库或
+        放行兜底。
       content:
         application/json:
           schema:

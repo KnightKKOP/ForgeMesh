@@ -214,13 +214,15 @@ async def list_inference_services(
     namespace: str | None = None,
     limit: int = 100,
     page_token: str | None = Query(default=None, alias="pageToken"),
+    deprecated_tenant_id: str | None = Query(default=None, alias="tenantId", deprecated=True),
     correlation_id: str = Depends(get_correlation_id),
 ) -> Any:
     """列出推理服务（可选按 namespace 过滤），按 ``(namespace, name)`` 升序分页。
 
     响应带 ``nextPageToken`` 时还有下一页：以相同的 ``namespace`` 把它作为 ``pageToken``
     传回（``limit`` 可以不同）；无效、被篡改或签发给另一租户 / 另一组过滤条件的
-    ``pageToken`` 返回 400。
+    ``pageToken`` 返回 400。``tenantId`` 查询参数已弃用且被忽略（租户取自凭证），计划在
+    1.3.0 移除。
     """
     if (invalid := _invalid_limit(limit, correlation_id)) is not None:
         return invalid
@@ -314,7 +316,17 @@ async def replace_inference_service(
     )
 
 
-@router.patch("/inference-services/{name}", dependencies=[Depends(require_write)])
+@router.patch(
+    "/inference-services/{name}",
+    dependencies=[Depends(require_write)],
+    # 处理函数自行读取请求体，以便先检查媒体类型（415）再解析，因此在这里声明请求体。
+    openapi_extra={
+        "requestBody": {
+            "required": True,
+            "content": {MERGE_PATCH_MEDIA_TYPE: {"schema": {"type": "object"}}},
+        }
+    },
+)
 async def patch_inference_service(
     name: str,
     request: Request,

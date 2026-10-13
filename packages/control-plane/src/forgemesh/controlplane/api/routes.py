@@ -59,8 +59,20 @@ class ResourceListResponse(BaseModel):
 
 
 #: 由服务端维护、创建请求中一律忽略的元数据字段。已验证凭证中的租户是权威来源，
-#: 覆盖请求体中的租户字段，防止跨租户伪造。
-_SERVER_OWNED_METADATA = ("tenant_id", "tenantId", "uid", "resourceVersion")
+#: 覆盖请求体中的租户字段，防止跨租户伪造；generation 只由服务端在 spec 变化时递增，
+#: observedGeneration 只由控制器写入。
+_SERVER_OWNED_METADATA = (
+    "tenant_id",
+    "tenantId",
+    "uid",
+    "resourceVersion",
+    "generation",
+    "observedGeneration",
+    "observed_generation",
+)
+
+#: 新建资源的 ``metadata.generation``（``observedGeneration`` 为 0：控制器尚未处理）。
+INITIAL_GENERATION = 1
 
 #: 列表接口单页条数上限。
 MAX_LIST_LIMIT = 1000
@@ -69,8 +81,9 @@ MAX_LIST_LIMIT = 1000
 def _build_inference_service(body: dict[str, Any], tenant_id: str) -> InferenceService:
     """从请求体构造强类型 :class:`InferenceService`（OpenAPI 要求必须携带 ``spec``）。
 
-    租户取自请求头，``uid`` 由服务端分配；``status`` 属于观测状态，只能由控制器
-    写入，创建请求中的 ``status`` 被忽略。
+    租户取自已验证的凭证，``uid`` 由服务端分配，``generation`` 从
+    :data:`INITIAL_GENERATION` 开始；``status`` 属于观测状态，只能由控制器写入，
+    创建请求中的 ``status`` 与 generation 字段被忽略。
 
     Raises:
         ValueError: ``kind`` 不是 ``InferenceService``，或 ``metadata`` 不是对象。
@@ -85,6 +98,7 @@ def _build_inference_service(body: dict[str, Any], tenant_id: str) -> InferenceS
     metadata = {k: v for k, v in metadata.items() if k not in _SERVER_OWNED_METADATA}
     metadata["tenantId"] = tenant_id
     metadata["uid"] = uuid4().hex
+    metadata["generation"] = INITIAL_GENERATION
     return InferenceService.model_validate(
         {
             "apiVersion": body.get("apiVersion", "forgemesh.io/v1alpha1"),

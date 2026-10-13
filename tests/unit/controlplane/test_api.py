@@ -219,6 +219,31 @@ def test_create_preserves_spec_and_assigns_server_fields(client: TestClient) -> 
 
 
 @pytest.mark.parametrize(
+    "client_metadata",
+    [
+        pytest.param({"generation": 7, "observedGeneration": 3}, id="camel-case"),
+        pytest.param({"generation": 0, "observed_generation": 9}, id="snake-case"),
+    ],
+)
+def test_create_starts_at_generation_one(client: TestClient, client_metadata: dict) -> None:
+    """generation 由服务端维护：新建资源为 1、observedGeneration 为 0，请求中的值被忽略。"""
+    body = _payload()
+    body["metadata"].update(client_metadata)
+    body["status"] = {"observedGeneration": 5}
+
+    created = client.post("/api/v1/inference-services", json=body, headers=TENANT_HEADERS)
+
+    assert created.status_code == 201, created.text
+    fetched = client.get(
+        "/api/v1/inference-services/svc-1", headers=TENANT_HEADERS, params={"namespace": "default"}
+    ).json()
+    for resource in (created.json(), fetched):
+        metadata = resource["metadata"]
+        assert (metadata["generation"], metadata["observedGeneration"]) == (1, 0)
+        assert resource["status"]["observedGeneration"] == 0
+
+
+@pytest.mark.parametrize(
     "mutate",
     [
         pytest.param(lambda b: b.pop("spec"), id="missing-spec"),

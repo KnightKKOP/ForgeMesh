@@ -67,11 +67,12 @@
         "generation": {
           "type": "integer",
           "minimum": 0,
-          "description": "期望状态版本，spec 变更时递增（系统维护）。"
+          "description": "期望状态版本：创建时为 1，只有 spec 变化时递增（系统维护，请求中的值被忽略）。"
         },
         "observedGeneration": {
           "type": "integer",
-          "minimum": 0
+          "minimum": 0,
+          "description": "控制器已处理到的 generation（系统维护）。"
         }
       }
     },

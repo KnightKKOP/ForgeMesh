@@ -17,8 +17,8 @@ spec:
     - resource.read
     - inference.deploy
     - inference.inspect
-  isolation: restricted-rpc
-  entrypoint: "python -m forgemesh_runtime_vllm"
+  isolation: in-process
+  entrypoint: "deploy:VLLMDeployer"
   healthCheck:
     mode: rpc
     timeoutMs: 2000

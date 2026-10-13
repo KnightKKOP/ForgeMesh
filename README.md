@@ -62,7 +62,7 @@ forgemesh/
 │   ├── policy-engine/          # 授权、准入、配额、QoS
 │   ├── decision-api/           # DecisionProvider / DecisionRouter / 熔断器 / 降级
 │   ├── workflow-api/           # WorkflowRuntime 运行契约
-│   ├── plugin-sdk/             # 插件 Manifest / 签名 / 隔离 / SDK / 脚手架
+│   ├── plugin-sdk/             # 插件 Manifest / 权限词表 / Ed25519 签名 / 入口加载 / SDK / 脚手架
 │   ├── control-plane/          # 模块化单体控制平面（Registry / Reconciler / API / Outbox / Audit / Observability / Diagnostics）
 │   ├── workflow-runtime/       # 工作流执行引擎（持久化 / DSL / 补偿 / 审批 / GPU onboarding）
 │   ├── node-agent/             # 节点侧受控执行组件（注册 / 探测 / 运行时 / 健康 / 恢复）
@@ -291,7 +291,7 @@ ForgeMesh 目前处于预览阶段，API 稳定性标注为 `beta`：minor 版�
 - **协调控制器**：9 步声明式闭环（获取→查询→比较→生成候选→策略校验→调度分配→执行→重观察→更新状态）（现状：自 1.1.0 起由控制器自动驱动；同时设置 `FORGEMESH_INVENTORY_FILE` 与 `FORGEMESH_RUNTIME_LAUNCHER` 后，调度、部署、写入 `status.endpoints` 与受控删除形成完整闭环，见[部署推理服务](#部署推理服务)；未设置启动器时，新建的推理服务停在 `Pending`，并报告 `Ready=False`（`SchedulerUnavailable` 或 `WorkflowRuntimeUnavailable`）。控制平面重启后实例不会自动重新启动）
 - **策略引擎**：allow/deny/require_approval 三态决策，配额规则，高风险审批触发
   - 说明：Decision Router 的 `OK/FALLBACK_REQUIRED/FAILED` 是决策路由层的另一组状态，与 Policy 三态不混用
-- **插件管理器**：Manifest 解析校验，生命周期状态机，能力发现，权限授予（现状：授予的权限直接取自插件清单自己的声明）
+- **插件管理器**：Manifest 解析校验，生命周期状态机，能力发现，权限授予（现状：自 1.1.0 起注册时验证 Ed25519 签名，权限按管理员的授予判定；控制平面应用尚未加载插件）
 - **审计与 Outbox**：事务性 Outbox，异步事件发布，幂等消费，correlation_id 全链路（现状：组件已实现，尚未接入控制平面的生产路径）
 - **REST API 与 CLI**：资源 CRUD，状态查询，任务管理，租户上下文注入（现状：没有更新接口；CLI 每条命令使用一个新的内存数据库，尚不可用）
 
@@ -314,7 +314,7 @@ ForgeMesh 目前处于预览阶段，API 稳定性标注为 `beta`：minor 版�
 - **Token 计量**：追加式 UsageRecord，计量修正事件
 - **可观测性**：OpenTelemetry 接入，8 类关键指标，敏感数据过滤（现状：指标与追踪只记录在内存中，没有 Prometheus / OTLP 导出）
 - **诊断包**：统一诊断聚合（资源/工作流/插件/决策/日志），按租户权限受限
-- **插件安全**：制品签名验证，隔离宿主（受限 RPC），升级兼容性（现状：签名为 HMAC 对称签名，注册插件时不验签；受限 RPC 没有进程级隔离）
+- **插件安全**：制品签名验证，隔离宿主（受限 RPC），升级兼容性（现状：自 1.1.0 起制品使用 Ed25519 签名，注册时验签；受限 RPC 宿主尚未实现，插件都在宿主进程内运行，清单只能声明 `in-process`）
 - **安全测试**：租户隔离，插件权限，密钥脱敏，灾备文档
 
 ### 扩展与生态（M6）
@@ -330,7 +330,7 @@ ForgeMesh 目前处于预览阶段，API 稳定性标注为 `beta`：minor 版�
 
 | 类型 | 数量 |
 |------|------|
-| Python 测试 | **1623** |
+| Python 测试 | **1800** |
 | Go 测试 | 134 个测试函数，全部通过 |
 | ruff 检查 | All checks passed |
 
@@ -348,6 +348,8 @@ ForgeMesh 通过可插拔架构支持 6 种插件类型：
 | gpu | `gpu-nvidia` | GPU Provider（含 MIG / 异构） |
 | metering | `metering-basic` | Token 计量 |
 | qos | `qos-basic` | QoS 优先级与限流 |
+
+插件在宿主进程内运行，目前没有进程隔离（清单 `isolation` 只能是 `in-process`），入口点形如 `<模块>:<类>`（如 `provider:RulesProvider`）。插件管理器注册插件时要求随制品分发的 Ed25519 签名（覆盖制品内容与清单），只接受插件策略文件 `trustedKeys` 中的公钥；清单的 `permissions` 只是申请，插件实际拥有的权限是申请与策略文件 `grants` 授予的交集。密钥生成、签名与验签：`python -m forgemesh.plugin.signtool {keygen,sign,verify}`。控制平面应用目前不加载插件，也不构造插件管理器，因此没有对应的环境变量。
 
 插件开发指南见 [`docs/plugin-development/guide.md`](docs/plugin-development/guide.md)。
 

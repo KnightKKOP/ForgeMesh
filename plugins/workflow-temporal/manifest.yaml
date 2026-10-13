@@ -21,8 +21,8 @@ spec:
   permissions:
     - resource.read
     - workflow.execute
-  isolation: restricted-rpc
-  entrypoint: "python -m forgemesh_workflow_temporal"
+  isolation: in-process
+  entrypoint: "provider:TemporalWorkflowProvider"
   healthCheck:
     mode: rpc
     timeoutMs: 2000

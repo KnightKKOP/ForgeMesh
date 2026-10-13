@@ -16,8 +16,8 @@ spec:
   permissions:
     - resource.read
     - decision.evaluate
-  isolation: restricted-rpc
-  entrypoint: "python -m forgemesh_decision_rules"
+  isolation: in-process
+  entrypoint: "provider:RulesProvider"
   healthCheck:
     mode: rpc
     timeoutMs: 2000

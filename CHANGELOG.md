@@ -41,6 +41,10 @@
 - `deploy/docker/docker-compose.fake-runtime.yaml`：叠加在 `docker-compose.yaml` 之上，以一块虚构设备的加速器清单 `deploy/docker/fake-runtime-inventory.json` 与假启动器打开推理服务的完整闭环，不需要 GPU；实例在控制平面容器内监听全部地址，写进实例地址的主机为服务名 `control-plane`，实例端口不发布到宿主机。
 - 新增 `tests/e2e/test_closed_loop.py`：以控制平面应用、一块设备的加速器清单与假启动器覆盖创建 → `Ready` → 向实例发出流式对话 → 删除（实例停止、分配释放）→ 重新创建 → 重启后 `Degraded` → 删除的闭环。
 - [docs/operations/backup-restore.md](docs/operations/backup-restore.md) 覆盖工作流存储：部署推理服务时控制平面有两个数据库文件，备份与恢复脚本、Python 示例与容器内的命令都按同一组处理两个文件（先备份注册表、再备份工作流存储，同一组恢复，见 2.6 节）；新增 3.5 节说明恢复之后的推理服务（`Ready` 的转为 `Degraded`）。
+- 插件签名工具 `python -m forgemesh.plugin.signtool`：`keygen --private-key <路径>` 生成 Ed25519 密钥对（私钥文件权限 `0600`，已有文件不覆盖），输出 key id 与可以直接追加到插件策略文件 `trustedKeys` 的公钥条目；`sign --private-key <私钥> --manifest <清单> --artifact <制品>` 写出签名文档（默认 `<制品>.sig`）；`verify --public-key <公钥> --manifest <清单> --artifact <制品>` 校验失败时以退出码 `1` 结束。签名文档是随制品分发的 JSON（`algorithm` / `keyId` / `artifactDigest` / `manifestDigest` / `signature`），私钥只由插件作者保管。
+- 插件策略文件（JSON，由管理员维护）：`trustedKeys` 列出受信任的 Ed25519 签名公钥（PEM），`grants` 按插件的 `metadata.id` 授予权限，对该插件的所有版本生效。`load_plugin_policy` 严格校验：文件不可读、未知字段、非法或重复的公钥、带版本号的 `pluginId`、同一插件的多条授予、词表之外或重复的权限都抛出 `PluginPolicyError`；`PluginManager.from_policy_file` 按策略文件构造插件管理器，`PluginManager.effective_permissions` 返回插件实际拥有的权限。控制平面应用目前不构造插件管理器，因此没有对应的环境变量。
+- 插件权限词表 `forgemesh.plugin.permissions.Permission`（15 项，形如 `<域>.<动作>`，如 `resource.read`、`network.egress`、`platform.admin`）：清单的 `spec.permissions`、JSON Schema 的权限枚举、管理员的授予与 `forgemesh.plugin.isolation` 共用这一份词表，契约测试保证 Schema 枚举与词表逐项一致。
+- `forgemesh.plugin.loader.load_entrypoint(plugin_dir, entrypoint)`：按清单 `spec.entrypoint`（`<模块>:<类>`）把插件目录作为 Python 包加载并返回入口类；插件目录必须含 `__init__.py`，入口类必须定义在插件包内。加载在当前进程内执行插件代码，不提供任何隔离。
 
 ### Changed
 
@@ -76,10 +80,20 @@
 - **破坏性**：`ReconciliationController` 注入 `workflow_runtime` 时必须同时注入 `release_provider`（否则抛 `ValueError`：删除资源会留下运行中的实例），运行时须实现 `find_run` 并在快照中返回步骤输出；新增参数 `workflow_poll_interval`（默认 `2.0` 秒，须为正数）与可选的 `launcher`（注入时写入 `Ready` 之前以 `is_running` 确认实例仍在运行）。不是 `InferenceService` 的资源报告 `Ready=False`（`NotDeployable`），不分配、不启动工作流。
 - **破坏性**：`ReferenceWorkflowRuntime` 在后台执行运行（见 Added）：`start()` 返回时运行可能仍在执行，步骤失败时补偿并以 `Failed` 结束，`cancel()` 等待运行进入终态；使用方须在启动时调用 `recover()`、关闭时调用 `aclose()`。
 - `control-plane` 包新增依赖 `forgemesh-workflow-runtime`（应用以其中的 `LocalWorkflowRuntime` 组装部署工作流），`deploy/docker/Dockerfile.control-plane` 随之安装该包。
+- **破坏性**：插件制品签名由 HMAC-SHA256 改为 Ed25519（`forgemesh.plugin.signing`，`plugin-sdk` 新增依赖 `cryptography>=42`）。`PluginSigner.sign(content, manifest, private_key_pem)` 返回签名文档 `PluginSignature`（`algorithm` / `keyId` / `artifactDigest` / `manifestDigest` / `signature`），签名覆盖算法标识、制品内容摘要与清单摘要；`PluginSigner.verify(content, manifest, signature, trusted_keys)` 从制品内容与清单重新计算两个摘要，通过时返回签名公钥的 key id（此前返回 `True`），未签名、算法不是 `ed25519`、公钥不受信任、摘要不符、签名不符都抛出 `SigningError`。签名模块的 `PluginArtifact` 以及 `PluginSignature` 原有的 `signer` / `signed_at` 字段移除，`signature` 由原始字节改为 base64 字符串。
+- **破坏性**：`PluginManager.register(manifest, *, artifact=None, signature=None)` 注册前按 `PluginManifest` 重新校验清单（记录中保存校验后的副本），再用策略中受信任的公钥校验签名；清单非法、未签名、有签名但没有制品内容、签名校验失败都抛出 `PluginRejectedError`（`ForbiddenError` 的子类），插件不会进入注册表。`PluginManager()` 不传策略时不信任任何公钥；未签名的插件只能在显式开启的开发模式（`dev_mode_allow_unsigned=True`，默认关闭）下注册，开启开发模式和每次注册未签名插件都会记录告警。注册记录新增 `signing_key_id` / `artifact_digest`。
+- **破坏性**：`PluginManager.check_permissions` 改按管理员授予判定：插件实际拥有的权限是清单申请与策略 `grants` 授予的交集，清单申请了、管理员没有授予的权限不生效（此前直接把清单的 `spec.permissions` 当作已授予）；`required` 中有词表之外的权限名时抛出 `ValueError`。
+- **破坏性**：清单 `spec.permissions` 只能取权限词表中的名字（模型与 Schema 枚举一致），模型同样拒绝重复的权限；此前可以是任意字符串。`IsolationGuard.check_access` / `validate_manifest` 改用同一份词表（此前为 `database` / `filesystem` / `network` / `admin` 等自由字符串，`check_access` 的参数 `resource` 改名为 `permission`），未知的权限名抛出 `IsolationError`。
+- **破坏性**：清单 `spec.isolation` 只能是 `in-process`（模型与 Schema 一致），声明 `restricted-rpc` / `sandbox` 校验失败：插件都在宿主进程内运行，ADR-006 的受限 RPC 宿主尚未实现（见 Fixed）。脚手架生成的清单改为 `in-process`。
+- **破坏性**：清单 `spec.entrypoint` 必须形如 `<模块>:<类>`（模块路径相对于插件包，模型与 Schema 使用同一正则），插件目录须含 `__init__.py`。全部 10 个插件与示例清单 `examples/single-node/plugin-vllm.yaml` 改为真实入口（如 `provider:RulesProvider`、`discovery:GPUDiscoverer`、`deploy:VLLMDeployer`），`plugins/workflow-reference` 补上 `__init__.py`；脚手架生成 `"provider:<类名>"`。
+- `scripts/plugin_entrypoint_smoke.py` 按清单 `spec.entrypoint` 经 `load_entrypoint` 加载入口类，缺少 `entrypoint` 即失败（此前跳过），并做基本健康检查：构造器没有必填参数时实例化一次（目前 6 个插件）；需要宿主注入依赖的只报告所需参数（`decision-typesafe-jev` 的客户端、`metering-basic` 的存储、`qos-basic` 的配置、`workflow-reference` 的存储与执行器等）。
+- `PluginSdk.validate_manifest` 的告警与实际行为一致：未设置 `isolation` 时说明插件在进程内运行（此前称安装器默认使用 `restricted-rpc`），未设置 `entrypoint` 时说明插件无法加载；清单仍写 `artifactDigest` / `signature` 时给出弃用告警（见 Deprecated）。
+- [docs/plugin-development/guide.md](docs/plugin-development/guide.md) 按当前实现更新运行方式与隔离、权限词表、入口点、签名与注册流程；`SECURITY.md` 3.2 / 3.3 节、README 与 [ADR-006](docs/design-decisions/adr-006.md)（新增实施现状）同步更新；[docs/architecture/module-mapping.md](docs/architecture/module-mapping.md) 更新插件的加载方式与运行形态，更正 `runtime-vllm` 的文件列表（没有 `provider.py`），新增偏差 D3（受限 RPC 宿主未实现）。
 
 ### Deprecated
 
 - `GET /api/v1/inference-services` 的 `tenantId` 查询参数：从未生效，租户取自凭证（ADR-014）；计划在 1.3.0 移除。
+- 插件清单的 `spec.artifactDigest` / `spec.signature`：从未被任何代码读取或校验，也无法起作用（清单打包在它要描述的制品之内，签名无法覆盖包含它自身的文档）。Schema 标为 `deprecated`，`validate_manifest` 给出告警，插件管理器注册时既不把它们当作签名，也不拿它们与制品比对；改用 `python -m forgemesh.plugin.signtool sign` 生成随制品分发的签名文档（见插件开发指南第 6 节）。计划在 2.0.0 移除。
 
 ### Fixed
 
@@ -118,6 +132,9 @@
 - `Terminating` 协调按 `{kind}/{name}` 释放分配，忽略命名空间，删除一个服务可能释放另一个命名空间中同名服务的分配：现按资源 uid（限本租户）释放。资源已被删除、或同名资源已以新 uid 重建时，只释放原资源的分配，不再移除新资源的 finalizer 并把它删除。
 - 协调器启动一个没有步骤的工作流后立即登记去重键并写入 `Ready=True`（`Reconciled`），启动失败时只记一条警告、同样报告 `Ready=True`；`phase` 停在 `Pending`，`status.endpoints` 从不写入（改进计划 4.10 遗留问题、5.3）：现按 phase 逐轮部署，运行成功之后才 `Ready=True`（见 Changed）。部署工作流没能启动时停在 `Preparing`、`Ready=False`（`WorkflowStartFailed`），保留分配，不登记去重键，退避重试（从 `workflow_poll_interval` 起每次翻倍，最多 60 秒）；查询运行失败同样处理（`WorkflowLookupFailed`）。
 - 参考工作流运行时的 `start()` 只创建运行记录并推进到 `Running`，从不执行步骤，运行永远停在 `Running`，`cancel(cleanup=True)` 补偿的是从未执行过的步骤：现由 `LocalWorkflowRuntime` 在后台执行（见 Added）。
+- 全部 10 个插件清单与示例清单的 `entrypoint` 写成 `python -m forgemesh_<名称>`，而这些模块并不存在，没有一个插件能按清单加载；入口冒烟只用 `entrypoint` 判断是否跳过，随后绕开它按文件路径加载 `provider.py`（或包的 `__init__.py`），只断言其中有公有类。现改为真实的 `<模块>:<类>` 入口，冒烟按入口加载（见 Changed）。
+- 全部 10 个插件与示例清单声明 `isolation: restricted-rpc`，而受限 RPC 宿主并不存在，插件实际都在宿主进程内运行；其中 `decision-typesafe-jev` 在进程内经 `urllib` 直接请求 TypeSafe API。现全部改为 `in-process`（`decision-typesafe-jev` 已申请 `network.egress`）。
+- `plugin-sdk` 包补齐 `pyyaml` 依赖声明：`forgemesh.plugin.sdk` 与签名工具都用它读取清单，此前独立安装（如控制平面镜像）后导入 `forgemesh.plugin.sdk` 即失败。
 
 ### Security
 
@@ -127,6 +144,8 @@
 - 网关限流改按已验证的租户计数，不再读取客户端可控的租户头或 `X-Forwarded-For`（此前更换头值即可获得新的令牌桶）。
 - 网关只连接允许网段内的推理实例：此前流式代理会连接 `status.endpoints` 中的任意地址，实例地址被写成 `169.254.169.254` 或内网服务时，网关就成了访问它们的跳板。现在拨号时逐个检查解析出的 IP（主机名之后解析到别处同样生效）；`GATEWAY_INSTANCE_ALLOWED_CIDRS` 列出允许的网段，未设置时拒绝回环、链路本地、未指定、组播地址与已知云元数据服务地址；被拒绝的连接返回 `502 INSTANCE_ADDRESS_NOT_ALLOWED`，并计一次实例失败。
 - 网关请求体此前不设上限，原样转发给控制平面与推理实例：现限制为 `GATEWAY_MAX_REQUEST_BODY_BYTES`（见 Added）。
+- 插件签名此前使用 HMAC-SHA256 对称密钥，能验签的一方同样能伪造签名；`verify` 只在调用方提供制品内容时重新计算摘要，否则直接信任调用方给出的摘要；签名中的算法标识从不校验；清单不在签名范围内，签名之后改动清单（例如追加申请的权限）不会被发现。现改为 Ed25519（见 Changed）：控制平面只保存公钥，摘要总是从制品内容与清单重新计算。
+- `PluginManager.register` 此前不做任何校验，签名校验没有接入注册，任何清单都能注册；`check_permissions` 把清单自己声明的权限当作已授予，插件可以给自己授权。现注册时校验清单与签名，权限以管理员授予为准（见 Changed）。
 
 ## [1.0.1] - 2026-10-11
 

@@ -2,9 +2,11 @@
 
 验证插件权限隔离机制，覆盖供应链安全与运行时隔离边界：
 
-* **UNTRUSTED 插件**：不能访问 database，不能声明 admin 权限。
-* **TRUSTED 插件**：拥有完整访问权限（IN_PROCESS 模式，所有资源可访问）。
-* **RESTRICTED_RPC 模式**：无直连 DB / filesystem / network。
+* **UNTRUSTED 插件**：不能使用 ``database.access``，不能申请 ``platform.admin``。
+* **TRUSTED 插件**：拥有完整访问权限（IN_PROCESS 模式，全部权限可用）。
+* **RESTRICTED_RPC 模式**：不可使用 ``database.access`` / ``filesystem.access`` /
+  ``network.egress``。
+* **权限名**：只接受 Permission 词表中的名称。
 * **未签名插件**：被拒绝加载（SigningError）。
 * **摘要不符插件**：被拒绝加载（SigningError）。
 * **升级不变量（IVT-8）**：升级不改变既有实例的执行定义。
@@ -22,30 +24,23 @@ from forgemesh.plugin.isolation import (
     PluginVersionCompat,
     TrustLevel,
 )
+from forgemesh.plugin.manifest import PluginManifest, PluginMeta, PluginSpec
+from forgemesh.plugin.permissions import Permission
 from forgemesh.plugin.signing import (
-    PluginArtifact,
-    PluginSignature,
     PluginSigner,
     SigningError,
+    generate_private_key,
+    load_trusted_keys,
+    public_key_pem,
 )
 
 _SIGNER = PluginSigner()
-_KEY = b"test-secret-key-for-security-tests"
-
-
-def _make_artifact(
-    content: bytes = b"plugin payload",
-    digest: str | None = None,
-    signature: PluginSignature | None = None,
-) -> PluginArtifact:
-    """构造测试用制品。"""
-    return PluginArtifact(
-        name="forgemesh.plugin.example",
-        version="1.0.0",
-        digest=digest if digest is not None else PluginSigner.compute_digest(content),
-        signature=signature,
-        content=content,
-    )
+_PRIVATE_KEY = generate_private_key()
+_TRUSTED = load_trusted_keys([public_key_pem(_PRIVATE_KEY)])
+_MANIFEST = PluginManifest(
+    metadata=PluginMeta(id="forgemesh.plugin.example", version="1.0.0"),
+    spec=PluginSpec(category="policy"),
+)
 
 
 # --------------------------------------------------------------------------- #
@@ -55,20 +50,33 @@ def _make_artifact(
 
 @pytest.mark.unit
 def test_untrusted_plugin_no_database_access() -> None:
-    """UNTRUSTED 插件不能访问 database：check_access 抛 IsolationError。"""
+    """UNTRUSTED 插件不能使用 database.access：check_access 抛 IsolationError。"""
     guard = IsolationGuard()
 
-    with pytest.raises(IsolationError, match="database"):
-        guard.check_access(TrustLevel.UNTRUSTED, "database")
+    with pytest.raises(IsolationError, match="'database.access' not available"):
+        guard.check_access(TrustLevel.UNTRUSTED, "database.access")
 
 
 @pytest.mark.unit
 def test_untrusted_plugin_no_admin_permission() -> None:
-    """UNTRUSTED 插件不能声明 admin 权限：validate_manifest 抛 IsolationError。"""
+    """UNTRUSTED 插件不能申请 platform.admin：validate_manifest 抛 IsolationError。"""
     guard = IsolationGuard()
 
-    with pytest.raises(IsolationError, match="admin"):
-        guard.validate_manifest(TrustLevel.UNTRUSTED, ["read", "admin"])
+    with pytest.raises(IsolationError, match=r"cannot request .*'platform\.admin'"):
+        guard.validate_manifest(TrustLevel.UNTRUSTED, ["resource.read", "platform.admin"])
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("legacy_name", ["database", "admin", "network", "metrics:read"])
+def test_free_form_permission_names_rejected(legacy_name: str) -> None:
+    """词表外的权限名（含旧版自由命名）在任何信任级别下都报错，不会被当作普通权限放行。"""
+    guard = IsolationGuard()
+
+    for trust_level in TrustLevel:
+        with pytest.raises(IsolationError, match="unknown permission"):
+            guard.check_access(trust_level, legacy_name)
+        with pytest.raises(IsolationError, match="unknown permission"):
+            guard.validate_manifest(trust_level, [legacy_name])
 
 
 # --------------------------------------------------------------------------- #
@@ -78,18 +86,20 @@ def test_untrusted_plugin_no_admin_permission() -> None:
 
 @pytest.mark.unit
 def test_trusted_plugin_full_access() -> None:
-    """TRUSTED 插件有完整访问权限：IN_PROCESS 模式，所有资源可访问，任意权限可声明。"""
+    """TRUSTED 插件有完整访问权限：IN_PROCESS 模式，全部权限可用，任意权限可申请。"""
     guard = IsolationGuard()
 
     # TRUSTED → IN_PROCESS 模式
     assert guard.get_mode(TrustLevel.TRUSTED) == IsolationMode.IN_PROCESS
 
-    # 可访问所有受限资源
-    for resource in ("database", "filesystem", "network", "config"):
-        guard.check_access(TrustLevel.TRUSTED, resource)  # 不抛异常
+    # 可使用全部权限（含直接访问宿主资源的权限）
+    for permission in Permission:
+        guard.check_access(TrustLevel.TRUSTED, permission)  # 不抛异常
 
-    # 可声明任意权限（含 database / admin）
-    guard.validate_manifest(TrustLevel.TRUSTED, ["database", "admin", "read"])
+    # 可申请任意权限（含 database.access / platform.admin）
+    guard.validate_manifest(
+        TrustLevel.TRUSTED, ["database.access", "platform.admin", "resource.read"]
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -99,7 +109,7 @@ def test_trusted_plugin_full_access() -> None:
 
 @pytest.mark.unit
 def test_restricted_rpc_no_direct_db() -> None:
-    """RESTRICTED_RPC 模式无直连 DB：UNTRUSTED / VERIFIED 均禁止 database/filesystem/network。"""
+    """RESTRICTED_RPC 模式无直连 DB：UNTRUSTED / VERIFIED 均禁止直接访问宿主资源的权限。"""
     guard = IsolationGuard()
 
     # UNTRUSTED → RESTRICTED_RPC
@@ -107,15 +117,15 @@ def test_restricted_rpc_no_direct_db() -> None:
     # VERIFIED → RESTRICTED_RPC
     assert guard.get_mode(TrustLevel.VERIFIED) == IsolationMode.RESTRICTED_RPC
 
-    # 两个受限信任级别均禁止直连 DB / filesystem / network
+    # 两个受限信任级别均禁止 database.access / filesystem.access / network.egress
     for trust_level in (TrustLevel.UNTRUSTED, TrustLevel.VERIFIED):
-        for resource in ("database", "filesystem", "network"):
-            with pytest.raises(IsolationError, match=resource):
-                guard.check_access(trust_level, resource)
+        for permission in ("database.access", "filesystem.access", "network.egress"):
+            with pytest.raises(IsolationError, match=f"'{permission}' not available"):
+                guard.check_access(trust_level, permission)
 
-    # 非受限资源仍可访问
-    guard.check_access(TrustLevel.UNTRUSTED, "config")
-    guard.check_access(TrustLevel.VERIFIED, "metrics")
+    # 经宿主 API 的权限仍可使用
+    guard.check_access(TrustLevel.UNTRUSTED, "resource.read")
+    guard.check_access(TrustLevel.VERIFIED, "metering.read")
 
 
 # --------------------------------------------------------------------------- #
@@ -126,10 +136,8 @@ def test_restricted_rpc_no_direct_db() -> None:
 @pytest.mark.unit
 def test_unsigned_plugin_rejected() -> None:
     """未签名插件被拒绝加载：verify 抛 SigningError("unsigned plugin rejected")。"""
-    artifact = _make_artifact(signature=None)
-
     with pytest.raises(SigningError, match="unsigned plugin rejected"):
-        _SIGNER.verify(artifact, _KEY)
+        _SIGNER.verify(b"plugin payload", _MANIFEST, None, _TRUSTED)
 
 
 # --------------------------------------------------------------------------- #
@@ -139,13 +147,11 @@ def test_unsigned_plugin_rejected() -> None:
 
 @pytest.mark.unit
 def test_digest_mismatch_rejected() -> None:
-    """摘要不符的插件被拒绝加载：verify 抛 SigningError("digest mismatch")。"""
-    # 构造一个摘要与内容不符的制品
-    artifact = _make_artifact(digest="sha256:deadbeef00000000")
-    artifact.signature = _SIGNER.sign(artifact, _KEY)
+    """签名后被篡改的制品被拒绝加载：verify 从内容重算摘要，抛 SigningError。"""
+    signature = _SIGNER.sign(b"plugin payload", _MANIFEST, _PRIVATE_KEY)
 
-    with pytest.raises(SigningError, match="digest mismatch"):
-        _SIGNER.verify(artifact, _KEY)
+    with pytest.raises(SigningError, match="artifact digest mismatch"):
+        _SIGNER.verify(b"tampered payload", _MANIFEST, signature, _TRUSTED)
 
 
 # --------------------------------------------------------------------------- #

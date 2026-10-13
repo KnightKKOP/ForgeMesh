@@ -3,7 +3,7 @@
 覆盖：
 
 * **核心 API 版本兼容**：PluginManifest apiVersion、PluginVersionCompat 语义版本兼容。
-* **签名验证（安全认证）**：PluginSigner 三重拒绝（未签名/摘要不符/签名不符）。
+* **签名验证（安全认证）**：PluginSigner 拒绝未签名、摘要不符、签名公钥不受信任的制品。
 * **隔离边界（安全认证）**：RESTRICTED_RPC 资源访问边界、UNTRUSTED 权限边界。
 * **升级安全（IVT-8）**：升级不静默改变既有工作流实例的执行定义。
 * **SDK 打包/发布兼容**：PluginSdk.pack/publish 端到端兼容性。
@@ -17,6 +17,7 @@ import hashlib
 from pathlib import Path
 
 import pytest
+import yaml
 from forgemesh.plugin.isolation import (
     IsolationError,
     IsolationGuard,
@@ -28,11 +29,22 @@ from forgemesh.plugin.isolation import (
 from forgemesh.plugin.manifest import PluginManifest, PluginMeta, PluginSpec
 from forgemesh.plugin.sdk import PluginArtifact as SdkArtifact
 from forgemesh.plugin.sdk import PluginSdk, PublishResult, ValidationResult
-from forgemesh.plugin.signing import PluginArtifact as SignedArtifact
-from forgemesh.plugin.signing import PluginSigner, SigningError
+from forgemesh.plugin.signing import (
+    PluginSigner,
+    SigningError,
+    generate_private_key,
+    load_trusted_keys,
+    public_key_pem,
+)
 
 #: 兼容性测试统一标记。
 _compat = pytest.mark.contract
+
+#: 签名测试使用的清单。
+_SIGNED_MANIFEST = PluginManifest(
+    metadata=PluginMeta(id="p", version="0.1.0"),
+    spec=PluginSpec(category="policy"),
+)
 
 
 # ===========================================================================
@@ -153,7 +165,7 @@ class TestPluginVersionCompat:
 
 
 class TestSigningSecurity:
-    """PluginSigner 安全认证：三重拒绝 + 正常验证通过。"""
+    """PluginSigner 安全认证：拒绝未签名、篡改与非受信任签名 + 正常验证通过。"""
 
     @_compat
     def test_compute_digest_format(self) -> None:
@@ -164,49 +176,41 @@ class TestSigningSecurity:
 
     @_compat
     def test_sign_and_verify_success(self) -> None:
-        """签名后用相同密钥验证应通过。"""
+        """签名后用对应的受信任公钥验证应通过。"""
         signer = PluginSigner()
-        key = b"secret-key"
+        key = generate_private_key()
         content = b"plugin content"
-        digest = PluginSigner.compute_digest(content)
-        artifact = SignedArtifact(name="p", version="0.1.0", digest=digest, content=content)
-        artifact.signature = signer.sign(artifact, key)
-        assert signer.verify(artifact, key) is True
+        signature = signer.sign(content, _SIGNED_MANIFEST, key)
+        trusted = load_trusted_keys([public_key_pem(key)])
+        assert signer.verify(content, _SIGNED_MANIFEST, signature, trusted) == signature.key_id
 
     @_compat
     def test_unsigned_rejected(self) -> None:
         """未签名制品应被拒绝。"""
         signer = PluginSigner()
-        artifact = SignedArtifact(name="p", version="0.1.0", digest="sha256:x")
         with pytest.raises(SigningError, match="unsigned"):
-            signer.verify(artifact, b"key")
+            signer.verify(b"plugin content", _SIGNED_MANIFEST, None, {})
 
     @_compat
     def test_digest_mismatch_rejected(self) -> None:
         """摘要不符应被拒绝。"""
         signer = PluginSigner()
-        key = b"secret-key"
-        content = b"plugin content"
-        digest = PluginSigner.compute_digest(content)
-        artifact = SignedArtifact(name="p", version="0.1.0", digest=digest, content=content)
-        artifact.signature = signer.sign(artifact, key)
+        key = generate_private_key()
+        signature = signer.sign(b"plugin content", _SIGNED_MANIFEST, key)
+        trusted = load_trusted_keys([public_key_pem(key)])
         # 篡改内容使摘要不匹配
-        artifact.content = b"tampered"
         with pytest.raises(SigningError, match="digest"):
-            signer.verify(artifact, key)
+            signer.verify(b"tampered", _SIGNED_MANIFEST, signature, trusted)
 
     @_compat
     def test_signature_mismatch_rejected(self) -> None:
-        """签名不符（密钥不同）应被拒绝。"""
+        """签名公钥不受信任（密钥不同）应被拒绝。"""
         signer = PluginSigner()
-        sign_key = b"sign-key"
-        verify_key = b"different-key"
         content = b"plugin content"
-        digest = PluginSigner.compute_digest(content)
-        artifact = SignedArtifact(name="p", version="0.1.0", digest=digest, content=content)
-        artifact.signature = signer.sign(artifact, sign_key)
-        with pytest.raises(SigningError, match="signature"):
-            signer.verify(artifact, verify_key)
+        signature = signer.sign(content, _SIGNED_MANIFEST, generate_private_key())
+        trusted = load_trusted_keys([public_key_pem(generate_private_key())])
+        with pytest.raises(SigningError, match="not trusted"):
+            signer.verify(content, _SIGNED_MANIFEST, signature, trusted)
 
     @_compat
     def test_digest_deterministic(self) -> None:
@@ -217,15 +221,12 @@ class TestSigningSecurity:
 
     @_compat
     def test_signer_fingerprint_stable(self) -> None:
-        """相同密钥应产生相同 signer 指纹。"""
+        """相同密钥应产生相同 key id。"""
         signer = PluginSigner()
-        key = b"secret-key"
-        digest = PluginSigner.compute_digest(b"content")
-        art1 = SignedArtifact(name="p", version="0.1.0", digest=digest)
-        art2 = SignedArtifact(name="p", version="0.1.0", digest=digest)
-        sig1 = signer.sign(art1, key)
-        sig2 = signer.sign(art2, key)
-        assert sig1.signer == sig2.signer
+        key = generate_private_key()
+        sig1 = signer.sign(b"content", _SIGNED_MANIFEST, key)
+        sig2 = signer.sign(b"other content", _SIGNED_MANIFEST, key)
+        assert sig1.key_id == sig2.key_id
 
 
 # ===========================================================================
@@ -234,44 +235,46 @@ class TestSigningSecurity:
 
 
 class TestIsolationBoundary:
-    """隔离边界安全认证：资源访问边界 + 权限声明边界。"""
+    """隔离边界安全认证：权限使用边界 + 权限申请边界。"""
 
     @_compat
     def test_trusted_in_process_allows_database(self) -> None:
-        """TRUSTED（IN_PROCESS）允许访问 database。"""
+        """TRUSTED（IN_PROCESS）允许使用 database.access。"""
         guard = IsolationGuard()
-        guard.check_access(TrustLevel.TRUSTED, "database")  # 不抛异常
+        guard.check_access(TrustLevel.TRUSTED, "database.access")  # 不抛异常
 
     @_compat
     @pytest.mark.parametrize("trust", [TrustLevel.VERIFIED, TrustLevel.UNTRUSTED])
     def test_non_trusted_blocks_database(self, trust: TrustLevel) -> None:
         """VERIFIED/UNTRUSTED 应禁止直连 database。"""
         guard = IsolationGuard()
-        with pytest.raises(IsolationError):
-            guard.check_access(trust, "database")
+        with pytest.raises(IsolationError, match="'database.access' not available"):
+            guard.check_access(trust, "database.access")
 
     @_compat
     @pytest.mark.parametrize("trust", [TrustLevel.VERIFIED, TrustLevel.UNTRUSTED])
     def test_non_trusted_blocks_filesystem(self, trust: TrustLevel) -> None:
         """VERIFIED/UNTRUSTED 应禁止直连 filesystem。"""
         guard = IsolationGuard()
-        with pytest.raises(IsolationError):
-            guard.check_access(trust, "filesystem")
+        with pytest.raises(IsolationError, match="'filesystem.access' not available"):
+            guard.check_access(trust, "filesystem.access")
 
     @_compat
     @pytest.mark.parametrize("trust", [TrustLevel.VERIFIED, TrustLevel.UNTRUSTED])
     def test_non_trusted_blocks_network(self, trust: TrustLevel) -> None:
-        """VERIFIED/UNTRUSTED 应禁止直连 network。"""
+        """VERIFIED/UNTRUSTED 应禁止直接对外发起网络连接。"""
         guard = IsolationGuard()
-        with pytest.raises(IsolationError):
-            guard.check_access(trust, "network")
+        with pytest.raises(IsolationError, match="'network.egress' not available"):
+            guard.check_access(trust, "network.egress")
 
     @_compat
     def test_untrusted_combined_forbidden_permissions_rejected(self) -> None:
-        """UNTRUSTED 同时声明 database + admin 应被拒绝。"""
+        """UNTRUSTED 同时申请 database.access + platform.admin 应被拒绝。"""
         guard = IsolationGuard()
-        with pytest.raises(IsolationError):
-            guard.validate_manifest(TrustLevel.UNTRUSTED, ["metrics:read", "database", "admin"])
+        with pytest.raises(IsolationError, match=r"\['database\.access', 'platform\.admin'\]"):
+            guard.validate_manifest(
+                TrustLevel.UNTRUSTED, ["metering.read", "database.access", "platform.admin"]
+            )
 
     @_compat
     def test_custom_isolation_policy(self) -> None:
@@ -285,8 +288,8 @@ class TestIsolationBoundary:
         )
         guard = IsolationGuard(policy=custom_policy)
         # 自定义策略下 TRUSTED 也走 RESTRICTED_RPC
-        with pytest.raises(IsolationError):
-            guard.check_access(TrustLevel.TRUSTED, "database")
+        with pytest.raises(IsolationError, match="not available in RESTRICTED_RPC mode"):
+            guard.check_access(TrustLevel.TRUSTED, "database.access")
 
 
 # ===========================================================================
@@ -360,6 +363,24 @@ class TestSdkPackPublishCompat:
         assert isinstance(result, ValidationResult)
         assert result.valid is True
         assert result.errors == []
+
+    @_compat
+    def test_validate_manifest_warns_about_inline_signature(self, tmp_path: Path) -> None:
+        """清单仍写 artifactDigest / signature 时给出弃用告警：两个字段都不参与任何校验。"""
+        sdk = PluginSdk()
+        plugin_dir = sdk.generate_scaffold("legacy-plugin", "decision", tmp_path)
+        manifest_path = plugin_dir / "manifest.yaml"
+        assert not [w for w in sdk.validate_manifest(manifest_path).warnings if "deprecated" in w]
+
+        data = yaml.safe_load(manifest_path.read_text(encoding="utf-8"))
+        data["spec"].update(artifactDigest="sha256:ab12", signature="cosign:xyz")
+        manifest_path.write_text(yaml.safe_dump(data), encoding="utf-8")
+        result = sdk.validate_manifest(manifest_path)
+        assert result.valid is True
+        deprecated = [w for w in result.warnings if "deprecated" in w]
+        assert len(deprecated) == 1
+        assert "forgemesh.plugin.signtool" in deprecated[0]
+        assert "2.0.0" in deprecated[0]
 
     @_compat
     def test_validate_manifest_missing_file(self, tmp_path: Path) -> None:

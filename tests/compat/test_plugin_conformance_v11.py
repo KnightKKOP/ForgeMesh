@@ -31,7 +31,6 @@ from __future__ import annotations
 import asyncio
 import importlib.util
 import json
-import re
 import sys
 from collections.abc import Awaitable, Callable
 from pathlib import Path
@@ -39,15 +38,19 @@ from typing import Any
 
 import pytest
 import yaml
+from forgemesh.controlplane.plugin_manager import PluginManager, PluginPolicy
 from forgemesh.core.errors import (
     ConflictError,
     InvalidStateTransition,
     NotFoundError,
 )
+from forgemesh.plugin.loader import load_entrypoint
 from forgemesh.plugin.manifest import (
     PluginLifecycleState,
     PluginManifest,
 )
+from forgemesh.plugin.permissions import Permission
+from forgemesh.plugin.signing import PluginSigner, generate_private_key, public_key_pem
 from forgemesh.workflow.runtime import Step, WorkflowDefinition, WorkflowRuntime
 from forgemesh.workflow.states import WorkflowStatus
 from jsonschema import Draft202012Validator
@@ -74,11 +77,11 @@ ALL_PLUGIN_DIRS: list[str] = [
     "metering-basic",
 ]
 
-#: manifest 允许的隔离级别枚举（对齐 schema enum 与 ADR-006）。
-_ALLOWED_ISOLATION = {"in-process", "restricted-rpc", "sandbox"}
+#: manifest 允许的隔离级别（对齐 schema enum）：插件都在宿主进程内运行，没有进程边界。
+_ALLOWED_ISOLATION = {"in-process"}
 
-#: 最小权限形式：至少两段点分的小写标识（如 ``resource.read``）。
-_PERMISSION_RE = re.compile(r"^[a-z0-9-]+(\.[a-z0-9-]+)+$")
+#: 插件可申请的权限词表。
+_PERMISSION_VOCABULARY = {p.value for p in Permission}
 
 #: 10 插件 manifest schema（模块级加载一次，供第 1 节复用）。
 _MANIFEST_SCHEMA: dict[str, Any] = json.loads(
@@ -192,7 +195,7 @@ class TestManifestAndIsolationConformance:
     def test_isolation_declaration_within_allowed_enum(
         self, plugin_dir: str
     ) -> None:
-        """isolation 声明值须落在允许枚举 {in-process, restricted-rpc, sandbox} 内。"""
+        """isolation 只能声明 in-process（restricted-rpc / sandbox 尚无进程边界实现）。"""
         isolation = _load_manifest_dict(plugin_dir)["spec"]["isolation"]
         assert isolation in _ALLOWED_ISOLATION, (
             f"{plugin_dir}: 非法 isolation 声明 {isolation!r}"
@@ -204,35 +207,12 @@ class TestManifestAndIsolationConformance:
         [pytest.param(p, id=p) for p in ALL_PLUGIN_DIRS],
     )
     def test_isolation_matches_directory_shape(self, plugin_dir: str) -> None:
-        """isolation 声明须与目录形态一致。
+        """声明 ``in-process`` 的插件须能在进程内按清单入口点加载。"""
+        spec = _load_manifest_dict(plugin_dir)["spec"]
+        assert spec["isolation"] == "in-process"
 
-        * 声明 ``in-process``：目录须有可加载入口（provider.py 或
-          ``__init__.py``），且进程内实际加载成功；
-        * 声明 ``restricted-rpc`` / ``sandbox``：允许仅有清单（不强求沙箱
-          运行时存在），枚举合法性由前一用例保证。
-        """
-        manifest = _load_manifest_dict(plugin_dir)
-        isolation = manifest["spec"]["isolation"]
-        plugin_path = _PLUGINS_ROOT / plugin_dir
-
-        if isolation == "in-process":
-            has_entry = (plugin_path / "provider.py").is_file() or (
-                plugin_path / "__init__.py"
-            ).is_file()
-            assert has_entry, (
-                f"{plugin_dir} 声明 in-process 但缺少可加载入口"
-                "（provider.py 或 __init__.py）"
-            )
-            # 进程内加载须成功（幂等注册到 sys.modules）。
-            if (plugin_path / "provider.py").is_file():
-                _ensure_plugin_module(
-                    f"_conformance_{plugin_dir.replace('-', '_')}", plugin_dir
-                )
-            else:
-                _ensure_plugin_package(
-                    f"_conformance_{plugin_dir.replace('-', '_')}", plugin_dir
-                )
-        # restricted-rpc / sandbox：不强制沙箱运行时存在，无需目录形态断言。
+        entry = load_entrypoint(_PLUGINS_ROOT / plugin_dir, spec["entrypoint"])
+        assert entry.__name__ == spec["entrypoint"].split(":")[1]
 
     @_compat
     @pytest.mark.parametrize(
@@ -240,15 +220,12 @@ class TestManifestAndIsolationConformance:
         [pytest.param(p, id=p) for p in ALL_PLUGIN_DIRS],
     )
     def test_permissions_nonempty_and_parseable(self, plugin_dir: str) -> None:
-        """spec.permissions 非空，且每项均为可解析的最小权限点分形式。"""
+        """spec.permissions 非空，且每项都在 Permission 词表中。"""
         permissions = _load_manifest_dict(plugin_dir)["spec"]["permissions"]
         assert permissions, f"{plugin_dir}: permissions 不得为空"
         for perm in permissions:
-            assert isinstance(perm, str) and perm, (
-                f"{plugin_dir}: 权限项须为非空字符串: {perm!r}"
-            )
-            assert _PERMISSION_RE.fullmatch(perm), (
-                f"{plugin_dir}: 权限项 {perm!r} 不符合 '域.动作' 最小权限形式"
+            assert perm in _PERMISSION_VOCABULARY, (
+                f"{plugin_dir}: 权限项 {perm!r} 不在 Permission 词表中"
             )
 
 
@@ -1065,6 +1042,23 @@ def _manifest_model(plugin_dir: str, *, version: str | None = None) -> PluginMan
     return PluginManifest.model_validate(data)
 
 
+#: 第 5 节的插件作者私钥：每次运行时生成，不写入磁盘。
+_AUTHOR_KEY = generate_private_key()
+
+
+def _plugin_manager() -> PluginManager:
+    """只信任 ``_AUTHOR_KEY`` 的插件管理器。"""
+    trusted = public_key_pem(_AUTHOR_KEY).decode("ascii")
+    return PluginManager(PluginPolicy(trustedKeys=[trusted]))
+
+
+def _register(manager: PluginManager, manifest: PluginManifest) -> str:
+    """签名后注册；制品内容用占位字节，签名校验只关心内容与签名是否一致。"""
+    artifact = f"{manifest.metadata.id}-{manifest.metadata.version}.tar.gz".encode()
+    signature = PluginSigner().sign(artifact, manifest, _AUTHOR_KEY)
+    return manager.register(manifest, artifact=artifact, signature=signature)
+
+
 class TestUpgradeAndUnloadSafety:
     """升级/卸载安全：运行中引用下的卸载语义与版本并存规则。
 
@@ -1092,10 +1086,8 @@ class TestUpgradeAndUnloadSafety:
 
         期望行为（未实现）：应被拒绝或进入 Draining，见类 docstring。
         """
-        from forgemesh.controlplane.plugin_manager import PluginManager
-
-        manager = PluginManager()
-        pid = manager.register(_manifest_model("decision-rules"))
+        manager = _plugin_manager()
+        pid = _register(manager, _manifest_model("decision-rules"))
 
         # 走完合法安装链路：Discovered → Validating → Installed → Enabled。
         for target in (
@@ -1119,8 +1111,6 @@ class TestUpgradeAndUnloadSafety:
     @_compat
     def test_uninstall_unknown_plugin_rejected(self) -> None:
         """卸载未注册插件须被拒绝（NotFoundError）。"""
-        from forgemesh.controlplane.plugin_manager import PluginManager
-
         manager = PluginManager()
         with pytest.raises(NotFoundError):
             manager.transition(
@@ -1130,10 +1120,8 @@ class TestUpgradeAndUnloadSafety:
     @_compat
     def test_disorderly_transition_rejected(self) -> None:
         """无序转移被拒：Discovered 不能直接 Enabled/Uninstalled 之外的越级跳转。"""
-        from forgemesh.controlplane.plugin_manager import PluginManager
-
-        manager = PluginManager()
-        pid = manager.register(_manifest_model("qos-basic"))
+        manager = _plugin_manager()
+        pid = _register(manager, _manifest_model("qos-basic"))
 
         # 越级：Discovered → Enabled（须先 Validating → Installed）。
         with pytest.raises(InvalidStateTransition):
@@ -1145,10 +1133,8 @@ class TestUpgradeAndUnloadSafety:
     @_compat
     def test_uninstalled_is_terminal_no_revive(self) -> None:
         """Uninstalled 为终态：已卸载插件不可再转移（不可复活/重启用）。"""
-        from forgemesh.controlplane.plugin_manager import PluginManager
-
-        manager = PluginManager()
-        pid = manager.register(_manifest_model("metering-basic"))
+        manager = _plugin_manager()
+        pid = _register(manager, _manifest_model("metering-basic"))
         manager.transition(pid, PluginLifecycleState.VALIDATING)
         manager.transition(pid, PluginLifecycleState.UNINSTALLED)
 
@@ -1158,14 +1144,12 @@ class TestUpgradeAndUnloadSafety:
     @_compat
     def test_same_id_different_versions_coexist(self) -> None:
         """版本并存（ADR-011）：同 id 不同版本以 id:version 复合键并存。"""
-        from forgemesh.controlplane.plugin_manager import PluginManager
-
-        manager = PluginManager()
+        manager = _plugin_manager()
         m_v1 = _manifest_model("decision-rules", version="0.0.1")
         m_v2 = _manifest_model("decision-rules", version="0.1.0")
 
-        pid1 = manager.register(m_v1)
-        pid2 = manager.register(m_v2)
+        pid1 = _register(manager, m_v1)
+        pid2 = _register(manager, m_v2)
 
         assert pid1 != pid2, "不同版本应有不同 plugin_id（id:version）"
         same_id = [
@@ -1182,9 +1166,7 @@ class TestUpgradeAndUnloadSafety:
     @_compat
     def test_duplicate_exact_version_registration_conflicts(self) -> None:
         """重复注册同一 id:version 须抛 ConflictError（并存≠重复注册）。"""
-        from forgemesh.controlplane.plugin_manager import PluginManager
-
-        manager = PluginManager()
-        manager.register(_manifest_model("workflow-reference"))
+        manager = _plugin_manager()
+        _register(manager, _manifest_model("workflow-reference"))
         with pytest.raises(ConflictError, match="already registered"):
-            manager.register(_manifest_model("workflow-reference"))
+            _register(manager, _manifest_model("workflow-reference"))

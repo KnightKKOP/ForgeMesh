@@ -23,6 +23,7 @@ from forgemesh.plugin.isolation import (
     IsolationMode,
     TrustLevel,
 )
+from forgemesh.plugin.loader import load_entrypoint
 from forgemesh.plugin.manifest import (
     PLUGIN_TRANSITIONS,
     PluginCategory,
@@ -32,6 +33,7 @@ from forgemesh.plugin.manifest import (
     PluginSpec,
     validate_plugin_transition,
 )
+from forgemesh.plugin.permissions import Permission
 from forgemesh.plugin.scaffold import KIND_CATEGORY_MAP, SUPPORTED_KINDS, ScaffoldGenerator
 from pydantic import ValidationError
 
@@ -64,9 +66,9 @@ def _make_manifest(**spec_overrides: Any) -> PluginManifest:
         "category": PluginCategory.POLICY,
         "compatibility": {"coreApi": "v1alpha1"},
         "provides": ["test-plugin"],
-        "permissions": ["metrics:read"],
-        "isolation": "restricted-rpc",
-        "entrypoint": "TestPlugin",
+        "permissions": ["metering.read"],
+        "isolation": "in-process",
+        "entrypoint": "provider:TestPlugin",
     }
     spec_fields.update(spec_overrides)
     return PluginManifest(
@@ -135,6 +137,13 @@ class TestPluginManifestSchema:
         assert manifest.metadata.version == "1.0.0"
         assert manifest.spec.isolation == "in-process"
 
+    @pytest.mark.contract
+    @pytest.mark.parametrize("isolation", ["restricted-rpc", "sandbox"])
+    def test_unimplemented_isolation_rejected(self, isolation: str) -> None:
+        """宿主没有进程边界，清单不得声明 restricted-rpc / sandbox。"""
+        with pytest.raises(ValidationError, match="declare 'in-process'"):
+            _make_manifest(isolation=isolation)
+
 
 # ===========================================================================
 # 2. Provider 契约一致性
@@ -173,6 +182,21 @@ class TestProviderContract:
 
         raw = yaml.safe_load((root / "manifest.yaml").read_text(encoding="utf-8"))
         assert raw["spec"]["category"] == KIND_CATEGORY_MAP[kind]
+
+    @pytest.mark.contract
+    @pytest.mark.parametrize("kind", SUPPORTED_KINDS, ids=SUPPORTED_KINDS)
+    def test_scaffold_entrypoint_loads(self, kind: str, tmp_path: Path) -> None:
+        """生成的 manifest 声明的入口点应能按声明加载并实例化。"""
+        root = ScaffoldGenerator().generate(f"test-{kind}-plugin", kind, tmp_path)
+        import yaml
+
+        raw = yaml.safe_load((root / "manifest.yaml").read_text(encoding="utf-8"))
+        manifest = PluginManifest.model_validate(raw)
+        assert manifest.spec.entrypoint == f"provider:Test{kind.capitalize()}Plugin"
+
+        entry = load_entrypoint(root, manifest.spec.entrypoint)
+        assert entry.__name__ == f"Test{kind.capitalize()}Plugin"
+        entry()
 
     @pytest.mark.contract
     @pytest.mark.parametrize("kind", SUPPORTED_KINDS, ids=SUPPORTED_KINDS)
@@ -315,40 +339,59 @@ class TestPermissionModel:
 
     @pytest.mark.contract
     def test_untrusted_cannot_declare_database_permission(self) -> None:
-        """UNTRUSTED 插件声明 database 权限应被拒绝。"""
+        """UNTRUSTED 插件申请 database.access 应被拒绝。"""
         guard = IsolationGuard()
-        with pytest.raises(IsolationError):
-            guard.validate_manifest(TrustLevel.UNTRUSTED, ["database"])
+        with pytest.raises(IsolationError, match="cannot request permissions"):
+            guard.validate_manifest(TrustLevel.UNTRUSTED, ["database.access"])
 
     @pytest.mark.contract
     def test_untrusted_cannot_declare_admin_permission(self) -> None:
-        """UNTRUSTED 插件声明 admin 权限应被拒绝。"""
+        """UNTRUSTED 插件申请 platform.admin 应被拒绝。"""
         guard = IsolationGuard()
-        with pytest.raises(IsolationError):
-            guard.validate_manifest(TrustLevel.UNTRUSTED, ["admin"])
+        with pytest.raises(IsolationError, match="cannot request permissions"):
+            guard.validate_manifest(TrustLevel.UNTRUSTED, ["platform.admin"])
 
     @pytest.mark.contract
     def test_untrusted_can_declare_safe_permission(self) -> None:
-        """UNTRUSTED 插件声明安全权限（如 metrics:read）应通过。"""
+        """UNTRUSTED 插件申请安全权限（如 metering.read）应通过。"""
         guard = IsolationGuard()
-        guard.validate_manifest(TrustLevel.UNTRUSTED, ["metrics:read"])  # 不抛异常
+        guard.validate_manifest(TrustLevel.UNTRUSTED, ["metering.read"])  # 不抛异常
 
     @pytest.mark.contract
     def test_trusted_can_declare_any_permission(self) -> None:
-        """TRUSTED 插件可声明任意权限。"""
+        """TRUSTED 插件可申请词表中的任意权限。"""
         guard = IsolationGuard()
-        guard.validate_manifest(TrustLevel.TRUSTED, ["database", "admin"])  # 不抛异常
+        guard.validate_manifest(TrustLevel.TRUSTED, list(Permission))  # 不抛异常
 
     @pytest.mark.contract
-    @pytest.mark.parametrize("resource", ["database", "filesystem", "network"])
-    def test_restricted_rpc_blocks_direct_resources(self, resource: str) -> None:
-        """RESTRICTED_RPC 模式应禁止直连 database/filesystem/network。"""
+    def test_permission_outside_vocabulary_rejected(self) -> None:
+        """词表外的权限名在任何信任级别下都应被拒绝。"""
         guard = IsolationGuard()
-        with pytest.raises(IsolationError):
-            guard.check_access(TrustLevel.UNTRUSTED, resource)
+        with pytest.raises(IsolationError, match="unknown permission 'admin'"):
+            guard.validate_manifest(TrustLevel.TRUSTED, ["admin"])
+
+    @pytest.mark.contract
+    @pytest.mark.parametrize(
+        "permission", ["database.access", "filesystem.access", "network.egress"]
+    )
+    def test_restricted_rpc_blocks_direct_resources(self, permission: str) -> None:
+        """RESTRICTED_RPC 模式应禁止直接访问宿主资源的权限。"""
+        guard = IsolationGuard()
+        with pytest.raises(IsolationError, match="not available in RESTRICTED_RPC mode"):
+            guard.check_access(TrustLevel.UNTRUSTED, permission)
 
     @pytest.mark.contract
     def test_in_process_allows_all_resources(self) -> None:
-        """IN_PROCESS 模式应允许所有资源访问。"""
+        """IN_PROCESS 模式应允许全部权限。"""
         guard = IsolationGuard()
-        guard.check_access(TrustLevel.TRUSTED, "database")  # 不抛异常
+        for permission in Permission:
+            guard.check_access(TrustLevel.TRUSTED, permission)  # 不抛异常
+
+    @pytest.mark.contract
+    def test_manifest_permissions_limited_to_vocabulary(self) -> None:
+        """清单只能申请词表中的权限，且不得重复。"""
+        assert _make_manifest().spec.permissions == [Permission.METERING_READ]
+        with pytest.raises(ValidationError, match="permissions"):
+            _make_manifest(permissions=["metrics:read"])
+        with pytest.raises(ValidationError, match="duplicate permissions"):
+            _make_manifest(permissions=["resource.read", "resource.read"])

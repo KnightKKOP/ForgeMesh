@@ -4,8 +4,10 @@
 * TrustLevel / IsolationMode 枚举；
 * IsolationPolicy 映射（TRUSTED→IN_PROCESS, UNTRUSTED→RESTRICTED_RPC）；
 * IsolationGuard.check_access（IN_PROCESS 允许全部, RESTRICTED_RPC 禁止
-  database/filesystem/network）；
-* validate_manifest（UNTRUSTED 不允许 database/admin 权限）；
+  network.egress/filesystem.access/database.access）；
+* validate_manifest（UNTRUSTED 不允许 database.access/platform.admin）；
+* 权限名与清单共用 Permission 词表，未知名称报错；
+* 清单 isolation 只能声明 in-process（没有进程边界），仓库内清单均如实声明；
 * PluginVersionCompat.is_compatible（兼容/不兼容）；
 * check_upgrade（非破坏性/破坏性升级）；
 * IVT-8：升级后既有实例按原版本执行。
@@ -13,7 +15,10 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
+import yaml
 from forgemesh.plugin.isolation import (
     IsolationError,
     IsolationGuard,
@@ -23,6 +28,15 @@ from forgemesh.plugin.isolation import (
     TrustLevel,
     UpgradeCheck,
 )
+from forgemesh.plugin.manifest import PluginSpec
+from forgemesh.plugin.permissions import Permission
+from pydantic import ValidationError
+
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+_SHIPPED_MANIFESTS = [
+    *sorted(_REPO_ROOT.glob("plugins/*/manifest.yaml")),
+    _REPO_ROOT / "examples" / "single-node" / "plugin-vllm.yaml",
+]
 
 
 class TestEnums:
@@ -68,38 +82,46 @@ class TestIsolationPolicy:
 
 
 class TestIsolationGuardCheckAccess:
-    """资源访问校验。"""
+    """权限使用校验。"""
 
-    def test_in_process_allows_all_resources(self) -> None:
+    def test_in_process_allows_all_permissions(self) -> None:
         guard = IsolationGuard()
 
-        for resource in ("database", "filesystem", "network", "config", "anything"):
-            guard.check_access(TrustLevel.TRUSTED, resource)  # 不抛异常
+        for permission in Permission:
+            guard.check_access(TrustLevel.TRUSTED, permission)  # 不抛异常
 
-    def test_restricted_rpc_blocks_database(self) -> None:
+    def test_restricted_rpc_blocks_database_access(self) -> None:
         guard = IsolationGuard()
 
-        with pytest.raises(IsolationError, match="database"):
-            guard.check_access(TrustLevel.UNTRUSTED, "database")
+        with pytest.raises(IsolationError, match="database.access"):
+            guard.check_access(TrustLevel.UNTRUSTED, "database.access")
 
-    def test_restricted_rpc_blocks_filesystem(self) -> None:
+    def test_restricted_rpc_blocks_filesystem_access(self) -> None:
         guard = IsolationGuard()
 
-        with pytest.raises(IsolationError, match="filesystem"):
-            guard.check_access(TrustLevel.UNTRUSTED, "filesystem")
+        with pytest.raises(IsolationError, match="filesystem.access"):
+            guard.check_access(TrustLevel.UNTRUSTED, "filesystem.access")
 
-    def test_restricted_rpc_blocks_network(self) -> None:
+    def test_restricted_rpc_blocks_network_egress(self) -> None:
         guard = IsolationGuard()
 
-        with pytest.raises(IsolationError, match="network"):
-            guard.check_access(TrustLevel.UNTRUSTED, "network")
+        with pytest.raises(IsolationError, match="network.egress"):
+            guard.check_access(TrustLevel.UNTRUSTED, "network.egress")
 
-    def test_restricted_rpc_allows_other_resources(self) -> None:
+    def test_restricted_rpc_allows_host_api_permissions(self) -> None:
         guard = IsolationGuard()
 
-        guard.check_access(TrustLevel.UNTRUSTED, "config")
-        guard.check_access(TrustLevel.UNTRUSTED, "metrics")
-        guard.check_access(TrustLevel.VERIFIED, "config")
+        guard.check_access(TrustLevel.UNTRUSTED, "resource.read")
+        guard.check_access(TrustLevel.UNTRUSTED, Permission.METERING_READ)
+        guard.check_access(TrustLevel.VERIFIED, "resource.write")
+
+    @pytest.mark.parametrize("name", ["database", "network", "admin", "metrics:read", ""])
+    def test_unknown_permission_rejected_in_every_mode(self, name: str) -> None:
+        guard = IsolationGuard()
+
+        for trust_level in TrustLevel:
+            with pytest.raises(IsolationError, match="unknown permission"):
+                guard.check_access(trust_level, name)
 
     def test_get_mode(self) -> None:
         guard = IsolationGuard()
@@ -110,35 +132,73 @@ class TestIsolationGuardCheckAccess:
 
 
 class TestValidateManifest:
-    """权限声明校验。"""
+    """权限申请校验。"""
 
-    def test_untrusted_cannot_declare_database(self) -> None:
+    def test_untrusted_cannot_request_database_access(self) -> None:
         guard = IsolationGuard()
 
-        with pytest.raises(IsolationError, match="database"):
-            guard.validate_manifest(TrustLevel.UNTRUSTED, ["database", "read"])
+        with pytest.raises(IsolationError, match="database.access"):
+            guard.validate_manifest(TrustLevel.UNTRUSTED, ["database.access", "resource.read"])
 
-    def test_untrusted_cannot_declare_admin(self) -> None:
+    def test_untrusted_cannot_request_platform_admin(self) -> None:
         guard = IsolationGuard()
 
-        with pytest.raises(IsolationError, match="admin"):
-            guard.validate_manifest(TrustLevel.UNTRUSTED, ["admin"])
+        with pytest.raises(IsolationError, match="platform.admin"):
+            guard.validate_manifest(TrustLevel.UNTRUSTED, ["platform.admin"])
 
-    def test_untrusted_can_declare_safe_permissions(self) -> None:
+    def test_untrusted_can_request_safe_permissions(self) -> None:
         guard = IsolationGuard()
 
-        guard.validate_manifest(TrustLevel.UNTRUSTED, ["read", "metrics", "log"])
+        guard.validate_manifest(
+            TrustLevel.UNTRUSTED, ["resource.read", "metering.read", "event.subscribe"]
+        )
 
-    def test_trusted_can_declare_any_permission(self) -> None:
+    def test_trusted_can_request_any_permission(self) -> None:
         guard = IsolationGuard()
 
-        guard.validate_manifest(TrustLevel.TRUSTED, ["database", "admin"])
+        guard.validate_manifest(TrustLevel.TRUSTED, list(Permission))
 
-    def test_verified_can_declare_database(self) -> None:
+    def test_verified_can_request_database_access(self) -> None:
         """VERIFIED 级别不受 UNTRUSTED 权限限制。"""
         guard = IsolationGuard()
 
-        guard.validate_manifest(TrustLevel.VERIFIED, ["database"])
+        guard.validate_manifest(TrustLevel.VERIFIED, ["database.access"])
+
+    def test_unknown_permission_rejected(self) -> None:
+        guard = IsolationGuard()
+
+        with pytest.raises(IsolationError, match="unknown permission 'admin'"):
+            guard.validate_manifest(TrustLevel.TRUSTED, ["resource.read", "admin"])
+
+
+class TestManifestIsolationDeclaration:
+    """清单 ``spec.isolation``：没有进程边界，只能如实声明 in-process。"""
+
+    @pytest.mark.parametrize("isolation", ["in-process", None])
+    def test_in_process_or_unset_accepted(self, isolation: str | None) -> None:
+        assert PluginSpec(category="policy", isolation=isolation).isolation == isolation
+
+    @pytest.mark.parametrize("isolation", ["restricted-rpc", "sandbox", "RESTRICTED_RPC", ""])
+    def test_other_isolation_rejected(self, isolation: str) -> None:
+        with pytest.raises(ValidationError, match="without a process boundary"):
+            PluginSpec(category="policy", isolation=isolation)
+
+    @pytest.mark.parametrize(
+        "path", _SHIPPED_MANIFESTS, ids=lambda p: str(p.relative_to(_REPO_ROOT))
+    )
+    def test_shipped_manifests_declare_in_process(self, path: Path) -> None:
+        spec = yaml.safe_load(path.read_text(encoding="utf-8"))["spec"]
+
+        assert spec["isolation"] == "in-process"
+
+    def test_typesafe_jev_declares_direct_network_egress(self) -> None:
+        """typesafe-jev 在进程内直接用 urllib 访问外部 API，须如实申请 network.egress。"""
+        plugin = _REPO_ROOT / "plugins" / "decision-typesafe-jev"
+        spec = yaml.safe_load((plugin / "manifest.yaml").read_text(encoding="utf-8"))["spec"]
+
+        assert "urllib.request.urlopen" in (plugin / "provider.py").read_text(encoding="utf-8")
+        assert spec["isolation"] == "in-process"
+        assert "network.egress" in spec["permissions"]
 
 
 class TestIsCompatible:

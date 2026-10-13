@@ -16,8 +16,8 @@ spec:
   permissions:
     - metering.read
     - event.subscribe
-  isolation: restricted-rpc
-  entrypoint: "python -m forgemesh_metering_basic"
+  isolation: in-process
+  entrypoint: "provider:MeteringProvider"
   healthCheck:
     mode: rpc
     timeoutMs: 2000

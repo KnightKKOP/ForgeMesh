@@ -6,13 +6,17 @@
   隔离模式。
 * **隔离模式**：
 
-  - ``IN_PROCESS``——进程内执行，允许所有资源访问。
-  - ``RESTRICTED_RPC``——受限 RPC，禁止直连 ``database`` / ``filesystem`` /
-    ``network``，无直连 DB。
+  - ``IN_PROCESS``——进程内执行，允许全部权限。
+  - ``RESTRICTED_RPC``——受限 RPC，不允许绕过宿主 API 直接访问宿主资源的权限
+    （``network.egress`` / ``filesystem.access`` / ``database.access``）。
 
-* **权限校验**：``UNTRUSTED`` 插件不得声明 ``database`` / ``admin`` 权限。
+* **权限校验**：``UNTRUSTED`` 插件不得申请 ``database.access`` / ``platform.admin``。
 * **升级兼容（IVT-8）**：语义版本兼容检查；升级不静默改变既有工作流实例的
   执行定义——运行实例始终按其记录的插件版本执行，新版本仅作用于后续新建实例。
+
+权限名与插件清单共用 :class:`~forgemesh.plugin.permissions.Permission` 词表，未知的
+权限名直接报错。本模块只回答「某个信任级别的插件能否使用某项权限」，不建立任何进程
+边界：``RESTRICTED_RPC`` 尚无实现，插件代码实际能访问什么不受这里的检查约束。
 
 ``IsolationError`` 复用 :class:`forgemesh.core.errors.ForgeMeshError` 统一异常体系；
 若核心包未就绪，则回退到本地兜底基类。
@@ -21,8 +25,10 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Iterable
 from enum import IntEnum
 
+from forgemesh.plugin.permissions import Permission
 from pydantic import BaseModel
 
 try:  # 优先复用核心包统一异常体系
@@ -60,10 +66,21 @@ class IsolationMode(IntEnum):
     RESTRICTED_RPC = 1
 
 
-# 受限 RPC 下禁止直接访问的资源。
-_RESTRICTED_RESOURCES: frozenset[str] = frozenset({"database", "filesystem", "network"})
-# UNTRUSTED 插件禁止声明的权限。
-_UNTRUSTED_FORBIDDEN_PERMISSIONS: frozenset[str] = frozenset({"database", "admin"})
+# 受限 RPC 下不可用的权限：它们绕过宿主 API，直接访问宿主资源。
+_DIRECT_ACCESS_PERMISSIONS: frozenset[Permission] = frozenset(
+    {Permission.NETWORK_EGRESS, Permission.FILESYSTEM_ACCESS, Permission.DATABASE_ACCESS}
+)
+# UNTRUSTED 插件禁止申请的权限。
+_UNTRUSTED_FORBIDDEN_PERMISSIONS: frozenset[Permission] = frozenset(
+    {Permission.DATABASE_ACCESS, Permission.PLATFORM_ADMIN}
+)
+
+
+def _to_permission(value: Permission | str) -> Permission:
+    try:
+        return Permission(value)
+    except ValueError as exc:
+        raise IsolationError(f"unknown permission {value!r}") from exc
 
 
 class IsolationPolicy:
@@ -98,41 +115,41 @@ class IsolationGuard:
         """获取信任级别对应的隔离模式。"""
         return self.policy.resolve(trust_level)
 
-    def check_access(self, trust_level: TrustLevel, resource: str) -> None:
-        """检查插件对指定资源的访问权限。
+    def check_access(self, trust_level: TrustLevel, permission: Permission | str) -> None:
+        """检查指定信任级别的插件能否使用某项权限。
 
         Args:
             trust_level: 插件信任级别。
-            resource: 资源标识（如 ``database`` / ``filesystem`` / ``network``）。
+            permission: :class:`Permission` 词表中的权限名（如 ``network.egress``）。
 
         Raises:
-            IsolationError: ``RESTRICTED_RPC`` 模式下访问受限资源。
+            IsolationError: 权限名未知，或 ``RESTRICTED_RPC`` 模式下使用直接访问宿主资源
+                的权限。
         """
-        mode = self.get_mode(trust_level)
-        if mode == IsolationMode.IN_PROCESS:
-            return  # 进程内执行：允许所有资源
-        # RESTRICTED_RPC：禁止直连 database/filesystem/network
-        if resource in _RESTRICTED_RESOURCES:
-            raise IsolationError(
-                f"resource {resource!r} not accessible in RESTRICTED_RPC mode",
-            )
+        perm = _to_permission(permission)
+        if self.get_mode(trust_level) == IsolationMode.IN_PROCESS:
+            return
+        if perm in _DIRECT_ACCESS_PERMISSIONS:
+            raise IsolationError(f"permission {perm.value!r} not available in RESTRICTED_RPC mode")
 
-    def validate_manifest(self, trust_level: TrustLevel, permissions: list[str]) -> None:
-        """校验插件权限声明是否与其信任级别相符。
+    def validate_manifest(
+        self, trust_level: TrustLevel, permissions: Iterable[Permission | str]
+    ) -> None:
+        """校验插件申请的权限是否与其信任级别相符。
 
         Args:
             trust_level: 插件信任级别。
-            permissions: 插件声明的权限列表。
+            permissions: 插件清单申请的权限。
 
         Raises:
-            IsolationError: ``UNTRUSTED`` 插件声明了 ``database`` 或 ``admin`` 权限。
+            IsolationError: 权限名未知，或 ``UNTRUSTED`` 插件申请了 ``database.access`` /
+                ``platform.admin``。
         """
+        requested = {_to_permission(p) for p in permissions}
         if trust_level == TrustLevel.UNTRUSTED:
-            forbidden = _UNTRUSTED_FORBIDDEN_PERMISSIONS & set(permissions)
+            forbidden = sorted(p.value for p in requested & _UNTRUSTED_FORBIDDEN_PERMISSIONS)
             if forbidden:
-                raise IsolationError(
-                    f"UNTRUSTED plugin cannot declare permissions: {sorted(forbidden)}",
-                )
+                raise IsolationError(f"UNTRUSTED plugin cannot request permissions: {forbidden}")
 
 
 # ---------------------------------------------------------------------------

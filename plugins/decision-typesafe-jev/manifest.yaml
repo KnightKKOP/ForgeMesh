@@ -17,8 +17,8 @@ spec:
     - resource.read
     - decision.evaluate
     - network.egress
-  isolation: restricted-rpc
-  entrypoint: "python -m forgemesh_decision_typesafe_jev"
+  isolation: in-process
+  entrypoint: "provider:TypeSafeJevProvider"
   healthCheck:
     mode: http
     timeoutMs: 3000

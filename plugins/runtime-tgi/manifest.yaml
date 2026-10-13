@@ -18,8 +18,8 @@ spec:
     - resource.read
     - inference.deploy
     - inference.inspect
-  isolation: restricted-rpc
-  entrypoint: "python -m forgemesh_runtime_tgi"
+  isolation: in-process
+  entrypoint: "provider:TgiRuntimeProvider"
   healthCheck:
     mode: rpc
     timeoutMs: 2000

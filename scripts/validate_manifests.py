@@ -8,10 +8,13 @@
    未声明时缺省 Draft 2020-12。
 2. 实例校验：用 ``api/schemas/plugin-manifest.schema.json`` 逐个校验
    ``plugins/*/manifest.yaml``（yaml.safe_load 后经 jsonschema 校验）。
+   ``spec.permissions`` 由 schema 的枚举限定在权限词表内；该枚举与
+   ``forgemesh.plugin.permissions.Permission`` 一致（契约测试保证）。
 
 schema 之外追加两条平台约定检查（manifest 必须满足而 schema 未强制）：
 
-- ``spec.entrypoint`` 必填且为非空字符串（插件入口冒烟的依据）；
+- ``spec.entrypoint`` 必填且为非空字符串（插件入口冒烟按它加载；``<模块>:<类>``
+  格式由 schema 的 pattern 约束）；
 - ``metadata.version`` 必须是语义化版本 MAJOR.MINOR.PATCH（可选预发布/构建后缀）。
 
 任一失败打印"文件名 + 校验错误路径"并以退出码 1 结束；

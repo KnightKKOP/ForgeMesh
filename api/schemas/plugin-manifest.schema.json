@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://forgemesh.io/schemas/plugin-manifest.schema.json",
   "title": "PluginManifest",
-  "description": "ForgeMesh 插件清单。对齐 architecture 8.2 与 development-plan 5.7 / 6.3。声明能力(provides)与依赖(requires)及最小权限集合；声明能力≠实际具备，运行时须经探测与验证（ADR-006 隔离）。",
+  "description": "ForgeMesh 插件清单。对齐 architecture 8.2 与 development-plan 5.7 / 6.3。声明能力(provides)、依赖(requires)与权限申请(permissions，实际授予由管理员决定)；声明能力≠实际具备，运行时须经探测与验证（ADR-006 隔离）。",
   "type": "object",
   "required": ["apiVersion", "kind", "metadata", "spec"],
   "additionalProperties": false,
@@ -55,8 +55,27 @@
         },
         "permissions": {
           "type": "array",
-          "description": "最小权限集合（按信任级别授予，ADR-006）。",
-          "items": {"type": "string", "minLength": 1},
+          "description": "插件申请的权限，取值与 forgemesh.plugin.permissions.Permission 词表一致；清单不能给自己授权，实际授予由管理员的授予记录决定。",
+          "items": {
+            "type": "string",
+            "enum": [
+              "resource.read",
+              "resource.write",
+              "decision.evaluate",
+              "policy.evaluate",
+              "workflow.execute",
+              "inference.deploy",
+              "inference.inspect",
+              "device.read",
+              "device.partition",
+              "metering.read",
+              "event.subscribe",
+              "network.egress",
+              "filesystem.access",
+              "database.access",
+              "platform.admin"
+            ]
+          },
           "uniqueItems": true
         },
         "compatibility": {
@@ -69,17 +88,23 @@
         },
         "isolation": {
           "type": "string",
-          "enum": ["in-process", "restricted-rpc", "sandbox"],
-          "description": "隔离级别（ADR-006）。"
+          "enum": ["in-process"],
+          "description": "隔离级别。插件都在宿主进程内运行，目前只能声明 in-process；restricted-rpc / sandbox 需要真实的进程边界（ADR-006），实现之前不得声明。"
         },
-        "entrypoint": {"type": "string"},
+        "entrypoint": {
+          "type": "string",
+          "pattern": "^[A-Za-z_][A-Za-z0-9_]*(\\.[A-Za-z_][A-Za-z0-9_]*)*:[A-Za-z_][A-Za-z0-9_]*$",
+          "description": "入口点 <模块>:<类>（如 provider:RulesProvider），模块路径相对于插件包，插件目录须含 __init__.py。"
+        },
         "artifactDigest": {
           "type": "string",
-          "description": "制品摘要，如 sha256:...（供应链安全）。"
+          "deprecated": true,
+          "description": "已弃用，不参与任何校验，计划在 2.0.0 移除。制品摘要记录在随制品分发的独立签名文档中（python -m forgemesh.plugin.signtool sign），注册时由插件管理器校验。"
         },
         "signature": {
           "type": "string",
-          "description": "制品签名，如 cosign:...（供应链安全）。"
+          "deprecated": true,
+          "description": "已弃用，不参与任何校验，计划在 2.0.0 移除。签名是随制品分发的独立签名文档（python -m forgemesh.plugin.signtool sign），注册时由插件管理器校验。"
         },
         "configuration": {
           "type": "object",

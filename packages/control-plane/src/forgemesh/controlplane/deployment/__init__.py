@@ -11,6 +11,8 @@
 * :mod:`.fake` —— 在控制平面进程内为每个实例提供 OpenAI 兼容桩服务的
   :class:`FakeLauncher`（CI 与本地开发）；
 * :mod:`.process` —— 本机进程启动器的公共部分（启动、就绪检查与停止）；
+* :mod:`.process_records` —— 本机进程启动器的实例记录文件（:func:`record_file_path`），
+  控制平面被杀死之后下次启动时据此结束留下的实例进程；
 * :mod:`.vllm_process` —— 把每个实例作为本机 vLLM 子进程运行的 :class:`VLLMProcessLauncher`；
 * :mod:`.tgi_process` —— 把每个实例作为本机 TGI 子进程运行的 :class:`TGIProcessLauncher`；
 * :mod:`.config` —— 按环境变量（``FORGEMESH_RUNTIME_LAUNCHER`` 等）选择启动器的
@@ -33,6 +35,7 @@ from .config import (
 from .fake import FakeLauncher
 from .launcher import LaunchedInstance, LaunchRequest, RuntimeLauncher
 from .memory import InMemoryLauncher
+from .process_records import record_file_path
 from .recovery import (
     DEFAULT_INSTANCE_CHECK_INTERVAL_SECONDS,
     INSTANCE_LOST_REASON,
@@ -87,4 +90,5 @@ __all__ = [
     "launched_instance",
     "launcher_from_env",
     "reclaim_orphaned_allocations",
+    "record_file_path",
 ]

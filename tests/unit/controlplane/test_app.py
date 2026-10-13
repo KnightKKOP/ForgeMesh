@@ -1,12 +1,16 @@
 """控制平面应用入口测试：真实路由已挂载、存储可配置、探针反映存储状态、控制器随应用运行、
-配置加速器清单时启用调度器、配置启动器时启用部署、定期核对实例并回收孤立的分配（完整闭环
-见 ``tests/e2e/test_closed_loop.py``）。"""
+配置加速器清单时启用调度器、配置启动器时启用部署、启动时结束上次运行留下的实例进程、定期
+核对实例并回收孤立的分配（完整闭环见 ``tests/e2e/test_closed_loop.py``）。"""
 
 from __future__ import annotations
 
 import asyncio
 import json
+import os
+import signal
 import sqlite3
+import subprocess
+import sys
 import time
 from pathlib import Path
 from typing import Any
@@ -321,8 +325,8 @@ def test_a_launcher_enables_deployments_with_their_own_workflow_database(
 def test_deployments_recover_before_the_controller_starts_and_stop_after_it(
     tmp_path, monkeypatch
 ) -> None:
-    """启动：恢复未完成的部署 → 标记实例已丢失的服务 → 控制器；关闭：控制器 → 工作流运行时
-    （其补偿还会调用启动器）→ 启动器 → 工作流存储。"""
+    """启动：结束上次运行留下的实例 → 恢复未完成的部署 → 标记实例已丢失的服务 → 控制器；
+    关闭：控制器 → 工作流运行时（其补偿还会调用启动器）→ 启动器 → 工作流存储。"""
     calls: list[str] = []
 
     def record(owner: Any, name: str, label: str) -> None:
@@ -334,6 +338,7 @@ def test_deployments_recover_before_the_controller_starts_and_stop_after_it(
 
         monkeypatch.setattr(owner, name, wrapper)
 
+    record(FakeLauncher, "start", "launcher.start")
     record(LocalWorkflowRuntime, "recover", "runtime.recover")
     record(app_module, "check_instances", "check_instances")
     record(ControllerManager, "start", "controller.start")
@@ -347,13 +352,50 @@ def test_deployments_recover_before_the_controller_starts_and_stop_after_it(
     with TestClient(create_app(db_path=str(tmp_path / "cp.db"))):
         started = list(calls)
 
-    assert started == ["runtime.recover", "check_instances", "controller.start"]
+    assert started == ["launcher.start", "runtime.recover", "check_instances", "controller.start"]
     assert calls[len(started) :] == [
         "controller.stop",
         "runtime.aclose",
         "launcher.aclose",
         "workflow_store.close",
     ]
+
+
+@pytest.mark.unit
+def test_the_app_stops_instance_processes_a_killed_control_plane_left_running(
+    tmp_path, monkeypatch
+) -> None:
+    """进程启动器的实例记录在数据库旁的 ``cp.instances.json`` 中：应用开始服务时，被杀死的
+    控制平面留下、仍在运行的实例进程已经结束，记录已删去。"""
+    record_file = tmp_path / "cp.instances.json"
+    monkeypatch.setenv(INVENTORY_FILE_ENV, str(_write_inventory(tmp_path)))
+    monkeypatch.setenv(launcher_config.RUNTIME_LAUNCHER_ENV, "vllm-process")
+    monkeypatch.setenv(launcher_config.VLLM_COMMAND_ENV, sys.executable)
+    leftover = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(600)"], start_new_session=True
+    )
+    try:
+        stat = Path(f"/proc/{leftover.pid}/stat").read_text().rpartition(")")[2].split()
+        boot_id = Path("/proc/sys/kernel/random/boot_id").read_text(encoding="ascii").strip()
+        instance = {
+            "instanceId": "vllm-0123456789ab",
+            "instanceKey": "deployment:uid-llama:1",
+            "pid": leftover.pid,
+            "startTime": int(stat[19]),
+        }
+        content = {
+            "version": 1,
+            "bootId": boot_id,
+            "pidNamespace": os.readlink("/proc/self/ns/pid"),
+        }
+        record_file.write_text(json.dumps({**content, "instances": [instance]}))
+
+        with TestClient(create_app(db_path=str(tmp_path / "cp.db"))):
+            assert leftover.poll() == -signal.SIGTERM
+            assert json.loads(record_file.read_text()) == {**content, "instances": []}
+    finally:
+        leftover.kill()
+        leftover.wait()
 
 
 @pytest.mark.unit

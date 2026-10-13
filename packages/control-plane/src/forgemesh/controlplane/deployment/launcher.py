@@ -5,7 +5,8 @@
 :meth:`~RuntimeLauncher.prepare`、:meth:`~RuntimeLauncher.launch` 与
 :meth:`~RuntimeLauncher.verify`；部署失败时的补偿与删除资源时调用
 :meth:`~RuntimeLauncher.stop`。控制平面用 :meth:`~RuntimeLauncher.is_running` 确认实例
-仍在运行（重启之后、写入 ``Ready`` 之前），关闭时调用 :meth:`~RuntimeLauncher.aclose`。
+仍在运行（重启之后、写入 ``Ready`` 之前），启动时（恢复部署之前）调用
+:meth:`~RuntimeLauncher.start`，关闭时调用 :meth:`~RuntimeLauncher.aclose`。
 
 契约放在控制平面而不是契约包中：启动器由控制平面按配置选择和组装，请求直接使用强类型
 的 :class:`~forgemesh.resource.inference.InferenceServiceSpec`。插件不能导入控制平面，
@@ -80,6 +81,13 @@ class RuntimeLauncher(ABC):
     相同的请求再执行一次，因此每个方法都须幂等；每次调用受该步骤的时限约束，超时或取消
     部署时调用方的任务被取消（收到 :class:`asyncio.CancelledError`）。
     """
+
+    async def start(self) -> None:  # noqa: B027 - 可选，实例随控制平面结束的启动器无需准备
+        """应用启动时、恢复未完成的部署之前调用一次；默认什么都不做。
+
+        实例可能比控制平面进程活得更久的启动器（本机子进程）在这里结束控制平面上次运行时
+        留下的实例，它们占用的设备才能重新使用。
+        """
 
     async def prepare(self, request: LaunchRequest) -> None:  # noqa: B027 - 可选步骤，默认不做事
         """准备实例需要的模型制品（下载、校验摘要等）；默认什么都不做。

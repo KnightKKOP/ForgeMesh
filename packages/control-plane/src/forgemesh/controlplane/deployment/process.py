@@ -27,16 +27,19 @@ id 即实例进程的 pid）：``stop`` 向实例进程的进程组发送 ``SIGT
 
 控制平面重启
 ------------
-实例随控制平面结束：``aclose`` 停止全部实例，容器中整个进程树随容器结束。重启之后启动器
-不认识重启之前的实例。直接在主机上运行、控制平面被 ``SIGKILL`` 时，实例进程（不在控制
-平面的进程组中）不会随之结束、继续占用 GPU：请以容器或 systemd 服务（默认
-``KillMode=control-group``）运行控制平面。
+``aclose`` 停止全部实例，容器中整个进程树随容器结束。重启之后启动器不认识重启之前的实例
+（``is_running`` 返回 ``False``）。控制平面直接在主机上运行、被 ``SIGKILL`` 时，实例进程在
+自己的会话中，不会随之结束：给出 ``record_file`` 时启动器把每个实例记在这个文件中，下次
+启动时 :meth:`ProcessLauncher.start` 结束其中仍在运行的实例，保证与限制见
+:mod:`.process_records`。以 systemd 服务（默认 ``KillMode=control-group``）运行时，控制
+平面的主进程结束之后 systemd 还会结束服务 cgroup 中剩下的进程。
 """
 
 from __future__ import annotations
 
 import asyncio
 import contextlib
+import functools
 import logging
 import math
 import os
@@ -47,7 +50,7 @@ import socket
 import tempfile
 import uuid
 from abc import abstractmethod
-from collections.abc import Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from typing import ClassVar
 
@@ -55,6 +58,7 @@ from forgemesh.resource.inference import EndpointProtocol
 
 from .launcher import LaunchedInstance, LaunchRequest, RuntimeLauncher
 from .network import instance_url, local_address, probe_health, resolve_hosts, socket_family
+from .process_records import ProcessRecord, ProcessRecordFile, directory_prefix
 
 #: 默认监听地址（同时也是默认写进实例地址的主机）。
 DEFAULT_BIND_HOST = "127.0.0.1"
@@ -69,6 +73,7 @@ _INDEX_DEVICE = re.compile(r"(?:gpu-)?([0-9]+)")
 _UUID_DEVICE = re.compile(r"(?:GPU|MIG)-[0-9A-Za-z][0-9A-Za-z/-]*")
 _PORT_ATTEMPTS = 20
 _KILL_POLL_SECONDS = 0.05
+_ENDED_STATES = (b"Z", b"X")
 
 
 def cuda_device(device_id: str) -> str:
@@ -99,6 +104,34 @@ def _signal_group(pgid: int, sig: signal.Signals) -> None:
         os.killpg(pgid, sig)
 
 
+def _stat_fields(pid: int) -> list[bytes] | None:
+    """``/proc/<pid>/stat`` 中进程名之后的各项（从第 3 项状态开始）；读不到时为 ``None``。"""
+    try:
+        with open(f"/proc/{pid}/stat", "rb") as file:
+            stat = file.read()
+    except OSError:
+        return None
+    # 进程名在括号中且可能含空格与括号。
+    return stat.rpartition(b")")[2].split()
+
+
+def _start_time(pid: int) -> int | None:
+    """进程的启动时间（开机以来的时钟滴答数，第 22 项）；读不到时为 ``None``。"""
+    fields = _stat_fields(pid)
+    return int(fields[19]) if fields is not None and len(fields) >= 20 else None
+
+
+def _runs(pid: int, start_time: int) -> bool:
+    """``pid`` 仍是启动时间为 ``start_time`` 的进程，而且尚未结束（僵尸进程不算）。"""
+    fields = _stat_fields(pid)
+    return (
+        fields is not None
+        and len(fields) >= 20
+        and fields[0] not in _ENDED_STATES
+        and int(fields[19]) == start_time
+    )
+
+
 def _session_groups(sid: int) -> set[int]:
     """会话 ``sid`` 中尚未结束的进程（僵尸进程不算）所在的进程组；没有 ``/proc`` 时为空。"""
     try:
@@ -107,18 +140,59 @@ def _session_groups(sid: int) -> set[int]:
         return set()
     groups: set[int] = set()
     for entry in entries:
-        if not entry.isdigit():
-            continue
-        try:
-            with open(f"/proc/{entry}/stat", "rb") as file:
-                stat = file.read()
-        except OSError:
-            continue
-        # 进程名在括号中且可能含空格与括号：其后依次是状态、父进程、进程组与会话。
-        fields = stat.rpartition(b")")[2].split()
-        if len(fields) >= 4 and int(fields[3]) == sid and fields[0] not in (b"Z", b"X"):
+        fields = _stat_fields(int(entry)) if entry.isdigit() else None
+        # 前四项依次是状态、父进程、进程组与会话。
+        if (
+            fields is not None
+            and len(fields) >= 4
+            and int(fields[3]) == sid
+            and fields[0] not in _ENDED_STATES
+        ):
             groups.add(int(fields[2]))
     return groups
+
+
+async def _end_session(
+    sid: int,
+    leader_running: Callable[[], bool],
+    wait: Callable[[float], Awaitable[object]],
+    name: str,
+) -> None:
+    """向会话 ``sid`` 中的每个进程组发送 ``SIGKILL``，直到首进程与会话中的进程都已退出。
+
+    Args:
+        sid: 会话 id，即首进程（实例进程）的 pid。
+        leader_running: 首进程是否仍在运行；只在它运行时向 ``sid`` 这个进程组发送信号。
+        wait: 至多等待给定的秒数（首进程退出时可以提前返回）。
+        name: 错误信息中的实例。
+
+    Raises:
+        RuntimeError: :data:`KILL_WAIT_SECONDS` 秒之后仍有进程没有退出。
+    """
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + KILL_WAIT_SECONDS
+    while True:
+        groups = await asyncio.to_thread(_session_groups, sid)
+        running = leader_running()
+        for pgid in groups | ({sid} if running else set()):
+            _signal_group(pgid, signal.SIGKILL)
+        if not running and not groups:
+            return
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            detail = (
+                f"(pid {sid})"
+                if running
+                else f"(process groups {', '.join(map(str, sorted(groups)))})"
+            )
+            raise RuntimeError(f"{name} {detail} did not exit after SIGKILL")
+        await wait(min(_KILL_POLL_SECONDS, remaining))
+
+
+async def _wait_for_exit(process: asyncio.subprocess.Process, timeout: float) -> None:
+    with contextlib.suppress(TimeoutError):
+        async with asyncio.timeout(timeout):
+            await process.wait()
 
 
 class LaunchResources:
@@ -182,6 +256,8 @@ class ProcessLauncher(RuntimeLauncher):
         ready_timeout: 进程启动后等它就绪的时限（秒）。
         stop_grace: ``SIGTERM`` 之后等进程退出的宽限期（秒），之后 ``SIGKILL``。
         poll_interval: 等待就绪时两次 ``GET /health`` 之间的秒数。
+        record_file: 实例记录文件（见 :mod:`.process_records`）；为空时不记录实例，
+            :meth:`start` 什么都不做。
 
     Raises:
         ValueError: 命令为空、地址非法或时间不是正数。
@@ -208,6 +284,7 @@ class ProcessLauncher(RuntimeLauncher):
         ready_timeout: float = DEFAULT_READY_TIMEOUT_SECONDS,
         stop_grace: float = DEFAULT_STOP_GRACE_SECONDS,
         poll_interval: float = 1.0,
+        record_file: str | None = None,
     ) -> None:
         if command is None:
             command = self.default_command
@@ -227,6 +304,7 @@ class ProcessLauncher(RuntimeLauncher):
         self._ready_timeout = _positive("ready_timeout", ready_timeout)
         self._stop_grace = _positive("stop_grace", stop_grace)
         self._poll_interval = _positive("poll_interval", poll_interval)
+        self._records = ProcessRecordFile(record_file) if record_file is not None else None
         self._by_key: dict[str, _Process] = {}
         self._by_id: dict[str, _Process] = {}
         self._closed = False
@@ -274,6 +352,46 @@ class ProcessLauncher(RuntimeLauncher):
             resources: 需要时从中再取空闲端口或私有临时目录。
         """
 
+    async def start(self) -> None:
+        """结束控制平面上次运行时启动、仍在运行的实例（见 :mod:`.process_records`）。
+
+        结束不了的实例记一条错误日志并保留记录，下次启动时再试。
+        """
+        if self._records is None:
+            return
+        if not self._records.enabled:
+            self._logger.warning(
+                "instances are not recorded in %s: the boot id and PID namespace cannot be read "
+                "from /proc, so instances left running by a killed control plane are not "
+                "stopped at startup",
+                self._records.path,
+            )
+            return
+        leftovers = self._records.leftovers()
+        results = await asyncio.gather(
+            *(self._stop_leftover(record) for record in leftovers), return_exceptions=True
+        )
+        for record, result in zip(leftovers, results, strict=True):
+            if isinstance(result, BaseException):
+                self._logger.error(
+                    "instance %s (pid %d), left running before the control plane restarted, "
+                    "could not be stopped; it is stopped again at the next start: %r",
+                    record.instance_id,
+                    record.pid,
+                    result,
+                )
+                continue
+            if result:
+                self._logger.warning(
+                    "stopped instance %s (pid %d, instance_key=%s), left running before the "
+                    "control plane restarted",
+                    record.instance_id,
+                    record.pid,
+                    record.instance_key,
+                )
+            record.remove_directories()
+            self._records.remove(record.instance_id)
+
     async def launch(self, request: LaunchRequest) -> LaunchedInstance:
         """启动实例进程并立即返回；``instance_key`` 的进程仍在运行时返回它。
 
@@ -281,7 +399,7 @@ class ProcessLauncher(RuntimeLauncher):
             ValueError: 资源不是本启动器服务的运行时、模型引用为空、设备不在本节点或设备 id
                 无法写进 ``CUDA_VISIBLE_DEVICES``。
             RuntimeError: 启动器已关闭，或找不到空闲端口。
-            OSError: 无法启动命令。
+            OSError: 无法启动命令，或无法写入实例记录（进程随即停止）。
         """
         if self._closed:
             raise RuntimeError(f"the {self.runtime_name} process launcher is closed")
@@ -296,7 +414,7 @@ class ProcessLauncher(RuntimeLauncher):
         resources = LaunchResources(
             self._bind_host,
             {port for state in self._by_id.values() for port in state.resources.ports},
-            prefix=f"forgemesh-{instance_id}-",
+            prefix=directory_prefix(instance_id),
         )
         env = {
             name: value for name, value in os.environ.items() if not name.startswith("FORGEMESH_")
@@ -342,6 +460,11 @@ class ProcessLauncher(RuntimeLauncher):
             env["CUDA_VISIBLE_DEVICES"],
             state.key,
         )
+        try:
+            self._record(state)
+        except OSError:
+            await self.stop(instance.instance_id)
+            raise
         return instance
 
     async def verify(self, instance: LaunchedInstance) -> None:
@@ -396,8 +519,9 @@ class ProcessLauncher(RuntimeLauncher):
             *(self._terminate(state) for state in states), return_exceptions=True
         )
         for state, result in zip(states, results, strict=True):
-            self._forget(state)
-            if isinstance(result, BaseException):
+            failed = isinstance(result, BaseException)
+            self._forget(state, stopped=not failed)
+            if failed:
                 self._logger.error(
                     "%s instance %s (pid %d) could not be stopped: %r",
                     self.runtime_name,
@@ -423,11 +547,30 @@ class ProcessLauncher(RuntimeLauncher):
             )
         return [cuda_device(device.device_id) for device in request.devices]
 
-    def _forget(self, state: _Process) -> None:
+    def _record(self, state: _Process) -> None:
+        if self._records is None:
+            return
+        start_time = _start_time(state.process.pid)
+        if start_time is None:
+            return
+        self._records.add(
+            ProcessRecord(
+                instance_id=state.instance.instance_id,
+                instance_key=state.key,
+                pid=state.process.pid,
+                start_time=start_time,
+                directories=tuple(state.resources.directories),
+            )
+        )
+
+    def _forget(self, state: _Process, *, stopped: bool = True) -> None:
+        """不再管理实例；``stopped`` 为假（没能停止）时保留它的记录，下次启动时再结束它。"""
         self._by_id.pop(state.instance.instance_id, None)
         if self._by_key.get(state.key) is state:
             del self._by_key[state.key]
         state.resources.remove_directories()
+        if stopped and self._records is not None:
+            self._records.remove(state.instance.instance_id)
 
     async def _terminate(self, state: _Process) -> None:
         process = state.process
@@ -444,7 +587,15 @@ class ProcessLauncher(RuntimeLauncher):
                     process.pid,
                     self._stop_grace,
                 )
-        await self._kill_session(state)
+        # 实例进程已被回收时，它的进程组中可能还有进程，没有 /proc 时会话扫描找不到它们；
+        # 进程组中还有进程时这个 id 不会被复用。
+        _signal_group(process.pid, signal.SIGKILL)
+        await _end_session(
+            process.pid,
+            lambda: process.returncode is None,
+            functools.partial(_wait_for_exit, process),
+            f"instance {state.instance.instance_id}",
+        )
         self._logger.info(
             "%s instance stopped: instance_id=%s pid=%d returncode=%s",
             self.runtime_name,
@@ -453,34 +604,25 @@ class ProcessLauncher(RuntimeLauncher):
             process.returncode,
         )
 
-    async def _kill_session(self, state: _Process) -> None:
-        """向实例会话中的每个进程组发送 ``SIGKILL``，直到实例进程与会话中的进程都已退出。
+    async def _stop_leftover(self, record: ProcessRecord) -> bool:
+        """像 :meth:`stop` 那样结束记录中的进程；它已不在（或 pid 已被复用）时返回 ``False``。
 
         Raises:
-            RuntimeError: :data:`KILL_WAIT_SECONDS` 秒之后仍有进程没有退出。
+            RuntimeError: ``SIGKILL`` 之后仍有进程没有退出。
         """
-        process = state.process
+
+        def running() -> bool:
+            return _runs(record.pid, record.start_time)
+
+        if not running():
+            return False
+        _signal_group(record.pid, signal.SIGTERM)
         loop = asyncio.get_running_loop()
-        deadline = loop.time() + KILL_WAIT_SECONDS
-        while True:
-            groups = await asyncio.to_thread(_session_groups, process.pid)
-            for pgid in groups | {process.pid}:
-                _signal_group(pgid, signal.SIGKILL)
-            if process.returncode is not None and not groups:
-                return
-            remaining = deadline - loop.time()
-            if remaining <= 0:
-                running = (
-                    f"(pid {process.pid})"
-                    if process.returncode is None
-                    else f"(process groups {', '.join(map(str, sorted(groups)))})"
-                )
-                raise RuntimeError(
-                    f"instance {state.instance.instance_id} {running} did not exit after SIGKILL"
-                )
-            with contextlib.suppress(TimeoutError):
-                async with asyncio.timeout(min(_KILL_POLL_SECONDS, remaining)):
-                    await process.wait()
+        deadline = loop.time() + self._stop_grace
+        while running() and loop.time() < deadline:
+            await asyncio.sleep(_KILL_POLL_SECONDS)
+        await _end_session(record.pid, running, asyncio.sleep, f"instance {record.instance_id}")
+        return True
 
 
 __all__ = [

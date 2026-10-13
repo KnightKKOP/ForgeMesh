@@ -23,6 +23,9 @@
   ``FORGEMESH_TGI_READY_TIMEOUT_SECONDS``（默认 ``1200``）与
   ``FORGEMESH_TGI_STOP_GRACE_SECONDS``（默认 ``10``）的含义同 ``vllm-process``，对清单的
   要求也相同。
+* ``vllm-process`` 与 ``tgi-process`` 把实例进程记在 ``record_file`` 中（应用使用数据库旁的
+  ``forgemesh.instances.json``），控制平面被杀死之后，下次启动时结束其中仍在运行的进程（见
+  :mod:`~.process_records`）。
 * ``FORGEMESH_INSTANCE_CHECK_INTERVAL_SECONDS``（默认 ``10``，见
   :func:`instance_check_interval_from_env`）：选择了启动器时，控制器每隔这么多秒经启动器
   核对一次 ``Ready`` / ``Degraded`` 服务的实例（见 :func:`~.recovery.check_instances`），
@@ -211,6 +214,7 @@ def _process_launcher(
     env: Mapping[str, str],
     command_from_env: Callable[[Mapping[str, str]], tuple[str, ...]],
     variables: _ProcessVariables,
+    record_file: str | None,
 ) -> ProcessLauncher:
     node_id = _process_node(inventory, launcher)
     command = command_from_env(env)
@@ -222,11 +226,15 @@ def _process_launcher(
         advertise_host=advertise,
         ready_timeout=_seconds(env, variables.ready_timeout, DEFAULT_READY_TIMEOUT_SECONDS),
         stop_grace=_seconds(env, variables.stop_grace, DEFAULT_STOP_GRACE_SECONDS),
+        record_file=record_file,
     )
 
 
 def launcher_from_env(
-    inventory: Inventory | None, environ: Mapping[str, str] | None = None
+    inventory: Inventory | None,
+    environ: Mapping[str, str] | None = None,
+    *,
+    record_file: str | None = None,
 ) -> RuntimeLauncher | None:
     """按环境变量构造启动器；未设置 ``FORGEMESH_RUNTIME_LAUNCHER`` 时返回 ``None``。
 
@@ -234,6 +242,9 @@ def launcher_from_env(
         inventory: 已加载的加速器清单（:func:`~forgemesh.controlplane.scheduler.inventory_from_env`），
             未配置时为 ``None``。
         environ: 环境变量，默认 :data:`os.environ`。
+        record_file: ``vllm-process`` / ``tgi-process`` 记录实例进程的文件（见
+            :mod:`~.process_records`，应用使用数据库旁的
+            :func:`~.process_records.record_file_path`）；为空时不记录。
 
     Raises:
         LauncherConfigError: 启动器未知、缺少清单，或所选启动器的配置非法（见模块说明）。
@@ -259,9 +270,11 @@ def launcher_from_env(
         return FakeLauncher(bind_host=bind, advertise_host=advertise)
     if name == VLLM_PROCESS_LAUNCHER:
         return _process_launcher(
-            VLLMProcessLauncher, inventory, env, _vllm_command, _VLLM_VARIABLES
+            VLLMProcessLauncher, inventory, env, _vllm_command, _VLLM_VARIABLES, record_file
         )
-    return _process_launcher(TGIProcessLauncher, inventory, env, _tgi_command, _TGI_VARIABLES)
+    return _process_launcher(
+        TGIProcessLauncher, inventory, env, _tgi_command, _TGI_VARIABLES, record_file
+    )
 
 
 def instance_check_interval_from_env(environ: Mapping[str, str] | None = None) -> float:

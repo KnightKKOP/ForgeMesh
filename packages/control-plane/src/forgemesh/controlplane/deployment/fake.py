@@ -8,7 +8,10 @@
 * ``POST /v1/chat/completions`` → 请求体须是带非空 ``messages`` 数组的 JSON 对象；
   ``"stream": true`` 时以 SSE 返回若干 ``chat.completion.chunk`` 事件（每个一行
   ``data: {...}``），以 ``data: [DONE]`` 结束，否则返回一个 ``chat.completion`` 对象。
-  回复内容固定，含实例 id。
+  回复内容固定，含实例 id；
+* ``POST /fake/exit`` → ``202``，实例随之像进程退出一样结束：启动器立即不再认为它在运行，
+  随后停止监听、中断其余请求。用来测试控制平面发现并替换丢失的实例（见
+  ``scripts/compose_smoke.sh``）；网关只转发到推理协议的路径，经网关调用不到它。
 
 每个连接只处理一个请求（``Connection: close``）；请求体须以 ``Content-Length`` 给出长度，
 至多 1 MiB。
@@ -46,6 +49,7 @@ MAX_BODY_BYTES = 1024 * 1024
 
 _HEALTH_PATH = "/health"
 _CHAT_PATH = "/v1/chat/completions"
+_EXIT_PATH = "/fake/exit"
 
 
 class _HttpError(Exception):
@@ -148,6 +152,7 @@ class FakeLauncher(RuntimeLauncher):
         self._probe_host = local_address(self._bind_host)
         self._by_key: dict[str, _Instance] = {}
         self._by_id: dict[str, _Instance] = {}
+        self._exits: set[asyncio.Task[None]] = set()
         self._closed = False
 
     @property
@@ -230,12 +235,13 @@ class FakeLauncher(RuntimeLauncher):
         return instance_id in self._by_id
 
     async def aclose(self) -> None:
-        """停止全部实例；之后 :meth:`launch` 抛出 :class:`RuntimeError`。"""
+        """停止全部实例，等正在退出的实例停止监听；之后 :meth:`launch` 抛出
+        :class:`RuntimeError`。"""
         self._closed = True
         states = list(self._by_id.values())
         for state in states:
             self._forget(state)
-        await asyncio.gather(*(self._shutdown(state) for state in states))
+        await asyncio.gather(*(self._shutdown(state) for state in states), *self._exits)
 
     def _forget(self, state: _Instance) -> None:
         self._by_id.pop(state.instance.instance_id, None)
@@ -250,6 +256,18 @@ class FakeLauncher(RuntimeLauncher):
         await asyncio.gather(*connections, return_exceptions=True)
         await state.server.wait_closed()
         logger.info("fake instance stopped: instance_id=%s", state.instance.instance_id)
+
+    def _exit(self, state: _Instance) -> None:
+        """``POST /fake/exit``：实例立即不再算作在运行，随后停止监听、中断其余请求；这个请求
+        不在中断之列，照常得到响应。"""
+        logger.info("fake instance exits on request: instance_id=%s", state.instance.instance_id)
+        self._forget(state)
+        connection = asyncio.current_task()
+        if connection is not None:
+            state.connections.discard(connection)
+        task = asyncio.create_task(self._shutdown(state))
+        self._exits.add(task)
+        task.add_done_callback(self._exits.discard)
 
     async def _serve(
         self, instance_id: str, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
@@ -297,6 +315,11 @@ class FakeLauncher(RuntimeLauncher):
             if method != "POST":
                 raise _HttpError(HTTPStatus.METHOD_NOT_ALLOWED, "use POST", allow="POST")
             return self._chat(state, body)
+        if path == _EXIT_PATH:
+            if method != "POST":
+                raise _HttpError(HTTPStatus.METHOD_NOT_ALLOWED, "use POST", allow="POST")
+            self._exit(state)
+            return [_response(HTTPStatus.ACCEPTED, b"", "text/plain")]
         raise _HttpError(HTTPStatus.NOT_FOUND, f"no route for {path}")
 
     def _chat(self, state: _Instance, body: bytes) -> list[bytes]:

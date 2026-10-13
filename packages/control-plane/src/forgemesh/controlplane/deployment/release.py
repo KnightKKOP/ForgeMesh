@@ -19,8 +19,8 @@ class DeploymentReleaser:
     协调器同样先经它停止旧的实例。
 
     按 :func:`~forgemesh.controlplane.deployment.workflow.find_deployment_runs` 找到资源（uid）
-    的全部部署运行（每一代 spec 一次运行，含 1.1.0 之前不含 generation 的运行），按创建
-    先后逐个处理：
+    的全部部署运行（每一代 spec 一次运行，实例丢失后重新部署时再启动一次，含 1.1.0 之前
+    不含 generation 的运行），按创建先后逐个处理：
 
     * 运行未结束（正在部署）：``cancel(cleanup=True)`` 中断正在执行的步骤、补偿已完成的
       步骤（停止已启动的实例），并等待运行结束；

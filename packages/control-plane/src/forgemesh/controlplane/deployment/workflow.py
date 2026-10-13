@@ -1,7 +1,8 @@
 """推理服务的部署工作流：准备模型 → 启动实例 → 验证实例。
 
 协调器以 :func:`deployment_run_key` 为幂等键启动工作流（资源 uid 的每一代 spec 一次运行，
-:func:`find_deployment_runs` 找回资源的全部运行），运行输入是 :func:`deployment_inputs` 包装的
+实例丢失后重新部署时同一代 spec 再启动一次，:func:`find_deployment_runs` 找回资源的全部
+运行），运行输入是 :func:`deployment_inputs` 包装的
 :class:`~forgemesh.controlplane.deployment.launcher.LaunchRequest`。各步骤经
 :class:`DeploymentSteps` 调用 :class:`~forgemesh.controlplane.deployment.launcher.RuntimeLauncher`：
 
@@ -92,14 +93,21 @@ def deployment_workflow() -> WorkflowDefinition:
     )
 
 
-def deployment_run_key(uid: str, generation: int) -> str:
-    """资源 ``uid`` 第 ``generation`` 代 spec 的部署运行的幂等键，也是实例的幂等键
-    （``LaunchRequest.instance_key``），形如 ``deployment:{uid}:{generation}``。
+def deployment_run_key(uid: str, generation: int, attempt: int = 1) -> str:
+    """资源 ``uid`` 第 ``generation`` 代 spec 第 ``attempt`` 次部署的运行的幂等键，也是实例的
+    幂等键（``LaunchRequest.instance_key``）：第一次形如 ``deployment:{uid}:{generation}``，
+    之后（实例丢失后重新部署）形如 ``deployment:{uid}:{generation}:{attempt}``。
 
-    spec 变化（新的 generation）启动新的运行与新的实例；删除资源或重新部署之前，
+    spec 变化（新的 generation）与重新部署都启动新的运行与新的实例；删除资源或部署之前，
     :func:`find_deployment_runs` 找回资源的全部运行，旧实例不会无人管理。
+
+    Raises:
+        ValueError: ``attempt`` 小于 1。
     """
-    return f"{_RUN_KEY_PREFIX}{uid}:{generation}"
+    if attempt < 1:
+        raise ValueError(f"attempt must be >= 1, got {attempt}")
+    key = f"{_RUN_KEY_PREFIX}{uid}:{generation}"
+    return key if attempt == 1 else f"{key}:{attempt}"
 
 
 @dataclass(frozen=True)
@@ -111,11 +119,13 @@ class DeploymentRun:
         generation: 运行部署的 spec 的 generation；1.1.0 之前的运行（键为
             ``deployment:{uid}``，不含 generation）为 ``None``。
         run: 运行快照。
+        attempt: 这一代 spec 的第几次部署（1.1.0 之前的运行为 1）。
     """
 
     key: str
     generation: int | None
     run: RunInfo
+    attempt: int = 1
 
 
 async def find_deployment_runs(
@@ -124,11 +134,11 @@ async def find_deployment_runs(
     """资源 ``uid`` 的部署运行（不创建），按创建先后排列。
 
     经 :meth:`~forgemesh.workflow.runtime.WorkflowRuntime.find_runs` 按幂等键前缀查找；给出
-    ``generation`` 时只返回部署这一代 spec 的运行，否则返回全部运行，包括 1.1.0 之前的
-    ``deployment:{uid}``。
+    ``generation`` 时只返回部署这一代 spec 的运行（各次部署），否则返回全部运行，包括 1.1.0
+    之前的 ``deployment:{uid}``。
     """
     prefix = f"{_RUN_KEY_PREFIX}{uid}"
-    pattern = re.compile(rf"{re.escape(prefix)}(?::(\d+))?", re.ASCII)
+    pattern = re.compile(rf"{re.escape(prefix)}(?::(\d+)(?::(\d+))?)?", re.ASCII)
     if generation is not None:
         prefix = f"{prefix}:{generation}"
     runs = []
@@ -137,8 +147,9 @@ async def find_deployment_runs(
         if match is None:
             continue
         found = int(match[1]) if match[1] is not None else None
+        attempt = int(match[2]) if match[2] is not None else 1
         if generation is None or found == generation:
-            runs.append(DeploymentRun(key=key, generation=found, run=run))
+            runs.append(DeploymentRun(key=key, generation=found, run=run, attempt=attempt))
     return runs
 
 

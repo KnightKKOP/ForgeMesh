@@ -252,15 +252,21 @@ def test_deployment_workflow_prepares_launches_and_verifies() -> None:
 
 
 @pytest.mark.unit
-def test_deployment_run_key_is_per_resource_uid_and_generation() -> None:
+def test_deployment_run_key_is_per_resource_uid_generation_and_attempt() -> None:
+    """第一次部署的键不带次数（与之前的版本相同），之后的重新部署带上次数。"""
     assert KEY == "deployment:uid-1:1"
+    assert deployment_run_key("uid-1", 1, attempt=1) == KEY
     assert deployment_run_key("uid-1", 2) == "deployment:uid-1:2"
+    assert deployment_run_key("uid-1", 2, attempt=3) == "deployment:uid-1:2:3"
     assert deployment_run_key("uid-2", 1) != KEY
+    with pytest.raises(ValueError, match="attempt must be >= 1"):
+        deployment_run_key("uid-1", 1, attempt=0)
 
 
 @pytest.mark.unit
 def test_find_deployment_runs_returns_the_runs_of_one_resource_in_creation_order() -> None:
-    """包括 1.1.0 之前不含 generation 的键；uid 互为前缀的其他资源不算在内。"""
+    """包括 1.1.0 之前不含 generation 的键与重新部署的各次运行；uid 互为前缀的其他资源
+    不算在内。"""
     keys = [
         "deployment:uid-1:2",
         "deployment:uid-1",
@@ -268,9 +274,12 @@ def test_find_deployment_runs_returns_the_runs_of_one_resource_in_creation_order
         "deployment:uid-1:1",
         "deployment:uid-1:x",
         "deployment:uid-1:12",
+        "deployment:uid-1:1:2",
+        "deployment:uid-1:1:y",
+        "deployment:uid-1:12:3",
     ]
 
-    async def scenario() -> dict[int | None, list[tuple[str, int | None]]]:
+    async def scenario() -> dict[int | None, list[tuple[str, int | None, int]]]:
         runtime = _runtime(InMemoryLauncher())
         try:
             run_ids = {key: await _deploy(runtime, key) for key in keys}
@@ -278,7 +287,7 @@ def test_find_deployment_runs_returns_the_runs_of_one_resource_in_creation_order
             for generation in (None, 1, 2, 3):
                 runs = await find_deployment_runs(runtime, "uid-1", generation)
                 assert all(run.run.run_id == run_ids[run.key] for run in runs)
-                found[generation] = [(run.key, run.generation) for run in runs]
+                found[generation] = [(run.key, run.generation, run.attempt) for run in runs]
             return found
         finally:
             await runtime.aclose()
@@ -286,13 +295,15 @@ def test_find_deployment_runs_returns_the_runs_of_one_resource_in_creation_order
     found = asyncio.run(scenario())
 
     assert found[None] == [
-        ("deployment:uid-1:2", 2),
-        ("deployment:uid-1", None),
-        ("deployment:uid-1:1", 1),
-        ("deployment:uid-1:12", 12),
+        ("deployment:uid-1:2", 2, 1),
+        ("deployment:uid-1", None, 1),
+        ("deployment:uid-1:1", 1, 1),
+        ("deployment:uid-1:12", 12, 1),
+        ("deployment:uid-1:1:2", 1, 2),
+        ("deployment:uid-1:12:3", 12, 3),
     ]
-    assert found[1] == [("deployment:uid-1:1", 1)]
-    assert found[2] == [("deployment:uid-1:2", 2)]
+    assert found[1] == [("deployment:uid-1:1", 1, 1), ("deployment:uid-1:1:2", 1, 2)]
+    assert found[2] == [("deployment:uid-1:2", 2, 1)]
     assert found[3] == []
 
 

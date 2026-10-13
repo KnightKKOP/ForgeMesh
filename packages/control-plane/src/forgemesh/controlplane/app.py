@@ -27,9 +27,11 @@
   ``status.endpoints``；删除时停止实例、释放分配。工作流运行存放在单独的数据库文件
   （:func:`~forgemesh.controlplane.sqlite.workflow_db_path`，如 ``forgemesh.workflows.db``）
   中。启动时先恢复未完成的部署，再把实例已不在运行的 ``Ready`` 服务转为 ``Degraded``
-  （控制器随后重新部署它们），然后才启动控制器；关闭时依次停止控制器、工作流运行时、
-  启动器（其实例随之停止）。``POST /workflows`` 不使用这个运行时（仍返回 503）。未设置时
-  不部署，协调器在分配之前即报告 ``WorkflowRuntimeUnavailable``。
+  （控制器随后重新部署它们），然后才启动控制器；控制器运行中每隔
+  ``FORGEMESH_INSTANCE_CHECK_INTERVAL_SECONDS`` 秒（默认 10，不论是否选择启动器都校验）
+  再核对一次实例。关闭时依次停止控制器、工作流运行时、启动器（其实例随之停止）。
+  ``POST /workflows`` 不使用这个运行时（仍返回 503）。未设置时不部署，协调器在分配之前
+  即报告 ``WorkflowRuntimeUnavailable``。
 * **无导入副作用**：数据库在应用启动（lifespan）时才打开，导入本模块不会
   创建文件。
 * **探针**：``/healthz``（存活）恒为 ok；``/readyz``（就绪）探测权威存储可用。
@@ -41,6 +43,7 @@
 
 from __future__ import annotations
 
+import functools
 import ipaddress
 import json
 import logging
@@ -68,10 +71,12 @@ from .auth import (
 )
 from .controller import ControllerManager
 from .deployment import (
+    DEFAULT_INSTANCE_CHECK_INTERVAL_SECONDS,
     RUNTIME_LAUNCHER_ENV,
     DeploymentReleaser,
     DeploymentSteps,
     check_instances,
+    instance_check_interval_from_env,
     launcher_from_env,
 )
 from .reconciler import ProcessedKeyStore, ReconciliationController
@@ -178,6 +183,7 @@ def _build_controller(
     inventory: Inventory | None,
     runtime: LocalWorkflowRuntime | None = None,
     launcher: RuntimeLauncher | None = None,
+    instance_check_interval: float = DEFAULT_INSTANCE_CHECK_INTERVAL_SECONDS,
 ) -> ControllerManager:
     # 没有授权规则的 DefaultPolicyEngine 拒绝一切操作。资源的创建和删除已经由 API 的
     # 认证与 scope 把关，协调只是推进这些已被接受的期望状态，因此放行 reconcile。
@@ -199,7 +205,16 @@ def _build_controller(
         workflow_poll_interval=WORKFLOW_POLL_INTERVAL_SECONDS,
         launcher=launcher,
     )
-    return ControllerManager(registry, reconciler, poll_interval=CONTROLLER_POLL_INTERVAL_SECONDS)
+    instance_check = (
+        functools.partial(check_instances, registry, launcher) if launcher is not None else None
+    )
+    return ControllerManager(
+        registry,
+        reconciler,
+        poll_interval=CONTROLLER_POLL_INTERVAL_SECONDS,
+        instance_check=instance_check,
+        instance_check_interval=instance_check_interval,
+    )
 
 
 if _FASTAPI_AVAILABLE:
@@ -245,6 +260,7 @@ if _FASTAPI_AVAILABLE:
                     sum(len(node.devices) for node in inventory.nodes),
                 )
             launcher = launcher_from_env(inventory)
+            instance_check_interval = instance_check_interval_from_env()
             path = resolve_db_path(db_path)
             async with AsyncExitStack() as cleanup:
                 registry = init_registry(path)
@@ -279,7 +295,7 @@ if _FASTAPI_AVAILABLE:
                         len(checked),
                     )
                 controller = _build_controller(
-                    registry, processed_store, inventory, runtime, launcher
+                    registry, processed_store, inventory, runtime, launcher, instance_check_interval
                 )
                 cleanup.push_async_callback(controller.stop)
                 await controller.start()

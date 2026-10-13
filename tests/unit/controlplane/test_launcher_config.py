@@ -4,7 +4,9 @@
   加速器清单都拒绝启动；
 * ``fake``：监听地址与写进实例地址的主机；
 * ``vllm-process``：命令（默认要求本解释器装有 ``vllm``）、地址与时限；清单必须恰好有一个
-  节点，设备 id 都能写进 ``CUDA_VISIBLE_DEVICES`` 且不会选中同一块设备。
+  节点，设备 id 都能写进 ``CUDA_VISIBLE_DEVICES`` 且不会选中同一块设备；
+* 控制器核对实例的间隔 ``FORGEMESH_INSTANCE_CHECK_INTERVAL_SECONDS``：默认 10 秒，取值
+  必须是有限的正数秒。
 """
 
 from __future__ import annotations
@@ -18,6 +20,7 @@ from forgemesh.controlplane.deployment import (
     FakeLauncher,
     LauncherConfigError,
     VLLMProcessLauncher,
+    instance_check_interval_from_env,
     launcher_from_env,
 )
 from forgemesh.controlplane.deployment import config as config_module
@@ -313,6 +316,41 @@ def test_the_vllm_launcher_needs_an_inventory_of_this_host(
     assert message in _refusal(inventory, dict(VLLM))
 
 
+# ---------------------------------------------------------------------- #
+# 核对实例的间隔
+# ---------------------------------------------------------------------- #
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("value", "interval"), [(None, 10.0), ("", 10.0), ("  ", 10.0), ("2.5", 2.5), (" 30 ", 30.0)]
+)
+def test_instances_are_checked_every_ten_seconds_unless_configured(
+    value: str | None, interval: float
+) -> None:
+    env = {} if value is None else {"FORGEMESH_INSTANCE_CHECK_INTERVAL_SECONDS": value}
+
+    assert instance_check_interval_from_env(env) == interval
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("value", "problem"),
+    [
+        ("soon", "is not a number of seconds"),
+        ("0", "must be a positive number of seconds"),
+        ("-5", "must be a positive number of seconds"),
+        ("nan", "must be a positive number of seconds"),
+        ("inf", "must be a positive number of seconds"),
+    ],
+)
+def test_an_invalid_instance_check_interval_is_refused(value: str, problem: str) -> None:
+    with pytest.raises(LauncherConfigError) as caught:
+        instance_check_interval_from_env({"FORGEMESH_INSTANCE_CHECK_INTERVAL_SECONDS": value})
+
+    assert str(caught.value) == f"FORGEMESH_INSTANCE_CHECK_INTERVAL_SECONDS={value!r} {problem}"
+
+
 @pytest.mark.unit
 def test_settings_are_read_from_the_process_environment_by_default(
     monkeypatch: pytest.MonkeyPatch,
@@ -320,8 +358,10 @@ def test_settings_are_read_from_the_process_environment_by_default(
     monkeypatch.setenv("FORGEMESH_RUNTIME_LAUNCHER", "fake")
     monkeypatch.setenv("FORGEMESH_FAKE_LAUNCHER_ADVERTISE_HOST", "127.0.0.2")
     monkeypatch.delenv("FORGEMESH_FAKE_LAUNCHER_BIND_HOST", raising=False)
+    monkeypatch.setenv("FORGEMESH_INSTANCE_CHECK_INTERVAL_SECONDS", "3")
 
     launcher = launcher_from_env(ONE_NODE)
 
     assert isinstance(launcher, FakeLauncher)
     assert launcher.advertise_host == "127.0.0.2"
+    assert instance_check_interval_from_env() == 3.0

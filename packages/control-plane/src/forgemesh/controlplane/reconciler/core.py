@@ -59,7 +59,7 @@ generation 的运行（spec 在部署过程中变化，或运行来自 1.1.0 之
 ------------------------
 实例已不在运行的 ``Ready`` 服务由
 :func:`~forgemesh.controlplane.deployment.recovery.check_instances` 转为 ``Degraded``（控制
-平面启动时）。spec 没有变化的 ``Degraded`` 服务每一轮：
+平面启动时，以及控制器运行中定期核对时）。spec 没有变化的 ``Degraded`` 服务每一轮：
 
 * 这一代 spec 最近一次部署的运行进行中：每 ``workflow_poll_interval`` 秒查询一次；
 * 运行成功、实例在运行（实例回来了，或重新部署成功）：回到 ``Ready``，写入实例地址；

@@ -6,12 +6,12 @@
 * :mod:`.release` —— 删除资源或部署新的 spec 之前取消部署、停止实例的
   :class:`DeploymentReleaser`；
 * :mod:`.recovery` —— 把实例已不在运行的 ``Ready`` 服务转为 ``Degraded`` 的
-  :func:`check_instances`；
+  :func:`check_instances`（控制平面启动时与运行中定期调用）；
 * :mod:`.fake` —— 在控制平面进程内为每个实例提供 OpenAI 兼容桩服务的
   :class:`FakeLauncher`（CI 与本地开发）；
 * :mod:`.vllm_process` —— 把每个实例作为本机 vLLM 子进程运行的 :class:`VLLMProcessLauncher`；
 * :mod:`.config` —— 按环境变量（``FORGEMESH_RUNTIME_LAUNCHER`` 等）选择启动器的
-  :func:`launcher_from_env`；
+  :func:`launcher_from_env` 与核对实例的间隔 :func:`instance_check_interval_from_env`；
 * :mod:`.network` —— 启动器共用的地址校验与健康检查；
 * :mod:`.memory` —— 测试替身 :class:`InMemoryLauncher`。
 
@@ -20,11 +20,17 @@
 
 from __future__ import annotations
 
-from .config import RUNTIME_LAUNCHER_ENV, LauncherConfigError, launcher_from_env
+from .config import (
+    INSTANCE_CHECK_INTERVAL_ENV,
+    RUNTIME_LAUNCHER_ENV,
+    LauncherConfigError,
+    instance_check_interval_from_env,
+    launcher_from_env,
+)
 from .fake import FakeLauncher
 from .launcher import LaunchedInstance, LaunchRequest, RuntimeLauncher
 from .memory import InMemoryLauncher
-from .recovery import INSTANCE_LOST_REASON, check_instances
+from .recovery import DEFAULT_INSTANCE_CHECK_INTERVAL_SECONDS, INSTANCE_LOST_REASON, check_instances
 from .release import DeploymentReleaser
 from .vllm_process import VLLMProcessLauncher
 from .workflow import (
@@ -43,7 +49,9 @@ from .workflow import (
 )
 
 __all__ = [
+    "DEFAULT_INSTANCE_CHECK_INTERVAL_SECONDS",
     "DEPLOYMENT_WORKFLOW",
+    "INSTANCE_CHECK_INTERVAL_ENV",
     "INSTANCE_LOST_REASON",
     "LAUNCH_INSTANCE",
     "PREPARE_MODEL",
@@ -65,6 +73,7 @@ __all__ = [
     "deployment_run_key",
     "deployment_workflow",
     "find_deployment_runs",
+    "instance_check_interval_from_env",
     "launched_instance",
     "launcher_from_env",
 ]

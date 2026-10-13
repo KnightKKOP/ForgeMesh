@@ -1,5 +1,6 @@
 """控制平面应用入口测试：真实路由已挂载、存储可配置、探针反映存储状态、控制器随应用运行、
-配置加速器清单时启用调度器、配置启动器时启用部署（完整闭环见 ``tests/e2e/test_closed_loop.py``）。"""
+配置加速器清单时启用调度器、配置启动器时启用部署并定期核对实例（完整闭环见
+``tests/e2e/test_closed_loop.py``）。"""
 
 from __future__ import annotations
 
@@ -77,6 +78,25 @@ def _wait_for_ready_condition(client: TestClient, timeout: float = 5.0) -> dict[
             if condition["type"] == "Ready":
                 return condition
         assert time.monotonic() < deadline, "the controller did not report a Ready condition"
+        time.sleep(0.02)
+
+
+def _wait_for_instance(
+    client: TestClient, other_than: str | None = None, timeout: float = 5.0
+) -> dict[str, Any]:
+    """轮询直到 ``llama`` 为 Ready，且实例不是 ``other_than``，返回它的 endpoint。"""
+    deadline = time.monotonic() + timeout
+    while True:
+        response = client.get(
+            "/api/v1/inference-services/llama", params={"namespace": "default"}, headers=HEADERS
+        )
+        assert response.status_code == 200
+        status = response.json()["status"]
+        if status["phase"] == "Ready":
+            [endpoint] = status["endpoints"]
+            if endpoint["instanceId"] != other_than:
+                return endpoint
+        assert time.monotonic() < deadline, f"llama did not serve a new instance: {status}"
         time.sleep(0.02)
 
 
@@ -320,6 +340,36 @@ def test_deployments_recover_before_the_controller_starts_and_stop_after_it(
 
 
 @pytest.mark.unit
+def test_the_controller_deploys_a_service_again_once_its_instance_exits(
+    tmp_path, monkeypatch
+) -> None:
+    """控制器每隔 FORGEMESH_INSTANCE_CHECK_INTERVAL_SECONDS 秒核对实例：实例在控制器背后停止
+    之后，服务以新的实例回到 Ready。"""
+    launchers: list[Any] = []
+    original = app_module.launcher_from_env
+
+    def recording_launcher_from_env(*args: Any, **kwargs: Any) -> Any:
+        launchers.append(original(*args, **kwargs))
+        return launchers[-1]
+
+    monkeypatch.setattr(app_module, "launcher_from_env", recording_launcher_from_env)
+    monkeypatch.setattr(app_module, "WORKFLOW_POLL_INTERVAL_SECONDS", 0.05)
+    monkeypatch.setenv(INVENTORY_FILE_ENV, str(_write_inventory(tmp_path)))
+    monkeypatch.setenv(launcher_config.RUNTIME_LAUNCHER_ENV, "fake")
+    monkeypatch.setenv(launcher_config.INSTANCE_CHECK_INTERVAL_ENV, "0.05")
+
+    with TestClient(create_app(db_path=str(tmp_path / "cp.db"))) as client:
+        created = client.post("/api/v1/inference-services", json=BODY, headers=HEADERS)
+        assert created.status_code == 201
+        first = _wait_for_instance(client)
+        [launcher] = launchers
+        client.portal.call(launcher.stop, first["instanceId"])
+
+        second = _wait_for_instance(client, other_than=first["instanceId"])
+        assert client.portal.call(launcher.is_running, second["instanceId"])
+
+
+@pytest.mark.unit
 @pytest.mark.parametrize(
     ("settings", "with_inventory", "message"),
     [
@@ -340,6 +390,21 @@ def test_deployments_recover_before_the_controller_starts_and_stop_after_it(
             True,
             "FORGEMESH_FAKE_LAUNCHER_ADVERTISE_HOST must be set",
             id="no-advertise-host",
+        ),
+        pytest.param(
+            {
+                "FORGEMESH_RUNTIME_LAUNCHER": "fake",
+                "FORGEMESH_INSTANCE_CHECK_INTERVAL_SECONDS": "0",
+            },
+            True,
+            "FORGEMESH_INSTANCE_CHECK_INTERVAL_SECONDS='0' must be a positive number of seconds",
+            id="instance-check-interval",
+        ),
+        pytest.param(
+            {"FORGEMESH_INSTANCE_CHECK_INTERVAL_SECONDS": "soon"},
+            False,
+            "FORGEMESH_INSTANCE_CHECK_INTERVAL_SECONDS='soon' is not a number of seconds",
+            id="instance-check-interval-without-launcher",
         ),
     ],
 )

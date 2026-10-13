@@ -1,4 +1,4 @@
-"""按环境变量选择推理实例的启动器。
+"""按环境变量选择推理实例的启动器，以及控制器核对实例的间隔。
 
 * ``FORGEMESH_RUNTIME_LAUNCHER``：``fake``（:class:`~.fake.FakeLauncher`，控制平面进程内的
   OpenAI 兼容桩服务，供 CI 与本地开发）或 ``vllm-process``
@@ -16,6 +16,10 @@
   ``10``）为 ``SIGTERM`` 之后的宽限期。实例只运行在控制平面所在的主机上，因此清单必须
   恰好有一个节点，其设备 id 都能写进 ``CUDA_VISIBLE_DEVICES``，且不会有两个 id 选中同一块
   设备（见 :func:`~.vllm_process.cuda_device`）。
+* ``FORGEMESH_INSTANCE_CHECK_INTERVAL_SECONDS``（默认 ``10``，见
+  :func:`instance_check_interval_from_env`）：选择了启动器时，控制器每隔这么多秒经启动器
+  核对一次 ``Ready`` / ``Degraded`` 服务的实例（见 :func:`~.recovery.check_instances`），
+  实例退出之后的下一次核对把服务转为 ``Degraded``。
 
 未选中的启动器的变量不读取。空白值视同未设置。
 """
@@ -35,6 +39,7 @@ from . import fake, vllm_process
 from .fake import FakeLauncher
 from .launcher import RuntimeLauncher
 from .network import check_advertise_host, check_bind_host, resolve_hosts
+from .recovery import DEFAULT_INSTANCE_CHECK_INTERVAL_SECONDS
 from .vllm_process import (
     DEFAULT_COMMAND,
     DEFAULT_READY_TIMEOUT_SECONDS,
@@ -56,6 +61,7 @@ VLLM_BIND_HOST_ENV = "FORGEMESH_VLLM_BIND_HOST"
 VLLM_ADVERTISE_HOST_ENV = "FORGEMESH_VLLM_ADVERTISE_HOST"
 VLLM_READY_TIMEOUT_ENV = "FORGEMESH_VLLM_READY_TIMEOUT_SECONDS"
 VLLM_STOP_GRACE_ENV = "FORGEMESH_VLLM_STOP_GRACE_SECONDS"
+INSTANCE_CHECK_INTERVAL_ENV = "FORGEMESH_INSTANCE_CHECK_INTERVAL_SECONDS"
 
 
 class LauncherConfigError(ValueError):
@@ -194,10 +200,24 @@ def launcher_from_env(
     )
 
 
+def instance_check_interval_from_env(environ: Mapping[str, str] | None = None) -> float:
+    """控制器两次核对已部署实例之间的秒数（``FORGEMESH_INSTANCE_CHECK_INTERVAL_SECONDS``）。
+
+    Args:
+        environ: 环境变量，默认 :data:`os.environ`。
+
+    Raises:
+        LauncherConfigError: 取值不是有限的正数秒。
+    """
+    env = os.environ if environ is None else environ
+    return _seconds(env, INSTANCE_CHECK_INTERVAL_ENV, DEFAULT_INSTANCE_CHECK_INTERVAL_SECONDS)
+
+
 __all__ = [
     "FAKE_ADVERTISE_HOST_ENV",
     "FAKE_BIND_HOST_ENV",
     "FAKE_LAUNCHER",
+    "INSTANCE_CHECK_INTERVAL_ENV",
     "RUNTIME_LAUNCHER_ENV",
     "VLLM_ADVERTISE_HOST_ENV",
     "VLLM_BIND_HOST_ENV",
@@ -206,5 +226,6 @@ __all__ = [
     "VLLM_READY_TIMEOUT_ENV",
     "VLLM_STOP_GRACE_ENV",
     "LauncherConfigError",
+    "instance_check_interval_from_env",
     "launcher_from_env",
 ]

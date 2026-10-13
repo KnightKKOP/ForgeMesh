@@ -16,7 +16,7 @@
 * ``Ready`` 的服务 spec 变化：经 ``Updating`` 停止旧实例、部署新的 spec 后回到 ``Ready``；
   更新失败时进入 ``Failed``；策略拒绝更新时服务保持原样；
 * 部署中途或 ``Ready`` 之后删除资源：取消运行、停止实例、释放分配、物理删除；
-* 在后台运行的控制器自行完成部署与删除。
+* 在后台运行的控制器自行完成部署与删除，定期核对实例时发现实例退出，自行重新部署。
 
 测试以 ``asyncio.run`` 驱动异步方法，不依赖 pytest-asyncio。“重启”在同一个事件循环中
 关闭全部组件，再以同一数据库文件重新组装；启动器对象沿用，相当于实例在控制平面重启后
@@ -26,6 +26,7 @@
 from __future__ import annotations
 
 import asyncio
+import functools
 import json
 import sqlite3
 import time
@@ -36,6 +37,7 @@ from typing import Any
 import pytest
 from forgemesh.controlplane.controller import ControllerManager
 from forgemesh.controlplane.deployment import (
+    DEFAULT_INSTANCE_CHECK_INTERVAL_SECONDS,
     DeploymentReleaser,
     DeploymentSteps,
     InMemoryLauncher,
@@ -222,7 +224,8 @@ class _ControlPlane:
 
     进入时调用 ``recover()`` 与 ``check_instances(after_restart=True)``（返回值存于
     :attr:`recovered` 与 :attr:`lost`）；退出时按应用的顺序关闭：控制器 → 工作流运行时 →
-    启动器 → 工作流存储 → 去重键存储 → 注册表。``clock`` 为协调器重新部署退避所用的时钟。
+    启动器 → 工作流存储 → 去重键存储 → 注册表。``clock`` 为协调器重新部署退避所用的时钟；
+    控制器管理器运行时每隔 ``instance_check_interval`` 秒核对一次实例。
     """
 
     def __init__(
@@ -232,6 +235,7 @@ class _ControlPlane:
         inventory: Inventory | None = None,
         policy: PolicyEngine | None = None,
         clock: Callable[[], float] = time.monotonic,
+        instance_check_interval: float = DEFAULT_INSTANCE_CHECK_INTERVAL_SECONDS,
     ) -> None:
         self.launcher = launcher
         self.registry = SQLiteRegistry(db)
@@ -254,7 +258,13 @@ class _ControlPlane:
             launcher=launcher,
             clock=clock,
         )
-        self.manager = ControllerManager(self.registry, reconciler, poll_interval=POLL_SECONDS)
+        self.manager = ControllerManager(
+            self.registry,
+            reconciler,
+            poll_interval=POLL_SECONDS,
+            instance_check=functools.partial(check_instances, self.registry, launcher),
+            instance_check_interval=instance_check_interval,
+        )
         self.recovered: list[str] = []
         self.lost: list[ResourceKey] = []
 
@@ -1312,5 +1322,38 @@ def test_a_running_controller_deploys_and_deletes_a_service_on_its_own():
             await _wait_for_phase(plane, None)
             assert launcher.stops == [instance.instance_id]
             await _assert_gone(plane)
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.unit
+def test_a_running_controller_deploys_a_service_again_once_its_instance_exits():
+    """控制器在后台运行、定期核对实例（测试既不逐轮驱动，也不自己核对）：实例退出之后，服务
+    以同一分配上的新实例回到 Ready，退出的实例被停止。"""
+    launcher = _ScriptedLauncher()
+
+    async def serving(plane: _ControlPlane) -> list[Endpoint]:
+        service = await plane.service()
+        return service.status.endpoints if service.status.phase.value == "Ready" else []
+
+    async def scenario() -> None:
+        async with _ControlPlane(
+            ":memory:", launcher, instance_check_interval=POLL_SECONDS
+        ) as plane:
+            await plane.manager.start()
+            await plane.registry.put(_service())
+            await _wait_for_phase(plane, "Ready")
+            [allocation] = await plane.registry.list_allocations(TENANT)
+            [first] = launcher.running.values()
+
+            launcher.down.add(first.instance_id)
+            async with asyncio.timeout(WAIT_SECONDS):
+                while (endpoints := await serving(plane)) in ([], [first.endpoint()]):
+                    await asyncio.sleep(POLL_SECONDS)
+
+            [second] = launcher.running.values()
+            assert endpoints == [second.endpoint()]
+            assert launcher.stops == [first.instance_id]
+            assert await plane.registry.list_allocations(TENANT) == [allocation]
 
     asyncio.run(scenario())

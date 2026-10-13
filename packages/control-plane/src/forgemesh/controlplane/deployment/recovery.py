@@ -5,7 +5,12 @@
 继续转发过去。:func:`check_instances` 经启动器核对实例：实例已不在运行的服务转为
 ``Degraded``，这些实例的 endpoint 标记为未就绪，``Ready=False``（``InstanceLost``），网关
 不再向它们转发（网关缓存解析结果的几秒内除外）；协调器随后按退避重新部署这些服务（见
-:mod:`forgemesh.controlplane.reconciler.core`）。应用在启动控制器之前调用一次。
+:mod:`forgemesh.controlplane.reconciler.core`）。应用在启动控制器之前调用一次
+（``after_restart=True``），之后由控制器管理器定期调用（间隔见
+:mod:`~forgemesh.controlplane.deployment.config`），把它返回的服务加入工作队列。
+
+核对只问启动器实例是否在运行（``is_running``），不探测实例能否服务请求：进程仍在、却
+不再响应的实例不会被发现。
 """
 
 from __future__ import annotations
@@ -25,6 +30,8 @@ logger = logging.getLogger(__name__)
 
 #: 实例已不在运行时 ``Ready`` 条件的原因。
 INSTANCE_LOST_REASON = "InstanceLost"
+#: 控制器两次核对已部署实例之间的默认秒数。
+DEFAULT_INSTANCE_CHECK_INTERVAL_SECONDS = 10.0
 
 _KIND = "InferenceService"
 
@@ -132,4 +139,4 @@ async def check_instances(
     return found
 
 
-__all__ = ["INSTANCE_LOST_REASON", "check_instances"]
+__all__ = ["DEFAULT_INSTANCE_CHECK_INTERVAL_SECONDS", "INSTANCE_LOST_REASON", "check_instances"]

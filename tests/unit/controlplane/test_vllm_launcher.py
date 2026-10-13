@@ -101,7 +101,7 @@ def _gone(pid: int) -> bool:
     """进程已不存在，或已结束、只等父进程回收（僵尸）。"""
     try:
         stat = Path(f"/proc/{pid}/stat").read_text()
-    except FileNotFoundError:
+    except (FileNotFoundError, ProcessLookupError):
         return True
     return stat.rpartition(")")[2].split()[0] in {"Z", "X"}
 

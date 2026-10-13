@@ -122,7 +122,8 @@ func (l *Limiter) maybeGC(now time.Time) {
 	}
 }
 
-// RateLimit 返回按租户限流的中间件，须位于 Authenticate 之后。
+// RateLimit 返回按租户限流的中间件，须位于 Authenticate 之后。超限返回 429 RATE_LIMITED
+// 错误信封与 Retry-After（攒够一个令牌所需的秒数）。
 //
 // key 取自认证中间件注入 context 的租户（来自已验证的凭证），而不是请求头——否则客户端
 // 每换一个租户头就能得到一个新令牌桶。context 中没有租户时（链上未启用认证）按 TCP 对端
@@ -142,7 +143,7 @@ func RateLimit(l *Limiter) Middleware {
 					secs = 1
 				}
 				w.Header().Set("Retry-After", strconv.Itoa(secs))
-				http.Error(w, http.StatusText(http.StatusTooManyRequests), http.StatusTooManyRequests)
+				WriteError(w, r, http.StatusTooManyRequests, "RATE_LIMITED", "rate limit exceeded")
 				return
 			}
 			next.ServeHTTP(w, r)

@@ -103,7 +103,7 @@ def error_body(
     correlation_id: str = "cid-server",
     details: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """控制平面的错误信封。"""
+    """控制平面与网关的错误信封。"""
     error: dict[str, Any] = {"code": code, "message": message, "correlationId": correlation_id}
     if details is not None:
         error["details"] = details

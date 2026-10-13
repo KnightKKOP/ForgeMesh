@@ -2,9 +2,9 @@
 
 网关与控制平面提供同一套 ``/api/v1`` API。一次命令行调用的全部请求带同一个
 ``X-Correlation-Id``，错误消息中显示它，便于在网关与控制平面的日志中找到这次调用。
-错误响应是控制平面与网关的错误信封，或网关自己的纯文本响应（限流 ``429``、连不上控制
-平面 ``502``）；两者都转换为 :class:`~.errors.ApiError`。客户端不跟随重定向，
-``Authorization`` 只发给配置的地址。
+控制平面与网关的错误响应都是错误信封；不是错误信封的错误响应（如网关前面的反向代理返回的
+纯文本 ``429`` / ``502``，或不提供 API 的地址返回的内容）同样转换为
+:class:`~.errors.ApiError`。客户端不跟随重定向，``Authorization`` 只发给配置的地址。
 """
 
 from __future__ import annotations
@@ -244,6 +244,8 @@ class ApiClient:
                 f"correlation id {printable(correlation_id)})",
                 *_validation_errors(details),
             ]
+            if status == 404 and code != "NOT_FOUND":
+                lines[0] += "; check --api-url"
         else:
             lines = [
                 f"{_plain_message(status, headers, raw)} (correlation id {self.correlation_id})"
@@ -296,12 +298,12 @@ def _validation_errors(details: Any) -> list[str]:
 
 
 def _plain_message(status: int, headers: Message, raw: bytes) -> str:
-    """不是错误信封的错误响应（网关的纯文本响应，或不提供 API 的地址）的说明。"""
+    """不是错误信封的错误响应（如网关前面的反向代理或不提供 API 的地址返回的）的说明。"""
     status_line = f"HTTP {status} {_phrase(status)}".rstrip()
     if status == 429:
-        return f"rate limited by the gateway ({status_line})"
+        return f"rate limited ({status_line})"
     if status == 502:
-        return f"the gateway could not reach the control plane ({status_line})"
+        return f"the server could not reach its upstream ({status_line})"
     if 300 <= status < 400:
         location = headers.get("Location")
         target = f" to {printable(location)}" if location else ""

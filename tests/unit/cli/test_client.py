@@ -1,7 +1,7 @@
 """HTTP 客户端单元测试：请求头、错误响应到消息与退出码的映射、重定向、连接失败与翻页。
 
-错误响应有两种：控制平面与网关的错误信封，以及网关自己的纯文本 ``429`` / ``502``（和
-不提供 API 的地址返回的任何内容）。
+错误响应有两种：控制平面与网关的错误信封，以及不是错误信封的响应（如网关前面的反向代理
+返回的纯文本 ``429`` / ``502``，和不提供 API 的地址返回的任何内容）。
 """
 
 from __future__ import annotations
@@ -98,7 +98,29 @@ def test_an_envelope_without_a_correlation_id_shows_the_one_the_cli_sent(api: Fa
     )
 
 
-def test_the_gateway_rate_limit_is_plain_text_with_retry_after(api: FakeApi) -> None:
+def test_the_gateway_rate_limit_keeps_its_code_and_retry_after(api: FakeApi) -> None:
+    api.reply(
+        "GET",
+        PATH,
+        429,
+        error_body("RATE_LIMITED", "rate limit exceeded", "cid-gw"),
+        headers={"Retry-After": "2"},
+    )
+
+    error = get_error(api)
+
+    assert (error.exit_code, error.code, error.retry_after, error.transient) == (
+        ExitCode.RATE_LIMITED,
+        "RATE_LIMITED",
+        2,
+        True,
+    )
+    assert error.message == (
+        "rate limit exceeded (HTTP 429 RATE_LIMITED, correlation id cid-gw); retry after 2 s"
+    )
+
+
+def test_a_plain_text_rate_limit_keeps_retry_after(api: FakeApi) -> None:
     api.reply("GET", PATH, 429, raw=b"Too Many Requests\n", headers={"Retry-After": "2"})
 
     error = get_error(api)
@@ -110,8 +132,7 @@ def test_the_gateway_rate_limit_is_plain_text_with_retry_after(api: FakeApi) -> 
         True,
     )
     assert error.message == (
-        "rate limited by the gateway (HTTP 429 Too Many Requests) (correlation id cid-cli); "
-        "retry after 2 s"
+        "rate limited (HTTP 429 Too Many Requests) (correlation id cid-cli); retry after 2 s"
     )
 
 
@@ -124,15 +145,27 @@ def test_a_retry_after_that_is_not_a_number_of_seconds_is_ignored(api: FakeApi) 
     assert "retry after" not in error.message
 
 
-def test_the_gateway_bad_gateway_is_plain_text(api: FakeApi) -> None:
+def test_the_gateway_without_a_control_plane_is_unavailable(api: FakeApi) -> None:
+    api.reply(
+        "GET", PATH, 502, error_body("UPSTREAM_UNAVAILABLE", "control plane unavailable", "cid-gw")
+    )
+
+    error = get_error(api)
+
+    assert (error.exit_code, error.transient) == (ExitCode.UNAVAILABLE, True)
+    assert error.message == (
+        "control plane unavailable (HTTP 502 UPSTREAM_UNAVAILABLE, correlation id cid-gw)"
+    )
+
+
+def test_a_plain_text_bad_gateway_is_unavailable(api: FakeApi) -> None:
     api.reply("GET", PATH, 502, raw=b"Bad Gateway\n")
 
     error = get_error(api)
 
     assert (error.exit_code, error.transient) == (ExitCode.UNAVAILABLE, True)
     assert error.message == (
-        "the gateway could not reach the control plane (HTTP 502 Bad Gateway) "
-        "(correlation id cid-cli)"
+        "the server could not reach its upstream (HTTP 502 Bad Gateway) (correlation id cid-cli)"
     )
 
 
@@ -144,10 +177,37 @@ def test_a_control_plane_that_is_not_ready_is_unavailable(api: FakeApi) -> None:
     assert (error.exit_code, error.transient) == (ExitCode.UNAVAILABLE, True)
 
 
+def test_the_gateway_route_not_found_does_not_mean_the_service_is_missing(api: FakeApi) -> None:
+    """网关对没有路由的路径返回 ``ROUTE_NOT_FOUND``：地址错了，退出码不能是"资源不存在"。"""
+    api.reply("GET", PATH, 404, error_body("ROUTE_NOT_FOUND", "route not found", "cid-gw"))
+
+    error = get_error(api)
+
+    assert (error.exit_code, error.not_found, error.code) == (
+        ExitCode.ERROR,
+        False,
+        "ROUTE_NOT_FOUND",
+    )
+    assert error.message == (
+        "route not found (HTTP 404 ROUTE_NOT_FOUND, correlation id cid-gw); check --api-url"
+    )
+
+
+def test_a_missing_service_is_not_found(api: FakeApi) -> None:
+    api.reply("GET", PATH, 404, error_body("NOT_FOUND", "InferenceService 'llama' not found"))
+
+    error = get_error(api)
+
+    assert (error.exit_code, error.not_found) == (ExitCode.NOT_FOUND, True)
+    assert error.message == (
+        "InferenceService 'llama' not found (HTTP 404 NOT_FOUND, correlation id cid-server)"
+    )
+
+
 def test_a_404_that_is_not_from_the_api_does_not_mean_the_service_is_missing(
     api: FakeApi,
 ) -> None:
-    """网关对没有路由的路径返回纯文本 404：地址错了，退出码不能是"资源不存在"。"""
+    """不提供 API 的地址返回纯文本 404：地址错了，退出码不能是"资源不存在"。"""
     api.reply("GET", PATH, 404, raw=b"404 page not found\n")
 
     error = get_error(api)

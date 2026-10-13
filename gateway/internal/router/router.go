@@ -16,11 +16,15 @@
 //	                                          ready 实例，轮询分发，按实例协议映射
 //	                                          路径；要求 read 作用域）
 //	ANY  /api/v1/inference/{svc}/chat          同上，用于不带命名空间的服务
+//	ANY  /api/v1/ 下的其他路径                 404 ROUTE_NOT_FOUND（经过完整的中间件链）
+//	ANY  其他路径                              404 ROUTE_NOT_FOUND（经过 Correlation、TraceContext 与
+//	                                          AccessLog，不经过认证与限流）
 //
 // 中间件链（执行顺序）：Observe → Recovery → Correlation → TraceContext → AccessLog →
 // Authenticate → RateLimit → LimitRequestBody → Route。
 // Observe 与 Recovery 包住全量请求（Observe 按路由类别记录请求数与耗时，Recovery 兜底
 // panic）；探针与 /metrics 刻意不经过认证/限流（也不写访问日志），保证健康检查与抓取可用。
+// 除探针的状态文档外，网关自己返回的错误响应都是 JSON 错误信封（见 middleware.WriteError）。
 // 认证模式见 config.AuthModeAPIKey / config.AuthModeDev 与 ADR-014。
 package router
 
@@ -114,6 +118,7 @@ func New(cfg config.Config, logger *log.Logger) (*Router, error) {
 	streamHandler := middleware.RequireScope(middleware.ScopeRead)(streamProxy)
 	apiMux.Handle(streamRoutePattern, streamHandler)
 	apiMux.Handle(streamWithoutNamespacePattern, streamHandler)
+	apiMux.HandleFunc(apiPrefix, notFound)
 
 	maxBody := cfg.MaxRequestBodyBytes
 	if maxBody <= 0 {
@@ -139,12 +144,18 @@ func New(cfg config.Config, logger *log.Logger) (*Router, error) {
 	m.WatchRateLimiter(limiter.Rejected)
 	m.WatchInstances(resolver.InstanceStates)
 
-	// 顶层路由：探针与 /metrics 不经过鉴权/限流。
+	// 顶层路由：探针与 /metrics 不经过鉴权/限流。没有匹配的路径不经过认证与限流，但带关联 ID
+	// 与 trace-id，并写访问日志。
 	root := http.NewServeMux()
 	root.HandleFunc(healthzPath, hc.Live)
 	root.HandleFunc(readyzPath, hc.Ready)
-	root.Handle(metricsPath, m)
+	root.Handle(metricsPath, getOrHead(m))
 	root.Handle(apiPrefix, apiHandler)
+	root.Handle("/", middleware.Chain(http.HandlerFunc(notFound),
+		middleware.Correlation(cfg.CorrelationHeader),
+		middleware.TraceContext(),
+		middleware.AccessLog(logger),
+	))
 
 	// Recovery 兜底全量请求的 panic；Observe 在它外层，兜底返回的 500 也被计入。
 	return &Router{handler: middleware.Chain(root,
@@ -177,6 +188,25 @@ func classifier(root, api *http.ServeMux) func(*http.Request) metrics.Route {
 		}
 		return metrics.RouteUnmatched
 	}
+}
+
+// notFound 回复没有匹配路由的请求。错误码不能是控制平面表示资源不存在的 NOT_FOUND：客户端
+// （如 CLI）以错误码区分资源不存在与地址配置错误。
+func notFound(w http.ResponseWriter, r *http.Request) {
+	middleware.WriteError(w, r, http.StatusNotFound, "ROUTE_NOT_FOUND", "route not found")
+}
+
+// getOrHead 只把 GET 与 HEAD 交给 next，其他方法返回 405 错误信封。用于 /metrics：它不经过
+// Correlation 与 TraceContext，信封不带关联 ID 与 trace-id。
+func getOrHead(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet && r.Method != http.MethodHead {
+			w.Header().Set("Allow", "GET, HEAD")
+			middleware.WriteError(w, r, http.StatusMethodNotAllowed, "METHOD_NOT_ALLOWED", "method not allowed")
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 // newAuthenticator 按配置构造入口认证器；未知模式视为配置错误，绝不退化为信任请求头。

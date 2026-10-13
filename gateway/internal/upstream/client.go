@@ -97,7 +97,7 @@ func New(target *url.URL, correlationHeader, tenantHeader string, logger *log.Lo
 			}
 			logger.Printf("upstream proxy error: corr=%s trace=%s path=%s err=%v", r.Header.Get(c.correlationHeader),
 				middleware.TraceIDFromContext(r.Context()), r.URL.Path, err)
-			http.Error(w, http.StatusText(http.StatusBadGateway), http.StatusBadGateway)
+			middleware.WriteError(w, r, http.StatusBadGateway, "UPSTREAM_UNAVAILABLE", "control plane unavailable")
 		},
 	}
 

@@ -489,8 +489,30 @@ func TestProxy_UpstreamError(t *testing.T) {
 	if rec.Code != http.StatusBadGateway {
 		t.Fatalf("实例不可达应返回 502，实际 %d", rec.Code)
 	}
+	want := `{"error":{"code":"UPSTREAM_UNAVAILABLE","message":"推理实例不可用: ` + endpoint + `"}}` + "\n"
+	if ct := rec.Header().Get("Content-Type"); rec.Body.String() != want || ct != "application/json" {
+		t.Fatalf("应返回 UPSTREAM_UNAVAILABLE 错误信封 %q，实际 %q（%q）", want, rec.Body.String(), ct)
+	}
 	if got := res.failureCount(endpoint); got != 1 {
 		t.Fatalf("应上报 1 次失败，实际 %d", got)
+	}
+}
+
+// TestProxy_UnbuildableUpstreamRequest 验证由实例地址拼出的 URL 无法构造请求时返回 502
+// INVALID_UPSTREAM 错误信封。
+func TestProxy_UnbuildableUpstreamRequest(t *testing.T) {
+	const endpoint = "http://[::1"
+	proxy := New(newFakeResolver(nil, nil), "X-Tenant-ID", allowLoopback, nil)
+
+	rec := httptest.NewRecorder()
+	proxy.forward(rec, newChatRequest("svc-a"), endpoint+"/v1/chat/completions", endpoint, time.Now())
+
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("无法构造实例请求应返回 502，实际 %d", rec.Code)
+	}
+	want := `{"error":{"code":"INVALID_UPSTREAM","message":"实例地址非法: ` + endpoint + `"}}` + "\n"
+	if ct := rec.Header().Get("Content-Type"); rec.Body.String() != want || ct != "application/json" {
+		t.Fatalf("应返回 INVALID_UPSTREAM 错误信封 %q，实际 %q（%q）", want, rec.Body.String(), ct)
 	}
 }
 

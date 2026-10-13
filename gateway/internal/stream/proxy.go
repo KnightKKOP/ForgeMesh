@@ -162,7 +162,7 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, upstreamURL, end
 
 	req, err := http.NewRequestWithContext(ctx, r.Method, upstreamURL, r.Body)
 	if err != nil {
-		http.Error(w, http.StatusText(http.StatusBadGateway), http.StatusBadGateway)
+		middleware.WriteError(w, r, http.StatusBadGateway, "INVALID_UPSTREAM", "实例地址非法: "+endpoint)
 		return
 	}
 	req.Header = copyForwardHeaders(r.Header)
@@ -191,7 +191,7 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, upstreamURL, end
 		if ctx.Err() == nil {
 			p.metrics.UpstreamError(metrics.UpstreamInstance, metrics.ErrorConnect)
 		}
-		http.Error(w, http.StatusText(http.StatusBadGateway), http.StatusBadGateway)
+		middleware.WriteError(w, r, http.StatusBadGateway, "UPSTREAM_UNAVAILABLE", "推理实例不可用: "+endpoint)
 		return
 	}
 	defer resp.Body.Close()

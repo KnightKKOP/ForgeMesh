@@ -166,7 +166,7 @@ func TestChain_ProbeBypassesChainNoLeak(t *testing.T) {
 }
 
 // TestChain_RejectResponsesOpaque 验证认证/限流失败响应不含内部细节：
-// 均为 http.StatusText 风格的固定文案，无堆栈、源码路径或实现细节。
+// 均为固定文案的错误信封，无堆栈、源码路径或实现细节。
 func TestChain_RejectResponsesOpaque(t *testing.T) {
 	h := newAPIChain(NewRateLimiter(0.001, 1), nil)
 
@@ -186,8 +186,9 @@ func TestChain_RejectResponsesOpaque(t *testing.T) {
 	req2.Header.Set(DefaultTenantHeader, "tenant-a")
 	rec429 := httptest.NewRecorder()
 	h.ServeHTTP(rec429, req2)
-	if want := "Too Many Requests\n"; rec429.Body.String() != want {
-		t.Fatalf("429 响应体应为 %q，实际 %q", want, rec429.Body.String())
+	if env := readEnvelope(t, rec429); env.Code != "RATE_LIMITED" || env.Message != "rate limit exceeded" ||
+		env.CorrelationID != rec429.Header().Get(DefaultCorrelationHeader) {
+		t.Fatalf("429 响应体应为带关联 ID 的 RATE_LIMITED 错误信封，实际 %q", rec429.Body.String())
 	}
 
 	// 内部细节泄漏检查（401/429 两类错误信封）。

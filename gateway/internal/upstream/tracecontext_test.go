@@ -110,9 +110,9 @@ func TestClient_ForwardsTraceHeaders(t *testing.T) {
 	}
 }
 
-// TestClient_ErrorLogCarriesCorrelationAndTraceIDs 验证控制平面不可达时的错误日志带关联 ID 与
-// trace-id。
-func TestClient_ErrorLogCarriesCorrelationAndTraceIDs(t *testing.T) {
+// TestClient_ConnectErrorCarriesCorrelationAndTraceIDs 验证控制平面不可达时返回 502
+// UPSTREAM_UNAVAILABLE 错误信封，信封与错误日志都带关联 ID 与 trace-id。
+func TestClient_ConnectErrorCarriesCorrelationAndTraceIDs(t *testing.T) {
 	target, err := url.Parse("http://127.0.0.1:1")
 	if err != nil {
 		t.Fatal(err)
@@ -129,6 +129,11 @@ func TestClient_ErrorLogCarriesCorrelationAndTraceIDs(t *testing.T) {
 
 	if rec.Code != http.StatusBadGateway {
 		t.Fatalf("控制平面不可达应 502，实际 %d", rec.Code)
+	}
+	want := `{"error":{"code":"UPSTREAM_UNAVAILABLE","message":"control plane unavailable",` +
+		`"correlationId":"corr-1","traceId":"` + testTraceID + `"}}` + "\n"
+	if ct := rec.Header().Get("Content-Type"); rec.Body.String() != want || ct != "application/json" {
+		t.Fatalf("应返回错误信封 %q，实际 %q（%q）", want, rec.Body.String(), ct)
 	}
 	if want := "corr=corr-1 trace=" + testTraceID + " "; !strings.Contains(logs.String(), want) {
 		t.Fatalf("错误日志应含 %q，实际 %q", want, logs.String())

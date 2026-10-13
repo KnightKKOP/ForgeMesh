@@ -1,24 +1,41 @@
 """事务性 Outbox 与事件 Dispatcher。
 
-对齐 development-plan 5.5。Outbox 模式保证状态更新与事件发布的原子性：
-同一 SQLite 事务中写入业务状态和事件记录，Dispatcher 异步发布。
+对齐 ADR-008 与 architecture.md §12.3：业务写入与它的事件在同一个 SQLite 事务中提交
+（:meth:`Outbox.put` 不自行提交），:class:`Dispatcher` 异步发布。
 
-幂等保证：消费者按 event_id 去重，重复投递不产生重复副作用。
+投递语义
+--------
+* **至少一次**：事件发布成功后才标记 ``published``；发布成功、标记之前进程退出时，
+  重启后会再次发布。消费者须按 ``event_id`` 去重（:class:`IdempotentConsumer`）。
+* **状态只在数据库中**：``pending`` → ``published``；发布失败时记录失败次数
+  ``attempts`` 与最近一次错误 ``last_error``，按指数退避推迟 ``next_attempt_at``
+  （:class:`RetryPolicy`）；失败次数达到上限后进入 ``dead``，不再自动重试，可经
+  :meth:`Outbox.redrive` 重新投递。Dispatcher 不在内存中记录已处理的事件，重启后
+  不会重复发布已标记 ``published`` 的事件。
+* **顺序**：按创建时间尽力有序。重试与重新投递会让后创建的事件先送达，消费者以
+  资源版本（``resourceVersion``）判断新旧。
 """
 
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import inspect
 import json
+import logging
 import sqlite3
 import time
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
+from dataclasses import dataclass
+from enum import StrEnum
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
 from .sqlite import Database
+
+logger = logging.getLogger(__name__)
 
 _SCHEMA_SQL = """\
 CREATE TABLE IF NOT EXISTS outbox_events (
@@ -29,10 +46,37 @@ CREATE TABLE IF NOT EXISTS outbox_events (
     payload TEXT NOT NULL,
     created_at REAL NOT NULL,
     published_at REAL,
-    status TEXT NOT NULL DEFAULT 'pending'
+    status TEXT NOT NULL DEFAULT 'pending',
+    attempts INTEGER NOT NULL DEFAULT 0,
+    next_attempt_at REAL,
+    last_error TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_outbox_status ON outbox_events(status, created_at);
 """
+
+#: v1.0.0 的 ``outbox_events`` 没有的列（打开存量库时补齐）。
+_ADDED_COLUMNS = (
+    ("attempts", "attempts INTEGER NOT NULL DEFAULT 0"),
+    ("next_attempt_at", "next_attempt_at REAL"),
+    ("last_error", "last_error TEXT"),
+)
+
+#: ``last_error`` 保存的最大字符数。
+_MAX_ERROR_LENGTH = 500
+
+#: 已发布事件默认保留 7 天，之后由 :meth:`Dispatcher.run` 删除。
+DEFAULT_RETENTION_SECONDS = 7 * 24 * 3600.0
+
+_PURGE_INTERVAL_SECONDS = 3600.0
+_MAX_ERROR_BACKOFF_SECONDS = 30.0
+
+
+class OutboxStatus(StrEnum):
+    """``outbox_events.status`` 的取值。"""
+
+    PENDING = "pending"
+    PUBLISHED = "published"
+    DEAD = "dead"
 
 
 class OutboxEvent(BaseModel):
@@ -42,11 +86,14 @@ class OutboxEvent(BaseModel):
         event_id: 事件唯一标识（UUID），消费者据此去重。
         aggregate_type: 聚合根类型（如 InferenceService）。
         aggregate_id: 聚合根标识。
-        event_type: 事件类型（如 Created/Updated/Deleted）。
-        payload: 事件负载（JSON 可序列化字典）。
+        event_type: 事件类型（如 inference.service.created）。
+        payload: 事件负载（JSON 可序列化字典），发布时原样送出。
         created_at: 事件创建时间戳。
         published_at: 事件发布时间戳，未发布时为 None。
-        status: 事件状态（pending/published/failed）。
+        status: 事件状态（pending / published / dead）。
+        attempts: 已失败的发布次数。
+        next_attempt_at: ``pending`` 事件的下次发布时间戳；其余状态为 None。
+        last_error: 最近一次发布失败的原因。
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -58,14 +105,50 @@ class OutboxEvent(BaseModel):
     payload: dict[str, Any] = Field(default_factory=dict)
     created_at: float = Field(default_factory=time.time)
     published_at: float | None = None
-    status: str = "pending"
+    status: OutboxStatus = OutboxStatus.PENDING
+    attempts: int = 0
+    next_attempt_at: float | None = None
+    last_error: str | None = None
+
+
+@dataclass(frozen=True)
+class RetryPolicy:
+    """发布失败后的重试策略。
+
+    第 ``n`` 次失败后等待 ``min(base_delay * 2 ** (n - 1), max_delay)`` 秒再试；失败
+    ``max_attempts`` 次后进入 ``dead``。默认值下两次尝试之间依次等待 1、2、4 … 256 秒，
+    第一次失败约 8.5 分钟后放弃。
+
+    Raises:
+        ValueError: ``max_attempts`` 小于 1、``base_delay`` 不大于 0 或
+            ``max_delay`` 小于 ``base_delay``。
+    """
+
+    max_attempts: int = 10
+    base_delay: float = 1.0
+    max_delay: float = 300.0
+
+    def __post_init__(self) -> None:
+        if self.max_attempts < 1:
+            raise ValueError(f"max_attempts must be >= 1, got {self.max_attempts}")
+        if self.base_delay <= 0:
+            raise ValueError(f"base_delay must be > 0, got {self.base_delay}")
+        if self.max_delay < self.base_delay:
+            raise ValueError(
+                f"max_delay must be >= base_delay, got {self.max_delay} < {self.base_delay}"
+            )
+
+    def delay(self, attempts: int) -> float:
+        """第 ``attempts`` 次失败之后等待的秒数。"""
+        exponent = min(max(attempts - 1, 0), 63)  # 2.0 ** 很大的指数会溢出
+        return min(self.base_delay * 2.0**exponent, self.max_delay)
 
 
 class Outbox:
     """事务性 Outbox（SQLite 后端）。
 
     Outbox 模式核心：业务状态更新与事件写入在同一 SQLite 事务中完成，
-    保证二者原子性。Dispatcher 异步轮询 pending 事件并发布。
+    保证二者原子性。Dispatcher 异步轮询到期的 pending 事件并发布。
 
     Args:
         db_path: SQLite 数据库路径，默认 :memory:。
@@ -80,18 +163,44 @@ class Outbox:
         self._init_schema()
 
     def _init_schema(self) -> None:
-        """创建表与索引（幂等）。"""
+        """创建表与索引（幂等），并迁移存量库。"""
         with self._db.lock:
             self._conn.executescript(_SCHEMA_SQL)
+            self._migrate_legacy_events()
             self._conn.commit()
+
+    def _migrate_legacy_events(self) -> None:
+        """存量库迁移（幂等）：补齐重试相关的列；v1.0.0 的 ``failed``（一次失败即永久
+        放弃）改为 ``dead``，可经 :meth:`redrive` 重新投递；pending 事件以创建时间作为
+        下次发布时间。"""
+        columns = {row["name"] for row in self._conn.execute("PRAGMA table_info(outbox_events)")}
+        for name, ddl in _ADDED_COLUMNS:
+            if name not in columns:
+                self._conn.execute(f"ALTER TABLE outbox_events ADD COLUMN {ddl}")
+                logger.info("migrated outbox_events: added column %r", name)
+        failed = self._conn.execute(
+            "UPDATE outbox_events SET status = ? WHERE status = 'failed'",
+            (OutboxStatus.DEAD.value,),
+        ).rowcount
+        if failed:
+            logger.info("migrated outbox_events: %d legacy 'failed' events are now 'dead'", failed)
+        self._conn.execute(
+            "UPDATE outbox_events SET next_attempt_at = created_at "
+            "WHERE status = ? AND next_attempt_at IS NULL",
+            (OutboxStatus.PENDING.value,),
+        )
 
     @property
     def database(self) -> Database:
         """事件表所在的数据库，供业务写入与事件共用同一个连接和锁。"""
         return self._db
 
+    def _query(self, sql: str, params: tuple[Any, ...] = ()) -> list[sqlite3.Row]:
+        return self._db.call(lambda: self._conn.execute(sql, params).fetchall())
+
     def put(self, event: OutboxEvent) -> None:
-        """在调用方的事务中写入事件，不提交：事件随业务写入一起提交或回滚。
+        """在调用方的事务中写入一个新的 pending 事件，不提交：事件随业务写入一起提交
+        或回滚。``event`` 的状态与重试字段被忽略，事件立即到期。
 
         调用方须持有 :attr:`database` 的锁并已开启事务，例如在
         :meth:`Database.transaction <forgemesh.controlplane.sqlite.Database.transaction>`
@@ -105,8 +214,8 @@ class Outbox:
             raise RuntimeError("Outbox.put must run inside the caller's transaction")
         self._conn.execute(
             "INSERT INTO outbox_events (event_id, aggregate_type, aggregate_id, "
-            "event_type, payload, created_at, status) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            "event_type, payload, created_at, status, attempts, next_attempt_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?)",
             (
                 event.event_id,
                 event.aggregate_type,
@@ -114,31 +223,54 @@ class Outbox:
                 event.event_type,
                 json.dumps(event.payload, ensure_ascii=False),
                 event.created_at,
-                event.status,
+                OutboxStatus.PENDING.value,
+                event.created_at,
             ),
         )
 
     def get_pending(self, limit: int = 100) -> list[OutboxEvent]:
-        """获取待发布事件，按创建时间升序排列。"""
-        rows = self._db.call(
-            lambda: self._conn.execute(
-                "SELECT * FROM outbox_events WHERE status = 'pending' ORDER BY created_at LIMIT ?",
-                (limit,),
-            ).fetchall()
+        """获取 pending 事件（含尚在退避中的），按创建时间升序排列。"""
+        rows = self._query(
+            "SELECT * FROM outbox_events WHERE status = ? ORDER BY created_at, event_id LIMIT ?",
+            (OutboxStatus.PENDING.value, limit),
         )
         return [self._row_to_event(r) for r in rows]
 
-    def mark_published(self, event_id: str) -> None:
+    def due(self, limit: int = 100, now: float | None = None) -> list[OutboxEvent]:
+        """获取已到发布时间的 pending 事件，按创建时间升序排列。
+
+        Args:
+            limit: 最多返回的事件数。
+            now: 当前时间（Unix 秒），默认取系统时间。
+        """
+        at = time.time() if now is None else now
+        rows = self._query(
+            "SELECT * FROM outbox_events WHERE status = ? AND next_attempt_at <= ? "
+            "ORDER BY created_at, event_id LIMIT ?",
+            (OutboxStatus.PENDING.value, at, limit),
+        )
+        return [self._row_to_event(r) for r in rows]
+
+    def list_dead(self, limit: int = 100) -> list[OutboxEvent]:
+        """获取 ``dead`` 事件（含失败次数与最近一次错误），按创建时间升序排列。"""
+        rows = self._query(
+            "SELECT * FROM outbox_events WHERE status = ? ORDER BY created_at, event_id LIMIT ?",
+            (OutboxStatus.DEAD.value, limit),
+        )
+        return [self._row_to_event(r) for r in rows]
+
+    def mark_published(self, event_id: str, now: float | None = None) -> None:
         """标记事件已发布。
 
         仅当事件处于 pending 状态时才可标记；否则抛 ValueError。
         """
+        at = time.time() if now is None else now
 
         def _mark() -> None:
             cur = self._conn.execute(
-                "UPDATE outbox_events SET status = 'published', published_at = ? "
-                "WHERE event_id = ? AND status = 'pending'",
-                (time.time(), event_id),
+                "UPDATE outbox_events SET status = ?, published_at = ?, next_attempt_at = NULL "
+                "WHERE event_id = ? AND status = ?",
+                (OutboxStatus.PUBLISHED.value, at, event_id, OutboxStatus.PENDING.value),
             )
             if cur.rowcount == 0:
                 raise ValueError(f"event not found or already published: {event_id}")
@@ -146,31 +278,108 @@ class Outbox:
 
         self._db.call(_mark)
 
-    def mark_failed(self, event_id: str, reason: str = "") -> None:
-        """标记事件发布失败。
+    def mark_failed(
+        self,
+        event_id: str,
+        reason: str = "",
+        *,
+        policy: RetryPolicy | None = None,
+        now: float | None = None,
+    ) -> OutboxEvent:
+        """记录一次发布失败：按 ``policy`` 推迟下次发布，失败次数达到上限时进入 ``dead``。
 
         Args:
             event_id: 事件标识。
-            reason: 失败原因（保留用于未来扩展，当前未持久化）。
-        """
+            reason: 失败原因，截断到 500 个字符后存入 ``last_error``。
+            policy: 重试策略，默认 :class:`RetryPolicy`。
+            now: 当前时间（Unix 秒），默认取系统时间。
 
-        def _mark() -> None:
+        Returns:
+            更新后的事件。
+
+        Raises:
+            ValueError: 事件不存在或不处于 pending。
+        """
+        retry = policy or RetryPolicy()
+        at = time.time() if now is None else now
+        error = reason[:_MAX_ERROR_LENGTH] or None
+
+        def _mark() -> OutboxEvent:
+            row = self._conn.execute(
+                "SELECT * FROM outbox_events WHERE event_id = ? AND status = ?",
+                (event_id, OutboxStatus.PENDING.value),
+            ).fetchone()
+            if row is None:
+                raise ValueError(f"event not found or not pending: {event_id}")
+            attempts = row["attempts"] + 1
+            if attempts >= retry.max_attempts:
+                status, next_attempt_at = OutboxStatus.DEAD, None
+            else:
+                status, next_attempt_at = OutboxStatus.PENDING, at + retry.delay(attempts)
             self._conn.execute(
-                "UPDATE outbox_events SET status = 'failed' "
-                "WHERE event_id = ? AND status = 'pending'",
-                (event_id,),
+                "UPDATE outbox_events SET status = ?, attempts = ?, next_attempt_at = ?, "
+                "last_error = ? WHERE event_id = ? AND status = ?",
+                (status.value, attempts, next_attempt_at, error, event_id, row["status"]),
             )
             self._conn.commit()
+            return self._row_to_event(row).model_copy(
+                update={
+                    "status": status,
+                    "attempts": attempts,
+                    "next_attempt_at": next_attempt_at,
+                    "last_error": error,
+                }
+            )
 
-        self._db.call(_mark)
+        return self._db.call(_mark)
+
+    def redrive(self, event_ids: Iterable[str] | None = None, *, now: float | None = None) -> int:
+        """把 ``dead`` 事件放回待发布队列：失败次数与错误清零、立即到期。
+
+        Args:
+            event_ids: 只处理其中的 ``dead`` 事件；``None`` 表示全部 ``dead`` 事件。
+                其他状态的事件不受影响。
+            now: 当前时间（Unix 秒），默认取系统时间。
+
+        Returns:
+            重新放回队列的事件数。
+        """
+        at = time.time() if now is None else now
+        ids = None if event_ids is None else list(dict.fromkeys(event_ids))
+        if ids == []:
+            return 0
+        sql = (
+            "UPDATE outbox_events SET status = ?, attempts = 0, next_attempt_at = ?, "
+            "last_error = NULL WHERE status = ?"
+        )
+        params: list[Any] = [OutboxStatus.PENDING.value, at, OutboxStatus.DEAD.value]
+        if ids is not None:
+            sql += f" AND event_id IN ({', '.join('?' for _ in ids)})"
+            params.extend(ids)
+
+        def _redrive() -> int:
+            count = self._conn.execute(sql, params).rowcount
+            self._conn.commit()
+            return count
+
+        return self._db.call(_redrive)
+
+    def purge_published(self, before: float) -> int:
+        """删除发布时间早于 ``before``（Unix 秒）的已发布事件，返回删除条数。"""
+
+        def _purge() -> int:
+            count = self._conn.execute(
+                "DELETE FROM outbox_events WHERE status = ? AND published_at < ?",
+                (OutboxStatus.PUBLISHED.value, before),
+            ).rowcount
+            self._conn.commit()
+            return count
+
+        return self._db.call(_purge)
 
     def get_stats(self) -> dict[str, int]:
         """获取 Outbox 统计信息（各状态事件数量）。"""
-        rows = self._db.call(
-            lambda: self._conn.execute(
-                "SELECT status, COUNT(*) as cnt FROM outbox_events GROUP BY status"
-            ).fetchall()
-        )
+        rows = self._query("SELECT status, COUNT(*) as cnt FROM outbox_events GROUP BY status")
         return {row["status"]: row["cnt"] for row in rows}
 
     @staticmethod
@@ -185,6 +394,9 @@ class Outbox:
             created_at=row["created_at"],
             published_at=row["published_at"],
             status=row["status"],
+            attempts=row["attempts"],
+            next_attempt_at=row["next_attempt_at"],
+            last_error=row["last_error"],
         )
 
     async def close(self) -> None:
@@ -193,18 +405,32 @@ class Outbox:
             await asyncio.to_thread(self._db.close)
 
 
-class Dispatcher:
-    """异步事件 Dispatcher：轮询 Outbox 并发布。
+def _describe(exc: Exception) -> str:
+    message = str(exc)
+    return f"{type(exc).__name__}: {message}" if message else type(exc).__name__
 
-    从 Outbox 取出 pending 事件，调用 publisher 回调发布，成功后标记 published，
-    失败则标记 failed。已处理的 event_id 不会重复处理（幂等）。
+
+class Dispatcher:
+    """异步事件 Dispatcher：从数据库取出到期的 pending 事件，交给 publisher 发布。
+
+    发布成功标记 ``published``；失败按 :class:`RetryPolicy` 推迟重试或进入 ``dead``，
+    并结束本轮：发布目标不可用时，不会在一轮里对每个事件各等一次超时。是否已发布
+    只看数据库状态，重启后不会重复发布已标记的事件。
 
     Args:
         outbox: Outbox 实例。
         publisher: 发布回调，签名 ``async (event: OutboxEvent) -> None``
-            或同步 ``(event: OutboxEvent) -> None``。
-        poll_interval: 轮询间隔秒数。
-        batch_size: 每批获取事件数。
+            或同步 ``(event: OutboxEvent) -> None``；抛出异常表示发布失败，
+            异常类型与消息记入 ``last_error`` 和日志，不得包含凭证。
+        poll_interval: 两轮之间的间隔秒数。
+        batch_size: 每轮最多发布的事件数。
+        retry: 重试策略，默认 :class:`RetryPolicy`。
+        retention: 已发布事件的保留秒数，:meth:`run` 每小时删除更早的事件；
+            ``None`` 表示不删除。
+        clock: 当前时间（Unix 秒），供测试注入。
+
+    Raises:
+        ValueError: ``poll_interval`` 不大于 0，或 ``batch_size`` 小于 1。
     """
 
     def __init__(
@@ -213,42 +439,125 @@ class Dispatcher:
         publisher: Callable[[OutboxEvent], Any],
         poll_interval: float = 1.0,
         batch_size: int = 100,
+        *,
+        retry: RetryPolicy | None = None,
+        retention: float | None = DEFAULT_RETENTION_SECONDS,
+        clock: Callable[[], float] = time.time,
     ) -> None:
+        if poll_interval <= 0:
+            raise ValueError(f"poll_interval must be > 0, got {poll_interval}")
+        if batch_size < 1:
+            raise ValueError(f"batch_size must be >= 1, got {batch_size}")
         self._outbox = outbox
         self._publisher = publisher
         self._poll_interval = poll_interval
         self._batch_size = batch_size
-        self._running = False
-        self._processed: set[str] = set()  # 已处理的 event_id（幂等）
+        self._retry = retry or RetryPolicy()
+        self._retention = retention
+        self._clock = clock
+        self._stopped = False
+        self._wakeup: asyncio.Event | None = None
+        self._task: asyncio.Task[None] | None = None
 
     async def dispatch_once(self) -> int:
-        """执行一轮分发，返回处理的事件数。"""
-        events = await asyncio.to_thread(self._outbox.get_pending, self._batch_size)
-        count = 0
+        """发布一轮到期事件，返回发布成功的事件数；遇到发布失败即结束本轮。"""
+        events = await asyncio.to_thread(self._outbox.due, self._batch_size, self._clock())
+        published = 0
         for event in events:
-            if event.event_id in self._processed:
-                continue  # 幂等：跳过已处理
+            if self._stopped:
+                break
             try:
                 result = self._publisher(event)
-                if asyncio.iscoroutine(result):
+                if inspect.isawaitable(result):
                     await result
-                await asyncio.to_thread(self._outbox.mark_published, event.event_id)
-                self._processed.add(event.event_id)
-                count += 1
-            except Exception:
-                await asyncio.to_thread(self._outbox.mark_failed, event.event_id)
-        return count
+            except Exception as exc:
+                failed = await asyncio.to_thread(
+                    self._outbox.mark_failed,
+                    event.event_id,
+                    _describe(exc),
+                    policy=self._retry,
+                    now=self._clock(),
+                )
+                self._log_failure(failed)
+                break
+            await asyncio.to_thread(self._outbox.mark_published, event.event_id, self._clock())
+            published += 1
+        return published
+
+    def _log_failure(self, event: OutboxEvent) -> None:
+        if event.status == OutboxStatus.DEAD:
+            logger.error(
+                "outbox event %s (%s) is dead after %d failed attempts: %s",
+                event.event_id,
+                event.event_type,
+                event.attempts,
+                event.last_error,
+            )
+            return
+        logger.warning(
+            "outbox event %s (%s) publish failed (attempt %d of %d), retrying in %.0fs: %s",
+            event.event_id,
+            event.event_type,
+            event.attempts,
+            self._retry.max_attempts,
+            self._retry.delay(event.attempts),
+            event.last_error,
+        )
 
     async def run(self) -> None:
-        """持续轮询分发（阻塞，直到 stop）。"""
-        self._running = True
-        while self._running:
-            await self.dispatch_once()
-            await asyncio.sleep(self._poll_interval)
+        """持续分发，直到 :meth:`stop`。
+
+        数据库错误不会结束循环：记录日志后按指数退避（最长 30 秒）再试。
+        """
+        self._wakeup = asyncio.Event()
+        errors = 0
+        next_purge = 0.0
+        while not self._stopped:
+            try:
+                await self.dispatch_once()
+                if self._retention is not None and time.monotonic() >= next_purge:
+                    before = self._clock() - self._retention
+                    await asyncio.to_thread(self._outbox.purge_published, before)
+                    next_purge = time.monotonic() + _PURGE_INTERVAL_SECONDS
+                errors = 0
+                delay = self._poll_interval
+            except Exception:
+                errors += 1
+                delay = min(self._poll_interval * 2**errors, _MAX_ERROR_BACKOFF_SECONDS)
+                logger.exception("outbox dispatch failed; retrying in %.1fs", delay)
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(self._wakeup.wait(), delay)
 
     def stop(self) -> None:
-        """停止轮询。"""
-        self._running = False
+        """停止轮询：正在进行的发布完成后，:meth:`run` 返回。"""
+        self._stopped = True
+        if self._wakeup is not None:
+            self._wakeup.set()
+
+    def start(self) -> asyncio.Task[None]:
+        """在当前事件循环中以后台任务运行 :meth:`run`。
+
+        Raises:
+            RuntimeError: 已经启动过。
+        """
+        if self._task is not None:
+            raise RuntimeError("dispatcher already started")
+        self._task = asyncio.create_task(self.run(), name="outbox-dispatcher")
+        return self._task
+
+    async def shutdown(self, timeout: float = 10.0) -> None:
+        """停止并等待 :meth:`start` 启动的任务结束；超过 ``timeout`` 秒则取消它。
+
+        被取消时正在发布的事件尚未标记 ``published``，重启后会再次发布。
+        """
+        self.stop()
+        task, self._task = self._task, None
+        if task is None:
+            return
+        try:
+            await asyncio.wait_for(task, timeout)
+        except TimeoutError:
+            logger.warning("outbox dispatcher did not stop within %.1fs; cancelled", timeout)
 
 
 class IdempotentConsumer:
@@ -281,4 +590,12 @@ class IdempotentConsumer:
         return len(self._processed_ids)
 
 
-__all__ = ["Outbox", "OutboxEvent", "Dispatcher", "IdempotentConsumer"]
+__all__ = [
+    "DEFAULT_RETENTION_SECONDS",
+    "Dispatcher",
+    "IdempotentConsumer",
+    "Outbox",
+    "OutboxEvent",
+    "OutboxStatus",
+    "RetryPolicy",
+]

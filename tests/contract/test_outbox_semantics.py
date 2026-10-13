@@ -7,8 +7,9 @@
 * 重复发布：Dispatcher 对同一 Outbox 记录重复发布（发布后标记前崩溃重试）
   时，消费者侧按 eventId 去重，副作用只发生一次；
 * 消费者提交失败：消费者处理成功但确认丢失后，重新投递不产生重复副作用；
-* 死信/重放：发布失败的记录进入持久失败状态（事实上的死信态）、可查询、
-  不再被自动重试，且可通过重置状态手动重放。
+* 退避重试与死信：发布失败按指数退避重试，目标恢复后最终送达；失败次数达到
+  上限后进入 ``dead``、可查询、不再自动重试，可经 ``redrive`` 重新投递；
+* 重启：发布状态只在数据库中，已发布的事件不会再次发布。
 
 记录性测试：``IdempotentConsumer`` 去重状态仅存内存，进程重启后重复投递会
 产生重复副作用；以测试固化当前行为并在 docstring 标注 v1.1 后续期望。
@@ -25,6 +26,7 @@ from forgemesh.controlplane.outbox import (
     IdempotentConsumer,
     Outbox,
     OutboxEvent,
+    RetryPolicy,
 )
 from forgemesh.controlplane.sqlite import Database
 
@@ -240,47 +242,89 @@ def test_consumer_dedup_is_in_memory_only_after_restart() -> None:
 
 
 # ---------------------------------------------------------------------- #
-# 语义四：死信/重放
+# 语义四：退避重试、死信与重新投递
 # ---------------------------------------------------------------------- #
 
 
 @pytest.mark.contract
-def test_failed_event_is_dead_and_queryable(tmp_path) -> None:
-    """死信语义（记录性）：发布失败进入持久 failed 态，可查询且不再自动重试。
+def test_publish_failure_is_retried_with_backoff_until_delivered(tmp_path) -> None:
+    """注入发布失败：事件按指数退避重试，发布目标恢复后最终送达。"""
+    outbox = Outbox(str(tmp_path / "outbox-retry.db"))
+    _put(outbox, _make_event("evt-retry"))
+    start = 2e9
+    now = [start]
+    attempts: list[float] = []
 
-    当前实现无重试计数与独立死信队列：publisher 一次失败即 ``mark_failed``，
-    事件脱离 pending 队列（不再被后续轮次自动重发），``failed`` 即事实上的
-    死信状态。v1.1 期望按最大重试次数退避重试、超限后进入显式死信队列。
-    """
+    def flaky_publisher(ev: OutboxEvent) -> None:
+        attempts.append(now[0] - start)
+        if len(attempts) < 3:
+            raise ConnectionError("broker unreachable")
+
+    dispatcher = Dispatcher(outbox, flaky_publisher, clock=lambda: now[0])
+    for _ in range(8):  # 每 0.5 秒一轮
+        _run(dispatcher.dispatch_once())
+        now[0] += 0.5
+
+    # 两次失败后分别等待 1 秒、2 秒：重试发生在 +1 秒与 +3 秒，第三次送达。
+    assert attempts == [0.0, 1.0, 3.0]
+    assert outbox.get_stats() == {"published": 1}
+
+
+@pytest.mark.contract
+def test_event_is_dead_after_the_retry_limit(tmp_path, caplog) -> None:
+    """失败次数达到上限：进入 dead，可查询（含次数与原因）、记录错误日志，不再自动重试。"""
     outbox = Outbox(str(tmp_path / "outbox-dead.db"))
     _put(outbox, _make_event("evt-dead"))
+    now = [2e9]
     attempts: list[str] = []
 
     def broken_publisher(ev: OutboxEvent) -> None:
         attempts.append(ev.event_id)
         raise RuntimeError("broker unreachable")
 
-    dispatcher = Dispatcher(outbox, broken_publisher)
-    count = _run(dispatcher.dispatch_once())
+    dispatcher = Dispatcher(
+        outbox, broken_publisher, retry=RetryPolicy(max_attempts=3), clock=lambda: now[0]
+    )
+    for _ in range(6):  # 每轮都已过退避时间
+        assert _run(dispatcher.dispatch_once()) == 0
+        now[0] += 3600
 
-    # 发布失败：本轮无成功处理，事件进入持久 failed 状态且可查询。
-    assert count == 0
-    assert outbox.get_stats() == {"failed": 1}
-    assert outbox.get_pending() == []  # 脱离待发布队列
-
-    # 后续轮次不再自动重试（attempts 不再增长）——无无限重发。
-    assert _run(dispatcher.dispatch_once()) == 0
-    assert attempts == ["evt-dead"]
+    assert attempts == ["evt-dead"] * 3
+    assert outbox.get_stats() == {"dead": 1}
+    assert outbox.get_pending() == []
+    [dead] = outbox.list_dead()
+    assert (dead.event_id, dead.attempts) == ("evt-dead", 3)
+    assert dead.last_error == "RuntimeError: broker unreachable"
+    assert "evt-dead (Created) is dead after 3 failed attempts" in caplog.text
 
 
 @pytest.mark.contract
-def test_manual_replay_failed_event(tmp_path) -> None:
-    """手动重放（记录性）：failed 记录可经状态重置重放并成功发布。
+def test_restart_does_not_redeliver_published_events(tmp_path) -> None:
+    """进程重启：已发布的事件不再发布，只发布重启前尚未发布的事件。"""
+    path = str(tmp_path / "outbox-restart.db")
+    deliveries: list[str] = []
 
-    当前实现无官方 replay API，重放路径为经共享连接将 failed 重置为
-    pending 后由 Dispatcher 重新分发。v1.1 期望提供显式 replay/dead-letter
-    API；届时本测试应改用正式接口。
-    """
+    def publisher(ev: OutboxEvent) -> None:
+        deliveries.append(ev.event_id)
+
+    outbox = Outbox(path)
+    _put(outbox, _make_event("evt-before"))
+    assert _run(Dispatcher(outbox, publisher).dispatch_once()) == 1
+    _put(outbox, _make_event("evt-after"))
+    _run(outbox.close())
+
+    restarted = Outbox(path)
+    try:
+        assert _run(Dispatcher(restarted, publisher).dispatch_once()) == 1
+        assert _run(Dispatcher(restarted, publisher).dispatch_once()) == 0
+    finally:
+        _run(restarted.close())
+    assert deliveries == ["evt-before", "evt-after"]
+
+
+@pytest.mark.contract
+def test_redrive_dead_event(tmp_path) -> None:
+    """重新投递：dead 事件经 ``redrive`` 放回队列后成功发布，副作用恰好一次。"""
     outbox = Outbox(str(tmp_path / "outbox-replay.db"))
     _put(outbox, _make_event("evt-replay"))
 
@@ -297,18 +341,14 @@ def test_manual_replay_failed_event(tmp_path) -> None:
             raise RuntimeError("transient broker failure")  # 首次投递失败
         consumer.consume(ev, handler)  # 重放投递成功送达消费者
 
-    # 首轮发布失败：进入死信（failed）状态，未产生副作用。
-    failed_round = Dispatcher(outbox, flaky_publisher)
+    # 首轮发布失败且不再重试：进入 dead，未产生副作用。
+    failed_round = Dispatcher(outbox, flaky_publisher, retry=RetryPolicy(max_attempts=1))
     assert _run(failed_round.dispatch_once()) == 0
-    assert outbox.get_stats() == {"failed": 1}
+    assert outbox.get_stats() == {"dead": 1}
     assert side_effects == []
 
-    # 手动重放：通过 Outbox 暴露的共享连接重置状态（模拟运维重放动作）。
-    outbox.database.conn.execute(
-        "UPDATE outbox_events SET status = 'pending' WHERE event_id = ?",
-        ("evt-replay",),
-    )
-    outbox.database.conn.commit()
+    # 运维重新投递。
+    assert outbox.redrive(["evt-replay"]) == 1
     assert [e.event_id for e in outbox.get_pending()] == ["evt-replay"]
 
     replay_round = Dispatcher(outbox, flaky_publisher)

@@ -9,6 +9,7 @@
 # 常用目标：
 #   make install   创建 .venv，安装全部子包（editable）+ 开发依赖
 #   make test      运行全部测试（pytest）
+#   make coverage  运行全部测试并检查覆盖率下限（与 CI 相同）
 #   make lint      ruff 静态检查
 #   make fmt       ruff 自动修复 + 格式化
 #   make clean     清理构建与缓存产物
@@ -21,7 +22,7 @@ VENV_PIP:= $(VENV)/bin/pip
 
 .DEFAULT_GOAL := help
 
-.PHONY: help install deps test test-unit test-contract lint fmt clean
+.PHONY: help install deps test test-unit test-contract coverage lint fmt clean
 
 help:
 	@echo "ForgeMesh 顶层命令："
@@ -29,6 +30,7 @@ help:
 	@echo "  make test           运行全部测试（pytest）"
 	@echo "  make test-unit      仅运行单元测试"
 	@echo "  make test-contract  仅运行契约测试"
+	@echo "  make coverage       运行全部测试并检查覆盖率下限（与 CI 相同）"
 	@echo "  make lint           ruff 静态检查"
 	@echo "  make fmt            ruff 自动修复与格式化"
 	@echo "  make clean          清理构建与缓存产物"
@@ -73,6 +75,9 @@ test-unit:
 
 test-contract:
 	$(VENV_PY) -m pytest tests/contract
+
+coverage:
+	$(VENV_PY) -m pytest --cov
 
 lint:
 	$(VENV_PY) -m ruff check .

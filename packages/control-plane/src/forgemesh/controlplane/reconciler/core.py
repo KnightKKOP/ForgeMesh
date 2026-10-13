@@ -1211,7 +1211,12 @@ class ReconciliationController(Reconciler):
         if current.finalizers:
             # 仍有其他 finalizer 持有方未完成清理：写回并等待。
             try:
-                await self._registry.put(current, expected_version=current.metadata.resourceVersion)
+                await self._registry.put(
+                    current,
+                    expected_version=current.metadata.resourceVersion,
+                    actor="reconciler",
+                    correlation_id=ctx.correlation_id,
+                )
             except ConflictError:
                 # 版本漂移：下轮重读重试。
                 return ReconcileResult(done=False, requeue_after=5.0)

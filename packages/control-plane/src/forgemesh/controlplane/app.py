@@ -87,6 +87,7 @@ from .deployment import (
 from .reconciler import ProcessedKeyStore, ReconciliationController
 from .scheduler import INVENTORY_FILE_ENV, FirstFitScheduler, inventory_from_env
 from .sqlite import workflow_db_path
+from .version import CONTROL_PLANE_VERSION
 
 if TYPE_CHECKING:  # pragma: no cover - 仅静态类型检查使用
     from .auth import Authenticator
@@ -109,9 +110,6 @@ API_PREFIX = "/api/v1"
 
 #: 兜底服务（无 FastAPI）的占位错误码。
 NOT_IMPLEMENTED_CODE = "NOT_IMPLEMENTED"
-
-#: 控制平面版本（用于探针与事件 producer.version）。
-CONTROL_PLANE_VERSION = "0.0.1"
 
 DB_PATH_ENV = "FORGEMESH_DB_PATH"
 DEFAULT_DB_PATH = "forgemesh.db"

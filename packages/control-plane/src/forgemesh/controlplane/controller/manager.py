@@ -235,17 +235,18 @@ class ControllerManager:
         dedup_key = compute_dedup_key(
             key.kind, key.namespace, key.name, meta.uid, meta.generation, operation
         ).key
+        correlation_id = uuid4().hex
         result = await self._reconciler.reconcile(
             ReconcileContext(
                 resource=resource,
                 observed={"phase": phase} if phase is not None else {},
-                correlation_id=uuid4().hex,
+                correlation_id=correlation_id,
                 tenant_id=key.tenant_id,
                 dedup_key=dedup_key,
             )
         )
         if result.status_patch and not await self._write_status(
-            key, resource, operation, result.status_patch
+            key, resource, operation, result.status_patch, correlation_id
         ):
             self._queue.add(key)
             return
@@ -261,8 +262,12 @@ class ControllerManager:
         resource: Resource,
         operation: str,
         patch: dict[str, Any],
+        correlation_id: str,
     ) -> bool:
-        """以协调前读到的版本 CAS 写入 status；资源已变得不适用这次结果时返回 ``False``。"""
+        """以协调前读到的版本 CAS 写入 status；资源已变得不适用这次结果时返回 ``False``。
+
+        ``correlation_id`` 是这次协调的关联 ID，随 status 写入的资源变更事件送出。
+        """
         target = (resource.metadata.uid, resource.metadata.generation, operation)
         expected_version = resource.metadata.resourceVersion
         for _ in range(self._status_write_attempts):
@@ -275,6 +280,7 @@ class ControllerManager:
                     patch,
                     observed_generation=resource.metadata.generation,
                     expected_version=expected_version,
+                    correlation_id=correlation_id,
                 )
                 return True
             except NotFoundError:

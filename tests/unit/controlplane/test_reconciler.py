@@ -7,7 +7,8 @@ Verifying → Ready，写入 ``status.endpoints``）、分配请求的资源身�
 （uid + generation）、调度需求取自 ``spec.resources.accelerator``、部署工作流的启动
 （按 uid + generation 的幂等键，输入携带分配）与启动 / 查询 / 停止失败时的退避、部署过程中
 spec 变化（停止之前的部署、加速器申请变化时重新分配）、运行失败时进入 ``Failed`` 以及
-分配的去留、实例丢失后按退避重新部署、缺少调度器 / 工作流运行时时如实报告 ``Ready=False``、
+分配的去留（补偿没能停止的实例在之后的 ``Failed`` 一轮停止，然后释放分配）、实例丢失后按
+退避重新部署、缺少调度器 / 工作流运行时时如实报告 ``Ready=False``、
 幂等性，以及 Terminating 受控删除闭环
 （ReleaseProvider 释放 → 移除 finalizer → 按 uid 释放 Allocation → 物理删除）。
 """
@@ -340,10 +341,12 @@ def _allocate(registry: SQLiteRegistry, service: InferenceService, device_id: st
     return asyncio.run(registry.create_allocation(meta.tenant_id, owner, f"{meta.uid}:1", [device]))
 
 
-def _allocated_service(phase: InferencePhase) -> tuple[SQLiteRegistry, InferenceService]:
-    """注册表中处于 ``phase`` 的服务，它持有一个设备的 Active 分配。"""
+def _allocated_service(
+    phase: InferencePhase, observed_generation: int = 0
+) -> tuple[SQLiteRegistry, InferenceService]:
+    """注册表中处于 ``phase`` 的服务（第 1 代 spec），它持有一个设备的 Active 分配。"""
     registry = SQLiteRegistry()
-    service = make_inference_service(phase=phase)
+    service = make_inference_service(phase=phase, observed_generation=observed_generation)
     asyncio.run(registry.put(service))
     _allocate(registry, service)
     return registry, service
@@ -1070,8 +1073,9 @@ def test_a_failed_run_fails_the_service_and_releases_its_allocation(run, message
 
 
 @pytest.mark.unit
-def test_an_instance_that_compensation_could_not_stop_keeps_the_allocation():
-    """补偿没能停止实例：进入 Failed 但保留分配（实例可能仍在运行），删除资源时再处理。"""
+def test_an_instance_that_compensation_could_not_stop_keeps_the_allocation_for_now():
+    """补偿没能停止实例：进入 Failed 但暂时保留分配（实例可能仍在运行），立即重新排队，由
+    之后的 Failed 一轮停止实例、释放分配。"""
     run = make_run(
         WorkflowStatus.FAILED,
         StepStatus.COMPENSATION_FAILED,
@@ -1084,12 +1088,13 @@ def test_an_instance_that_compensation_could_not_stop_keeps_the_allocation():
 
     result = asyncio.run(controller.reconcile(make_service_context(service)))
 
+    assert (result.done, result.requeue_after) == (True, 0.0)
     assert result.status_patch == {
         "phase": "Failed",
         **_not_ready(
             "WorkflowFailed",
             "step 'verify-instance' failed: timed out; instance instance-1 may still be running "
-            "and is stopped when the resource is deleted",
+            "and is stopped before the allocation is released",
         ),
     }
     assert asyncio.run(registry.get_active_allocation("uid-1", "tenant-1")) is not None
@@ -1109,7 +1114,7 @@ def test_an_instance_that_compensation_could_not_stop_keeps_the_allocation():
 )
 def test_a_run_that_cannot_tell_where_its_instance_is_keeps_the_allocation(run, reason, message):
     """找不到运行（如工作流数据库被重置），或运行成功却没有报告实例：无法确认实例是否
-    在运行，进入 Failed 并保留分配。"""
+    在运行，进入 Failed 并保留分配，立即重新排队（之后的 Failed 一轮同样保留分配）。"""
     registry, service = _allocated_service(InferencePhase.DEPLOYING)
     controller = _controller(
         registry=registry, scheduler=MockScheduler(), workflow=StubWorkflowRuntime(run=run)
@@ -1117,11 +1122,119 @@ def test_a_run_that_cannot_tell_where_its_instance_is_keeps_the_allocation(run, 
 
     result = asyncio.run(controller.reconcile(make_service_context(service)))
 
-    assert (result.done, result.status_patch) == (
+    assert (result.done, result.requeue_after, result.status_patch) == (
         True,
+        0.0,
         {"phase": "Failed", **_not_ready(reason, message)},
     )
     assert asyncio.run(registry.get_active_allocation("uid-1", "tenant-1")) is not None
+
+
+@pytest.mark.unit
+def test_a_failed_service_stops_its_instance_before_releasing_its_allocation():
+    """spec 没有变化的 Failed 一轮（补偿没能停止实例，分配还在）：经 release provider 停止
+    实例，然后释放分配；这一轮不写 status、登记去重键，之后的协调不再停止。"""
+    run = make_run(WorkflowStatus.FAILED, StepStatus.COMPENSATION_FAILED)
+    registry, service = _allocated_service(InferencePhase.FAILED, observed_generation=1)
+    release = StubReleaseProvider()
+    controller = _controller(
+        registry=registry, workflow=StubWorkflowRuntime(run=run), release=release
+    )
+    ctx = make_service_context(service)
+
+    results = [asyncio.run(controller.reconcile(ctx)) for _ in range(2)]
+
+    assert [(r.done, r.requeue_after, r.status_patch) for r in results] == [(True, None, {})] * 2
+    assert release.released == ["svc-1"]
+    assert ctx.dedup_key in controller._processed_keys
+    assert asyncio.run(registry.get_active_allocation("uid-1", "tenant-1")) is None
+    assert asyncio.run(registry.allocated_devices()) == frozenset()
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("failure", ["lookup", "stop"])
+def test_a_failed_service_whose_deployment_cannot_be_stopped_keeps_its_allocation(failure):
+    """Failed 一轮查询运行或停止实例失败：保留分配，不写 status、不登记去重键，按指数退避
+    重试；之后停止成功时释放分配。"""
+    workflow = StubWorkflowRuntime(
+        run=make_run(WorkflowStatus.FAILED, StepStatus.COMPENSATION_FAILED)
+    )
+    release = StubReleaseProvider()
+    if failure == "lookup":
+        workflow.lookup_error = RuntimeError("database is locked")
+    else:
+        release.fail = True
+    registry, service = _allocated_service(InferencePhase.FAILED, observed_generation=1)
+    controller = _controller(
+        registry=registry, workflow=workflow, release=release, workflow_poll_interval=0.5
+    )
+    ctx = make_service_context(service)
+
+    failures = [asyncio.run(controller.reconcile(ctx)) for _ in range(2)]
+    held = asyncio.run(registry.get_active_allocation("uid-1", "tenant-1"))
+    marked = ctx.dedup_key in controller._processed_keys
+    workflow.lookup_error, release.fail = None, False
+    stopped = asyncio.run(controller.reconcile(ctx))
+
+    assert [(r.done, r.requeue_after, r.status_patch) for r in failures] == [
+        (False, 0.5, {}),
+        (False, 1.0, {}),
+    ]
+    assert (held is not None, marked) == (True, False)
+    assert (stopped.done, stopped.status_patch) == (True, {})
+    assert asyncio.run(registry.get_active_allocation("uid-1", "tenant-1")) is None
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "runs",
+    [
+        {},
+        {RUN_KEY: make_run(WorkflowStatus.SUCCEEDED, outputs=False)},
+        {
+            RUN_KEY: make_run(WorkflowStatus.SUCCEEDED, outputs=False),
+            deployment_run_key("uid-1", 2): make_run(
+                WorkflowStatus.FAILED, StepStatus.COMPENSATION_FAILED
+            ),
+        },
+    ],
+    ids=["no-run", "no-instance-reported", "one-run-reports-no-instance"],
+)
+def test_a_failed_service_whose_instance_cannot_be_found_keeps_its_allocation(runs):
+    """Failed 一轮找不到运行，或有运行成功却没有报告实例：无从停止实例，不调用 release
+    provider，保留分配（删除资源时释放），登记去重键。"""
+    registry, service = _allocated_service(InferencePhase.FAILED, observed_generation=1)
+    workflow = StubWorkflowRuntime()
+    workflow.runs = dict(runs)
+    release = StubReleaseProvider()
+    controller = _controller(registry=registry, workflow=workflow, release=release)
+    ctx = make_service_context(service)
+
+    result = asyncio.run(controller.reconcile(ctx))
+
+    assert (result.done, result.requeue_after, result.status_patch) == (True, None, {})
+    assert release.released == []
+    assert ctx.dedup_key in controller._processed_keys
+    assert asyncio.run(registry.get_active_allocation("uid-1", "tenant-1")) is not None
+
+
+@pytest.mark.unit
+def test_a_failed_service_without_an_allocation_has_nothing_to_stop():
+    """Failed 一轮且资源没有 Active 分配（失败时已释放）：不查询运行、不调用 release
+    provider，登记去重键。"""
+    registry = SQLiteRegistry()
+    service = make_inference_service(phase=InferencePhase.FAILED, observed_generation=1)
+    asyncio.run(registry.put(service))
+    workflow = StubWorkflowRuntime(run=make_run(WorkflowStatus.FAILED, StepStatus.COMPENSATED))
+    release = StubReleaseProvider()
+    controller = _controller(registry=registry, workflow=workflow, release=release)
+    ctx = make_service_context(service)
+
+    result = asyncio.run(controller.reconcile(ctx))
+
+    assert (result.done, result.status_patch) == (True, {})
+    assert (workflow.lookups, release.released) == ([], [])
+    assert ctx.dedup_key in controller._processed_keys
 
 
 @pytest.mark.unit

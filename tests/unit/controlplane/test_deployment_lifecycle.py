@@ -9,8 +9,8 @@
   为未就绪），在同一分配上重新部署后回到 ``Ready``，运行成功却还没写入 ``Ready`` 的服务
   同样重新部署；重新部署按退避，失败时说明原因；实例回来了的服务直接回到 ``Ready``；
 * 部署工作流没能启动时保留分配并重试；部署失败时实例被停止、分配释放，资源停在
-  ``Failed``，修改 spec 之后从 ``Pending`` 重新部署；补偿没能停止的实例在删除资源或重新
-  部署时停止；
+  ``Failed``，修改 spec 之后从 ``Pending`` 重新部署；补偿没能停止的实例在之后的一轮停止
+  （然后释放分配），或在删除资源、重新部署时停止；
 * 部署过程中 spec 变化：上一代 spec 的运行被取消，服务以新的 spec 进入 ``Ready``；加速器
   申请变化、持有的设备不再满足时释放分配、重新分配；
 * ``Ready`` 的服务 spec 变化：经 ``Updating`` 停止旧实例、部署新的 spec 后回到 ``Ready``；
@@ -476,6 +476,38 @@ def test_an_instance_that_compensation_could_not_stop_is_stopped_when_the_servic
 
             assert launcher.stops == [instance.instance_id]
             assert launcher.running == {}
+            await _assert_gone(plane)
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.unit
+def test_an_instance_that_compensation_could_not_stop_is_stopped_before_the_allocation_is_freed():
+    """补偿没能停止实例、资源进入 Failed 之后，下一轮停止实例，然后释放分配；停止失败时保留
+    分配，之后的一轮重试。资源停在 Failed，之后的协调不再停止，删除时直接物理删除。"""
+    launcher = _ScriptedLauncher()
+    launcher.fail.add("verify")
+    launcher.stop_failures = 2
+
+    async def scenario() -> None:
+        async with _ControlPlane(":memory:", launcher) as plane:
+            await plane.registry.put(_service())
+            assert await plane.deploy() == ["Scheduling", "Preparing", "Deploying", "Failed"]
+            [instance] = launcher.running.values()
+
+            await plane.manager.process(KEY)
+            assert launcher.running == {instance.instance_id: instance}
+            assert await plane.registry.get_active_allocation(UID, TENANT) is not None
+
+            await plane.manager.process(KEY)
+            assert launcher.running == {}
+            assert await plane.registry.get_active_allocation(UID, TENANT) is None
+            assert await plane.registry.allocated_devices() == frozenset()
+
+            await plane.manager.process(KEY)
+            assert launcher.stops == [instance.instance_id]
+            assert await plane.phase() == "Failed"
+            assert await plane.delete() is True
             await _assert_gone(plane)
 
     asyncio.run(scenario())

@@ -90,18 +90,21 @@ generation 的运行（spec 在部署过程中变化，或运行来自 1.1.0 之
   与停止之前的部署失败（``StopFailed``）同样退避重试。
 * 部署运行失败（某一步用尽重试，工作流已补偿、停止了实例）、被取消或超时：
   ``phase=Failed``、``Ready=False``（``WorkflowFailed``，消息含失败的步骤），释放分配。
-  补偿没能停止实例时保留分配，删除资源时再停止实例、释放分配；资源没有任何部署运行
-  （``WorkflowRunNotFound``，如工作流数据库被重置）或运行成功却没有报告实例（运行时
-  不返回步骤输出）时同样进入 ``Failed`` 并保留分配。
-* ``Failed`` 不自动重试。spec 变化（``generation`` 大于 ``observedGeneration``）时回到
+  补偿没能停止实例时暂时保留分配并立即重新排队：之后 spec 没有变化的 ``Failed`` 一轮经
+  release provider 停止资源的实例，然后释放分配（这一轮不写 status，停止失败时按指数退避
+  重试）。资源没有任何部署运行（``WorkflowRunNotFound``，如工作流数据库被重置）或运行
+  成功却没有报告实例（运行时不返回步骤输出）时同样进入 ``Failed``：无从确认、无从停止
+  实例，分配留到删除资源时释放。
+* ``Failed`` 不自动重试部署。spec 变化（``generation`` 大于 ``observedGeneration``）时回到
   ``Pending``（``Ready=False``，原因 ``Pending``，这一轮没有副作用），之后与新建的资源一样
-  经过策略校验、分配与部署：补偿没能停止的实例在启动新的部署运行之前停止，仍持有的分配
-  满足新的申请时复用。spec 没有变化时删除后重新创建资源即可再次部署。
+  经过策略校验、分配与部署：还没停止的实例在启动新的部署运行之前停止，仍持有的分配满足
+  新的申请时复用。spec 没有变化时删除后重新创建资源即可再次部署。
 
 需要分配或执行工作流、却未注入对应组件时，在任何副作用之前返回 ``Ready=False``
 （``SchedulerUnavailable`` / ``WorkflowRuntimeUnavailable``）。没有 ``metadata.uid`` 的
 资源报告 ``MissingUid``，不是 ``InferenceService`` 的资源报告 ``NotDeployable``。spec 没有
-变化的 ``Ready`` / ``Failed``，以及 ``Unknown`` 的资源没有可做的事。
+变化的 ``Ready``，以及 ``Unknown`` 的资源没有可做的事；spec 没有变化的 ``Failed`` 只在仍
+持有分配时停止实例、释放分配（见上文）。
 
 终止协调（Terminating，对齐 architecture.md §5.3/§12.4 与 development-plan
 第 7 章删除闭环）
@@ -262,8 +265,8 @@ class ReleaseProvider(Protocol):
 
     职责：在资源进入 ``Terminating`` 后释放其外部副作用（取消进行中的部署、停止推理
     实例等，如 :class:`~forgemesh.controlplane.deployment.DeploymentReleaser`）；协调器在
-    启动新的部署运行之前同样调用它，停止资源之前部署的实例。实现方应保证**幂等**：
-    同一资源重复调用不得产生重复副作用。
+    启动新的部署运行之前、释放 ``Failed`` 服务的分配之前同样调用它，停止资源之前部署的
+    实例。实现方应保证**幂等**：同一资源重复调用不得产生重复副作用。
 
     ``release`` 正常返回视为释放成功；抛出任意异常视为释放失败——协调器
     将保持 ``Terminating``（或当前 phase）并 requeue 重试，**不会**物理删除资源，也不会
@@ -985,14 +988,15 @@ class ReconciliationController(Reconciler):
         if instance is not None:
             message += (
                 f"; instance {instance.instance_id} may still be running and is stopped "
-                "when the resource is deleted"
+                "before the allocation is released"
             )
         return await self._fail(ctx, "WorkflowFailed", message, release_allocation=instance is None)
 
     async def _fail(
         self, ctx: ReconcileContext, reason: str, message: str, *, release_allocation: bool
     ) -> ReconcileResult:
-        """进入终态 ``Failed``；``release_allocation`` 为真时先释放资源的分配。"""
+        """进入 ``Failed``；``release_allocation`` 为真时先释放资源的分配，否则立即重新排队，
+        由之后的 ``Failed`` 一轮停止实例、释放分配（见 :meth:`_reclaim`）。"""
         if release_allocation:
             await self._release_allocation(ctx, reason="deployment failed")
         await self._mark_processed(ctx.dedup_key)
@@ -1011,7 +1015,7 @@ class ReconciliationController(Reconciler):
         )
         return ReconcileResult(
             done=True,
-            requeue_after=None,
+            requeue_after=None if release_allocation else 0.0,
             status_patch={
                 "phase": InferencePhase.FAILED.value,
                 "conditions": [_ready_condition("False", reason, message)],
@@ -1019,15 +1023,15 @@ class ReconciliationController(Reconciler):
         )
 
     async def _reconcile_failed(self, ctx: ReconcileContext) -> ReconcileResult:
-        """``Failed`` 一轮：spec 变化时回到 ``Pending`` 重新部署，否则没有可做的事。
+        """``Failed`` 一轮：spec 变化时回到 ``Pending`` 重新部署，否则释放资源仍持有的分配
+        （见 :meth:`_reclaim`）。
 
-        这一轮没有副作用，也不评估策略：``Pending`` 一轮像对新建的资源一样授权这次部署，
-        之前的实例与分配由之后的部署轮次停止、复用或替换。
+        回到 ``Pending`` 的一轮没有副作用，也不评估策略：``Pending`` 一轮像对新建的资源一样
+        授权这次部署，之前的实例与分配由之后的部署轮次停止、复用或替换。
         """
         meta = ctx.resource.metadata
         if meta.generation <= meta.observed_generation:
-            await self._mark_processed(ctx.dedup_key)
-            return ReconcileResult(done=True)
+            return await self._reclaim(ctx)
         if meta.uid:
             self._retry_counts.pop(meta.uid, None)
         message = f"the spec changed (generation {meta.generation}); deploying it again"
@@ -1040,6 +1044,74 @@ class ReconciliationController(Reconciler):
                 "conditions": [_ready_condition("False", InferencePhase.PENDING.value, message)],
             },
         )
+
+    async def _reclaim(self, ctx: ReconcileContext) -> ReconcileResult:
+        """spec 没有变化的 ``Failed`` 一轮：资源仍持有分配时停止它的实例，然后释放分配。
+
+        补偿没能停止实例时，进入 ``Failed`` 的一轮保留了分配。这一轮像 ``Terminating`` 一样经
+        release provider 停止资源的全部部署，再释放分配；查询或停止失败时不登记去重键，按
+        指数退避重试。资源没有部署运行，或有运行成功却没有报告实例时无从停止实例，分配留到
+        删除资源时释放。这一轮不写 status。
+        """
+        uid = ctx.resource.metadata.uid
+        get_active = getattr(self._registry, "get_active_allocation", None)
+        if (
+            uid
+            and self._workflow is not None
+            and callable(get_active)
+            and await get_active(uid, ctx.tenant_id) is not None
+        ):
+            kept = await self._stop_failed_deployment(ctx)
+            if kept is not None:
+                return kept
+        await self._mark_processed(ctx.dedup_key)
+        return ReconcileResult(done=True)
+
+    async def _stop_failed_deployment(self, ctx: ReconcileContext) -> ReconcileResult | None:
+        """停止 ``Failed`` 服务的部署并释放它的分配；查询或停止失败时返回退避重试的结果。"""
+        service = ctx.resource
+        meta = service.metadata
+        try:
+            runs = await find_deployment_runs(self._workflow, meta.uid)
+            stoppable = bool(runs) and all(
+                deployment.run.status is not WorkflowStatus.SUCCEEDED
+                or launched_instance(deployment.run) is not None
+                for deployment in runs
+            )
+            if stoppable:
+                await self._release_provider.release(service)
+        except Exception as exc:  # noqa: BLE001 - 保留分配，退避重试
+            delay = self._next_retry_delay(meta.uid)
+            logger.warning(
+                "the deployment of a failed service could not be stopped, its allocation is "
+                "kept (retrying in %.1fs): %s; kind=%s namespace=%s name=%s uid=%s "
+                "tenant_id=%s correlation_id=%s",
+                delay,
+                _describe(exc),
+                service.kind,
+                meta.namespace,
+                meta.name,
+                meta.uid,
+                ctx.tenant_id,
+                ctx.correlation_id,
+            )
+            return ReconcileResult(done=False, requeue_after=delay)
+        self._retry_counts.pop(meta.uid, None)
+        if stoppable:
+            await self._release_allocation(ctx, reason="the failed deployment was stopped")
+            return None
+        logger.info(
+            "the allocation of a failed service is kept until the service is deleted, its "
+            "instance cannot be found: kind=%s namespace=%s name=%s uid=%s tenant_id=%s "
+            "correlation_id=%s",
+            service.kind,
+            meta.namespace,
+            meta.name,
+            meta.uid,
+            ctx.tenant_id,
+            ctx.correlation_id,
+        )
+        return None
 
     def _next_retry_delay(self, uid: str) -> float:
         failures = self._retry_counts.get(uid, 0) + 1

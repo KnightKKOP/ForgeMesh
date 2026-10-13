@@ -16,8 +16,8 @@
   下一个周期重试。
 * **并发**：``workers`` 个 worker 协程；同一资源同一时刻只由一个 worker 处理。
 * **status 回写**：以协调前读到的 ``resource_version`` 做 CAS。冲突时重读：
-  ``uid``、``generation`` 与操作（reconcile / recover / terminate）都没变就以新版本重试，
-  否则丢弃这次结果并立即重新排队。
+  ``uid``、``generation`` 与操作（reconcile / recover / reclaim / terminate）都没变就以新
+  版本重试，否则丢弃这次结果并立即重新排队。
 * **去重键**：协调器以 ``record_dedup_keys=False`` 构造，管理器在 status 写入
   成功之后才登记去重键，避免"已登记、状态却没写进去"。
 * **重新排队**：``requeue_after`` 非空时按该延迟重试；为空时不再定时重试，等待
@@ -52,6 +52,7 @@ MAX_POLL_BACKOFF_SECONDS = 30.0
 
 _TERMINATING = "Terminating"
 _DEGRADED = "Degraded"
+_FAILED = "Failed"
 
 
 def _operation(phase: str | None) -> str:
@@ -59,12 +60,15 @@ def _operation(phase: str | None) -> str:
 
     ``Degraded`` 单独使用 ``recover``：同一代 spec 可能多次丢失实例、多次恢复，部署进入
     ``Ready`` 时登记的去重键不得挡住恢复；报告实例丢失（``Ready`` 转为 ``Degraded``）也让
-    读到 ``Ready`` 的那一轮的结果作废，不会覆盖这次报告。
+    读到 ``Ready`` 的那一轮的结果作废，不会覆盖这次报告。``Failed`` 单独使用 ``reclaim``：
+    进入 ``Failed`` 的一轮登记的去重键不得挡住之后停止遗留实例、释放分配的一轮。
     """
     if phase == _TERMINATING:
         return "terminate"
     if phase == _DEGRADED:
         return "recover"
+    if phase == _FAILED:
+        return "reclaim"
     return "reconcile"
 
 

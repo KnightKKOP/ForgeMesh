@@ -1,4 +1,5 @@
-"""清理资源的部署：取消进行中的部署运行并停止实例（删除资源时，以及重新部署之前）。"""
+"""清理资源的部署：取消进行中的部署运行并停止实例（删除资源时、重新部署之前，以及释放
+分配之前）。"""
 
 from __future__ import annotations
 
@@ -15,8 +16,8 @@ logger = logging.getLogger(__name__)
 
 class DeploymentReleaser:
     """协调器的 :class:`~forgemesh.controlplane.reconciler.ReleaseProvider`：资源进入
-    ``Terminating`` 后清理它的部署，协调器随后释放分配并删除资源；部署新的 spec 之前，
-    协调器同样先经它停止旧的实例。
+    ``Terminating`` 后清理它的部署，协调器随后释放分配并删除资源；部署新的 spec 之前，以及
+    释放 ``Failed`` 服务的分配之前，协调器同样先经它停止旧的实例。
 
     按 :func:`~forgemesh.controlplane.deployment.workflow.find_deployment_runs` 找到资源（uid）
     的全部部署运行（每一代 spec 一次运行，实例丢失后重新部署时再启动一次，含 1.1.0 之前

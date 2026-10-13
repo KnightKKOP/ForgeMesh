@@ -17,9 +17,12 @@
 就绪与停止
 ----------
 ``verify`` 每隔 ``poll_interval`` 秒请求一次 ``GET /health``，返回 ``200`` 即就绪；进程
-退出、或进程启动 ``ready_timeout`` 秒后仍未就绪时抛出。每个实例在自己的会话（进程组）中
-运行：``stop`` 向整个进程组发送 ``SIGTERM``，``stop_grace`` 秒内没有退出就发送
-``SIGKILL``，运行时派生的工作进程一并结束。
+退出、或进程启动 ``ready_timeout`` 秒后仍未就绪时抛出。每个实例在自己的会话中运行（会话
+id 即实例进程的 pid）：``stop`` 向实例进程的进程组发送 ``SIGTERM``，等它退出至多
+``stop_grace`` 秒，然后向会话中的每个进程组发送 ``SIGKILL``。运行时派生的进程可能比实例
+进程活得更久，也可能在别的进程组中（TGI 的 router 与 shard 各在自己的进程组中）。在 Linux
+上（读 ``/proc``）``stop`` 等到会话中的进程都已退出才返回；调用 ``setsid`` 离开了会话的
+进程不在此列，没有 ``/proc`` 时只等实例进程。
 
 控制平面重启
 ------------
@@ -56,12 +59,13 @@ DEFAULT_BIND_HOST = "127.0.0.1"
 DEFAULT_READY_TIMEOUT_SECONDS = 1200.0
 #: ``SIGTERM`` 之后等进程退出的默认宽限期（秒）。
 DEFAULT_STOP_GRACE_SECONDS = 10.0
-#: ``SIGKILL`` 之后等进程退出的时限（秒）；超过即 :meth:`~ProcessLauncher.stop` 失败。
+#: ``SIGKILL`` 之后等实例的进程退出的时限（秒）；超过即 :meth:`~ProcessLauncher.stop` 失败。
 KILL_WAIT_SECONDS = 10.0
 
 _INDEX_DEVICE = re.compile(r"(?:gpu-)?([0-9]+)")
 _UUID_DEVICE = re.compile(r"(?:GPU|MIG)-[0-9A-Za-z][0-9A-Za-z/-]*")
 _PORT_ATTEMPTS = 20
+_KILL_POLL_SECONDS = 0.05
 
 
 def cuda_device(device_id: str) -> str:
@@ -90,6 +94,28 @@ def _positive(name: str, value: float) -> float:
 def _signal_group(pgid: int, sig: signal.Signals) -> None:
     with contextlib.suppress(ProcessLookupError):
         os.killpg(pgid, sig)
+
+
+def _session_groups(sid: int) -> set[int]:
+    """会话 ``sid`` 中尚未结束的进程（僵尸进程不算）所在的进程组；没有 ``/proc`` 时为空。"""
+    try:
+        entries = os.listdir("/proc")
+    except OSError:
+        return set()
+    groups: set[int] = set()
+    for entry in entries:
+        if not entry.isdigit():
+            continue
+        try:
+            with open(f"/proc/{entry}/stat", "rb") as file:
+                stat = file.read()
+        except OSError:
+            continue
+        # 进程名在括号中且可能含空格与括号：其后依次是状态、父进程、进程组与会话。
+        fields = stat.rpartition(b")")[2].split()
+        if len(fields) >= 4 and int(fields[3]) == sid and fields[0] not in (b"Z", b"X"):
+            groups.add(int(fields[2]))
+    return groups
 
 
 @dataclass(eq=False)
@@ -291,10 +317,10 @@ class ProcessLauncher(RuntimeLauncher):
             await asyncio.sleep(min(self._poll_interval, remaining))
 
     async def stop(self, instance_id: str) -> None:
-        """结束实例的整个进程组：先 ``SIGTERM``，宽限期过后 ``SIGKILL``。
+        """结束实例的全部进程：先 ``SIGTERM``，宽限期过后 ``SIGKILL``（见模块说明）。
 
         Raises:
-            RuntimeError: ``SIGKILL`` 之后进程仍未退出；实例仍记录在案，可以再次停止。
+            RuntimeError: ``SIGKILL`` 之后仍有进程没有退出；实例仍记录在案，可以再次停止。
         """
         state = self._by_id.get(instance_id)
         if state is None:
@@ -372,16 +398,7 @@ class ProcessLauncher(RuntimeLauncher):
                     process.pid,
                     self._stop_grace,
                 )
-        # 进程组中可能还有运行时派生的工作进程（领头进程已退出也一样）。
-        _signal_group(process.pid, signal.SIGKILL)
-        try:
-            async with asyncio.timeout(KILL_WAIT_SECONDS):
-                await process.wait()
-        except TimeoutError:
-            raise RuntimeError(
-                f"instance {state.instance.instance_id} (pid {process.pid}) did not exit "
-                "after SIGKILL"
-            ) from None
+        await self._kill_session(state)
         self._logger.info(
             "%s instance stopped: instance_id=%s pid=%d returncode=%s",
             self.runtime_name,
@@ -389,6 +406,35 @@ class ProcessLauncher(RuntimeLauncher):
             process.pid,
             process.returncode,
         )
+
+    async def _kill_session(self, state: _Process) -> None:
+        """向实例会话中的每个进程组发送 ``SIGKILL``，直到实例进程与会话中的进程都已退出。
+
+        Raises:
+            RuntimeError: :data:`KILL_WAIT_SECONDS` 秒之后仍有进程没有退出。
+        """
+        process = state.process
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + KILL_WAIT_SECONDS
+        while True:
+            groups = await asyncio.to_thread(_session_groups, process.pid)
+            for pgid in groups | {process.pid}:
+                _signal_group(pgid, signal.SIGKILL)
+            if process.returncode is not None and not groups:
+                return
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                running = (
+                    f"(pid {process.pid})"
+                    if process.returncode is None
+                    else f"(process groups {', '.join(map(str, sorted(groups)))})"
+                )
+                raise RuntimeError(
+                    f"instance {state.instance.instance_id} {running} did not exit after SIGKILL"
+                )
+            with contextlib.suppress(TimeoutError):
+                async with asyncio.timeout(min(_KILL_POLL_SECONDS, remaining)):
+                    await process.wait()
 
 
 __all__ = [

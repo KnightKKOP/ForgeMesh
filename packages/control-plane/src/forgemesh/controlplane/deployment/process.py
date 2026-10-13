@@ -1,11 +1,12 @@
 """本机进程启动器的公共部分：每个实例是控制平面所在主机上的一个子进程（及其派生的进程）。
 
-:class:`ProcessLauncher` 负责启动、就绪检查与停止，子类给出运行时、协议与命令行参数
-（:class:`~.vllm_process.VLLMProcessLauncher`）。实例继承控制平面的环境变量（去掉
-``FORGEMESH_*``），``CUDA_VISIBLE_DEVICES`` 取自分配的设备，未设置 ``CUDA_DEVICE_ORDER``
-时设为 ``PCI_BUS_ID``，设备序号因此与 ``nvidia-smi`` 一致；端口由操作系统挑选。实例的
-标准输出与标准错误即控制平面的输出。``spec.runtime.version`` 与 ``spec.model.digest`` 都
-不检查：运行的是 ``command`` 对应的运行时，模型由它按引用加载。
+:class:`ProcessLauncher` 负责启动、就绪检查与停止，子类给出运行时、协议与命令行参数：
+:class:`~.vllm_process.VLLMProcessLauncher`（vLLM）与 :class:`~.tgi_process.TGIProcessLauncher`
+（TGI）。实例继承控制平面的环境变量（去掉 ``FORGEMESH_*``），``CUDA_VISIBLE_DEVICES`` 取自
+分配的设备，未设置 ``CUDA_DEVICE_ORDER`` 时设为 ``PCI_BUS_ID``，设备序号因此与
+``nvidia-smi`` 一致；端口由操作系统挑选，同一启动器的实例不会分到同一个端口。实例的标准
+输出与标准错误即控制平面的输出。``spec.runtime.version`` 与 ``spec.model.digest`` 都不
+检查：运行的是 ``command`` 对应的运行时，模型由它按引用加载。
 
 实例在哪里运行
 --------------
@@ -40,8 +41,10 @@ import logging
 import math
 import os
 import re
+import shutil
 import signal
 import socket
+import tempfile
 import uuid
 from abc import abstractmethod
 from collections.abc import Sequence
@@ -118,6 +121,43 @@ def _session_groups(sid: int) -> set[int]:
     return groups
 
 
+class LaunchResources:
+    """一次启动为实例预留的空闲端口与私有临时目录；实例停止之后这些目录被删除。"""
+
+    def __init__(self, bind_host: str, taken: set[int], prefix: str) -> None:
+        self._bind_host = bind_host
+        self._taken = taken
+        self._prefix = prefix
+        self.ports: list[int] = []
+        self.directories: list[str] = []
+
+    def port(self) -> int:
+        """操作系统挑选的空闲端口，避开本启动器的实例已经占用（或即将监听）的端口。
+
+        Raises:
+            RuntimeError: 找不到这样的端口。
+        """
+        for _ in range(_PORT_ATTEMPTS):
+            with socket.socket(socket_family(self._bind_host), socket.SOCK_STREAM) as sock:
+                sock.bind((self._bind_host, 0))
+                port = sock.getsockname()[1]
+            if port not in self._taken:
+                self._taken.add(port)
+                self.ports.append(port)
+                return port
+        raise RuntimeError(f"no free port on {self._bind_host}")
+
+    def directory(self) -> str:
+        """新建的私有临时目录（权限 ``0700``，名称以 ``forgemesh-<实例 id>-`` 开头）。"""
+        path = tempfile.mkdtemp(prefix=self._prefix)
+        self.directories.append(path)
+        return path
+
+    def remove_directories(self) -> None:
+        for path in self.directories:
+            shutil.rmtree(path, ignore_errors=True)
+
+
 @dataclass(eq=False)
 class _Process:
     key: str
@@ -125,6 +165,7 @@ class _Process:
     process: asyncio.subprocess.Process
     port: int
     ready_deadline: float
+    resources: LaunchResources
 
 
 class ProcessLauncher(RuntimeLauncher):
@@ -221,13 +262,16 @@ class ProcessLauncher(RuntimeLauncher):
         return self._stop_grace
 
     @abstractmethod
-    def _arguments(self, request: LaunchRequest, devices: Sequence[str], port: int) -> list[str]:
+    def _arguments(
+        self, request: LaunchRequest, devices: Sequence[str], port: int, resources: LaunchResources
+    ) -> list[str]:
         """追加在命令之后的参数。
 
         Args:
             request: 启动请求。
             devices: 实例的 ``CUDA_VISIBLE_DEVICES``（与分配的设备一一对应）。
             port: 实例监听的端口。
+            resources: 需要时从中再取空闲端口或私有临时目录。
         """
 
     async def launch(self, request: LaunchRequest) -> LaunchedInstance:
@@ -248,30 +292,42 @@ class ProcessLauncher(RuntimeLauncher):
             await self._terminate(existing)
             self._forget(existing)
         devices = self._cuda_devices(request)
-        port = self._free_port()
-        instance = LaunchedInstance(
-            instance_id=f"{self.provider}-{uuid.uuid4().hex[:12]}",
-            url=instance_url(self._advertise_host, port),
-            protocol=self.protocol,
+        instance_id = f"{self.provider}-{uuid.uuid4().hex[:12]}"
+        resources = LaunchResources(
+            self._bind_host,
+            {port for state in self._by_id.values() for port in state.resources.ports},
+            prefix=f"forgemesh-{instance_id}-",
         )
         env = {
             name: value for name, value in os.environ.items() if not name.startswith("FORGEMESH_")
         }
         env["CUDA_VISIBLE_DEVICES"] = ",".join(devices)
         env.setdefault("CUDA_DEVICE_ORDER", "PCI_BUS_ID")
-        process = await asyncio.create_subprocess_exec(
-            *self._command,
-            *self._arguments(request, devices, port),
-            stdin=asyncio.subprocess.DEVNULL,
-            env=env,
-            start_new_session=True,
-        )
+        try:
+            port = resources.port()
+            instance = LaunchedInstance(
+                instance_id=instance_id,
+                url=instance_url(self._advertise_host, port),
+                protocol=self.protocol,
+            )
+            arguments = self._arguments(request, devices, port, resources)
+            process = await asyncio.create_subprocess_exec(
+                *self._command,
+                *arguments,
+                stdin=asyncio.subprocess.DEVNULL,
+                env=env,
+                start_new_session=True,
+            )
+        except BaseException:
+            resources.remove_directories()
+            raise
         state = _Process(
             key=request.instance_key,
             instance=instance,
             process=process,
             port=port,
             ready_deadline=asyncio.get_running_loop().time() + self._ready_timeout,
+            resources=resources,
         )
         self._by_key[state.key] = state
         self._by_id[instance.instance_id] = state
@@ -367,21 +423,11 @@ class ProcessLauncher(RuntimeLauncher):
             )
         return [cuda_device(device.device_id) for device in request.devices]
 
-    def _free_port(self) -> int:
-        """操作系统挑选的空闲端口，避开本启动器的实例已经占用（或即将监听）的端口。"""
-        taken = {state.port for state in self._by_id.values()}
-        for _ in range(_PORT_ATTEMPTS):
-            with socket.socket(socket_family(self._bind_host), socket.SOCK_STREAM) as sock:
-                sock.bind((self._bind_host, 0))
-                port = sock.getsockname()[1]
-            if port not in taken:
-                return port
-        raise RuntimeError(f"no free port on {self._bind_host}")
-
     def _forget(self, state: _Process) -> None:
         self._by_id.pop(state.instance.instance_id, None)
         if self._by_key.get(state.key) is state:
             del self._by_key[state.key]
+        state.resources.remove_directories()
 
     async def _terminate(self, state: _Process) -> None:
         process = state.process
@@ -442,6 +488,7 @@ __all__ = [
     "DEFAULT_READY_TIMEOUT_SECONDS",
     "DEFAULT_STOP_GRACE_SECONDS",
     "KILL_WAIT_SECONDS",
+    "LaunchResources",
     "ProcessLauncher",
     "cuda_device",
 ]

@@ -12,6 +12,7 @@
   :class:`FakeLauncher`（CI 与本地开发）；
 * :mod:`.process` —— 本机进程启动器的公共部分（启动、就绪检查与停止）；
 * :mod:`.vllm_process` —— 把每个实例作为本机 vLLM 子进程运行的 :class:`VLLMProcessLauncher`；
+* :mod:`.tgi_process` —— 把每个实例作为本机 TGI 子进程运行的 :class:`TGIProcessLauncher`；
 * :mod:`.config` —— 按环境变量（``FORGEMESH_RUNTIME_LAUNCHER`` 等）选择启动器的
   :func:`launcher_from_env` 与核对实例的间隔 :func:`instance_check_interval_from_env`；
 * :mod:`.network` —— 启动器共用的地址校验与健康检查；
@@ -39,6 +40,7 @@ from .recovery import (
     reclaim_orphaned_allocations,
 )
 from .release import DeploymentReleaser
+from .tgi_process import TGIProcessLauncher
 from .vllm_process import VLLMProcessLauncher
 from .workflow import (
     DEPLOYMENT_WORKFLOW,
@@ -74,6 +76,7 @@ __all__ = [
     "LauncherConfigError",
     "RuntimeLauncher",
     "StepCallable",
+    "TGIProcessLauncher",
     "VLLMProcessLauncher",
     "check_instances",
     "deployment_inputs",

@@ -21,6 +21,7 @@ from .process import (
     DEFAULT_READY_TIMEOUT_SECONDS,
     DEFAULT_STOP_GRACE_SECONDS,
     KILL_WAIT_SECONDS,
+    LaunchResources,
     ProcessLauncher,
     cuda_device,
 )
@@ -45,7 +46,9 @@ class VLLMProcessLauncher(ProcessLauncher):
     protocol = EndpointProtocol.OPENAI_CHAT
     default_command = DEFAULT_COMMAND
 
-    def _arguments(self, request: LaunchRequest, devices: Sequence[str], port: int) -> list[str]:
+    def _arguments(
+        self, request: LaunchRequest, devices: Sequence[str], port: int, resources: LaunchResources
+    ) -> list[str]:
         return [
             f"--model={request.spec.model.reference}",
             "--host",

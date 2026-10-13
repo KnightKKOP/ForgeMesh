@@ -21,8 +21,8 @@
   :class:`~forgemesh.controlplane.scheduler.FirstFitScheduler`，清单不可读或非法时
   拒绝启动；未设置时需要分配加速器的资源报告 ``Ready=False``
   （``SchedulerUnavailable``）。
-* **部署**：``FORGEMESH_RUNTIME_LAUNCHER``（``fake`` / ``vllm-process``，只能与清单一起
-  使用，见 :mod:`forgemesh.controlplane.deployment.config`）选择推理实例的启动器，配置
+* **部署**：``FORGEMESH_RUNTIME_LAUNCHER``（``fake`` / ``vllm-process`` / ``tgi-process``，
+  只能与清单一起使用，见 :mod:`forgemesh.controlplane.deployment.config`）选择推理实例的启动器，配置
   非法时拒绝启动。此时协调器分配加速器、经部署工作流启动并验证实例，就绪后写入
   ``status.endpoints``；删除时停止实例、释放分配。工作流运行存放在单独的数据库文件
   （:func:`~forgemesh.controlplane.sqlite.workflow_db_path`，如 ``forgemesh.workflows.db``）

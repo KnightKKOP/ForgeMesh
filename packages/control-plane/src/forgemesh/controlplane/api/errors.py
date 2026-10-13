@@ -3,6 +3,7 @@
 所有错误响应都使用 ``{"error": {"code", "message", "correlationId", "traceId", "details"}}``
 信封（对齐 OpenAPI ``Error`` schema），包括框架层面的 404/405、请求校验失败
 （FastAPI 默认的 422 统一改为 400）以及未捕获的异常（500，不向客户端暴露内部细节）。
+没有匹配路由的 404 与网关一样使用 ``ROUTE_NOT_FOUND``，有别于资源不存在的 ``NOT_FOUND``。
 
 关联 ID 与 trace-id 取自请求头：
 :class:`~forgemesh.controlplane.api.middleware.RequestContextMiddleware` 已把确定的取值写回
@@ -21,6 +22,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import ValidationError
 from starlette.exceptions import HTTPException as StarletteHTTPException
+from starlette.types import Receive, Scope, Send
 
 from ..app import error_envelope
 from ..tracecontext import TRACEPARENT_HEADER, parse_traceparent
@@ -146,8 +148,19 @@ async def _unhandled_exception_handler(request: Request, exc: Exception) -> JSON
     )
 
 
+async def _route_not_found(scope: Scope, receive: Receive, send: Send) -> None:
+    """路由器在路径不匹配任何路由时调用（路径匹配而方法不匹配时是 ``405``）。
+
+    客户端据错误码区分地址错误与资源不存在：例如 CLI 的 ``--api-url`` 多了一段路径时，
+    ``wait --for delete`` 不能因为 ``NOT_FOUND`` 而认为资源已删除。
+    """
+    raise ApiError(404, "ROUTE_NOT_FOUND", "route not found")
+
+
 def install_exception_handlers(app: FastAPI) -> None:
-    """为应用注册全局异常处理器，使所有错误响应都符合错误信封。"""
+    """为应用注册全局异常处理器，使所有错误响应都符合错误信封；没有匹配路由的请求以
+    ``404 ROUTE_NOT_FOUND`` 响应。"""
     app.add_exception_handler(StarletteHTTPException, _http_exception_handler)
     app.add_exception_handler(RequestValidationError, _validation_exception_handler)
     app.add_exception_handler(Exception, _unhandled_exception_handler)
+    app.router.default = _route_not_found

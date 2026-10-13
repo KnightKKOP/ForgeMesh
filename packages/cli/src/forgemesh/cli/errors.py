@@ -103,7 +103,7 @@ class ApiError(CliError):
     ) -> None:
         exit_code = exit_code_for_status(status)
         if exit_code is ExitCode.NOT_FOUND and code != "NOT_FOUND":
-            # 不是 API 的 404（如网关没有路由的路径）：地址错了，不能让脚本以为资源不存在
+            # 不是 API 的 404（如网关或控制平面没有路由的路径）：地址错了，不能让脚本以为资源不存在
             exit_code = ExitCode.ERROR
         super().__init__(message, exit_code)
         self.status = status
@@ -113,8 +113,8 @@ class ApiError(CliError):
 
     @property
     def not_found(self) -> bool:
-        """资源不存在：错误码为 ``NOT_FOUND`` 的 ``404``，而不是网关对没有路由的路径返回的
-        ``ROUTE_NOT_FOUND`` 或不提供 API 的地址返回的 ``404``。"""
+        """资源不存在：错误码为 ``NOT_FOUND`` 的 ``404``，而不是网关与控制平面对没有路由的路径
+        返回的 ``ROUTE_NOT_FOUND`` 或不提供 API 的地址返回的 ``404``。"""
         return self.status == 404 and self.code == "NOT_FOUND"
 
     @property

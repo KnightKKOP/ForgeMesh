@@ -224,6 +224,10 @@ def test_framework_errors_use_the_error_envelope(tmp_path) -> None:
             "/api/v1/inference-services/nope",
             headers={**HEADERS, "X-Correlation-Id": "corr-1"},
         )
+        no_route = client.get(
+            "/prefix/api/v1/inference-services/nope",
+            headers={**HEADERS, "X-Correlation-Id": "corr-2"},
+        )
         not_object = client.post("/api/v1/inference-services", json=[1, 2], headers=HEADERS)
         bad_limit = client.get(
             "/api/v1/inference-services", params={"limit": "many"}, headers=HEADERS
@@ -233,6 +237,13 @@ def test_framework_errors_use_the_error_envelope(tmp_path) -> None:
     assert missing.status_code == 404
     assert missing.json()["error"]["code"] == "NOT_FOUND"
     assert missing.json()["error"]["correlationId"] == "corr-1"
+    assert no_route.status_code == 404
+    error = no_route.json()["error"]
+    assert (error["code"], error["message"], error["correlationId"]) == (
+        "ROUTE_NOT_FOUND",
+        "route not found",
+        "corr-2",
+    )
     assert not_object.status_code == 400
     assert not_object.json()["error"]["code"] == "BAD_REQUEST"
     assert not_object.json()["error"]["details"]["errors"]

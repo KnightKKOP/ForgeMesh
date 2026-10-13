@@ -227,7 +227,7 @@ class FakeApi:
             if call.method == "PUT":
                 return self._replace(call, key, current)
             return self._delete(key, current)
-        return self._error(call, 404, "NOT_FOUND", "Not Found")
+        return self._error(call, 404, "ROUTE_NOT_FOUND", "route not found")
 
     def _create(self, call: Call) -> Reply:
         metadata = call.body["metadata"]

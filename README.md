@@ -199,7 +199,7 @@ curl -s -H "Authorization: Bearer fmk_…" http://127.0.0.1:8080/api/v1/inferenc
 
 ### REST API
 
-控制平面的 REST API 以 `/api/v1` 为前缀，契约是 [api/openapi/openapi.yaml](api/openapi/openapi.yaml)。契约测试 `tests/contract/test_openapi_contract.py` 双向核对应用提供的路由、参数、请求体与状态码（探针除外），并逐一调用每个操作、校验响应符合契约：修改路由时须同步修改契约。网关把 `/api/v1/inference-services`、`/api/v1/resources`、`/api/v1/audit-events`、`/api/v1/workflows`、`/api/v1/decisions` 及其子路径的请求（任意方法，连同查询串、请求头与请求体）转发给控制平面。错误响应都是错误信封 `{"error": {"code", "message", "correlationId", "traceId", "details"}}`，`correlationId` 回显请求头 `X-Correlation-Id`（经网关访问时由网关补上），`traceId` 是这个请求的 trace-id（见「可观测性」）。
+控制平面的 REST API 以 `/api/v1` 为前缀，契约是 [api/openapi/openapi.yaml](api/openapi/openapi.yaml)。契约测试 `tests/contract/test_openapi_contract.py` 双向核对应用提供的路由、参数、请求体与状态码（探针除外），并逐一调用每个操作、校验响应符合契约：修改路由时须同步修改契约。网关把 `/api/v1/inference-services`、`/api/v1/resources`、`/api/v1/audit-events`、`/api/v1/workflows`、`/api/v1/decisions` 及其子路径的请求（任意方法，连同查询串、请求头与请求体）转发给控制平面。错误响应都是错误信封 `{"error": {"code", "message", "correlationId", "traceId", "details"}}`，`correlationId` 回显请求头 `X-Correlation-Id`（经网关访问时由网关补上），`traceId` 是这个请求的 trace-id（见「可观测性」）。资源不存在的 `404` 错误码为 `NOT_FOUND`；路径不匹配任何端点（如多了一段前缀）的 `404` 错误码为 `ROUTE_NOT_FOUND`，与网关相同，客户端据此区分资源不存在与地址错误。
 
 | 端点 | 说明 |
 | --- | --- |
@@ -288,7 +288,7 @@ CLI 只管理 `InferenceService`（写作 `inferenceservice` 或 `inferenceservi
 | 退出码 | 含义 |
 | --- | --- |
 | `0` | 成功 |
-| `1` | 其他错误，如地址不提供 ForgeMesh API（错误码不是 `NOT_FOUND` 的 `404`，如网关的 `ROUTE_NOT_FOUND`；重定向）或响应无法解析 |
+| `1` | 其他错误，如地址不提供 ForgeMesh API（错误码不是 `NOT_FOUND` 的 `404`，如网关与控制平面对没有匹配路由的路径返回的 `ROUTE_NOT_FOUND`；重定向）或响应无法解析 |
 | `2` | 参数、配置或资源文档不合法，没有发出请求 |
 | `3` | 资源不存在（`404 NOT_FOUND`）；`wait --for delete` 此时以 `0` 成功 |
 | `4` | 冲突（`409`），如资源正在删除，或 `apply` 的 5 次尝试都遇到并发修改 |

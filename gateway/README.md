@@ -109,7 +109,7 @@ panic 兜底的 `500`）没有这两个字段。客户端按状态码与 `error.
 | --- | --- | --- |
 | `401` | `UNAUTHENTICATED` | 缺少或无效凭证（`dev` 模式下为缺少租户头），带 `WWW-Authenticate` |
 | `403` | `FORBIDDEN` | 租户头与 key 绑定的租户不一致；推理路由缺少 `read` scope；控制平面拒绝 Resolver 的查询 |
-| `404` | `ROUTE_NOT_FOUND` | 没有匹配的路由（有别于控制平面表示资源不存在的 `NOT_FOUND`：客户端据此区分地址错误与资源不存在） |
+| `404` | `ROUTE_NOT_FOUND` | 没有匹配的路由（有别于控制平面表示资源不存在的 `NOT_FOUND`：客户端据此区分地址错误与资源不存在）；反代给控制平面的路径下没有匹配的端点时，控制平面同样返回 `ROUTE_NOT_FOUND` |
 | `405` | `METHOD_NOT_ALLOWED` | `/metrics` 收到 `GET` / `HEAD` 之外的方法（带 `Allow: GET, HEAD`） |
 | `413` | `REQUEST_TOO_LARGE` | 请求体超过 `GATEWAY_MAX_REQUEST_BODY_BYTES` |
 | `429` | `RATE_LIMITED` | 超过租户的限流（带 `Retry-After`：攒够一个令牌所需的秒数，向上取整，至少为 `1`） |

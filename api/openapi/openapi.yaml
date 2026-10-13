@@ -12,7 +12,8 @@ info:
     租户取自 key 绑定的租户；X-Tenant-Id 请求头可以省略，携带时必须与之一致，
     否则返回 403。读接口要求 read scope，写接口要求 write scope。
     任何端点遇到未预期的内部错误都返回 500（错误码 INTERNAL_ERROR，不含内部细节），
-    各操作只列出设计中的响应。
+    各操作只列出设计中的响应。路径不匹配任何端点时返回 RouteNotFound（404，错误码
+    ROUTE_NOT_FOUND，与网关相同），有别于资源不存在的 NotFound（404，错误码 NOT_FOUND）。
   x-stability: beta
   x-deprecation-policy: >-
     端点或字段弃用时使用 x-deprecated: true 扩展字段标记，并附带 x-deprecated-since
@@ -929,7 +930,16 @@ components:
           schema:
             $ref: "#/components/schemas/Error"
     NotFound:
-      description: 资源不存在
+      description: 资源不存在（错误码 NOT_FOUND）
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    RouteNotFound:
+      description: >-
+        路径不匹配任何端点（错误码 ROUTE_NOT_FOUND，与网关相同），如前缀写错或没有这个子路径；
+        与某个端点只差结尾的 / 时不返回此响应，而是以 307 重定向到该端点。适用于本文件之外的任何
+        路径，因此不在各操作中列出。客户端据错误码区分地址错误与资源不存在（NotFound）。
       content:
         application/json:
           schema:

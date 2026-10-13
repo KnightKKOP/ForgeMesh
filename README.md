@@ -423,6 +423,8 @@ curl -s http://127.0.0.1:8081/metrics   # 网关
 | `forgemesh_allocations_active{accelerator_type}` | gauge | Active 分配数，按其设备在清单中的类型 |
 | `forgemesh_accelerator_devices{accelerator_type,state}` | gauge | 清单中的设备数，`state` 为 `free` / `allocated`；未配置清单时没有样本 |
 | `forgemesh_workflow_runs{status}` | gauge | 各状态的部署工作流运行数；未设置启动器时没有样本 |
+| `forgemesh_outbox_events{state}` | gauge | 未发布的资源变更事件数：`pending`（尚未发布失败过）/ `retrying`（发布失败过，等待重试）/ `dead`（失败次数达到上限，不再自动重试，重新投递见[备份与恢复](docs/operations/backup-restore.md)第 5 节） |
+| `forgemesh_outbox_publish_attempts_total{outcome}` | counter | 发布事件的尝试次数，在结果写入数据库之后计数：`published` / `failed`（将重试）/ `dead`（最后一次失败）；三个取值都从 0 开始输出 |
 | `forgemesh_database_lock_wait_seconds` | histogram | 控制平面数据库的一次操作等待连接锁的时间：注册中心、Outbox（含事件发布）与审计记录共用这个连接与锁（不含 SQLite 内部的忙等待） |
 
 **追踪上下文与日志**：网关沿用请求中合法的 W3C `traceparent`，否则生成一个，随请求转发给控制平面与推理实例。控制平面按同样的规则读取 `traceparent`（直连控制平面的请求同样适用），并沿用 `X-Correlation-Id`（缺失时生成，审计记录与资源变更事件使用同一个关联 ID），这个请求的日志与错误信封（`{"error": {"code", "message", "correlationId", "traceId", …}}`）都带上 trace-id 与关联 ID，一次请求在网关与控制平面的日志里可以按 trace-id 对上。控制平面的日志写到标准错误，默认每行一个 JSON 对象，uvicorn 的访问日志也是如此：

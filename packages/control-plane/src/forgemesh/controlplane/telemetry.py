@@ -24,13 +24,19 @@
   ``free`` / ``allocated``；未配置清单时没有样本。
 * ``forgemesh_workflow_runs{status}``：各状态的部署工作流运行数，每个状态都输出；未配置启动器
   时没有样本。
+* ``forgemesh_outbox_events{state}``：未发布的资源变更事件数，``state`` 为 ``pending``（尚未
+  发布失败过）、``retrying``（发布失败过、等待重试）、``dead``（失败次数达到上限，不再自动
+  重试），每个状态都输出（见 :class:`~forgemesh.controlplane.outbox.OutboxBacklog`）。
+* ``forgemesh_outbox_publish_attempts_total{outcome}``：Dispatcher 发布事件的尝试次数，在结果
+  写入数据库之后计数；``outcome`` 见 :class:`~forgemesh.controlplane.outbox.PublishOutcome`，
+  每个取值都从 0 开始输出。
 * ``forgemesh_database_lock_wait_seconds``：一次数据库操作等待控制平面数据库连接锁的时间。
   资源注册表、Outbox（含事件发布）与审计记录共用这个连接与锁（见
   :class:`~forgemesh.controlplane.sqlite.Database`）；不含 SQLite 内部的忙等待。
 
-仪表盘（队列深度、服务、分配、设备与工作流运行数）在抓取时从控制器、注册中心、加速器清单与
-工作流存储读取（见 :meth:`ControlPlaneMetrics.watch`），跨租户聚合；锁等待时间在每次数据库操作
-时记录。加速器类型取自运维配置的清单，不是租户数据。
+仪表盘（队列深度、服务、分配、设备、工作流运行与 Outbox 事件数）在抓取时从控制器、注册中心
+（含其 Outbox）、加速器清单与工作流存储读取（见 :meth:`ControlPlaneMetrics.watch`），跨租户
+聚合；锁等待时间在每次数据库操作时记录。加速器类型取自运维配置的清单，不是租户数据。
 
 ``/metrics`` 与探针一样不要求认证，只输出聚合数据；它不在 ``/api/v1`` 之下，网关不会
 转发它（见 README「可观测性」）。
@@ -38,6 +44,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import re
 from collections.abc import Callable, Mapping
 from enum import StrEnum
@@ -47,6 +54,7 @@ from forgemesh.resource.inference import InferencePhase
 from forgemesh.workflow.states import WorkflowStatus
 
 from .metrics import MetricsRegistry
+from .outbox import PublishOutcome
 
 if TYPE_CHECKING:  # pragma: no cover - 仅静态类型检查使用
     from forgemesh.core.reconciler import ReconcileResult
@@ -183,6 +191,35 @@ class ControllerMetrics:
             self._deployments.inc(outcome, _ready_reason(patch))
 
 
+class OutboxMetrics:
+    """Outbox 事件的发布尝试与未发布的事件数。
+
+    Args:
+        registry: 指标所在的注册中心；为空时新建（指标不会被导出）。
+    """
+
+    def __init__(self, registry: MetricsRegistry | None = None) -> None:
+        registry = registry if registry is not None else MetricsRegistry()
+        self._attempts = registry.counter(
+            "forgemesh_outbox_publish_attempts_total",
+            "Outbox event publish attempts by outcome, counted once the outcome is recorded.",
+            ("outcome",),
+        )
+        for outcome in PublishOutcome:
+            self._attempts.inc(outcome.value, amount=0)
+        #: 由 :meth:`ControlPlaneMetrics.watch` 登记的采集器在抓取时更新。
+        self.events = registry.gauge(
+            "forgemesh_outbox_events",
+            "Unpublished outbox events by state (pending, retrying or dead).",
+            ("state",),
+        )
+
+    def attempted(self, outcome: PublishOutcome) -> None:
+        """记录一次结果已写入数据库的发布尝试；用作
+        :class:`~forgemesh.controlplane.outbox.Dispatcher` 的 ``on_attempt``。"""
+        self._attempts.inc(outcome.value)
+
+
 class ControlPlaneMetrics:
     """控制平面的指标注册中心及各组件的指标。"""
 
@@ -190,6 +227,7 @@ class ControlPlaneMetrics:
         self.registry = MetricsRegistry()
         self.http = HTTPMetrics(self.registry)
         self.controller = ControllerMetrics(self.registry)
+        self.outbox = OutboxMetrics(self.registry)
         self._services = self.registry.gauge(
             "forgemesh_inference_services",
             "Inference services by phase.",
@@ -224,7 +262,8 @@ class ControlPlaneMetrics:
         inventory: Inventory | None = None,
         workflow_store: WorkflowStore | None = None,
     ) -> Callable[[], None]:
-        """在抓取时从这些组件读取状态类指标，并观测注册中心所在数据库的锁等待。
+        """在抓取时从这些组件（含注册中心的 Outbox）读取状态类指标，并观测注册中心所在数据库的
+        锁等待。
 
         返回注销函数：之后不再读取这些组件，状态类指标没有样本。
         """
@@ -268,10 +307,21 @@ class ControlPlaneMetrics:
             self._allocations.replace(by_type)
             self._devices.replace(by_state)
 
+        async def outbox() -> None:
+            backlog = await asyncio.to_thread(registry.outbox.backlog)
+            self.outbox.events.replace(
+                {
+                    ("pending",): backlog.pending,
+                    ("retrying",): backlog.retrying,
+                    ("dead",): backlog.dead,
+                }
+            )
+
         removers = [
             self.registry.add_collector(queue, [self.controller.queue_depth]),
             self.registry.add_collector(services, [self._services]),
             self.registry.add_collector(allocations, [self._allocations, self._devices]),
+            self.registry.add_collector(outbox, [self.outbox.events]),
         ]
         if workflow_store is not None:
             store = workflow_store
@@ -295,6 +345,7 @@ class ControlPlaneMetrics:
                 self._allocations,
                 self._devices,
                 self._workflow_runs,
+                self.outbox.events,
             ):
                 gauge.replace({})
 
@@ -312,5 +363,6 @@ __all__ = [
     "ControlPlaneMetrics",
     "ControllerMetrics",
     "HTTPMetrics",
+    "OutboxMetrics",
     "ReconcileOutcome",
 ]

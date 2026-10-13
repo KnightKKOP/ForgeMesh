@@ -255,7 +255,7 @@ expect_reply "$first_instance"
   || fail "the workflow store is not next to the registry"
 echo "ok: the workflow store lives next to the registry"
 
-# 此时只有 smoke-svc：Ready，占用清单中唯一的设备，部署工作流已成功。
+# 此时只有 smoke-svc：Ready，占用清单中唯一的设备，部署工作流已成功。事件写日志，不会发布失败。
 scrape "control plane /metrics" http://127.0.0.1:8080/metrics \
   'forgemesh_http_requests_total{method="POST",route="/api/v1/inference-services",status="201"} ' \
   'forgemesh_reconcile_total{operation="reconcile",outcome="done"} ' \
@@ -265,7 +265,11 @@ scrape "control plane /metrics" http://127.0.0.1:8080/metrics \
   'forgemesh_inference_services{phase="Ready"} 1$' \
   'forgemesh_allocations_active{accelerator_type="nvidia-gpu"} 1$' \
   'forgemesh_accelerator_devices{accelerator_type="nvidia-gpu",state="free"} 0$' \
-  'forgemesh_workflow_runs{status="Succeeded"} 1$'
+  'forgemesh_workflow_runs{status="Succeeded"} 1$' \
+  'forgemesh_outbox_publish_attempts_total{outcome="published"} [1-9]' \
+  'forgemesh_outbox_publish_attempts_total{outcome="failed"} 0$' \
+  'forgemesh_outbox_events{state="retrying"} 0$' \
+  'forgemesh_outbox_events{state="dead"} 0$'
 scrape "gateway /metrics" "$gateway/metrics" \
   'forgemesh_gateway_http_requests_total{route="control_plane",status="401"} 1$' \
   'forgemesh_gateway_http_requests_total{route="inference",status="200"} ' \

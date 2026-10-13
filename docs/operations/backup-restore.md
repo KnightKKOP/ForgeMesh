@@ -445,7 +445,7 @@ Kubernetes 上先 `kubectl -n forgemesh scale deploy/forgemesh-control-plane --r
 | 误删资源 | 用户报告 / 审计日志确认 | 从误删前备份恢复（需停服） |
 | 注册表与工作流存储来自不同的备份 | 恢复后仍在部署的服务进入 `Failed`（`WorkflowRunNotFound`），或设备被注册表之外的实例占用（2.6 节） | 停止控制平面，从同一组备份重新恢复两个文件 |
 | 租户数据串扰 | 安全测试失败 | 立即从备份恢复 + 排查隔离边界缺陷 |
-| 事件接收方（webhook）长时间不可用 | ERROR 日志 `outbox event … is dead after 10 failed attempts` | 修复接收方后重新投递 `dead` 事件（见下） |
+| 事件接收方（webhook）长时间不可用 | ERROR 日志 `outbox event … is dead after 10 failed attempts`；`/metrics` 的 `forgemesh_outbox_events{state="dead"}` 大于 0（接收方不可用期间 `state="retrying"` 持续大于 0） | 修复接收方后重新投递 `dead` 事件（见下） |
 
 `dead` 事件不再自动发送。下面的命令只改动 `outbox_events` 中的 `dead` 行（一次短事务），可以在控制平面运行时执行，Dispatcher 在下一轮发布放回队列的事件。路径须与 `FORGEMESH_DB_PATH` 一致（路径写错时会新建一个空库）：
 

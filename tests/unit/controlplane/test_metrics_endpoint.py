@@ -19,6 +19,7 @@ from forgemesh.controlplane.auth import (
 from forgemesh.controlplane.deployment import RUNTIME_LAUNCHER_ENV
 from forgemesh.controlplane.deployment.config import FAKE_ADVERTISE_HOST_ENV, FAKE_BIND_HOST_ENV
 from forgemesh.controlplane.metrics import CONTENT_TYPE
+from forgemesh.controlplane.outbox import OutboxEvent
 from forgemesh.controlplane.scheduler import INVENTORY_FILE_ENV
 
 from .exposition import parse
@@ -115,6 +116,43 @@ def test_unhandled_errors_are_counted_as_500(tmp_path, monkeypatch) -> None:
 
     requests = parse(text)["forgemesh_http_requests_total"]
     assert requests.value(method="GET", route="/api/v1/inference-services", status="500") == 1
+
+
+@pytest.mark.unit
+def test_outbox_metrics_follow_the_event_dispatcher(tmp_path, monkeypatch) -> None:
+    """创建事件发布成功、status 写入的事件发布失败：发布尝试按结果计数，失败的事件计为 retrying。"""
+    monkeypatch.setattr(app_module, "CONTROLLER_POLL_INTERVAL_SECONDS", 0.05)
+    monkeypatch.setattr(app_module, "EVENT_POLL_INTERVAL_SECONDS", 0.05)
+
+    def publisher(event: OutboxEvent) -> None:
+        if event.event_type.endswith(".status_updated"):
+            raise ConnectionError("webhook unreachable")
+
+    app = create_app(
+        db_path=str(tmp_path / "cp.db"),
+        authenticator=HeaderAuthenticator(),
+        event_publisher=publisher,
+    )
+    with TestClient(app) as client:
+        created = client.post("/api/v1/inference-services", json=BODY, headers=HEADERS)
+        assert created.status_code == 201
+        deadline = time.monotonic() + 10
+        while True:
+            families = parse(client.get("/metrics").text)
+            attempts = families["forgemesh_outbox_publish_attempts_total"]
+            events = families["forgemesh_outbox_events"]
+            if (
+                attempts.value(outcome="published") >= 1
+                and attempts.value(outcome="failed") >= 1
+                and events.value(state="retrying") >= 1
+            ):
+                break
+            assert time.monotonic() < deadline, "no event was both published and retried"
+            time.sleep(0.02)
+
+    assert attempts.value(outcome="dead") == 0
+    assert {s.labels["state"] for s in events.samples} == {"pending", "retrying", "dead"}
+    assert events.value(state="dead") == 0
 
 
 @pytest.mark.unit

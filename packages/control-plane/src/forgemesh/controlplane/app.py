@@ -315,7 +315,10 @@ if _FASTAPI_AVAILABLE:
                 cleanup.callback(reset_registry)
                 logger.info("control plane registry opened: %s", path)
                 dispatcher = Dispatcher(
-                    registry.outbox, publisher, poll_interval=EVENT_POLL_INTERVAL_SECONDS
+                    registry.outbox,
+                    publisher,
+                    poll_interval=EVENT_POLL_INTERVAL_SECONDS,
+                    on_attempt=metrics.outbox.attempted,
                 )
                 dispatcher.start()
                 cleanup.push_async_callback(dispatcher.shutdown)

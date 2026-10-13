@@ -1,4 +1,4 @@
-"""控制平面的指标：协调结果与耗时、重试、部署结果，以及抓取时读取的状态类指标。"""
+"""控制平面的指标：协调结果与耗时、重试、部署结果、Outbox 的发布尝试，以及抓取时读取的状态类指标。"""
 
 from __future__ import annotations
 
@@ -12,6 +12,7 @@ from typing import Any
 import pytest
 from forgemesh.controlplane.controller import ControllerManager, WorkQueue
 from forgemesh.controlplane.metrics import MetricsRegistry
+from forgemesh.controlplane.outbox import PublishOutcome, RetryPolicy
 from forgemesh.controlplane.registry import ResourceKey, SQLiteRegistry
 from forgemesh.controlplane.scheduler import Inventory
 from forgemesh.controlplane.telemetry import ControllerMetrics, ControlPlaneMetrics
@@ -227,6 +228,28 @@ def test_deployments_count_transitions_into_ready_or_failed_with_bounded_reasons
 
 
 @pytest.mark.unit
+def test_publish_attempts_are_counted_by_outcome_starting_from_zero() -> None:
+    metrics = ControlPlaneMetrics()
+    name = "forgemesh_outbox_publish_attempts_total"
+    initial = parse(metrics.registry.render())[name]
+    for outcome in (PublishOutcome.PUBLISHED, PublishOutcome.PUBLISHED, PublishOutcome.FAILED):
+        metrics.outbox.attempted(outcome)
+    attempts = parse(metrics.registry.render())[name]
+
+    assert initial.type == "counter"
+    assert {s.labels["outcome"]: s.value for s in initial.samples} == {
+        "published": 0,
+        "failed": 0,
+        "dead": 0,
+    }
+    assert {s.labels["outcome"]: s.value for s in attempts.samples} == {
+        "published": 2,
+        "failed": 1,
+        "dead": 0,
+    }
+
+
+@pytest.mark.unit
 def test_state_metrics_are_read_at_scrape_time_without_tenant_data() -> None:
     definition = WorkflowDefinition(name="deploy", steps=[Step(id="launch", uses="launch")])
 
@@ -306,8 +329,14 @@ def test_state_metrics_are_read_at_scrape_time_without_tenant_data() -> None:
         "delayed": 0,
         "processing": 0,
     }
+    events = families["forgemesh_outbox_events"]
+    assert {s.labels["state"]: s.value for s in events.samples} == {
+        "pending": 5,
+        "retrying": 0,
+        "dead": 0,
+    }
     lock_wait_count = "forgemesh_database_lock_wait_seconds_count"
-    assert families["forgemesh_database_lock_wait_seconds"].value(lock_wait_count) == 2
+    assert families["forgemesh_database_lock_wait_seconds"].value(lock_wait_count) == 3
     for hidden in ("tenant-", NAMESPACE, "svc-", "uid-", "node-", "gpu-", "run-"):
         assert hidden not in watched
 
@@ -318,9 +347,10 @@ def test_state_metrics_are_read_at_scrape_time_without_tenant_data() -> None:
         "forgemesh_accelerator_devices",
         "forgemesh_workflow_runs",
         "forgemesh_controller_queue_depth",
+        "forgemesh_outbox_events",
     ):
         assert after[name].samples == []
-    assert after["forgemesh_database_lock_wait_seconds"].value(lock_wait_count) == 2
+    assert after["forgemesh_database_lock_wait_seconds"].value(lock_wait_count) == 3
 
 
 @pytest.mark.unit
@@ -339,12 +369,53 @@ def test_state_metrics_from_an_unavailable_registry_are_dropped(caplog) -> None:
         available, unavailable = _run(scenario())
 
     assert parse(available)["forgemesh_inference_services"].value(phase="Pending") == 1
+    assert parse(available)["forgemesh_outbox_events"].value(state="pending") == 1
     families = parse(unavailable)
     assert families["forgemesh_inference_services"].samples == []
     assert families["forgemesh_allocations_active"].samples == []
     assert families["forgemesh_workflow_runs"].samples == []
+    assert families["forgemesh_outbox_events"].samples == []
     assert families["forgemesh_controller_queue_depth"].value(state="ready") == 0
     assert "metrics collector" in caplog.text
+
+
+@pytest.mark.unit
+def test_the_outbox_backlog_is_read_by_state_at_scrape_time() -> None:
+    async def scenario() -> tuple[str, str]:
+        registry = SQLiteRegistry()
+        metrics = ControlPlaneMetrics()
+        manager = ControllerManager(registry, StubReconciler(), metrics=metrics.controller)
+        for name in ("svc-a", "svc-b", "svc-c"):
+            await registry.put(_service(name))
+        unwatch = metrics.watch(registry, manager)
+        before = await metrics.registry.scrape()
+        retried, dead, _ = await asyncio.to_thread(registry.outbox.get_pending)
+        await asyncio.to_thread(registry.outbox.mark_failed, retried.event_id, "refused")
+        await asyncio.to_thread(
+            registry.outbox.mark_failed,
+            dead.event_id,
+            "refused",
+            policy=RetryPolicy(max_attempts=1),
+        )
+        after = await metrics.registry.scrape()
+        unwatch()
+        await registry.close()
+        return before, after
+
+    before, after = _run(scenario())
+    initial = parse(before)["forgemesh_outbox_events"]
+    events = parse(after)["forgemesh_outbox_events"]
+    assert initial.type == "gauge"
+    assert {s.labels["state"]: s.value for s in initial.samples} == {
+        "pending": 3,
+        "retrying": 0,
+        "dead": 0,
+    }
+    assert {s.labels["state"]: s.value for s in events.samples} == {
+        "pending": 1,
+        "retrying": 1,
+        "dead": 1,
+    }
 
 
 @pytest.mark.unit

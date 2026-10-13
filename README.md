@@ -174,6 +174,9 @@ curl -s -H "Authorization: Bearer fmk_…" http://127.0.0.1:8080/api/v1/inferenc
 | `FORGEMESH_TGI_ADVERTISE_HOST` | 同监听地址 | `tgi-process`：写进 `status.endpoints` 的主机名或 IP 地址；监听全部地址时必须设置 |
 | `FORGEMESH_TGI_READY_TIMEOUT_SECONDS` | `1200` | `tgi-process`：进程启动后等 `GET /health` 返回 `200` 的时限（秒），包括下载与加载模型 |
 | `FORGEMESH_TGI_STOP_GRACE_SECONDS` | `10` | `tgi-process`：停止实例时 `SIGTERM` 之后等它退出的秒数，之后 `SIGKILL` |
+| `FORGEMESH_EVENT_WEBHOOK_URL` | — | 资源变更事件的 webhook 地址（`http` / `https`，不得含用户信息与片段）：设置后把事件信封以 JSON `POST` 到这里，2xx 视为送达，不跟随重定向；未设置时事件写日志（见下文）。地址非法时拒绝启动；日志与错误信息只含地址的 scheme、主机与端口 |
+| `FORGEMESH_EVENT_WEBHOOK_TOKEN` | — | 可选，以 `Authorization: Bearer <token>` 发给 webhook，只能由可见的 ASCII 字符组成，不写入日志；经明文 `http` 发往非回环地址时启动日志给出警告 |
+| `FORGEMESH_EVENT_WEBHOOK_TIMEOUT_SECONDS` | `5` | 每次发送 webhook 的连接与读取超时（秒，大于 0、不超过 60）。这个变量与 token 只能与 `FORGEMESH_EVENT_WEBHOOK_URL` 一起设置，否则拒绝启动 |
 
 > 请求可以不带 `X-Tenant-Id`；带了就必须与 key 绑定的租户一致，否则返回 `403`。缺少或无效的 key 返回 `401`。
 
@@ -190,6 +193,8 @@ curl -s -H "Authorization: Bearer fmk_…" http://127.0.0.1:8080/api/v1/inferenc
 
 控制平面启动后会自动协调 `InferenceService`：新建、修改或请求删除的资源在 0.5 秒内被处理，协调结果写入 `status.conditions`（例如 `Ready=False` 及其原因）。未设置 `FORGEMESH_INVENTORY_FILE` 时，新建的服务会停在 `Pending`，并带有 `Ready=False`（`SchedulerUnavailable`）条件；只设置清单、未设置 `FORGEMESH_RUNTIME_LAUNCHER` 时，条件为 `Ready=False`（`WorkflowRuntimeUnavailable`），协调器在分配之前停下，不占用设备。两者都设置后，资源每轮推进一个 phase（`Pending` → `Scheduling` → `Preparing` → `Deploying` → `Verifying` → `Ready`）：分配设备，运行部署工作流（准备模型 → 启动实例 → 验证实例），成功后写入 `status.endpoints` 与 `Ready=True`，网关随即可以转发对话；`spec` 变化时经 `Updating` 重新部署（见下文「更新」）；实例丢失时服务转为 `Degraded` 并重新部署；部署失败时资源进入 `Failed`，不自动重试，修改 `spec` 或删除后重新创建即可再次部署；删除时先取消部署、停止实例，再释放分配。每个服务只部署一个实例（`spec.availability.replicas` 不生效）。控制器与 API 运行在同一个进程中，是权威存储的唯一写者（ADR-013）：请以单进程运行，不要使用 `uvicorn --workers` 或多副本。设置了启动器时 `POST /api/v1/workflows` 同样返回 `503`（`WORKFLOW_RUNTIME_UNAVAILABLE`）：部署工作流的运行时只供协调器使用，不对外开放。
 
+每次资源写入（经 API、控制器或启动时的实例核对）都在同一个事务中记下一条资源变更事件（信封见 `api/schemas/event.schema.json`，如 `inference.service.created`、`inference.service.status_updated`），控制平面在后台发布：默认写日志（logger `forgemesh.events`，每个事件一行 JSON，没有配置 logging 时写标准输出），设置 `FORGEMESH_EVENT_WEBHOOK_URL` 后 `POST` 到 webhook。事件至少投递一次，接收方按 `eventId`（webhook 请求头 `X-Forgemesh-Event-Id`）去重；发送失败时按 1 秒起翻倍、最长 300 秒的间隔重试，失败 10 次后不再发送（`dead`，记一条 ERROR 日志），修复接收方后可以重新投递，见[备份与灾备演练](docs/operations/backup-restore.md)第 5 节。经 API 创建、更新（`PUT` / `PATCH`）与删除资源时，同一事务还写入一条审计记录（租户、主体、key id、correlation id），可用 `GET /api/v1/audit-events` 查询（见下文 REST API）。
+
 ### REST API
 
 控制平面的 REST API 以 `/api/v1` 为前缀，契约是 [api/openapi/openapi.yaml](api/openapi/openapi.yaml)。契约测试 `tests/contract/test_openapi_contract.py` 双向核对应用提供的路由、参数、请求体与状态码（探针除外），并逐一调用每个操作、校验响应符合契约：修改路由时须同步修改契约。网关把 `/api/v1/inference-services`、`/api/v1/resources`、`/api/v1/workflows`、`/api/v1/decisions` 及其子路径的请求（任意方法，连同查询串、请求头与请求体）转发给控制平面。错误响应都是错误信封 `{"error": {"code", "message", "correlationId", "details"}}`，`correlationId` 回显请求头 `X-Correlation-Id`（经网关访问时由网关补上）。
@@ -203,6 +208,7 @@ curl -s -H "Authorization: Bearer fmk_…" http://127.0.0.1:8080/api/v1/inferenc
 | `PATCH /api/v1/inference-services/{name}` | JSON Merge Patch（RFC 7386，`Content-Type: application/merge-patch+json`），规则同 `PUT` |
 | `DELETE /api/v1/inference-services/{name}` | 受控删除：直接删除返回 `204`；持有 finalizer 或加速器分配时返回 `202`，资源进入 `Terminating`，由协调器释放后删除 |
 | `GET /api/v1/resources?kind=…` | 按 kind 列出资源，分页同上；省略 `kind` 时返回空列表 |
+| `GET /api/v1/audit-events` | 列出本租户的审计记录，最新的在前，可按 `correlationId` 过滤；`limit`、`count` 与 `pageToken` 同下文的分页，游标不能与资源列表的游标互换；网关尚未转发这个路径，请直接访问控制平面 |
 | `POST /api/v1/workflows`、`POST /api/v1/decisions` | 控制平面应用不注入工作流运行时与决策路由器，合法的请求返回 `503`（`WORKFLOW_RUNTIME_UNAVAILABLE` / `DECISION_ROUTER_UNAVAILABLE`）；决策的风险等级由服务端按 `question` 推导，请求中的 `riskLevel` 只能调高 |
 
 单个资源的端点以 `namespace` 查询参数指定命名空间，省略时指不带命名空间的资源。读接口要求 `read` scope，写接口（含 `PUT` / `PATCH`、启动工作流与请求决策）要求 `write` scope。

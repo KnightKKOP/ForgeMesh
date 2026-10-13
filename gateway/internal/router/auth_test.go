@@ -3,7 +3,8 @@
 //   - 无凭证或凭证无效 → 401，不触达上游；
 //   - 租户取自 key 绑定的租户，与凭证不符的租户头 → 403；
 //   - 控制平面收到调用方凭证，可独立校验（含 Resolver 查询）；推理实例收不到；
-//   - 推理调用要求 read 作用域。
+//   - 推理调用要求 read 作用域；
+//   - 审计查询与其他资源路由一样经认证后反代，路径与查询串原样到达控制平面。
 package router
 
 import (
@@ -67,17 +68,19 @@ func newAPIKeyRouter(t *testing.T, upstreamURL string) *Router {
 	return r
 }
 
-// headerRecorder 是记录请求头的假上游。
+// headerRecorder 是记录请求头与请求目标（路径与查询串）的假上游。
 type headerRecorder struct {
-	mu      sync.Mutex
-	calls   int
-	headers http.Header
+	mu         sync.Mutex
+	calls      int
+	headers    http.Header
+	requestURI string
 }
 
 func (h *headerRecorder) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	h.mu.Lock()
 	h.calls++
 	h.headers = r.Header.Clone()
+	h.requestURI = r.RequestURI
 	h.mu.Unlock()
 	w.WriteHeader(http.StatusOK)
 	_, _ = io.WriteString(w, `{"items":[],"count":0}`)
@@ -87,6 +90,13 @@ func (h *headerRecorder) snapshot() (int, http.Header) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	return h.calls, h.headers
+}
+
+// lastRequestURI 返回最近一次请求行中的请求目标，未经解析。
+func (h *headerRecorder) lastRequestURI() string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.requestURI
 }
 
 func newRecordingUpstream(t *testing.T) (*headerRecorder, string) {
@@ -163,6 +173,70 @@ func TestAPIKeyMode_RejectsForeignTenantHeader(t *testing.T) {
 	}
 	if !strings.Contains(rec.Body.String(), `"code":"FORBIDDEN"`) {
 		t.Fatalf("403 应为 FORBIDDEN 错误信封，实际 %s", rec.Body.String())
+	}
+	if calls, _ := upstreamRec.snapshot(); calls != 0 {
+		t.Fatalf("被拒请求不应触达控制平面，实际 %d 次", calls)
+	}
+}
+
+// TestAPIKeyMode_ForwardsAuditEventsQuery 验证审计查询与其他资源路由一样反代到控制平面：
+// 路径与查询串原样到达，租户取自凭证，凭证一并转发（read scope 由控制平面检查），
+// 调用方的关联 ID 透传到控制平面并回写到响应头。
+func TestAPIKeyMode_ForwardsAuditEventsQuery(t *testing.T) {
+	upstreamRec, url := newRecordingUpstream(t)
+	r := newAPIKeyRouter(t, url)
+
+	const target = "/api/v1/audit-events?limit=2&correlationId=corr-audit&pageToken=eyJwIjoxfQ%3D%3D"
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, target, nil)
+	req.Header.Set("Authorization", "Bearer "+routerKeyTenantA)
+	req.Header.Set("X-Correlation-ID", "corr-audit")
+	r.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK || rec.Body.String() != `{"items":[],"count":0}` {
+		t.Fatalf("应原样返回控制平面的 200 响应，实际 %d（body=%s）", rec.Code, rec.Body.String())
+	}
+	calls, headers := upstreamRec.snapshot()
+	if calls != 1 {
+		t.Fatalf("请求应触达控制平面 1 次，实际 %d", calls)
+	}
+	if got := upstreamRec.lastRequestURI(); got != target {
+		t.Fatalf("控制平面收到的请求目标应为 %q，实际 %q", target, got)
+	}
+	if got := headers.Values("X-Tenant-ID"); len(got) != 1 || got[0] != "tenant-a" {
+		t.Fatalf("控制平面收到的租户头应为 [tenant-a]，实际 %v", got)
+	}
+	if got := headers.Get("Authorization"); got != "Bearer "+routerKeyTenantA {
+		t.Fatalf("控制平面应收到调用方凭证，实际 %q", got)
+	}
+	if got := headers.Get("X-Correlation-ID"); got != "corr-audit" {
+		t.Fatalf("关联 ID 应透传到控制平面，实际 %q", got)
+	}
+	if got := rec.Header().Get("X-Correlation-ID"); got != "corr-audit" {
+		t.Fatalf("响应头应带回关联 ID，实际 %q", got)
+	}
+}
+
+// TestAPIKeyMode_AuditEventsRequireCredentials 验证审计查询同样先经网关认证：无凭证或
+// 未知 key 返回 401（带 WWW-Authenticate），不触达控制平面。
+func TestAPIKeyMode_AuditEventsRequireCredentials(t *testing.T) {
+	upstreamRec, url := newRecordingUpstream(t)
+	r := newAPIKeyRouter(t, url)
+
+	for name, auth := range map[string]string{"无凭证": "", "未知 key": "Bearer fmk_unknown"} {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/api/v1/audit-events?limit=1", nil)
+		if auth != "" {
+			req.Header.Set("Authorization", auth)
+		}
+		r.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusUnauthorized {
+			t.Fatalf("%s：应 401，实际 %d", name, rec.Code)
+		}
+		if rec.Header().Get("WWW-Authenticate") == "" {
+			t.Fatalf("%s：401 应携带 WWW-Authenticate", name)
+		}
 	}
 	if calls, _ := upstreamRec.snapshot(); calls != 0 {
 		t.Fatalf("被拒请求不应触达控制平面，实际 %d 次", calls)

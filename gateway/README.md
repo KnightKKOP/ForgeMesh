@@ -38,6 +38,7 @@ ForgeMesh 的**统一外部入口**与**高性能流式代理**。与 Python 控
 | ANY | `/api/v1/inference-services[/...]` | 反代 → Python 控制平面 | 全链 |
 | ANY | `/api/v1/workflows[/...]` | 反代 → Python 控制平面 | 全链 |
 | ANY | `/api/v1/decisions[/...]` | 反代 → Python 控制平面 | 全链 |
+| ANY | `/api/v1/audit-events[/...]` | 反代 → Python 控制平面（审计查询） | 全链 |
 | ANY | `/api/v1/namespaces/{ns}/inference/{svc}/chat` | **SSE 流式代理**（命名空间 `{ns}` 中的服务） | 全链 + `read` scope |
 | ANY | `/api/v1/inference/{svc}/chat` | **SSE 流式代理**（不带命名空间的服务） | 全链 + `read` scope |
 

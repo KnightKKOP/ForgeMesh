@@ -197,7 +197,7 @@ curl -s -H "Authorization: Bearer fmk_…" http://127.0.0.1:8080/api/v1/inferenc
 
 ### REST API
 
-控制平面的 REST API 以 `/api/v1` 为前缀，契约是 [api/openapi/openapi.yaml](api/openapi/openapi.yaml)。契约测试 `tests/contract/test_openapi_contract.py` 双向核对应用提供的路由、参数、请求体与状态码（探针除外），并逐一调用每个操作、校验响应符合契约：修改路由时须同步修改契约。网关把 `/api/v1/inference-services`、`/api/v1/resources`、`/api/v1/workflows`、`/api/v1/decisions` 及其子路径的请求（任意方法，连同查询串、请求头与请求体）转发给控制平面。错误响应都是错误信封 `{"error": {"code", "message", "correlationId", "details"}}`，`correlationId` 回显请求头 `X-Correlation-Id`（经网关访问时由网关补上）。
+控制平面的 REST API 以 `/api/v1` 为前缀，契约是 [api/openapi/openapi.yaml](api/openapi/openapi.yaml)。契约测试 `tests/contract/test_openapi_contract.py` 双向核对应用提供的路由、参数、请求体与状态码（探针除外），并逐一调用每个操作、校验响应符合契约：修改路由时须同步修改契约。网关把 `/api/v1/inference-services`、`/api/v1/resources`、`/api/v1/audit-events`、`/api/v1/workflows`、`/api/v1/decisions` 及其子路径的请求（任意方法，连同查询串、请求头与请求体）转发给控制平面。错误响应都是错误信封 `{"error": {"code", "message", "correlationId", "details"}}`，`correlationId` 回显请求头 `X-Correlation-Id`（经网关访问时由网关补上）。
 
 | 端点 | 说明 |
 | --- | --- |
@@ -208,7 +208,7 @@ curl -s -H "Authorization: Bearer fmk_…" http://127.0.0.1:8080/api/v1/inferenc
 | `PATCH /api/v1/inference-services/{name}` | JSON Merge Patch（RFC 7386，`Content-Type: application/merge-patch+json`），规则同 `PUT` |
 | `DELETE /api/v1/inference-services/{name}` | 受控删除：直接删除返回 `204`；持有 finalizer 或加速器分配时返回 `202`，资源进入 `Terminating`，由协调器释放后删除 |
 | `GET /api/v1/resources?kind=…` | 按 kind 列出资源，分页同上；省略 `kind` 时返回空列表 |
-| `GET /api/v1/audit-events` | 列出本租户的审计记录，最新的在前，可按 `correlationId` 过滤；`limit`、`count` 与 `pageToken` 同下文的分页，游标不能与资源列表的游标互换；网关尚未转发这个路径，请直接访问控制平面 |
+| `GET /api/v1/audit-events` | 列出本租户的审计记录，最新的在前，可按 `correlationId` 过滤；`limit`、`count` 与 `pageToken` 同下文的分页，游标不能与资源列表的游标互换 |
 | `POST /api/v1/workflows`、`POST /api/v1/decisions` | 控制平面应用不注入工作流运行时与决策路由器，合法的请求返回 `503`（`WORKFLOW_RUNTIME_UNAVAILABLE` / `DECISION_ROUTER_UNAVAILABLE`）；决策的风险等级由服务端按 `question` 推导，请求中的 `riskLevel` 只能调高 |
 
 单个资源的端点以 `namespace` 查询参数指定命名空间，省略时指不带命名空间的资源。读接口要求 `read` scope，写接口（含 `PUT` / `PATCH`、启动工作流与请求决策）要求 `write` scope。

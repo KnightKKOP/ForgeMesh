@@ -21,6 +21,9 @@ ignore = ["E501", "B008"]
 [tool.ruff.format]
 quote-style = "double"
 indent-style = "space"
+# ruff 0.17 也格式化 Markdown 中的 Python 代码块。文档里的代码是示意（如对齐的行尾注释），
+# 不按源码的格式要求。
+exclude = ["*.md"]
 
 [tool.pytest.ini_options]
 minversion = "7.0"

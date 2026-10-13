@@ -1803,7 +1803,7 @@ def test_a_redeployment_in_progress_is_polled_without_writing_status():
 
 @pytest.mark.unit
 def test_a_degraded_service_deployed_before_runs_were_keyed_by_generation_is_deployed_again():
-    """运行来自 1.1.0 之前（幂等键 ``deployment:{uid}``，不含 generation）：这一代 spec 没有
+    """运行来自旧版本（幂等键 ``deployment:{uid}``，不含 generation）：这一代 spec 没有
     运行，以它的第一次部署重新部署。"""
     workflow = StubWorkflowRuntime(run=make_run(WorkflowStatus.SUCCEEDED), key="deployment:uid-1")
     controller = _controller(scheduler=MockScheduler(), workflow=workflow, launcher=StubLauncher())

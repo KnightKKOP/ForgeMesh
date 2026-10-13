@@ -51,7 +51,7 @@
 资源的实例、释放这个分配，再重新分配（新的申请放不下时停在当前 phase，``AllocationFailed``）。
 启动部署运行之前总是先经 release provider 停止资源之前的部署（取消进行中的运行、停止实例），
 同一时刻只有一个实例占用分配的设备。``Deploying`` / ``Verifying`` / ``Updating`` 时没有当前
-generation 的运行（spec 在部署过程中变化，或运行来自 1.1.0 之前、幂等键不含 generation）：
+generation 的运行（spec 在部署过程中变化，或运行来自旧版本、幂等键不含 generation）：
 停止之前的部署、取得分配并启动当前 generation 的运行，phase 不变，之后跟踪新的运行，旧的
 运行不会让服务以旧的 spec 进入 ``Ready``。
 

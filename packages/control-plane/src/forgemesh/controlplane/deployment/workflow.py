@@ -116,10 +116,10 @@ class DeploymentRun:
 
     Attributes:
         key: 运行的幂等键。
-        generation: 运行部署的 spec 的 generation；1.1.0 之前的运行（键为
+        generation: 运行部署的 spec 的 generation；旧版本的运行（键为
             ``deployment:{uid}``，不含 generation）为 ``None``。
         run: 运行快照。
-        attempt: 这一代 spec 的第几次部署（1.1.0 之前的运行为 1）。
+        attempt: 这一代 spec 的第几次部署（旧版本的运行为 1）。
     """
 
     key: str
@@ -134,8 +134,8 @@ async def find_deployment_runs(
     """资源 ``uid`` 的部署运行（不创建），按创建先后排列。
 
     经 :meth:`~forgemesh.workflow.runtime.WorkflowRuntime.find_runs` 按幂等键前缀查找；给出
-    ``generation`` 时只返回部署这一代 spec 的运行（各次部署），否则返回全部运行，包括 1.1.0
-    之前的 ``deployment:{uid}``。
+    ``generation`` 时只返回部署这一代 spec 的运行（各次部署），否则返回全部运行，包括旧版本
+    的 ``deployment:{uid}``。
     """
     prefix = f"{_RUN_KEY_PREFIX}{uid}"
     pattern = re.compile(rf"{re.escape(prefix)}(?::(\d+)(?::(\d+))?)?", re.ASCII)

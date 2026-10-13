@@ -265,7 +265,7 @@ def test_deployment_run_key_is_per_resource_uid_generation_and_attempt() -> None
 
 @pytest.mark.unit
 def test_find_deployment_runs_returns_the_runs_of_one_resource_in_creation_order() -> None:
-    """包括 1.1.0 之前不含 generation 的键与重新部署的各次运行；uid 互为前缀的其他资源
+    """包括旧版本不含 generation 的键与重新部署的各次运行；uid 互为前缀的其他资源
     不算在内。"""
     keys = [
         "deployment:uid-1:2",
@@ -588,7 +588,7 @@ def test_releaser_retries_a_stop_that_failed_during_compensation() -> None:
 
 @pytest.mark.unit
 def test_releaser_stops_the_instances_of_every_deployment_run(caplog) -> None:
-    """每一代 spec 与 1.1.0 之前的运行都被处理；只为停止时仍在运行的实例记日志。"""
+    """每一代 spec 与旧版本的运行都被处理；只为停止时仍在运行的实例记日志。"""
     launcher = _ScriptedLauncher()
 
     async def scenario() -> tuple[list[RunInfo], list[str]]:

@@ -153,9 +153,7 @@ class JEVProvider:
 
         使用 ``req.context`` 作为 JEV 评估上下文。无匹配时返回空列表。
         """
-        return [
-            rule.to_candidate() for rule in self.rules if rule.evaluate(req.context)
-        ]
+        return [rule.to_candidate() for rule in self.rules if rule.evaluate(req.context)]
 
     @classmethod
     def from_file(cls, path: str | Path) -> JEVProvider:

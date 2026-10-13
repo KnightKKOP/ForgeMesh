@@ -308,7 +308,9 @@ class TemporalWorkflowProvider(WorkflowRuntime):
         workflow_type = self._map_to_workflow_type(defn)
         args = self._map_to_temporal_args(defn, inputs)
         workflow_id = await self._client.start_workflow(
-            workflow_type, args, idempotency_key,
+            workflow_type,
+            args,
+            idempotency_key,
         )
         self._run_to_definition[workflow_id] = defn
         self._run_to_inputs[workflow_id] = inputs
@@ -440,9 +442,7 @@ def temporal_eval_report() -> dict[str, Any]:
                 "mechanism": "RunRef.definition_version 固定，升级定义不影响既有实例",
             },
         },
-        "status_mapping": {
-            str(k): str(v) for k, v in _TEMPORAL_TO_WORKFLOW_STATUS.items()
-        },
+        "status_mapping": {str(k): str(v) for k, v in _TEMPORAL_TO_WORKFLOW_STATUS.items()},
         "invariants": [
             "业务语义不变性：与参考执行器（workflow-reference）行为一致",
             "不产出资源终态（INV-1/INV-3），状态写入经 Registry",

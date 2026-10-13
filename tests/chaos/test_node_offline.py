@@ -61,9 +61,7 @@ def test_heartbeat_timeout_marks_offline(monkeypatch: pytest.MonkeyPatch) -> Non
     """心跳超过离线阈值后 get_agent_state 返回 OFFLINE。"""
     t = [1000.0]
     monkeypatch.setattr(time, "time", lambda: t[0])
-    mgr = HeartbeatManager(
-        offline_threshold_seconds=30.0, degraded_threshold_seconds=15.0
-    )
+    mgr = HeartbeatManager(offline_threshold_seconds=30.0, degraded_threshold_seconds=15.0)
     _run(mgr.receive(_heartbeat("agent-1")))
 
     t[0] = 1031.0  # 超过离线阈值
@@ -74,9 +72,7 @@ def test_check_offline_returns_offline_agents(monkeypatch: pytest.MonkeyPatch) -
     """check_offline 返回本次新转为 OFFLINE 的 agent 列表。"""
     t = [1000.0]
     monkeypatch.setattr(time, "time", lambda: t[0])
-    mgr = HeartbeatManager(
-        offline_threshold_seconds=30.0, degraded_threshold_seconds=15.0
-    )
+    mgr = HeartbeatManager(offline_threshold_seconds=30.0, degraded_threshold_seconds=15.0)
     _run(mgr.receive(_heartbeat("agent-1")))
     _run(mgr.receive(_heartbeat("agent-2")))
 
@@ -99,9 +95,7 @@ def test_offline_agent_resources_not_available(
     """INV-4：离线 agent 资源健康为 Unknown，不可标记 Available/Healthy。"""
     t = [1000.0]
     monkeypatch.setattr(time, "time", lambda: t[0])
-    mgr = HeartbeatManager(
-        offline_threshold_seconds=30.0, degraded_threshold_seconds=15.0
-    )
+    mgr = HeartbeatManager(offline_threshold_seconds=30.0, degraded_threshold_seconds=15.0)
     _run(mgr.receive(_heartbeat("agent-1")))
 
     t[0] = 1031.0
@@ -119,9 +113,7 @@ def test_degraded_agent_resources_not_available(
     """DEGRADED agent 资源为 Degraded，同样不可标记 Available。"""
     t = [1000.0]
     monkeypatch.setattr(time, "time", lambda: t[0])
-    mgr = HeartbeatManager(
-        offline_threshold_seconds=30.0, degraded_threshold_seconds=15.0
-    )
+    mgr = HeartbeatManager(offline_threshold_seconds=30.0, degraded_threshold_seconds=15.0)
     _run(mgr.receive(_heartbeat("agent-1")))
 
     t[0] = 1016.0  # 超过降级阈值但未达离线阈值
@@ -139,9 +131,7 @@ def test_offline_agent_excluded_from_online_list(
     """INV-4：离线 agent 不出现在 list_online_agents 中（不回收到调度池）。"""
     t = [1000.0]
     monkeypatch.setattr(time, "time", lambda: t[0])
-    mgr = HeartbeatManager(
-        offline_threshold_seconds=30.0, degraded_threshold_seconds=15.0
-    )
+    mgr = HeartbeatManager(offline_threshold_seconds=30.0, degraded_threshold_seconds=15.0)
     _run(mgr.receive(_heartbeat("agent-1")))
     _run(mgr.receive(_heartbeat("agent-2")))
 
@@ -169,9 +159,7 @@ def test_offline_then_recover(monkeypatch: pytest.MonkeyPatch) -> None:
     """离线后重新心跳恢复 ONLINE，资源恢复 Healthy。"""
     t = [1000.0]
     monkeypatch.setattr(time, "time", lambda: t[0])
-    mgr = HeartbeatManager(
-        offline_threshold_seconds=30.0, degraded_threshold_seconds=15.0
-    )
+    mgr = HeartbeatManager(offline_threshold_seconds=30.0, degraded_threshold_seconds=15.0)
     _run(mgr.receive(_heartbeat("agent-1")))
 
     t[0] = 1031.0
@@ -188,9 +176,7 @@ def test_partial_outage_isolates_offline(monkeypatch: pytest.MonkeyPatch) -> Non
     """部分节点离线不影响在线节点：仅离线 agent 资源不可用。"""
     t = [1000.0]
     monkeypatch.setattr(time, "time", lambda: t[0])
-    mgr = HeartbeatManager(
-        offline_threshold_seconds=30.0, degraded_threshold_seconds=15.0
-    )
+    mgr = HeartbeatManager(offline_threshold_seconds=30.0, degraded_threshold_seconds=15.0)
     _run(mgr.receive(_heartbeat("agent-1")))
     _run(mgr.receive(_heartbeat("agent-2")))
 

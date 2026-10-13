@@ -87,9 +87,7 @@ class DeviceProber:
         return {
             "node": node.model_dump(mode="json"),
             "accelerators": [a.model_dump(mode="json") for a in result.accelerators],
-            "device_instances": [
-                d.model_dump(mode="json") for d in result.device_instances
-            ],
+            "device_instances": [d.model_dump(mode="json") for d in result.device_instances],
             "topology": result.topology.model_dump(mode="json"),
         }
 

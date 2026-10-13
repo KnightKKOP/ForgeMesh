@@ -11,6 +11,7 @@
 
 测试以 ``asyncio.run`` 驱动异步方法，不依赖 pytest-asyncio。
 """
+
 from __future__ import annotations
 
 import asyncio

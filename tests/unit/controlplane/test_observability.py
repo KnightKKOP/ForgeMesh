@@ -8,6 +8,7 @@
 * TraceSpan：start / end / duration、add_attribute、parent 链。
 * TraceRecorder：多 span、correlation_id 累计贯穿。
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -49,7 +50,9 @@ def test_new_correlation_id_is_string() -> None:
 def test_correlation_context_set_and_get() -> None:
     """set 后可 get，reset 后恢复 None。"""
     cid = new_correlation_id()
-    tokens = CorrelationContext.set(correlation_id=cid, tenant_id="t1", request_id="r1", operation="op1")
+    tokens = CorrelationContext.set(
+        correlation_id=cid, tenant_id="t1", request_id="r1", operation="op1"
+    )
     assert CorrelationContext.get_correlation_id() == cid
     assert CorrelationContext.get_tenant_id() == "t1"
     assert CorrelationContext.get_request_id() == "r1"

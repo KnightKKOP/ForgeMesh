@@ -84,14 +84,9 @@ def test_jev_in() -> None:
 def test_jev_contains() -> None:
     ctx = {"tags": ["ai", "inference"]}
     assert evaluate_jev({"field": "tags", "op": "contains", "value": "ai"}, ctx) is True
-    assert (
-        evaluate_jev({"field": "tags", "op": "contains", "value": "training"}, ctx)
-        is False
-    )
+    assert evaluate_jev({"field": "tags", "op": "contains", "value": "training"}, ctx) is False
     # 字段缺失时返回 False
-    assert (
-        evaluate_jev({"field": "missing", "op": "contains", "value": "a"}, ctx) is False
-    )
+    assert evaluate_jev({"field": "missing", "op": "contains", "value": "a"}, ctx) is False
 
 
 # --------------------------------------------------------------------------- #
@@ -150,10 +145,12 @@ def test_jev_nested_combination() -> None:
     ctx = {"x": 5, "y": 10}
     expr = {
         "and": [
-            {"or": [
-                {"field": "x", "op": "eq", "value": 5},
-                {"field": "y", "op": "gt", "value": 100},
-            ]},
+            {
+                "or": [
+                    {"field": "x", "op": "eq", "value": 5},
+                    {"field": "y", "op": "gt", "value": 100},
+                ]
+            },
             {"not": {"field": "y", "op": "lt", "value": 1}},
         ]
     }
@@ -249,9 +246,7 @@ def test_provider_decide_no_match_returns_empty() -> None:
         ]
     )
     result = list(
-        asyncio.get_event_loop().run_until_complete(
-            provider.decide(_request({"x": 999}))
-        )
+        asyncio.get_event_loop().run_until_complete(provider.decide(_request({"x": 999})))
     )
     assert result == []
 
@@ -278,10 +273,12 @@ def test_provider_from_file(tmp_path: pytest.fixture) -> None:
             },
             {
                 "name": "rule-b",
-                "expression": {"and": [
-                    {"field": "x", "op": "lt", "value": 100},
-                    {"field": "y", "op": "eq", "value": "ready"},
-                ]},
+                "expression": {
+                    "and": [
+                        {"field": "x", "op": "lt", "value": 100},
+                        {"field": "y", "op": "eq", "value": "ready"},
+                    ]
+                },
                 "action": "act-b",
             },
         ],
@@ -346,9 +343,7 @@ def test_router_integration_fallback_when_no_match() -> None:
         provider_id = "fallback"
         provider_version = "0.0.1"
 
-        async def decide(
-            self, req: DecisionRequest
-        ) -> Sequence[DecisionCandidate]:
+        async def decide(self, req: DecisionRequest) -> Sequence[DecisionCandidate]:
             return [DecisionCandidate(candidate_id="fb-1", action="schedule.cpu")]
 
     primary = JEVProvider(
@@ -360,12 +355,8 @@ def test_router_integration_fallback_when_no_match() -> None:
             )
         ]
     )
-    router = DecisionRouter(
-        providers=[primary, FallbackProvider()], timeout_seconds=1.0
-    )
-    result = asyncio.get_event_loop().run_until_complete(
-        router.route(_request({"x": 999}))
-    )
+    router = DecisionRouter(providers=[primary, FallbackProvider()], timeout_seconds=1.0)
+    result = asyncio.get_event_loop().run_until_complete(router.route(_request({"x": 999})))
     assert result.success is True
     assert result.chosen is not None
     assert result.chosen.candidate_id == "fb-1"

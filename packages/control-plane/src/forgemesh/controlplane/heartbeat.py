@@ -131,10 +131,7 @@ class HeartbeatManager:
         if degraded_threshold_seconds <= 0:
             raise ValueError("degraded_threshold_seconds must be positive")
         if degraded_threshold_seconds > offline_threshold_seconds:
-            raise ValueError(
-                "degraded_threshold_seconds must not exceed "
-                "offline_threshold_seconds"
-            )
+            raise ValueError("degraded_threshold_seconds must not exceed offline_threshold_seconds")
         self._offline_threshold = offline_threshold_seconds
         self._degraded_threshold = degraded_threshold_seconds
         #: agent_id → 追踪状态。
@@ -230,10 +227,7 @@ class HeartbeatManager:
         newly_offline: list[str] = []
         for agent_id, tracker in self._agents.items():
             new_state = self._compute_state(tracker, now)
-            if (
-                new_state is AgentState.OFFLINE
-                and tracker.state is not AgentState.OFFLINE
-            ):
+            if new_state is AgentState.OFFLINE and tracker.state is not AgentState.OFFLINE:
                 newly_offline.append(agent_id)
             tracker.state = new_state
         return newly_offline

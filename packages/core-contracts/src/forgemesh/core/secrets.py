@@ -32,8 +32,7 @@ class SecretRef(BaseModel):
         子类覆盖此方法。绝不将明文写入日志、事件或资源对象。
         """
         raise NotImplementedError(
-            "SecretRef.resolve() 必须由具体 Secret Provider 实现；"
-            "核心契约不持有明文"
+            "SecretRef.resolve() 必须由具体 Secret Provider 实现；核心契约不持有明文"
         )
 
 

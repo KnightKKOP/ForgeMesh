@@ -61,8 +61,10 @@ def main() -> int:
     """入口：遍历全部包，任一违规列出包名与字段并以退出码 1 结束。"""
     pyprojects = sorted(PACKAGES_DIR.glob("*/pyproject.toml"))
     if not pyprojects:
-        print(f"ERROR: {PACKAGES_DIR.relative_to(REPO_ROOT)}/ 下未找到任何 pyproject.toml",
-              file=sys.stderr)
+        print(
+            f"ERROR: {PACKAGES_DIR.relative_to(REPO_ROOT)}/ 下未找到任何 pyproject.toml",
+            file=sys.stderr,
+        )
         return 1
 
     errors: list[str] = []
@@ -74,8 +76,10 @@ def main() -> int:
             print(f"ERROR: {err}", file=sys.stderr)
         print(f"FAIL: {len(errors)} 处元数据不一致", file=sys.stderr)
         return 1
-    print(f"OK: {len(pyprojects)} 个包元数据一致 (requires-python={EXPECTED_REQUIRES_PYTHON!r}, "
-          "无 skeleton/placeholder 描述)")
+    print(
+        f"OK: {len(pyprojects)} 个包元数据一致 (requires-python={EXPECTED_REQUIRES_PYTHON!r}, "
+        "无 skeleton/placeholder 描述)"
+    )
     return 0
 
 

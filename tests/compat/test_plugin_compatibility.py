@@ -103,9 +103,7 @@ class TestPluginVersionCompat:
             ("1.3.1", "1.3.0", True),
         ],
     )
-    def test_is_compatible(
-        self, plugin_ver: str, required_ver: str, expected: bool
-    ) -> None:
+    def test_is_compatible(self, plugin_ver: str, required_ver: str, expected: bool) -> None:
         """同 major 且不低于所需版本则兼容。"""
         compat = PluginVersionCompat()
         assert compat.is_compatible(plugin_ver, required_ver) is expected

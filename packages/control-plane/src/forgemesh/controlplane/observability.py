@@ -25,18 +25,10 @@ from pydantic import BaseModel, ConfigDict, Field
 # 关联上下文
 # ---------------------------------------------------------------------- #
 
-_correlation_id_var: ContextVar[str | None] = ContextVar(
-    "forgemesh_correlation_id", default=None
-)
-_tenant_id_var: ContextVar[str | None] = ContextVar(
-    "forgemesh_tenant_id", default=None
-)
-_request_id_var: ContextVar[str | None] = ContextVar(
-    "forgemesh_request_id", default=None
-)
-_operation_var: ContextVar[str | None] = ContextVar(
-    "forgemesh_operation", default=None
-)
+_correlation_id_var: ContextVar[str | None] = ContextVar("forgemesh_correlation_id", default=None)
+_tenant_id_var: ContextVar[str | None] = ContextVar("forgemesh_tenant_id", default=None)
+_request_id_var: ContextVar[str | None] = ContextVar("forgemesh_request_id", default=None)
+_operation_var: ContextVar[str | None] = ContextVar("forgemesh_operation", default=None)
 
 
 def new_correlation_id() -> str:
@@ -269,13 +261,9 @@ class MetricsRecorder:
             每个条目含 ``name`` / ``tags`` / ``value``（histogram 为 ``values``）。
         """
         counters = [
-            {"name": e.name, "tags": e.tags, "value": e.value}
-            for e in self._counters.values()
+            {"name": e.name, "tags": e.tags, "value": e.value} for e in self._counters.values()
         ]
-        gauges = [
-            {"name": e.name, "tags": e.tags, "value": e.value}
-            for e in self._gauges.values()
-        ]
+        gauges = [{"name": e.name, "tags": e.tags, "value": e.value} for e in self._gauges.values()]
         histograms = [
             {"name": e.name, "tags": e.tags, "values": list(e.values)}
             for e in self._histograms.values()
@@ -388,9 +376,7 @@ class StructuredLogger:
 # 分布式追踪
 # ---------------------------------------------------------------------- #
 
-_parent_span_id_var: ContextVar[str | None] = ContextVar(
-    "forgemesh_parent_span_id", default=None
-)
+_parent_span_id_var: ContextVar[str | None] = ContextVar("forgemesh_parent_span_id", default=None)
 
 
 class TraceSpan:

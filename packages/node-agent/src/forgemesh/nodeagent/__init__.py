@@ -91,8 +91,7 @@ class NodeAgent(ABC):
     """
 
     @abstractmethod
-    async def register(self, *, agent_id: str, agent_version: str,
-                       capabilities: list[str]) -> bool:
+    async def register(self, *, agent_id: str, agent_version: str, capabilities: list[str]) -> bool:
         """注册并协商能力/兼容性。返回是否被接受。"""
         raise NotImplementedError
 
@@ -112,8 +111,7 @@ class NodeAgent(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    async def cancel_task(self, *, task_id: str, execution_id: str,
-                          reason: str = "") -> TaskResult:
+    async def cancel_task(self, *, task_id: str, execution_id: str, reason: str = "") -> TaskResult:
         """取消任务并返回其结果。"""
         raise NotImplementedError
 

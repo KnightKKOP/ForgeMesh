@@ -109,9 +109,7 @@ def test_sensitive_fields_redacted() -> None:
     assert redacted["count"] == 42
 
     # 确认 SENSITIVE_FIELDS 覆盖全部五种敏感字段名
-    assert frozenset(
-        {"password", "token", "secret", "api_key", "credentials"}
-    ) == SENSITIVE_FIELDS
+    assert frozenset({"password", "token", "secret", "api_key", "credentials"}) == SENSITIVE_FIELDS
 
     # 大小写不敏感匹配（键名小写后比对）
     mixed = {"Password": _PLAINTEXT_PASSWORD, "API_KEY": _PLAINTEXT_API_KEY}

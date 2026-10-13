@@ -90,6 +90,7 @@ async def _default_driver_info() -> dict[str, Any]:
     """默认驱动信息提供者：尝试 pynvml，不可用返回空版本。"""
     try:
         import pynvml as nvml  # noqa: PLC0415
+
         nvml.nvmlInit()
         version = str(nvml.nvmlSystemGetDriverVersion())
         nvml.nvmlShutdown()
@@ -103,6 +104,7 @@ async def _default_cuda_info() -> dict[str, Any]:
     """默认 CUDA 信息提供者：尝试 pynvml，不可用返回空版本。"""
     try:
         import pynvml as nvml  # noqa: PLC0415
+
         nvml.nvmlInit()
         cuda_version = nvml.nvmlSystemGetCudaDriverVersion()
         nvml.nvmlShutdown()

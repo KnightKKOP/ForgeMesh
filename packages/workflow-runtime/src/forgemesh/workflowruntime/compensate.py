@@ -45,9 +45,7 @@ class CompensationRegistry:
         """检查指定步骤是否注册了补偿 handler。"""
         return step_id in self._handlers
 
-    async def compensate_step(
-        self, step: Step, inputs: dict[str, Any]
-    ) -> dict[str, Any]:
+    async def compensate_step(self, step: Step, inputs: dict[str, Any]) -> dict[str, Any]:
         """执行指定步骤的补偿。
 
         Args:
@@ -113,9 +111,7 @@ class CompensationExecutor:
                 results[step_id] = StepStatus.SKIPPED
                 continue
             try:
-                await self._registry.compensate_step(
-                    step, step_results.get(step_id, {})
-                )
+                await self._registry.compensate_step(step, step_results.get(step_id, {}))
                 results[step_id] = StepStatus.COMPENSATED
             except Exception:
                 # 补偿失败不中断，继续补偿其余步骤以最大化清理。

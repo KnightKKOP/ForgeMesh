@@ -302,9 +302,7 @@ class PluginManager:
             raise NotFoundError(f"plugin not found: {plugin_id}")
         return self._plugins[plugin_id]
 
-    def discover(
-        self, category: PluginCategory | None = None
-    ) -> list[PluginManifest]:
+    def discover(self, category: PluginCategory | None = None) -> list[PluginManifest]:
         """发现已注册插件，可按类别过滤。
 
         Args:
@@ -323,9 +321,7 @@ class PluginManager:
     # 生命周期管理
     # ------------------------------------------------------------------ #
 
-    def transition(
-        self, plugin_id: str, target: PluginLifecycleState
-    ) -> PluginRecord:
+    def transition(self, plugin_id: str, target: PluginLifecycleState) -> PluginRecord:
         """执行生命周期状态转移。
 
         合法转移由 :data:`forgemesh.plugin.manifest.PLUGIN_TRANSITIONS` 定义。
@@ -470,9 +466,7 @@ class PluginManager:
             PluginLifecycleState.ENABLED,
             PluginLifecycleState.DISABLED,
         }
-        return [
-            r for r in self._plugins.values() if r.lifecycle_state in installed_states
-        ]
+        return [r for r in self._plugins.values() if r.lifecycle_state in installed_states]
 
 
 __all__ = [

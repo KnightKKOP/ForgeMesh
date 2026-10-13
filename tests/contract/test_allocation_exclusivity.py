@@ -57,8 +57,7 @@ def _make_allocation(
 def _count_active(reg: SQLiteRegistry, resource_id: str) -> int:
     """统计某 resource_id 当前 Active 记录数（直读 DB 的证据口径）。"""
     row = reg._conn.execute(
-        "SELECT COUNT(*) AS n FROM allocations "
-        "WHERE resource_id=? AND status='Active'",
+        "SELECT COUNT(*) AS n FROM allocations WHERE resource_id=? AND status='Active'",
         (resource_id,),
     ).fetchone()
     return int(row["n"])
@@ -80,12 +79,8 @@ def test_concurrent_put_allocation_single_active_winner(tmp_path) -> None:
         try:
             # 两写入方并发为同一资源创建 Active 分配（不同幂等键）
             results = await asyncio.gather(
-                writer1.put_allocation(
-                    _make_allocation("gpu-0", idempotency_key="idem-a")
-                ),
-                writer2.put_allocation(
-                    _make_allocation("gpu-0", idempotency_key="idem-b")
-                ),
+                writer1.put_allocation(_make_allocation("gpu-0", idempotency_key="idem-a")),
+                writer2.put_allocation(_make_allocation("gpu-0", idempotency_key="idem-b")),
                 return_exceptions=True,
             )
 
@@ -140,9 +135,7 @@ def test_release_then_reallocate_same_resource() -> None:
     """Active → Released 后，同一 resource_id 可再次分配（新 Active 成立）。"""
     reg = SQLiteRegistry()
     try:
-        first_id = _run(
-            reg.put_allocation(_make_allocation("gpu-0", idempotency_key="idem-1"))
-        )
+        first_id = _run(reg.put_allocation(_make_allocation("gpu-0", idempotency_key="idem-1")))
 
         # 释放后不再持有 Active
         _run(reg.release_allocation(first_id, TENANT, reason="contract-test"))
@@ -150,9 +143,7 @@ def test_release_then_reallocate_same_resource() -> None:
         assert _count_active(reg, "gpu-0") == 0
 
         # 同一 resource_id 可重新分配：部分唯一索引仅约束 Active 存量
-        second_id = _run(
-            reg.put_allocation(_make_allocation("gpu-0", idempotency_key="idem-2"))
-        )
+        second_id = _run(reg.put_allocation(_make_allocation("gpu-0", idempotency_key="idem-2")))
         assert second_id != first_id
 
         active = _run(reg.get_active_allocation("gpu-0", TENANT))
@@ -183,12 +174,8 @@ def test_distinct_resource_ids_independent(tmp_path) -> None:
         writer2 = SQLiteRegistry(str(db_file))
         try:
             ids = await asyncio.gather(
-                writer1.put_allocation(
-                    _make_allocation("gpu-0", idempotency_key="idem-gpu0")
-                ),
-                writer2.put_allocation(
-                    _make_allocation("gpu-1", idempotency_key="idem-gpu1")
-                ),
+                writer1.put_allocation(_make_allocation("gpu-0", idempotency_key="idem-gpu0")),
+                writer2.put_allocation(_make_allocation("gpu-1", idempotency_key="idem-gpu1")),
             )
             assert all(isinstance(i, str) and i for i in ids)
 

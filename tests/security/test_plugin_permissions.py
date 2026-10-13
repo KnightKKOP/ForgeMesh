@@ -195,8 +195,9 @@ def test_plugin_upgrade_ivt8() -> None:
     }
     original = instance_record["plugin_version"]
     # 升级发生后，既有实例解析出的版本仍是原版本
-    assert compat.instance_version_after_upgrade(
-        instance_record["plugin_version"], target_version
-    ) == original
+    assert (
+        compat.instance_version_after_upgrade(instance_record["plugin_version"], target_version)
+        == original
+    )
     # 实例记录本身未被修改
     assert instance_record["plugin_version"] == original

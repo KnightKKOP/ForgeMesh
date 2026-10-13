@@ -241,8 +241,13 @@ def test_classify_severity_info_for_extra() -> None:
 def test_classify_severity_all_critical_fields() -> None:
     """所有关键字段缺失都应分类为 critical。"""
     reporter = HeteroReporter()
-    critical_fields = ["mig_enabled", "memory_bytes", "compute_capability",
-                       "cuda_version", "driver_version"]
+    critical_fields = [
+        "mig_enabled",
+        "memory_bytes",
+        "compute_capability",
+        "cuda_version",
+        "driver_version",
+    ]
     for field in critical_fields:
         diff = CapabilityDiff(
             field_name=field,
@@ -273,12 +278,24 @@ def test_format_report_contains_all_diffs() -> None:
     """报告文本应包含每项差异的字段名与值。"""
     reporter = HeteroReporter()
     diffs = [
-        CapabilityDiff(field_name="mig_enabled", nvidia_value=True,
-                       other_vendor_value=None, diff_type=DIFF_MISSING),
-        CapabilityDiff(field_name="memory_bytes", nvidia_value=80,
-                       other_vendor_value=64, diff_type=DIFF_DIFFERENT),
-        CapabilityDiff(field_name="rocm_version", nvidia_value=None,
-                       other_vendor_value="6.0", diff_type=DIFF_EXTRA),
+        CapabilityDiff(
+            field_name="mig_enabled",
+            nvidia_value=True,
+            other_vendor_value=None,
+            diff_type=DIFF_MISSING,
+        ),
+        CapabilityDiff(
+            field_name="memory_bytes",
+            nvidia_value=80,
+            other_vendor_value=64,
+            diff_type=DIFF_DIFFERENT,
+        ),
+        CapabilityDiff(
+            field_name="rocm_version",
+            nvidia_value=None,
+            other_vendor_value="6.0",
+            diff_type=DIFF_EXTRA,
+        ),
     ]
 
     text = reporter.format_report(diffs)
@@ -298,12 +315,24 @@ def test_format_report_summary_counts() -> None:
     """报告汇总应正确统计 critical / warning / info 数量。"""
     reporter = HeteroReporter()
     diffs = [
-        CapabilityDiff(field_name="mig_enabled", nvidia_value=True,
-                       other_vendor_value=None, diff_type=DIFF_MISSING),       # critical
-        CapabilityDiff(field_name="name", nvidia_value="H100",
-                       other_vendor_value="MI300X", diff_type=DIFF_DIFFERENT),  # warning
-        CapabilityDiff(field_name="rocm_version", nvidia_value=None,
-                       other_vendor_value="6.0", diff_type=DIFF_EXTRA),         # info
+        CapabilityDiff(
+            field_name="mig_enabled",
+            nvidia_value=True,
+            other_vendor_value=None,
+            diff_type=DIFF_MISSING,
+        ),  # critical
+        CapabilityDiff(
+            field_name="name",
+            nvidia_value="H100",
+            other_vendor_value="MI300X",
+            diff_type=DIFF_DIFFERENT,
+        ),  # warning
+        CapabilityDiff(
+            field_name="rocm_version",
+            nvidia_value=None,
+            other_vendor_value="6.0",
+            diff_type=DIFF_EXTRA,
+        ),  # info
     ]
 
     text = reporter.format_report(diffs)

@@ -42,13 +42,15 @@ WARNING = "warning"
 INFO = "info"
 
 #: 关键能力字段：其缺失或差异直接影响调度正确性，视为 ``critical``。
-_CRITICAL_FIELDS: frozenset[str] = frozenset({
-    "mig_enabled",
-    "memory_bytes",
-    "compute_capability",
-    "cuda_version",
-    "driver_version",
-})
+_CRITICAL_FIELDS: frozenset[str] = frozenset(
+    {
+        "mig_enabled",
+        "memory_bytes",
+        "compute_capability",
+        "cuda_version",
+        "driver_version",
+    }
+)
 
 
 class CapabilityDiff(BaseModel):
@@ -103,26 +105,32 @@ class HeteroReporter:
             in_nvidia = field in nvidia_capability
             in_other = field in other_capability
             if in_nvidia and not in_other:
-                diffs.append(CapabilityDiff(
-                    field_name=field,
-                    nvidia_value=nvidia_capability[field],
-                    other_vendor_value=None,
-                    diff_type=DIFF_MISSING,
-                ))
+                diffs.append(
+                    CapabilityDiff(
+                        field_name=field,
+                        nvidia_value=nvidia_capability[field],
+                        other_vendor_value=None,
+                        diff_type=DIFF_MISSING,
+                    )
+                )
             elif not in_nvidia and in_other:
-                diffs.append(CapabilityDiff(
-                    field_name=field,
-                    nvidia_value=None,
-                    other_vendor_value=other_capability[field],
-                    diff_type=DIFF_EXTRA,
-                ))
+                diffs.append(
+                    CapabilityDiff(
+                        field_name=field,
+                        nvidia_value=None,
+                        other_vendor_value=other_capability[field],
+                        diff_type=DIFF_EXTRA,
+                    )
+                )
             elif nvidia_capability[field] != other_capability[field]:
-                diffs.append(CapabilityDiff(
-                    field_name=field,
-                    nvidia_value=nvidia_capability[field],
-                    other_vendor_value=other_capability[field],
-                    diff_type=DIFF_DIFFERENT,
-                ))
+                diffs.append(
+                    CapabilityDiff(
+                        field_name=field,
+                        nvidia_value=nvidia_capability[field],
+                        other_vendor_value=other_capability[field],
+                        diff_type=DIFF_DIFFERENT,
+                    )
+                )
         return diffs
 
     def classify_severity(self, diff: CapabilityDiff) -> str:

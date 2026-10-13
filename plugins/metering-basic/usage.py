@@ -202,9 +202,7 @@ class UsageStore:
             end: 结束时间戳（不包含），``None`` 表示不限制上界。
             limit: 最大返回条数。
         """
-        return await asyncio.to_thread(
-            self._list_by_tenant_sync, tenant_id, start, end, limit
-        )
+        return await asyncio.to_thread(self._list_by_tenant_sync, tenant_id, start, end, limit)
 
     def _list_by_tenant_sync(
         self,
@@ -230,20 +228,14 @@ class UsageStore:
     # aggregate
     # ------------------------------------------------------------------ #
 
-    async def aggregate(
-        self, tenant_id: str, start: float, end: float
-    ) -> UsageSummary:
+    async def aggregate(self, tenant_id: str, start: float, end: float) -> UsageSummary:
         """聚合统计指定租户在 ``[start, end)`` 时间范围内的使用记录。
 
         无记录时返回各字段为零的空统计。
         """
-        return await asyncio.to_thread(
-            self._aggregate_sync, tenant_id, start, end
-        )
+        return await asyncio.to_thread(self._aggregate_sync, tenant_id, start, end)
 
-    def _aggregate_sync(
-        self, tenant_id: str, start: float, end: float
-    ) -> UsageSummary:
+    def _aggregate_sync(self, tenant_id: str, start: float, end: float) -> UsageSummary:
         row = self._conn.execute(
             """
             SELECT
@@ -269,9 +261,7 @@ class UsageStore:
             success_count=row["success_count"],
             failure_count=row["failure_count"],
             total_latency_ms=total_latency,
-            avg_latency_ms=(
-                total_latency / record_count if record_count > 0 else 0.0
-            ),
+            avg_latency_ms=(total_latency / record_count if record_count > 0 else 0.0),
             record_count=record_count,
         )
 
@@ -279,9 +269,7 @@ class UsageStore:
     # correct — 计量修正（IVT-10）
     # ------------------------------------------------------------------ #
 
-    async def correct(
-        self, original_id: str, correction: UsageRecord
-    ) -> None:
+    async def correct(self, original_id: str, correction: UsageRecord) -> None:
         """计量修正：新增一条 ``correction_of`` 记录指向原记录，原记录保留。
 
         修正记录使用自身的 ``record_id``（须唯一），其 ``correction_of``
@@ -299,9 +287,7 @@ class UsageStore:
             (original_id,),
         ).fetchone()
         if existing is None:
-            raise NotFoundError(
-                f"original usage record not found: {original_id}"
-            )
+            raise NotFoundError(f"original usage record not found: {original_id}")
         correction.correction_of = original_id
         self._record_sync(correction)
 

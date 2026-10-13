@@ -60,9 +60,7 @@ def test_execute_step_success() -> None:
     executor = StepExecutor()
     step = _make_step()
 
-    result = asyncio.run(
-        executor.execute_step(step, {"x": 1}, "key-success", _ok_handler)
-    )
+    result = asyncio.run(executor.execute_step(step, {"x": 1}, "key-success", _ok_handler))
 
     assert result == {"step_id": "s1", "status": "ok"}
 
@@ -73,12 +71,8 @@ def test_execute_step_idempotent() -> None:
     executor = StepExecutor()
     step = _make_step()
 
-    result1 = asyncio.run(
-        executor.execute_step(step, {}, "key-idem", _ok_handler)
-    )
-    result2 = asyncio.run(
-        executor.execute_step(step, {}, "key-idem", _ok_handler)
-    )
+    result1 = asyncio.run(executor.execute_step(step, {}, "key-idem", _ok_handler))
+    result2 = asyncio.run(executor.execute_step(step, {}, "key-idem", _ok_handler))
 
     assert result1 == {"step_id": "s1", "status": "ok"}
     assert result2 == {"status": "skipped", "reason": "idempotent"}
@@ -97,15 +91,11 @@ def test_execute_step_retry_then_success() -> None:
         return {"status": "ok", "attempt": call_count}
 
     # 退避设为 0 以加速测试。
-    policy = RetryPolicy(
-        max_attempts=3, initial_backoff_seconds=0.0, max_backoff_seconds=0.0
-    )
+    policy = RetryPolicy(max_attempts=3, initial_backoff_seconds=0.0, max_backoff_seconds=0.0)
     executor = StepExecutor(retry_policy=policy)
     step = _make_step()
 
-    result = asyncio.run(
-        executor.execute_step(step, {}, "key-retry", flaky_handler)
-    )
+    result = asyncio.run(executor.execute_step(step, {}, "key-retry", flaky_handler))
 
     assert result == {"status": "ok", "attempt": 2}
     assert call_count == 2
@@ -114,38 +104,32 @@ def test_execute_step_retry_then_success() -> None:
 @pytest.mark.unit
 def test_execute_step_all_retries_fail() -> None:
     """全部重试失败抛异常。"""
+
     async def failing_handler(step: Step, inputs: dict[str, Any]) -> dict[str, Any]:
         raise RuntimeError("always fails")
 
-    policy = RetryPolicy(
-        max_attempts=2, initial_backoff_seconds=0.0, max_backoff_seconds=0.0
-    )
+    policy = RetryPolicy(max_attempts=2, initial_backoff_seconds=0.0, max_backoff_seconds=0.0)
     executor = StepExecutor(retry_policy=policy)
     step = _make_step()
 
     with pytest.raises(RuntimeError, match="always fails"):
-        asyncio.run(
-            executor.execute_step(step, {}, "key-fail", failing_handler)
-        )
+        asyncio.run(executor.execute_step(step, {}, "key-fail", failing_handler))
 
 
 @pytest.mark.unit
 def test_execute_step_timeout() -> None:
     """步骤超时抛 ExecutionError(timeout_level=STEP)。"""
+
     async def slow_handler(step: Step, inputs: dict[str, Any]) -> dict[str, Any]:
         await asyncio.sleep(10)
         return {"status": "ok"}
 
-    policy = RetryPolicy(
-        max_attempts=1, initial_backoff_seconds=0.0, max_backoff_seconds=0.0
-    )
+    policy = RetryPolicy(max_attempts=1, initial_backoff_seconds=0.0, max_backoff_seconds=0.0)
     executor = StepExecutor(retry_policy=policy)
     step = _make_step(timeout=1)
 
     with pytest.raises(ExecutionError) as exc_info:
-        asyncio.run(
-            executor.execute_step(step, {}, "key-timeout", slow_handler)
-        )
+        asyncio.run(executor.execute_step(step, {}, "key-timeout", slow_handler))
 
     assert exc_info.value.timeout_level == TimeoutLevel.STEP
     assert "timed out" in str(exc_info.value)
@@ -162,9 +146,7 @@ def test_execute_workflow_success() -> None:
     )
     executor = WorkflowExecutor()
 
-    results = asyncio.run(
-        executor.execute_workflow(defn, {"input": 1}, "wf-key", _ok_handler)
-    )
+    results = asyncio.run(executor.execute_workflow(defn, {"input": 1}, "wf-key", _ok_handler))
 
     assert set(results.keys()) == {"a", "b"}
     assert results["a"] == {"step_id": "a", "status": "ok"}
@@ -174,6 +156,7 @@ def test_execute_workflow_success() -> None:
 @pytest.mark.unit
 def test_execute_workflow_timeout() -> None:
     """工作流超时抛 ExecutionError(timeout_level=WORKFLOW)。"""
+
     async def slow_handler(step: Step, inputs: dict[str, Any]) -> dict[str, Any]:
         await asyncio.sleep(10)
         return {"status": "ok"}
@@ -182,9 +165,7 @@ def test_execute_workflow_timeout() -> None:
     executor = WorkflowExecutor()
 
     with pytest.raises(ExecutionError) as exc_info:
-        asyncio.run(
-            executor.execute_workflow(defn, {}, "wf-timeout", slow_handler)
-        )
+        asyncio.run(executor.execute_workflow(defn, {}, "wf-timeout", slow_handler))
 
     assert exc_info.value.timeout_level == TimeoutLevel.WORKFLOW
     assert "timed out" in str(exc_info.value)
@@ -204,16 +185,12 @@ def test_retry_backoff() -> None:
 
     # 退避：initial=0.05, max=1.0, max_attempts=3
     # 退避序列：0.05, 0.1（第 0 次后等 0.05，第 1 次后等 0.1）
-    policy = RetryPolicy(
-        max_attempts=3, initial_backoff_seconds=0.05, max_backoff_seconds=1.0
-    )
+    policy = RetryPolicy(max_attempts=3, initial_backoff_seconds=0.05, max_backoff_seconds=1.0)
     executor = StepExecutor(retry_policy=policy)
     step = _make_step()
 
     with pytest.raises(RuntimeError):
-        asyncio.run(
-            executor.execute_step(step, {}, "key-backoff", failing_handler)
-        )
+        asyncio.run(executor.execute_step(step, {}, "key-backoff", failing_handler))
 
     # 验证三次调用之间的间隔递增。
     assert len(call_times) == 3

@@ -10,6 +10,7 @@
 * collect_plugins 全局（不按租户隔离）。
 * correlation_id 累计贯穿。
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -339,14 +340,17 @@ def test_collect_plugins_global_in_bundle() -> None:
 def test_collect_logs_redaction() -> None:
     """collect_logs 对敏感字段脱敏。"""
     collector = DiagnosticCollector()
-    collector.register_log("t1", {
-        "message": "login",
-        "password": "secret123",
-        "token": "tok",
-        "secret": "s",
-        "api_key": "ak",
-        "credentials": "cr",
-    })
+    collector.register_log(
+        "t1",
+        {
+            "message": "login",
+            "password": "secret123",
+            "token": "tok",
+            "secret": "s",
+            "api_key": "ak",
+            "credentials": "cr",
+        },
+    )
 
     logs = asyncio.run(collector.collect_logs("t1", None))
     assert logs[0]["password"] == "***"
@@ -361,14 +365,17 @@ def test_collect_logs_redaction() -> None:
 def test_collect_logs_nested_redaction() -> None:
     """collect_logs 递归脱敏嵌套字典中的敏感字段。"""
     collector = DiagnosticCollector()
-    collector.register_log("t1", {
-        "message": "request",
-        "context": {
-            "user": "alice",
-            "password": "pw",
-            "headers": {"authorization": "Bearer x", "token": "t"},
+    collector.register_log(
+        "t1",
+        {
+            "message": "request",
+            "context": {
+                "user": "alice",
+                "password": "pw",
+                "headers": {"authorization": "Bearer x", "token": "t"},
+            },
         },
-    })
+    )
 
     logs = asyncio.run(collector.collect_logs("t1", None))
     assert logs[0]["context"]["user"] == "alice"

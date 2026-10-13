@@ -229,9 +229,7 @@ class MigManager:
         self._discover_profiles_fn: MigProfileDiscoveryFn = (
             profile_discovery_fn or _default_discover_profiles
         )
-        self._health_check_fn: MigHealthCheckFn = (
-            health_check_fn or _default_health_check
-        )
+        self._health_check_fn: MigHealthCheckFn = health_check_fn or _default_health_check
         # 实例注册表：instance_id -> MigInstance
         self._instances: dict[str, MigInstance] = {}
         # 状态注册表：instance_id -> 状态字符串

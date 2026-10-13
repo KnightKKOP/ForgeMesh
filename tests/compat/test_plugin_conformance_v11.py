@@ -126,7 +126,9 @@ def _ensure_plugin_package(package_name: str, plugin_dir: str) -> None:
     if not init_path.is_file():
         raise ImportError(f"plugin package __init__ not found: {init_path}")
     spec = importlib.util.spec_from_file_location(
-        package_name, init_path, submodule_search_locations=[str(pkg_path)],
+        package_name,
+        init_path,
+        submodule_search_locations=[str(pkg_path)],
     )
     if spec is None or spec.loader is None:
         raise ImportError(f"cannot create spec for {init_path}")
@@ -166,9 +168,8 @@ class TestManifestAndIsolationConformance:
         manifest = _load_manifest_dict(plugin_dir)
         validator = Draft202012Validator(_MANIFEST_SCHEMA)
         errors = sorted(validator.iter_errors(manifest), key=lambda e: list(e.path))
-        assert not errors, (
-            f"{plugin_dir}/manifest.yaml schema 校验失败: "
-            + "; ".join(f"{list(e.path)}: {e.message}" for e in errors)
+        assert not errors, f"{plugin_dir}/manifest.yaml schema 校验失败: " + "; ".join(
+            f"{list(e.path)}: {e.message}" for e in errors
         )
 
     @_compat
@@ -176,9 +177,7 @@ class TestManifestAndIsolationConformance:
         "plugin_dir",
         [pytest.param(p, id=p) for p in ALL_PLUGIN_DIRS],
     )
-    def test_manifest_parses_into_plugin_manifest_model(
-        self, plugin_dir: str
-    ) -> None:
+    def test_manifest_parses_into_plugin_manifest_model(self, plugin_dir: str) -> None:
         """manifest 须能加载进 PluginManifest 模型（extra=forbid，捕获模型与 schema 漂移）。"""
         manifest = PluginManifest.model_validate(_load_manifest_dict(plugin_dir))
         raw = _load_manifest_dict(plugin_dir)
@@ -192,14 +191,10 @@ class TestManifestAndIsolationConformance:
         "plugin_dir",
         [pytest.param(p, id=p) for p in ALL_PLUGIN_DIRS],
     )
-    def test_isolation_declaration_within_allowed_enum(
-        self, plugin_dir: str
-    ) -> None:
+    def test_isolation_declaration_within_allowed_enum(self, plugin_dir: str) -> None:
         """isolation 只能声明 in-process（restricted-rpc / sandbox 尚无进程边界实现）。"""
         isolation = _load_manifest_dict(plugin_dir)["spec"]["isolation"]
-        assert isolation in _ALLOWED_ISOLATION, (
-            f"{plugin_dir}: 非法 isolation 声明 {isolation!r}"
-        )
+        assert isolation in _ALLOWED_ISOLATION, f"{plugin_dir}: 非法 isolation 声明 {isolation!r}"
 
     @_compat
     @pytest.mark.parametrize(
@@ -291,9 +286,7 @@ def _make_typesafe_provider(
     delay_s: float = 0.0,
 ) -> Any:
     """构造 decision-typesafe-jev 的 TypeSafeJevProvider（注入离线 fake 客户端）。"""
-    _ensure_plugin_module(
-        "decision_typesafe_jev_provider", "decision-typesafe-jev"
-    )
+    _ensure_plugin_module("decision_typesafe_jev_provider", "decision-typesafe-jev")
     from decision_typesafe_jev_provider import (
         JevQuestion,
         StaticJevClient,
@@ -356,9 +349,7 @@ class TestDecisionProviderConformance:
             for p in ("decision-rules", "decision-jev", "decision-typesafe-jev")
         ],
     )
-    def test_normal_input_returns_structured_candidates(
-        self, plugin_dir: str
-    ) -> None:
+    def test_normal_input_returns_structured_candidates(self, plugin_dir: str) -> None:
         """正常输入返回结构化候选：含建议动作（action）与理由（rationale）字段。"""
         provider = _DECISION_FACTORIES[plugin_dir]()
         candidates = _run(provider.decide(_make_decision_request()))
@@ -368,9 +359,9 @@ class TestDecisionProviderConformance:
         # 按契约真实字段断言：建议动作 + 理由 + 置信度（仅排序/解释用）。
         assert cand.candidate_id, "candidate_id 不得为空"
         assert cand.action, "建议动作 action 不得为空"
-        assert cand.action.startswith("inference.") or cand.action.startswith(
-            "bind."
-        ), f"动作应为推理域动作: {cand.action!r}"
+        assert cand.action.startswith("inference.") or cand.action.startswith("bind."), (
+            f"动作应为推理域动作: {cand.action!r}"
+        )
         assert isinstance(cand.rationale, list) and cand.rationale, (
             "理由 rationale 应为非空列表（可解释性要求）"
         )
@@ -385,9 +376,7 @@ class TestDecisionProviderConformance:
             for p in ("decision-rules", "decision-jev", "decision-typesafe-jev")
         ],
     )
-    def test_provider_identity_declared_and_matches_manifest(
-        self, plugin_dir: str
-    ) -> None:
+    def test_provider_identity_declared_and_matches_manifest(self, plugin_dir: str) -> None:
         """provider_id/provider_version 须声明（IVT-11）且与 manifest metadata.id 一致。"""
         provider = _DECISION_FACTORIES[plugin_dir]()
         assert provider.provider_id, "provider_id 不得为空（IVT-11 决策记录）"
@@ -452,9 +441,7 @@ class TestDecisionProviderConformance:
     @_compat
     def test_typesafe_jev_invalid_output_raises_protocol_error(self) -> None:
         """typesafe-jev：Jev 返回 choice 越界/结构非法 → JevProtocolError（触发降级）。"""
-        _ensure_plugin_module(
-            "decision_typesafe_jev_provider", "decision-typesafe-jev"
-        )
+        _ensure_plugin_module("decision_typesafe_jev_provider", "decision-typesafe-jev")
         from decision_typesafe_jev_provider import JevProtocolError
 
         # choice 不在预定义 options 内 → 类型安全校验失败。
@@ -472,9 +459,7 @@ class TestDecisionProviderConformance:
     @_compat
     def test_typesafe_jev_unavailable_dependency_raises_for_degrade(self) -> None:
         """typesafe-jev：依赖故障 → JevUnavailableError，绝不默认放行。"""
-        _ensure_plugin_module(
-            "decision_typesafe_jev_provider", "decision-typesafe-jev"
-        )
+        _ensure_plugin_module("decision_typesafe_jev_provider", "decision-typesafe-jev")
         from decision_typesafe_jev_provider import JevUnavailableError
 
         provider = _make_typesafe_provider(error=RuntimeError("backend down"))
@@ -502,10 +487,7 @@ class TestDecisionProviderConformance:
     @_compat
     @pytest.mark.parametrize(
         "plugin_dir",
-        [
-            pytest.param(p, id=p)
-            for p in ("decision-rules", "decision-jev")
-        ],
+        [pytest.param(p, id=p) for p in ("decision-rules", "decision-jev")],
     )
     def test_local_providers_complete_within_deadline(self, plugin_dir: str) -> None:
         """rules/jev 为纯本地计算：decide 须在 deadline_ms 内完成（不超时）。"""
@@ -518,9 +500,7 @@ class TestDecisionProviderConformance:
     @_compat
     def test_typesafe_jev_deadline_timeout_raises(self) -> None:
         """typesafe-jev 超时语义：慢依赖 + 极小 deadline → JevTimeoutError 失败。"""
-        _ensure_plugin_module(
-            "decision_typesafe_jev_provider", "decision-typesafe-jev"
-        )
+        _ensure_plugin_module("decision_typesafe_jev_provider", "decision-typesafe-jev")
         from decision_typesafe_jev_provider import JevTimeoutError
 
         # 注入永远慢于 deadline 的依赖（5s 延迟），deadline 仅 80ms；
@@ -834,9 +814,7 @@ class TestRuntimeVllmConformance:
         assert stored is not None and stored.status == InstanceStatus.RUNNING
 
         # 2. verify：冒烟通过；通过后注册路由推进 Ready。
-        result = _run(
-            verifier.verify(VerifyConfig(endpoint=instance.endpoint, num_requests=2))
-        )
+        result = _run(verifier.verify(VerifyConfig(endpoint=instance.endpoint, num_requests=2)))
         assert result.passed is True
         endpoint = _run(deployer.register_route(instance))
         assert endpoint == instance.endpoint
@@ -844,9 +822,7 @@ class TestRuntimeVllmConformance:
         assert ready is not None and ready.status == InstanceStatus.READY
 
         # 3. release：停止 + 租约释放 + 分配核验全部成功。
-        release = _run(
-            releaser.release(deployer, instance.instance_id, "lease-1", [0])
-        )
+        release = _run(releaser.release(deployer, instance.instance_id, "lease-1", [0]))
         assert release.released is True
         assert release.verified is True
         stopped = _run(deployer.get_instance(instance.instance_id))
@@ -862,9 +838,7 @@ class TestRuntimeVllmConformance:
         verifier = self._make_verifier(ok=False)  # 推理全部失败。
 
         instance = _run(deployer.deploy(DeployConfig(model_path="/m", port=8101, gpu_ids=[0])))
-        result = _run(
-            verifier.verify(VerifyConfig(endpoint=instance.endpoint, num_requests=2))
-        )
+        result = _run(verifier.verify(VerifyConfig(endpoint=instance.endpoint, num_requests=2)))
         assert result.passed is False, "推理失败时 verify 不得通过"
         # conformance：verify 失败后不得推进 Ready（register_route 不应被调用）。
         stored = _run(deployer.get_instance(instance.instance_id))
@@ -883,13 +857,9 @@ class TestRuntimeVllmConformance:
         releaser = self._make_releaser()
         instance = _run(deployer.deploy(DeployConfig(model_path="/m", port=8102, gpu_ids=[0])))
 
-        first = _run(
-            releaser.release(deployer, instance.instance_id, "lease-2", [0])
-        )
+        first = _run(releaser.release(deployer, instance.instance_id, "lease-2", [0]))
         # 第二次 release：stop_instance 对已停止实例幂等返回，不抛错。
-        second = _run(
-            releaser.release(deployer, instance.instance_id, "lease-2", [0])
-        )
+        second = _run(releaser.release(deployer, instance.instance_id, "lease-2", [0]))
         assert first.released is True
         assert second.released is True, "重复 release 应幂等成功（实现语义）"
 
@@ -1113,9 +1083,7 @@ class TestUpgradeAndUnloadSafety:
         """卸载未注册插件须被拒绝（NotFoundError）。"""
         manager = PluginManager()
         with pytest.raises(NotFoundError):
-            manager.transition(
-                "forgemesh.ghost:0.0.1", PluginLifecycleState.UNINSTALLED
-            )
+            manager.transition("forgemesh.ghost:0.0.1", PluginLifecycleState.UNINSTALLED)
 
     @_compat
     def test_disorderly_transition_rejected(self) -> None:
@@ -1152,11 +1120,7 @@ class TestUpgradeAndUnloadSafety:
         pid2 = _register(manager, m_v2)
 
         assert pid1 != pid2, "不同版本应有不同 plugin_id（id:version）"
-        same_id = [
-            m
-            for m in manager.discover()
-            if m.metadata.id == "forgemesh.decision.rules"
-        ]
+        same_id = [m for m in manager.discover() if m.metadata.id == "forgemesh.decision.rules"]
         assert len(same_id) == 2, "同 id 两版本应同时可被发现（并存）"
         assert {manager.get_version(pid1), manager.get_version(pid2)} == {
             "0.0.1",

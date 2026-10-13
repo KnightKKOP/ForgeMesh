@@ -230,9 +230,7 @@ def validate_plugin_transition(
     to_s = _coerce(to)
     allowed = PLUGIN_TRANSITIONS.get(cur_s, set())
     if to_s not in allowed:
-        raise InvalidStateTransition(
-            f"illegal plugin transition: {cur_s.value} -> {to_s.value}"
-        )
+        raise InvalidStateTransition(f"illegal plugin transition: {cur_s.value} -> {to_s.value}")
 
 
 __all__ = [

@@ -182,9 +182,7 @@ def test_recovery_resume_only_when_running_or_unknown() -> None:
             mgr.recover(
                 server,
                 agent_id="agent-1",
-                running_executions=[
-                    RunningExecution(task_id="t1", execution_id="e1")
-                ],
+                running_executions=[RunningExecution(task_id="t1", execution_id="e1")],
             )
         )
         is_resume = actions[0].action == "resume"

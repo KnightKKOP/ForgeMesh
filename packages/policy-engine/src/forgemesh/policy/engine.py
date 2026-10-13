@@ -8,6 +8,7 @@
 全部通过返回 allow；条件授权/配额接近上限等降级类信息合并进
 obligations（不改变 allow 语义），高风险操作返回 require_approval。
 """
+
 from __future__ import annotations
 
 from typing import Any

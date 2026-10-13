@@ -94,16 +94,12 @@ def test_concurrent_cas_exactly_one_winner(tmp_path: pytest.TempPathFactory) -> 
         ok, conflict, final_version = asyncio.run(_round(round_index))
         total_ok += ok
         total_conflict += conflict
-        assert ok == 1, (
-            f"round {round_index}: 并发 CAS 成功 {ok} 次（期望恰 1 次）——出现双重写入"
-        )
+        assert ok == 1, f"round {round_index}: 并发 CAS 成功 {ok} 次（期望恰 1 次）——出现双重写入"
         assert conflict == N_CONCURRENT - 1, (
             f"round {round_index}: 冲突被正确拒绝 {conflict} 次"
             f"（期望 {N_CONCURRENT - 1} 次，100% 正确率）"
         )
-        assert final_version == "1", (
-            f"round {round_index}: 落库版本 {final_version!r}（期望 '1'）"
-        )
+        assert final_version == "1", f"round {round_index}: 落库版本 {final_version!r}（期望 '1'）"
 
     # 正确率口径：16 个并发写中每轮仅 1 个合法成功，其余 (N-1) 个应被
     # 拒绝；分母为"应被拒绝的冲突预期总数"，而非全部并发数。

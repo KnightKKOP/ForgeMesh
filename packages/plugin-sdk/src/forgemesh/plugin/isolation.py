@@ -229,9 +229,7 @@ class PluginVersionCompat:
         tgt = _parse_semver(target)
 
         if tgt == cur:
-            return UpgradeCheck(
-                compatible=True, breaking=False, reason=f"same version {current}"
-            )
+            return UpgradeCheck(compatible=True, breaking=False, reason=f"same version {current}")
         if tgt < cur:
             return UpgradeCheck(
                 compatible=False,

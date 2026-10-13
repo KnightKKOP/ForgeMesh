@@ -10,6 +10,7 @@
 * :meth:`QuotaPolicy.consume` 在锁内完成「检查 + 递增」，避免 check-then-act 竞态。
 * :meth:`QuotaPolicy.get_usage` 返回副本，防止外部修改内部状态。
 """
+
 from __future__ import annotations
 
 import asyncio

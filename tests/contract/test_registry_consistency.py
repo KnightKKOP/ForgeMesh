@@ -177,9 +177,7 @@ def test_resource_version_strictly_monotonic() -> None:
 
         # 连续 4 次成功 CAS：版本严格单调 +1，无跳变、无回退
         for expected in range(4):
-            current = _run(
-                reg.put(current, expected_version=str(expected))
-            )
+            current = _run(reg.put(current, expected_version=str(expected)))
             assert current.metadata.resourceVersion == str(expected + 1)
 
         # 冲突的 CAS 不推进版本（失败方不得影响单调性）

@@ -64,7 +64,8 @@ class TaskStatus(StrEnum):
 
 #: 任务终态集合（无出边），用于 ``list_pending`` 过滤。
 _TASK_TERMINAL_STATUSES: frozenset[str] = frozenset(
-    s.value for s in (
+    s.value
+    for s in (
         TaskStatus.SUCCEEDED,
         TaskStatus.FAILED,
         TaskStatus.CANCELLED,
@@ -261,8 +262,7 @@ class TaskStore:
         """同步更新任务状态与结果。"""
         now = self._now()
         cur = self._conn.execute(
-            "UPDATE tasks SET status = ?, result = ?, updated_at = ? "
-            "WHERE task_id = ?",
+            "UPDATE tasks SET status = ?, result = ?, updated_at = ? WHERE task_id = ?",
             (status.value, result, now, task_id),
         )
         if cur.rowcount == 0:
@@ -355,9 +355,7 @@ class TaskStore:
 
     async def list_by_idempotency_key(self, idempotency_key: str) -> Task | None:
         """按幂等键查询任务，不存在返回 ``None``。"""
-        return await self._db.run(
-            self._list_by_idempotency_key_sync, idempotency_key
-        )
+        return await self._db.run(self._list_by_idempotency_key_sync, idempotency_key)
 
     async def close(self) -> None:
         """关闭数据库连接（共用的 ``database`` 由创建者关闭）。"""

@@ -298,7 +298,7 @@ def test_deployments_recover_before_the_controller_starts_and_stop_after_it(
         monkeypatch.setattr(owner, name, wrapper)
 
     record(LocalWorkflowRuntime, "recover", "runtime.recover")
-    record(app_module, "mark_lost_instances", "mark_lost_instances")
+    record(app_module, "check_instances", "check_instances")
     record(ControllerManager, "start", "controller.start")
     record(ControllerManager, "stop", "controller.stop")
     record(LocalWorkflowRuntime, "aclose", "runtime.aclose")
@@ -310,7 +310,7 @@ def test_deployments_recover_before_the_controller_starts_and_stop_after_it(
     with TestClient(create_app(db_path=str(tmp_path / "cp.db"))):
         started = list(calls)
 
-    assert started == ["runtime.recover", "mark_lost_instances", "controller.start"]
+    assert started == ["runtime.recover", "check_instances", "controller.start"]
     assert calls[len(started) :] == [
         "controller.stop",
         "runtime.aclose",

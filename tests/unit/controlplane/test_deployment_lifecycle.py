@@ -4,8 +4,10 @@
 * 创建的资源每轮推进一个 phase（``Pending`` → ``Scheduling`` → ``Preparing`` →
   ``Deploying`` → ``Verifying`` → ``Ready``），``status.endpoints`` 是启动器返回的实例；
 * 重启（``Ready`` 之后、启动部署的一轮被重放、启动实例的中途）不会启动第二个实例，也
-  不会再分配；实例没有活过重启时，``Ready`` 的服务转为 ``Degraded``（endpoint 标记为未
-  就绪），运行成功却还没写入 ``Ready`` 的服务进入 ``Failed``；
+  不会再分配；
+* 实例丢失（没有活过重启，或自行退出）：``Ready`` 的服务转为 ``Degraded``（endpoint 标记
+  为未就绪），在同一分配上重新部署后回到 ``Ready``，运行成功却还没写入 ``Ready`` 的服务
+  同样重新部署；重新部署按退避，失败时说明原因；实例回来了的服务直接回到 ``Ready``；
 * 部署工作流没能启动时保留分配并重试；部署失败时实例被停止、分配释放，资源停在
   ``Failed``，修改 spec 之后从 ``Pending`` 重新部署；补偿没能停止的实例在删除资源或重新
   部署时停止；
@@ -26,8 +28,9 @@ from __future__ import annotations
 import asyncio
 import json
 import sqlite3
+import time
 from collections import defaultdict
-from collections.abc import Collection
+from collections.abc import Callable, Collection
 from typing import Any
 
 import pytest
@@ -39,12 +42,13 @@ from forgemesh.controlplane.deployment import (
     LaunchedInstance,
     LaunchRequest,
     RuntimeLauncher,
+    check_instances,
     deployment_run_key,
     find_deployment_runs,
     launched_instance,
-    mark_lost_instances,
 )
 from forgemesh.controlplane.reconciler import (
+    REDEPLOY_BACKOFF_RESET_SECONDS,
     ProcessedKeyStore,
     ReconciliationController,
     compute_dedup_key,
@@ -138,7 +142,8 @@ class _ScriptedLauncher(InMemoryLauncher):
 
     ``block`` / ``fail`` 中的名称：``launch``（创建实例之前）、``launched``（创建实例
     之后、返回之前，模拟结果落盘前进程退出）、``verify``；``stop_failures`` 为接下来要
-    失败的 ``stop`` 调用次数。
+    失败的 ``stop`` 调用次数；``down`` 中的实例（实例 id）不在运行，像进程已经退出，
+    移出 ``down`` 即实例回来了。
     """
 
     def __init__(self) -> None:
@@ -146,6 +151,7 @@ class _ScriptedLauncher(InMemoryLauncher):
         self.block: set[str] = set()
         self.fail: set[str] = set()
         self.stop_failures = 0
+        self.down: set[str] = set()
         self.entered: defaultdict[str, asyncio.Event] = defaultdict(asyncio.Event)
         self.cancelled: list[str] = []
 
@@ -181,6 +187,19 @@ class _ScriptedLauncher(InMemoryLauncher):
             raise RuntimeError("stop broke")
         await super().stop(instance_id)
 
+    async def is_running(self, instance_id: str) -> bool:
+        return instance_id not in self.down and await super().is_running(instance_id)
+
+
+class _Clock:
+    """手动推进的单调时钟（秒）。"""
+
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def __call__(self) -> float:
+        return self.now
+
 
 def _runtime(launcher: RuntimeLauncher, store: WorkflowStore) -> LocalWorkflowRuntime:
     """按部署工作流模块说明组装运行时；失败的步骤立即重试一次。"""
@@ -201,9 +220,9 @@ def _runtime(launcher: RuntimeLauncher, store: WorkflowStore) -> LocalWorkflowRu
 class _ControlPlane:
     """一个控制平面进程的组件，组装方式与应用相同（在 ``async with`` 内使用）。
 
-    进入时调用 ``recover()`` 与 ``mark_lost_instances()``（返回值存于 :attr:`recovered` 与
-    :attr:`lost`）；退出时按应用的顺序关闭：控制器 → 工作流运行时 → 启动器 → 工作流存储 →
-    去重键存储 → 注册表。
+    进入时调用 ``recover()`` 与 ``check_instances(after_restart=True)``（返回值存于
+    :attr:`recovered` 与 :attr:`lost`）；退出时按应用的顺序关闭：控制器 → 工作流运行时 →
+    启动器 → 工作流存储 → 去重键存储 → 注册表。``clock`` 为协调器重新部署退避所用的时钟。
     """
 
     def __init__(
@@ -212,6 +231,7 @@ class _ControlPlane:
         launcher: RuntimeLauncher,
         inventory: Inventory | None = None,
         policy: PolicyEngine | None = None,
+        clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self.launcher = launcher
         self.registry = SQLiteRegistry(db)
@@ -232,6 +252,7 @@ class _ControlPlane:
             record_dedup_keys=False,
             workflow_poll_interval=POLL_SECONDS,
             launcher=launcher,
+            clock=clock,
         )
         self.manager = ControllerManager(self.registry, reconciler, poll_interval=POLL_SECONDS)
         self.recovered: list[str] = []
@@ -239,7 +260,7 @@ class _ControlPlane:
 
     async def __aenter__(self) -> _ControlPlane:
         self.recovered = await self.runtime.recover()
-        self.lost = await mark_lost_instances(self.registry, self.launcher)
+        self.lost = await check_instances(self.registry, self.launcher, after_restart=True)
         return self
 
     async def __aexit__(self, *exc_info: object) -> None:
@@ -913,13 +934,14 @@ def test_a_restart_in_the_middle_of_a_launch_resumes_the_run_with_the_same_insta
 
 
 @pytest.mark.unit
-def test_an_instance_lost_between_a_successful_run_and_ready_fails_the_service(tmp_path):
-    """运行已成功、写入 Ready 之前重启，实例没有活过重启（新启动器不认识它）：资源进入
-    Failed（InstanceLost）并释放分配，不把不存在的实例写进 ``status.endpoints``。"""
+def test_an_instance_lost_between_a_successful_run_and_ready_is_deployed_again(tmp_path):
+    """运行已成功、写入 Ready 之前重启，实例没有活过重启（新启动器不认识它）：服务仍是
+    Verifying，停止之前的部署，以同一分配再部署一次（幂等键带上次数），不把不存在的实例
+    写进 ``status.endpoints``；之后以新实例进入 Ready 并登记去重键。"""
     db = str(tmp_path / "cp.db")
     fresh = _ScriptedLauncher()
 
-    async def scenario() -> None:
+    async def scenario() -> LaunchedInstance:
         async with _ControlPlane(db, _ScriptedLauncher()) as plane:
             await plane.registry.put(_service())
             assert await plane.deploy(until={"Verifying"}) == [
@@ -930,42 +952,50 @@ def test_an_instance_lost_between_a_successful_run_and_ready_fails_the_service(t
             ]
             run = await plane.runtime.find_run(RUN_KEY)
             assert run.status is WorkflowStatus.SUCCEEDED
-            instance = launched_instance(run)
+            lost = launched_instance(run)
+            [allocation] = await plane.registry.list_allocations(TENANT)
 
         async with _ControlPlane(db, fresh) as plane:
-            assert await plane.deploy() == ["Failed"]
+            await plane.manager.process(KEY)
             service = await plane.service()
+            redeployment = await plane.runtime.find_run(deployment_run_key(UID, 1, 2))
+            assert service.status.phase.value == "Verifying"
             assert service.status.endpoints == []
             assert _ready(service) == (
                 "False",
                 "InstanceLost",
-                f"instance {instance.instance_id} at {instance.url} is not running any more; "
-                "change the spec or re-create the service to deploy it again",
+                f"deployment workflow run {redeployment.run_id} redeploys the service (attempt 2)",
             )
-            assert await plane.registry.get_active_allocation(UID, TENANT) is None
-            assert await plane.registry.allocated_devices() == frozenset()
 
-    asyncio.run(scenario())
-    assert fresh.launches == []
+            assert await plane.deploy() == ["Ready"]
+            [instance] = fresh.running.values()
+            assert (await plane.service()).status.endpoints == [instance.endpoint()]
+            assert await plane.registry.list_allocations(TENANT) == [allocation]
+            assert await plane.processed.seen(DEDUP_KEY)
+        return lost
+
+    lost = asyncio.run(scenario())
+    assert [request.instance_key for request in fresh.launches] == [deployment_run_key(UID, 1, 2)]
+    assert fresh.stops == [lost.instance_id]
 
 
 @pytest.mark.unit
-def test_a_ready_service_whose_instance_did_not_survive_a_restart_is_degraded(tmp_path):
+def test_a_ready_service_whose_instance_did_not_survive_a_restart_is_deployed_again(tmp_path):
     """Ready 之后重启，实例没有活过重启：启动时服务转为 Degraded，endpoint 标记为未就绪，
-    ``Ready=False``（InstanceLost）；分配保留，之后的协调不再部署。删除时停止（已不存在的）
-    实例、释放分配。"""
+    ``Ready=False``（InstanceLost）；控制器停止（已不存在的）实例，在同一分配上再部署一次，
+    服务以新实例回到 Ready。"""
     db = str(tmp_path / "cp.db")
     fresh = _ScriptedLauncher()
 
-    async def scenario() -> Endpoint:
+    async def scenario() -> tuple[Endpoint, Endpoint]:
         async with _ControlPlane(db, _ScriptedLauncher()) as plane:
             await plane.registry.put(_service())
             await plane.deploy()
             [endpoint] = (await plane.service()).status.endpoints
+            [allocation] = await plane.registry.list_allocations(TENANT)
 
         async with _ControlPlane(db, fresh) as plane:
             assert plane.lost == [KEY]
-            await plane.manager.process(KEY)
             service = await plane.service()
             assert service.status.phase.value == "Degraded"
             assert service.status.endpoints == [endpoint.model_copy(update={"ready": False})]
@@ -973,17 +1003,18 @@ def test_a_ready_service_whose_instance_did_not_survive_a_restart_is_degraded(tm
                 "False",
                 "InstanceLost",
                 f"instance {endpoint.instanceId} at {endpoint.url} did not survive the control "
-                "plane restart; delete and re-create the service to deploy it again",
+                "plane restart; redeploying the service",
             )
-            assert await plane.registry.get_active_allocation(UID, TENANT) is not None
 
-            assert await plane.delete() is False
-            await plane.manager.process(KEY)
-            await _assert_gone(plane)
-        return endpoint
+            assert await plane.deploy() == ["Degraded", "Ready"]
+            [redeployed] = (await plane.service()).status.endpoints
+            assert await plane.registry.list_allocations(TENANT) == [allocation]
+        return endpoint, redeployed
 
-    endpoint = asyncio.run(scenario())
-    assert fresh.launches == []
+    endpoint, redeployed = asyncio.run(scenario())
+    [instance] = fresh.running.values()
+    assert redeployed == instance.endpoint()
+    assert [request.instance_key for request in fresh.launches] == [deployment_run_key(UID, 1, 2)]
     assert fresh.stops == [endpoint.instanceId]
 
 
@@ -1006,7 +1037,7 @@ def test_only_the_endpoints_whose_instance_is_gone_are_marked_not_ready():
                 {"endpoints": [unknown.model_dump(mode="json"), running.model_dump(mode="json")]},
             )
 
-            assert await mark_lost_instances(plane.registry, launcher) == [KEY]
+            assert await check_instances(plane.registry, launcher) == [KEY]
             return await plane.service()
 
     service = asyncio.run(scenario())
@@ -1017,8 +1048,7 @@ def test_only_the_endpoints_whose_instance_is_gone_are_marked_not_ready():
         (instance.url, True),
     ]
     assert _ready(service)[2] == (
-        "the instance at http://10.0.0.9:8000 did not survive the control plane restart; "
-        "delete and re-create the service to deploy it again"
+        "the instance at http://10.0.0.9:8000 is not running any more; redeploying the service"
     )
 
 
@@ -1035,9 +1065,171 @@ def test_a_service_changed_while_its_instances_are_checked_is_left_alone(monkeyp
                 raise ConflictError("changed meanwhile")
 
             monkeypatch.setattr(plane.registry, "update_status", conflict)
-            assert await mark_lost_instances(plane.registry, _ScriptedLauncher()) == []
+            assert await check_instances(plane.registry, _ScriptedLauncher()) == []
             monkeypatch.undo()
             assert await plane.phase() == "Ready"
+
+    asyncio.run(scenario())
+
+
+# ---------------------------------------------------------------------- #
+# 实例丢失
+# ---------------------------------------------------------------------- #
+
+
+async def _lose_the_instance(plane: _ControlPlane, launcher: _ScriptedLauncher) -> LaunchedInstance:
+    """服务的实例退出，检查实例时服务转为 Degraded；返回退出的实例。"""
+    [instance] = launcher.running.values()
+    launcher.down.add(instance.instance_id)
+    assert await check_instances(plane.registry, launcher) == [KEY]
+    return instance
+
+
+@pytest.mark.unit
+def test_a_service_whose_instance_exits_is_degraded_and_deployed_again_on_its_allocation():
+    """Ready 的服务实例自行退出：检查时转为 Degraded；下一轮停止之前的部署，以同一分配、同一
+    代 spec 再部署一次（幂等键带上次数），清空 ``status.endpoints``，服务以新实例回到 Ready。
+    部署进入 Ready 时登记的去重键不挡住恢复，回到 Ready 也不登记恢复的去重键。"""
+    launcher = _ScriptedLauncher()
+
+    async def scenario() -> None:
+        async with _ControlPlane(":memory:", launcher) as plane:
+            await plane.registry.put(_service())
+            await plane.deploy()
+            [allocation] = await plane.registry.list_allocations(TENANT)
+            first = await _lose_the_instance(plane, launcher)
+            service = await plane.service()
+            assert service.status.phase.value == "Degraded"
+            assert service.status.endpoints == [
+                first.endpoint().model_copy(update={"ready": False})
+            ]
+            assert _ready(service) == (
+                "False",
+                "InstanceLost",
+                f"instance {first.instance_id} at {first.url} is not running any more; "
+                "redeploying the service",
+            )
+
+            await plane.manager.process(KEY)
+            service = await plane.service()
+            redeployment = await plane.runtime.find_run(deployment_run_key(UID, 1, 2))
+            assert service.status.phase.value == "Degraded"
+            assert service.status.endpoints == []
+            assert _ready(service) == (
+                "False",
+                "InstanceLost",
+                f"deployment workflow run {redeployment.run_id} redeploys the service (attempt 2)",
+            )
+            assert launcher.stops == [first.instance_id]
+
+            assert await plane.deploy() == ["Ready"]
+            service = await plane.service()
+            [second] = launcher.running.values()
+            assert service.status.endpoints == [second.endpoint()]
+            assert _ready(service)[:2] == ("True", "Reconciled")
+            assert (service.metadata.generation, service.metadata.observed_generation) == (1, 1)
+            assert launcher.launches[-1].allocation_id == allocation["id"]
+            assert await plane.registry.list_allocations(TENANT) == [allocation]
+            recover = compute_dedup_key(KIND, NAMESPACE, NAME, UID, 1, "recover").key
+            assert not await plane.processed.seen(recover)
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.unit
+def test_a_degraded_service_whose_instance_is_back_returns_to_ready_without_a_redeployment():
+    """实例回来了（启动器又报告它在运行）：检查实例时交给控制器，服务以原来的实例回到
+    Ready，不停止、不启动实例；实例仍不在运行时检查不再报告这个服务。"""
+    launcher = _ScriptedLauncher()
+
+    async def scenario() -> None:
+        async with _ControlPlane(":memory:", launcher) as plane:
+            await plane.registry.put(_service())
+            await plane.deploy()
+            instance = await _lose_the_instance(plane, launcher)
+            assert await check_instances(plane.registry, launcher) == []
+
+            launcher.down.clear()
+            assert await check_instances(plane.registry, launcher) == [KEY]
+            assert await plane.phase() == "Degraded"
+            await plane.manager.process(KEY)
+
+            service = await plane.service()
+            assert service.status.phase.value == "Ready"
+            assert service.status.endpoints == [instance.endpoint()]
+            assert (len(launcher.launches), launcher.stops) == (1, [])
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.unit
+def test_redeployments_back_off_up_to_a_bound_and_start_over_after_a_quiet_period():
+    """同一代 spec 反复丢失实例：第一次立即重新部署，之后与上一次开始至少相隔 10 秒、每次
+    翻倍、最多 300 秒，等待期间不启动运行；上一次开始已过 600 秒时再丢失实例立即重新部署。"""
+    launcher = _ScriptedLauncher()
+    clock = _Clock()
+
+    async def scenario() -> list[int]:
+        async with _ControlPlane(":memory:", launcher, clock=clock) as plane:
+            await plane.registry.put(_service())
+            await plane.deploy()
+            for wait in (0.0, 10.0, 20.0, 40.0, 80.0, 160.0, 300.0, 300.0):
+                await _lose_the_instance(plane, launcher)
+                if wait:
+                    started = len(await find_deployment_runs(plane.runtime, UID))
+                    clock.now += wait - 1
+                    await plane.manager.process(KEY)
+                    assert len(await find_deployment_runs(plane.runtime, UID)) == started
+                    clock.now += 1
+                assert await plane.deploy() == ["Degraded", "Ready"]
+
+            clock.now += REDEPLOY_BACKOFF_RESET_SECONDS
+            await _lose_the_instance(plane, launcher)
+            assert await plane.deploy() == ["Degraded", "Ready"]
+            runs = await find_deployment_runs(plane.runtime, UID)
+            return [deployment.attempt for deployment in runs]
+
+    assert asyncio.run(scenario()) == list(range(1, 11))
+
+
+@pytest.mark.unit
+def test_a_failed_redeployment_reports_why_and_is_retried_after_the_backoff():
+    """重新部署的运行失败（启动实例用尽重试）：服务仍是 Degraded、继续持有分配，等待退避期间
+    ``Ready=False``（WorkflowFailed）说明原因，只写一次；退避结束后再部署一次，成功后回到
+    Ready。"""
+    launcher = _ScriptedLauncher()
+    clock = _Clock()
+
+    async def scenario() -> None:
+        async with _ControlPlane(":memory:", launcher, clock=clock) as plane:
+            await plane.registry.put(_service())
+            await plane.deploy()
+            [allocation] = await plane.registry.list_allocations(TENANT)
+            await _lose_the_instance(plane, launcher)
+            launcher.fail.add("launch")
+            await plane.manager.process(KEY)
+
+            assert await plane.deploy(until={"Degraded"}) == ["Degraded"]
+            service = await plane.service()
+            assert _ready(service) == (
+                "False",
+                "WorkflowFailed",
+                "step 'launch-instance' failed: launch broke; redeploying the service after a "
+                "backoff",
+            )
+            assert service.status.endpoints == []
+            assert await plane.registry.list_allocations(TENANT) == [allocation]
+            await plane.manager.process(KEY)
+            unchanged = await plane.service()
+            assert unchanged.metadata.resourceVersion == service.metadata.resourceVersion
+
+            launcher.fail.clear()
+            clock.now += 10
+            assert await plane.deploy() == ["Degraded", "Ready"]
+            [instance] = launcher.running.values()
+            assert (await plane.service()).status.endpoints == [instance.endpoint()]
+            assert [d.attempt for d in await find_deployment_runs(plane.runtime, UID)] == [1, 2, 3]
+            assert await plane.registry.list_allocations(TENANT) == [allocation]
 
     asyncio.run(scenario())
 

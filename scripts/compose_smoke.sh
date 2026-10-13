@@ -4,8 +4,8 @@
 # 启动控制平面与网关，经网关走完推理服务的闭环：
 #   创建 → Ready（status.endpoints 指向假实例）→ 经网关流式对话（SSE，以 [DONE] 结束）→
 #   删除 → 资源消失、实例停止 → 同名重新创建（只有一块设备，可见分配已释放）→ 再次对话 →
-#   重启控制平面：资源仍在，实例随旧进程结束，服务转为 Degraded（Ready=False，
-#   InstanceLost），网关不再转发（503）→ 删除。
+#   重启控制平面：资源仍在，实例随旧进程结束，服务转为 Degraded（InstanceLost）后重新部署，
+#   以新实例回到 Ready → 再次对话 → 删除。
 #
 # 用法（任意目录）：scripts/compose_smoke.sh
 # 依赖 docker（含 compose v2 插件）、curl 与 jq；占用 127.0.0.1:8080 与 127.0.0.1:8081。
@@ -137,22 +137,6 @@ expect_reply() {
   fail "streaming chat did not reach $1 (last HTTP $code, reply: ${got:-none})"
 }
 
-# expect_unroutable：网关不再转发对话（503 NO_HEALTHY_UPSTREAM；缓存过期之前可能先是连接
-# 旧实例失败的 502）。
-expect_unroutable() {
-  local code=""
-  for _ in $(seq 1 30); do
-    code=$(chat)
-    if [[ "$code" == 503 ]] && jq -e '.error.code == "NO_HEALTHY_UPSTREAM"' "$stream" >/dev/null
-    then
-      echo "ok: the gateway no longer routes to smoke-svc (HTTP 503 NO_HEALTHY_UPSTREAM)"
-      return 0
-    fi
-    sleep 1
-  done
-  fail "the gateway still routes to smoke-svc (last HTTP $code)"
-}
-
 # port_closed <端口>：控制平面容器内没有进程在该端口上监听。
 port_closed() {
   "${compose[@]}" exec -T control-plane python - "$1" <<'EOF'
@@ -229,20 +213,23 @@ second_instance=$(jq -r '.status.endpoints[0].instanceId' "$resource")
 echo "ok: the re-created service runs a new instance"
 expect_reply "$second_instance"
 
-# 假实例随控制平面进程结束：重启之后服务转为 Degraded，网关不再转发。
+# 假实例随控制平面进程结束：启动时服务转为 Degraded（InstanceLost，日志记录丢失的实例），
+# 控制器随后以同一分配重新部署，服务以新实例回到 Ready。
 "${compose[@]}" restart control-plane
 "${compose[@]}" up --detach --wait
 wait_ready
 check "resource survives a control plane restart" 200 "${auth[@]}" "$service"
-wait_phase Degraded
-expect "Ready=False (InstanceLost) after the restart" \
-  '.status.conditions[] | select(.type == "Ready") | .status == "False" and .reason == "InstanceLost"'
-# shellcheck disable=SC2016 # $id 是 jq 变量
-expect "the endpoint of the lost instance is no longer ready" \
-  '.status.endpoints | length == 1 and .[0].ready == false and .[0].instanceId == $id' \
-  --arg id "$second_instance"
-expect_unroutable
-check "delete the degraded service" 202 "${auth[@]}" -X DELETE "$service"
+logs=$("${compose[@]}" logs --no-color control-plane)
+grep -qF "service degraded, its instance is gone: instance $second_instance at" <<<"$logs" \
+  || fail "the restart did not report the lost instance $second_instance"
+echo "ok: the restart reported the lost instance"
+wait_phase Ready
+third_instance=$(jq -r '.status.endpoints[0].instanceId' "$resource")
+[[ "$third_instance" != "$second_instance" ]] \
+  || fail "the service still reports the lost instance $second_instance"
+echo "ok: the service was redeployed with a new instance after the restart"
+expect_reply "$third_instance"
+check "delete the redeployed service" 202 "${auth[@]}" -X DELETE "$service"
 wait_gone
 
 echo "compose smoke test passed"

@@ -26,10 +26,10 @@
     find_runs() 按幂等键前缀查询当前 generation 的运行：实例启动后进入 ``Verifying``；运行
     成功后进入 ``Ready``，写入 ``status.endpoints``（取自 ``launch-instance`` 的结果）与
     ``Ready=True``。运行未结束时每 ``workflow_poll_interval`` 秒查询一次。注入启动器时，写入
-    ``Ready`` 之前先确认实例仍在运行。
+    ``Ready`` 之前先确认实例仍在运行，实例已不在运行时重新部署（见“实例丢失”）。
 
-只有进入 ``Ready`` 或 ``Failed`` 的一轮返回 ``done=True``（登记去重键）；其余各轮返回
-``done=False``，同一 generation 的去重键不会挡住下一轮。
+部署与更新中只有进入 ``Ready`` 或 ``Failed`` 的一轮返回 ``done=True``（登记去重键）；其余
+各轮返回 ``done=False``，同一 generation 的去重键不会挡住下一轮。
 
 更新已部署的服务
 ----------------
@@ -55,6 +55,33 @@ generation 的运行（spec 在部署过程中变化，或运行来自 1.1.0 之
 停止之前的部署、取得分配并启动当前 generation 的运行，phase 不变，之后跟踪新的运行，旧的
 运行不会让服务以旧的 spec 进入 ``Ready``。
 
+实例丢失（``Degraded``）
+------------------------
+实例已不在运行的 ``Ready`` 服务由
+:func:`~forgemesh.controlplane.deployment.recovery.check_instances` 转为 ``Degraded``（控制
+平面启动时）。spec 没有变化的 ``Degraded`` 服务每一轮：
+
+* 这一代 spec 最近一次部署的运行进行中：每 ``workflow_poll_interval`` 秒查询一次；
+* 运行成功、实例在运行（实例回来了，或重新部署成功）：回到 ``Ready``，写入实例地址；
+* 运行成功却没有报告实例：与部署中一样进入 ``Failed``，保留分配；
+* 否则（实例仍不在运行，或重新部署的运行失败）：停止之前的部署，取得分配（通常复用资源
+  持有的分配），以同一代 spec 再启动一次部署运行（幂等键带上次数，见
+  :func:`~forgemesh.controlplane.deployment.workflow.deployment_run_key`），清空
+  ``status.endpoints``，``Ready=False``（``InstanceLost``）。phase 不变，不重新评估策略：
+  这一代 spec 的部署已经授权。
+
+运行成功之后、写入 ``Ready`` 之前实例就已不在运行时（``Verifying`` / ``Updating``，如控制
+平面恰好在这时重启）同样重新部署，phase 不变；这次运行失败时照常进入 ``Failed``。
+
+重新部署按资源退避：同一代 spec 的第一次立即开始，之后与上一次开始至少相隔
+:data:`REDEPLOY_BACKOFF_INITIAL_SECONDS` 秒，每次翻倍，最多
+:data:`REDEPLOY_BACKOFF_MAX_SECONDS` 秒；上一次开始已过
+:data:`REDEPLOY_BACKOFF_RESET_SECONDS` 秒时从头开始。等待期间上一次的运行失败时，
+``Ready=False``（``WorkflowFailed``）说明原因。退避只记在内存中，控制平面重启之后从头
+开始。恢复中只有进入 ``Failed`` 的一轮返回 ``done=True``：同一代 spec 可能多次丢失实例，
+回到 ``Ready`` 的一轮不登记去重键；控制器管理器为 ``Degraded`` 使用单独的去重操作
+（``recover``），部署进入 ``Ready`` 时登记的去重键不会挡住恢复。
+
 失败
 ----
 * 分配失败：停在当前 phase，``Ready=False``（``AllocationFailed``），10 秒后重试。
@@ -66,8 +93,6 @@ generation 的运行（spec 在部署过程中变化，或运行来自 1.1.0 之
   补偿没能停止实例时保留分配，删除资源时再停止实例、释放分配；资源没有任何部署运行
   （``WorkflowRunNotFound``，如工作流数据库被重置）或运行成功却没有报告实例（运行时
   不返回步骤输出）时同样进入 ``Failed`` 并保留分配。
-* 运行成功、实例却已不在运行（如控制平面在运行成功之后、写入 ``Ready`` 之前重启，
-  实例随进程结束）：``phase=Failed``、``Ready=False``（``InstanceLost``），释放分配。
 * ``Failed`` 不自动重试。spec 变化（``generation`` 大于 ``observedGeneration``）时回到
   ``Pending``（``Ready=False``，原因 ``Pending``，这一轮没有副作用），之后与新建的资源一样
   经过策略校验、分配与部署：补偿没能停止的实例在启动新的部署运行之前停止，仍持有的分配
@@ -76,7 +101,7 @@ generation 的运行（spec 在部署过程中变化，或运行来自 1.1.0 之
 需要分配或执行工作流、却未注入对应组件时，在任何副作用之前返回 ``Ready=False``
 （``SchedulerUnavailable`` / ``WorkflowRuntimeUnavailable``）。没有 ``metadata.uid`` 的
 资源报告 ``MissingUid``，不是 ``InferenceService`` 的资源报告 ``NotDeployable``。spec 没有
-变化的 ``Ready`` / ``Degraded`` / ``Failed``，以及 ``Unknown`` 的资源没有可做的事。
+变化的 ``Ready`` / ``Failed``，以及 ``Unknown`` 的资源没有可做的事。
 
 终止协调（Terminating，对齐 architecture.md §5.3/§12.4 与 development-plan
 第 7 章删除闭环）
@@ -97,6 +122,9 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import time
+from collections.abc import Callable
+from dataclasses import dataclass
 from typing import Any, Protocol
 
 from forgemesh.core.errors import ConflictError, NotFoundError
@@ -109,6 +137,7 @@ from forgemesh.workflow.runtime import RunInfo, RunRef
 from forgemesh.workflow.states import StepStatus, WorkflowStatus
 
 from ..deployment import (
+    INSTANCE_LOST_REASON,
     LAUNCH_INSTANCE,
     DeploymentRun,
     LaunchedInstance,
@@ -127,6 +156,12 @@ logger = logging.getLogger(__name__)
 
 #: 启动或查询部署运行失败后重试间隔的上限（秒）。
 MAX_RETRY_DELAY_SECONDS = 60.0
+#: 实例丢失后第二次重新部署与第一次开始之间的最短间隔（秒），之后每次翻倍。
+REDEPLOY_BACKOFF_INITIAL_SECONDS = 10.0
+#: 两次重新部署开始之间最短间隔的上限（秒）。
+REDEPLOY_BACKOFF_MAX_SECONDS = 300.0
+#: 上一次重新部署开始这么久（秒）之后再丢失实例时，退避从头开始（立即重新部署）。
+REDEPLOY_BACKOFF_RESET_SECONDS = 2 * REDEPLOY_BACKOFF_MAX_SECONDS
 
 #: 部署或更新过程中的 phase（``None`` 为尚未观测到 phase），每一轮都要协调。
 _DEPLOYMENT_PHASES: frozenset[str | None] = frozenset(
@@ -208,6 +243,20 @@ def _progress(phase: InferencePhase, message: str, requeue_after: float) -> Reco
     )
 
 
+def _latest(runs: list[DeploymentRun]) -> DeploymentRun | None:
+    """同一代 spec 的各次部署中最近的一次。"""
+    return max(runs, key=lambda deployment: deployment.attempt, default=None)
+
+
+@dataclass
+class _Redeploys:
+    """资源在本进程中为同一代 spec 重新部署的次数与最近一次开始的时刻（只用于退避）。"""
+
+    generation: int
+    count: int
+    last_started: float
+
+
 class ReleaseProvider(Protocol):
     """受控释放 Provider 协议（控制平面侧，不绑定具体运行时插件）。
 
@@ -258,7 +307,8 @@ class ReconciliationController(Reconciler):
             后退避的起点（之后每次翻倍，最多 :data:`MAX_RETRY_DELAY_SECONDS`）。
         launcher: 可选，部署工作流使用的启动器；注入时写入 ``Ready`` 之前以
             :meth:`~forgemesh.controlplane.deployment.RuntimeLauncher.is_running` 确认实例
-            仍在运行，否则进入 ``Failed``（``InstanceLost``）。
+            仍在运行，否则重新部署（未注入时视为实例在运行）。
+        clock: 单调时钟（秒），用于重新部署的退避；默认 :func:`time.monotonic`。
 
     Raises:
         ValueError: 注入了工作流运行时却没有 ``release_provider``，或
@@ -277,6 +327,7 @@ class ReconciliationController(Reconciler):
         record_dedup_keys: bool = True,
         workflow_poll_interval: float = 2.0,
         launcher: RuntimeLauncher | None = None,
+        clock: Callable[[], float] = time.monotonic,
     ) -> None:
         if workflow_runtime is not None and release_provider is None:
             raise ValueError(
@@ -295,11 +346,13 @@ class ReconciliationController(Reconciler):
         self._record_dedup_keys = record_dedup_keys
         self._poll_interval = workflow_poll_interval
         self._launcher = launcher
+        self._clock = clock
         # 已处理的去重键（内存级回退路径；processed_store 注入时以 SQLite
         # 持久化为准——architecture §5.5 不依赖单进程内存状态）。
         self._processed_keys: set[str] = set()
         # 按资源 uid 记录连续的启动 / 查询失败次数，只用于计算退避。
         self._retry_counts: dict[str, int] = {}
+        self._redeploys: dict[str, _Redeploys] = {}
 
     @property
     def records_dedup_keys(self) -> bool:
@@ -343,11 +396,13 @@ class ReconciliationController(Reconciler):
             await self._mark_processed(ctx.dedup_key)
             return ReconcileResult(done=True)
 
+        meta = resource.metadata
+        update = phase in _SERVING_PHASES and meta.generation > meta.observed_generation
         if phase in (None, InferencePhase.PENDING):
             blocked = await self._authorize(ctx, diff)
             if blocked is not None:
                 return blocked
-        if phase in _SERVING_PHASES:
+        if update:
             held = await self._update_blocked(ctx, diff)
             if held is not None:
                 return held
@@ -357,7 +412,7 @@ class ReconciliationController(Reconciler):
         if missing is not None:
             reason, message = missing
             return _not_ready(reason, message, requeue_after=None)
-        if not resource.metadata.uid:
+        if not meta.uid:
             return _not_ready(
                 "MissingUid", "metadata.uid is required to allocate resources", requeue_after=None
             )
@@ -372,8 +427,10 @@ class ReconciliationController(Reconciler):
             return _progress(
                 InferencePhase.SCHEDULING, "allocating accelerators", requeue_after=0.0
             )
-        if phase in _SERVING_PHASES:
+        if update:
             return self._begin_update(resource)
+        if phase == InferencePhase.DEGRADED:
+            return await self._recover(ctx, resource)
         if phase == InferencePhase.SCHEDULING:
             return await self._schedule(ctx, resource)
         if phase == InferencePhase.PREPARING:
@@ -552,11 +609,15 @@ class ReconciliationController(Reconciler):
         return None
 
     async def _start_run(
-        self, ctx: ReconcileContext, service: InferenceService, allocation: AllocationRef
+        self,
+        ctx: ReconcileContext,
+        service: InferenceService,
+        allocation: AllocationRef,
+        attempt: int = 1,
     ) -> RunRef | ReconcileResult:
-        """启动当前 generation 的部署运行；失败时返回停在当前 phase 的结果。"""
+        """启动当前 generation 第 ``attempt`` 次部署的运行；失败时返回停在当前 phase 的结果。"""
         meta = service.metadata
-        run_key = deployment_run_key(meta.uid, meta.generation)
+        run_key = deployment_run_key(meta.uid, meta.generation, attempt)
         request = LaunchRequest(
             instance_key=run_key,
             tenant_id=ctx.tenant_id,
@@ -579,9 +640,9 @@ class ReconciliationController(Reconciler):
         return run
 
     async def _deploy(
-        self, ctx: ReconcileContext, service: InferenceService
+        self, ctx: ReconcileContext, service: InferenceService, attempt: int = 1
     ) -> RunRef | ReconcileResult:
-        """停止之前的部署，取得分配，启动当前 generation 的部署运行。"""
+        """停止之前的部署，取得分配，启动当前 generation 第 ``attempt`` 次部署的运行。"""
         if self._scheduler is None:
             return _not_ready(
                 "SchedulerUnavailable", "no scheduler is configured to allocate resources", None
@@ -592,7 +653,7 @@ class ReconciliationController(Reconciler):
         allocation = await self._allocation(ctx, service)
         if isinstance(allocation, ReconcileResult):
             return allocation
-        return await self._start_run(ctx, service, allocation)
+        return await self._start_run(ctx, service, allocation, attempt)
 
     async def _lookup(
         self, service: InferenceService, generation: int | None = None
@@ -632,9 +693,10 @@ class ReconciliationController(Reconciler):
         runs = await self._lookup(service, service.metadata.generation)
         if isinstance(runs, ReconcileResult):
             return runs
-        if runs:
+        current = _latest(runs)
+        if current is not None:
             # 上一轮已启动运行，只是没能写入 Deploying。
-            run_id = runs[-1].run.run_id
+            run_id = current.run.run_id
         else:
             stopped = await self._stop_previous_deployment(ctx, service)
             if stopped is not None:
@@ -697,26 +759,24 @@ class ReconciliationController(Reconciler):
         runs = await self._lookup(service, meta.generation)
         if isinstance(runs, ReconcileResult):
             return runs
-        if not runs:
+        current = _latest(runs)
+        if current is None:
             if phase == InferencePhase.UPDATING:
                 return await self._redeploy(ctx, service)
             return await self._replace_deployment(ctx, service, phase)
-        self._retry_counts.pop(meta.uid, None)
-        run = runs[-1].run
+        run = current.run
         instance = launched_instance(run)
-        if run.status is WorkflowStatus.SUCCEEDED and instance is not None:
+        succeeded = run.status is WorkflowStatus.SUCCEEDED and instance is not None
+        if (
+            succeeded
+            and phase != InferencePhase.DEPLOYING
+            and not await self._is_running(instance.instance_id)
+        ):
+            return await self._redeploy_lost(ctx, service, current)
+        self._retry_counts.pop(meta.uid, None)
+        if succeeded:
             if phase == InferencePhase.DEPLOYING:
                 return self._verifying(instance, requeue_after=0.0)
-            if self._launcher is not None and not await self._launcher.is_running(
-                instance.instance_id
-            ):
-                return await self._fail(
-                    ctx,
-                    "InstanceLost",
-                    f"instance {instance.instance_id} at {instance.url} is not running any "
-                    "more; change the spec or re-create the service to deploy it again",
-                    release_allocation=True,
-                )
             return await self._ready(ctx, instance)
         if run.terminal:
             return await self._fail_run(ctx, run, instance)
@@ -759,6 +819,115 @@ class ReconciliationController(Reconciler):
             status_patch={"conditions": [_ready_condition("False", phase, message)]},
         )
 
+    # ------------------------------------------------------------------ #
+    # 实例丢失后重新部署（Degraded，以及运行成功之后实例丢失的 Verifying / Updating）
+    # ------------------------------------------------------------------ #
+
+    async def _recover(self, ctx: ReconcileContext, service: InferenceService) -> ReconcileResult:
+        """``Degraded`` 一轮（spec 没有变化）：实例回来了就回到 ``Ready``，否则重新部署。
+
+        回到 ``Ready`` 的一轮不登记去重键：同一代 spec 之后可能再次丢失实例。运行成功却没有
+        报告实例时与部署中一样进入 ``Failed``：重新部署也无从得知、无从停止新的实例。
+        """
+        meta = service.metadata
+        runs = await self._lookup(service, meta.generation)
+        if isinstance(runs, ReconcileResult):
+            return runs
+        current = _latest(runs)
+        if current is not None and not current.run.terminal:
+            self._retry_counts.pop(meta.uid, None)
+            return ReconcileResult(done=False, requeue_after=self._poll_interval)
+        if current is not None and current.run.status is WorkflowStatus.SUCCEEDED:
+            instance = launched_instance(current.run)
+            if instance is None:
+                return await self._fail_run(ctx, current.run, None)
+            if await self._is_running(instance.instance_id):
+                self._retry_counts.pop(meta.uid, None)
+                return await self._ready(ctx, instance, record=False)
+        return await self._redeploy_lost(ctx, service, current)
+
+    async def _redeploy_lost(
+        self, ctx: ReconcileContext, service: InferenceService, current: DeploymentRun | None
+    ) -> ReconcileResult:
+        """实例已不在运行：按退避等待，然后停止之前的部署，以同一代 spec 再部署一次。
+
+        ``current`` 为这一代 spec 最近一次部署的运行（已结束；这一代 spec 没有运行时为
+        ``None``）。phase 不变，也不重新评估策略：这一代 spec 的部署已经授权。上一次重新部署
+        的运行失败时，等待期间 ``Ready`` 条件说明失败原因。
+        """
+        meta = service.metadata
+        delay = self._redeploy_delay(meta.uid, meta.generation)
+        if delay > 0:
+            if current is None or current.run.status is WorkflowStatus.SUCCEEDED:
+                return ReconcileResult(done=False, requeue_after=delay)
+            run = current.run
+            error = run.error or f"deployment workflow run {run.run_id} ended {run.status.value}"
+            message = f"{error}; redeploying the service after a backoff"
+            return _not_ready("WorkflowFailed", message, delay)
+        attempt = 1 if current is None else current.attempt + 1
+        started = await self._deploy(ctx, service, attempt)
+        if isinstance(started, ReconcileResult):
+            return started
+        self._record_redeploy(meta.uid, meta.generation)
+        logger.warning(
+            "redeploying a service whose instance is gone: run_id=%s attempt=%d kind=%s "
+            "namespace=%s name=%s uid=%s generation=%s tenant_id=%s correlation_id=%s",
+            started.run_id,
+            attempt,
+            service.kind,
+            meta.namespace,
+            meta.name,
+            meta.uid,
+            meta.generation,
+            ctx.tenant_id,
+            ctx.correlation_id,
+        )
+        message = (
+            f"deployment workflow run {started.run_id} redeploys the service (attempt {attempt})"
+        )
+        return ReconcileResult(
+            done=False,
+            requeue_after=self._poll_interval,
+            status_patch={
+                "endpoints": [],
+                "conditions": [_ready_condition("False", INSTANCE_LOST_REASON, message)],
+            },
+        )
+
+    def _redeploy_delay(self, uid: str, generation: int) -> float:
+        """距离可以再次重新部署还要等待的秒数（``0`` 为现在就可以）。
+
+        同一代 spec 的第一次重新部署立即开始；之后与上一次开始至少相隔
+        :data:`REDEPLOY_BACKOFF_INITIAL_SECONDS`，每次翻倍，最多
+        :data:`REDEPLOY_BACKOFF_MAX_SECONDS`。上一次开始已过
+        :data:`REDEPLOY_BACKOFF_RESET_SECONDS` 时从头开始。
+        """
+        record = self._redeploys.get(uid)
+        if record is None or record.generation != generation:
+            return 0.0
+        elapsed = self._clock() - record.last_started
+        if elapsed >= REDEPLOY_BACKOFF_RESET_SECONDS:
+            return 0.0
+        interval = REDEPLOY_BACKOFF_INITIAL_SECONDS * 2 ** min(record.count - 1, 30)
+        return max(0.0, min(interval, REDEPLOY_BACKOFF_MAX_SECONDS) - elapsed)
+
+    def _record_redeploy(self, uid: str, generation: int) -> None:
+        now = self._clock()
+        record = self._redeploys.get(uid)
+        if (
+            record is None
+            or record.generation != generation
+            or now - record.last_started >= REDEPLOY_BACKOFF_RESET_SECONDS
+        ):
+            self._redeploys[uid] = _Redeploys(generation=generation, count=1, last_started=now)
+            return
+        record.count += 1
+        record.last_started = now
+
+    async def _is_running(self, instance_id: str) -> bool:
+        """实例是否在运行；未注入启动器时无从确认，视为在运行。"""
+        return self._launcher is None or await self._launcher.is_running(instance_id)
+
     @staticmethod
     def _verifying(instance: LaunchedInstance, requeue_after: float) -> ReconcileResult:
         return _progress(
@@ -767,9 +936,12 @@ class ReconciliationController(Reconciler):
             requeue_after=requeue_after,
         )
 
-    async def _ready(self, ctx: ReconcileContext, instance: LaunchedInstance) -> ReconcileResult:
-        """运行成功：进入 ``Ready``，写入实例地址。"""
-        await self._mark_processed(ctx.dedup_key)
+    async def _ready(
+        self, ctx: ReconcileContext, instance: LaunchedInstance, *, record: bool = True
+    ) -> ReconcileResult:
+        """运行成功：进入 ``Ready``，写入实例地址；``record`` 为真时登记去重键（``done``）。"""
+        if record:
+            await self._mark_processed(ctx.dedup_key)
         meta = ctx.resource.metadata
         logger.info(
             "deployment ready: instance_id=%s url=%s kind=%s namespace=%s name=%s uid=%s "
@@ -784,7 +956,7 @@ class ReconciliationController(Reconciler):
             ctx.correlation_id,
         )
         return ReconcileResult(
-            done=True,
+            done=record,
             requeue_after=None,
             status_patch={
                 "phase": InferencePhase.READY.value,
@@ -918,6 +1090,7 @@ class ReconciliationController(Reconciler):
         resource = ctx.resource
         if resource.metadata.uid:
             self._retry_counts.pop(resource.metadata.uid, None)
+            self._redeploys.pop(resource.metadata.uid, None)
 
         # 步骤 1：受控释放外部副作用（Provider 缺省 → Noop，仅移除 finalizer）。
         if self._release_provider is not None:
@@ -1036,13 +1209,13 @@ class ReconciliationController(Reconciler):
         判定逻辑：
 
         * phase 尚未观测到（``None``）或处于部署 / 更新过程中（``Pending`` 到 ``Verifying``、
-          ``Updating``）时需要协调；
-        * ``Ready`` / ``Degraded`` 只在 spec 变化（``generation`` 大于 ``observedGeneration``）
-          时需要协调（开始更新）；其余 phase 没有可做的事（:meth:`reconcile` 在此之前处理
+          ``Updating``）时需要协调；``Degraded`` 总是需要协调（开始更新或恢复）；
+        * ``Ready`` 只在 spec 变化（``generation`` 大于 ``observedGeneration``）时需要协调
+          （开始更新）；其余 phase 没有可做的事（:meth:`reconcile` 在此之前处理
           ``Terminating`` 与 ``Failed``）。
-        * ``needs_allocation``：本轮或之后的轮次要调用调度器（``Preparing`` 及之前，以及开始
-          更新的一轮）；``needs_workflow``：每一轮都要用到工作流运行时；``requirements``
-          为传给调度器的需求（见 :func:`_scheduling_requirements`）。
+        * ``needs_allocation``：本轮或之后的轮次要调用调度器（``Preparing`` 及之前、开始更新
+          的一轮，以及可能重新部署的 ``Degraded``）；``needs_workflow``：每一轮都要用到工作流
+          运行时；``requirements`` 为传给调度器的需求（见 :func:`_scheduling_requirements`）。
 
         Args:
             resource: 目标资源（含期望状态与元数据）。
@@ -1054,7 +1227,9 @@ class ReconciliationController(Reconciler):
         """
         observed_phase = _observed_phase(resource, observed)
         meta = resource.metadata
-        if observed_phase in _SERVING_PHASES and meta.generation > meta.observed_generation:
+        if observed_phase == InferencePhase.DEGRADED or (
+            observed_phase in _SERVING_PHASES and meta.generation > meta.observed_generation
+        ):
             needs_allocation = True
         elif observed_phase in _DEPLOYMENT_PHASES:
             needs_allocation = observed_phase in _ALLOCATION_PHASES
@@ -1072,4 +1247,11 @@ class ReconciliationController(Reconciler):
         }
 
 
-__all__ = ["MAX_RETRY_DELAY_SECONDS", "ReleaseProvider", "ReconciliationController"]
+__all__ = [
+    "MAX_RETRY_DELAY_SECONDS",
+    "REDEPLOY_BACKOFF_INITIAL_SECONDS",
+    "REDEPLOY_BACKOFF_MAX_SECONDS",
+    "REDEPLOY_BACKOFF_RESET_SECONDS",
+    "ReleaseProvider",
+    "ReconciliationController",
+]

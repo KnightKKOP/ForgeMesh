@@ -1,12 +1,11 @@
-"""控制平面重启之后核对已部署的实例，不再对外宣告没能活过重启的实例。
+"""核对已部署的实例：不再对外宣告已不在运行的实例，交给协调器重新部署。
 
 实例随控制平面进程结束的启动器（本进程内的假实例、子进程）在重启之后不认识重启之前的
-实例，``Ready`` 服务的 ``status.endpoints`` 却仍指向它们，网关会继续转发过去。应用在
-启动控制器之前调用 :func:`mark_lost_instances`：实例已不在运行的服务转为 ``Degraded``，
-这些实例的 endpoint 标记为未就绪，``Ready=False``（``InstanceLost``），网关不再向它们
-转发（网关缓存解析结果的几秒内除外）。
-
-不会自动重新部署：``Degraded`` 的服务保留分配，直到被删除；删除后重新创建即可再次部署。
+实例；实例也可能在运行中退出。``Ready`` 服务的 ``status.endpoints`` 却仍指向它们，网关会
+继续转发过去。:func:`check_instances` 经启动器核对实例：实例已不在运行的服务转为
+``Degraded``，这些实例的 endpoint 标记为未就绪，``Ready=False``（``InstanceLost``），网关
+不再向它们转发（网关缓存解析结果的几秒内除外）；协调器随后按退避重新部署这些服务（见
+:mod:`forgemesh.controlplane.reconciler.core`）。应用在启动控制器之前调用一次。
 """
 
 from __future__ import annotations
@@ -36,17 +35,26 @@ def _describe(endpoint: Endpoint) -> str:
     return f"instance {endpoint.instanceId} at {endpoint.url}"
 
 
-async def mark_lost_instances(
-    registry: SQLiteRegistry, launcher: RuntimeLauncher
-) -> list[ResourceKey]:
-    """把实例已不在运行的 ``Ready`` 服务转为 ``Degraded``，返回被转换的服务。
+async def _running(launcher: RuntimeLauncher, endpoint: Endpoint) -> bool:
+    return endpoint.instanceId is not None and await launcher.is_running(endpoint.instanceId)
 
-    只检查 ``phase=Ready`` 的 ``InferenceService``：``status.endpoints`` 中启动器不在运行的
-    实例（没有 ``instanceId`` 的 endpoint 无从确认，同样算作不在运行）标记为
-    ``ready: false``，``phase`` 转为 ``Degraded``，``Ready=False``（``InstanceLost``）。
-    写入以读到的版本做 CAS，资源在此期间被修改或删除时跳过它。须在控制器启动之前调用。
+
+async def check_instances(
+    registry: SQLiteRegistry, launcher: RuntimeLauncher, *, after_restart: bool = False
+) -> list[ResourceKey]:
+    """核对 ``Ready`` / ``Degraded`` 服务的实例，返回要交给协调器处理的服务。
+
+    * ``Ready`` 的服务：``status.endpoints`` 中启动器不在运行的实例（没有 ``instanceId`` 的
+      endpoint 无从确认，同样算作不在运行）标记为 ``ready: false``，``phase`` 转为
+      ``Degraded``，``Ready=False``（``InstanceLost``，``after_restart`` 为真时消息说明实例
+      没能活过控制平面重启）。
+    * ``Degraded`` 的服务：endpoint 不为空且实例全部在运行（实例回来了）时只返回它，由
+      协调器转回 ``Ready``。
+
+    写入以读到的版本做 CAS，资源在此期间被修改或删除时跳过它；不修改
+    ``observedGeneration``。
     """
-    marked: list[ResourceKey] = []
+    found: list[ResourceKey] = []
     for key in await registry.list_resource_keys([_KIND]):
         try:
             resource, phase = await registry.get_with_phase(
@@ -54,22 +62,25 @@ async def mark_lost_instances(
             )
         except NotFoundError:
             continue
-        if phase != InferencePhase.READY or not isinstance(resource, InferenceService):
+        if not isinstance(resource, InferenceService):
             continue
         endpoints = resource.status.endpoints
-        lost = [
-            endpoint.instanceId is None or not await launcher.is_running(endpoint.instanceId)
-            for endpoint in endpoints
-        ]
+        if phase == InferencePhase.DEGRADED:
+            if endpoints and all([await _running(launcher, endpoint) for endpoint in endpoints]):
+                found.append(key)
+            continue
+        if phase != InferencePhase.READY:
+            continue
+        lost = [not await _running(launcher, endpoint) for endpoint in endpoints]
         if not any(lost):
             continue
         described = " and ".join(
             _describe(endpoint) for endpoint, gone in zip(endpoints, lost, strict=True) if gone
         )
-        message = (
-            f"{described} did not survive the control plane restart; delete and re-create "
-            "the service to deploy it again"
-        )
+        if after_restart:
+            message = f"{described} did not survive the control plane restart"
+        else:
+            message = f"{described} is not running any more"
         patch = {
             "phase": InferencePhase.DEGRADED.value,
             "endpoints": [
@@ -83,7 +94,7 @@ async def mark_lost_instances(
                     "type": "Ready",
                     "status": "False",
                     "reason": INSTANCE_LOST_REASON,
-                    "message": message,
+                    "message": f"{message}; redeploying the service",
                 }
             ],
         }
@@ -110,15 +121,15 @@ async def mark_lost_instances(
         logger.warning(
             "service degraded, its instance is gone: %s; kind=%s namespace=%s name=%s uid=%s "
             "tenant_id=%s",
-            described,
+            message,
             key.kind,
             key.namespace,
             key.name,
             meta.uid,
             key.tenant_id,
         )
-        marked.append(key)
-    return marked
+        found.append(key)
+    return found
 
 
-__all__ = ["INSTANCE_LOST_REASON", "mark_lost_instances"]
+__all__ = ["INSTANCE_LOST_REASON", "check_instances"]

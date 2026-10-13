@@ -27,9 +27,9 @@
   ``status.endpoints``；删除时停止实例、释放分配。工作流运行存放在单独的数据库文件
   （:func:`~forgemesh.controlplane.sqlite.workflow_db_path`，如 ``forgemesh.workflows.db``）
   中。启动时先恢复未完成的部署，再把实例已不在运行的 ``Ready`` 服务转为 ``Degraded``
-  （不会自动重新部署），然后才启动控制器；关闭时依次停止控制器、工作流运行时、启动器
-  （其实例随之停止）。``POST /workflows`` 不使用这个运行时（仍返回 503）。未设置时不部署，
-  协调器在分配之前即报告 ``WorkflowRuntimeUnavailable``。
+  （控制器随后重新部署它们），然后才启动控制器；关闭时依次停止控制器、工作流运行时、
+  启动器（其实例随之停止）。``POST /workflows`` 不使用这个运行时（仍返回 503）。未设置时
+  不部署，协调器在分配之前即报告 ``WorkflowRuntimeUnavailable``。
 * **无导入副作用**：数据库在应用启动（lifespan）时才打开，导入本模块不会
   创建文件。
 * **探针**：``/healthz``（存活）恒为 ok；``/readyz``（就绪）探测权威存储可用。
@@ -71,8 +71,8 @@ from .deployment import (
     RUNTIME_LAUNCHER_ENV,
     DeploymentReleaser,
     DeploymentSteps,
+    check_instances,
     launcher_from_env,
-    mark_lost_instances,
 )
 from .reconciler import ProcessedKeyStore, ReconciliationController
 from .scheduler import INVENTORY_FILE_ENV, FirstFitScheduler, inventory_from_env
@@ -271,12 +271,12 @@ if _FASTAPI_AVAILABLE:
                         workflow_path,
                     )
                     resumed = await runtime.recover()
-                    lost = await mark_lost_instances(registry, launcher)
+                    checked = await check_instances(registry, launcher, after_restart=True)
                     logger.info(
-                        "deployments recovered: %d unfinished run(s) resumed, %d Ready "
-                        "service(s) degraded because their instance is gone",
+                        "deployments recovered: %d unfinished run(s) resumed, %d service(s) "
+                        "whose instance is gone or back handed to the controller",
                         len(resumed),
-                        len(lost),
+                        len(checked),
                     )
                 controller = _build_controller(
                     registry, processed_store, inventory, runtime, launcher

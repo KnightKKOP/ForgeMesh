@@ -1,7 +1,7 @@
 """``forgemesh.workflow.runtime`` 契约单元测试（向后兼容的新增项在此登记）。
 
-覆盖：:class:`RunInfo` 快照模型；``get_run`` / ``find_run`` 是带默认实现的非抽象方法，
-只实现四个抽象方法的既有运行时（如 Temporal 插件）不受影响。
+覆盖：:class:`RunInfo` 快照模型；``get_run`` / ``find_run`` / ``find_runs`` 是带默认实现的
+非抽象方法，只实现四个抽象方法的既有运行时（如 Temporal 插件）不受影响。
 """
 
 from __future__ import annotations
@@ -38,7 +38,7 @@ def test_the_abstract_methods_are_unchanged() -> None:
     assert WorkflowRuntime.__abstractmethods__ == {"start", "get_status", "cancel", "signal"}
 
 
-def test_get_run_defaults_to_the_status_and_find_run_is_optional() -> None:
+def test_get_run_defaults_to_the_status_and_the_lookups_are_optional() -> None:
     runtime = _StatusOnlyRuntime()
 
     info = asyncio.run(runtime.get_run("run-1"))
@@ -47,6 +47,8 @@ def test_get_run_defaults_to_the_status_and_find_run_is_optional() -> None:
     assert (info.steps, info.outputs, info.error) == ({}, {}, None)
     with pytest.raises(NotImplementedError):
         asyncio.run(runtime.find_run("uid-1:1"))
+    with pytest.raises(NotImplementedError):
+        asyncio.run(runtime.find_runs("uid-1"))
 
 
 def test_run_info_is_strict_and_frozen() -> None:

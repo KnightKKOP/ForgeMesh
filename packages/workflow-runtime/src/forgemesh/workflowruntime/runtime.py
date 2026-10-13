@@ -192,6 +192,11 @@ class LocalWorkflowRuntime(WorkflowRuntime):
         run = await self._store.get_run_by_idempotency_key(idempotency_key)
         return None if run is None else self._snapshot(run)
 
+    async def find_runs(self, key_prefix: str) -> dict[str, RunInfo]:
+        """查找幂等键以 ``key_prefix`` 开头的运行实例（不创建），按创建先后排列。"""
+        runs = await self._store.get_runs_by_idempotency_key_prefix(key_prefix)
+        return {run["idempotency_key"]: self._snapshot(run) for run in runs}
+
     async def cancel(self, run_id: str, cleanup: bool = False) -> None:
         """取消运行实例并等待它进入终态；已结束的运行直接返回。
 

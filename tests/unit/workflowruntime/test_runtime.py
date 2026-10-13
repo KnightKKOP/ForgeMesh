@@ -159,6 +159,31 @@ def test_start_executes_the_steps_in_the_background() -> None:
     assert missing is None
 
 
+def test_find_runs_returns_the_snapshots_by_key_in_creation_order() -> None:
+    async def scenario() -> tuple[Any, ...]:
+        store = WorkflowStore()
+        steps = _Steps()
+        runtime = _runtime(store, steps)
+        second = await runtime.start(DEFN, {}, "uid-1:2")
+        first = await runtime.start(DEFN, {}, "uid-1:1")
+        await runtime.start(DEFN, {}, "uid-2:1")
+        await runtime.wait(second.run_id)
+        await runtime.wait(first.run_id)
+        found = await runtime.find_runs("uid-1:")
+        snapshots = [await runtime.get_run(ref.run_id) for ref in (second, first)]
+        missing = await runtime.find_runs("uid-3:")
+        await runtime.aclose()
+        await store.close()
+        return found, snapshots, missing
+
+    found, snapshots, missing = asyncio.run(scenario())
+
+    assert list(found) == ["uid-1:2", "uid-1:1"]
+    assert list(found.values()) == snapshots
+    assert all(info.status is WorkflowStatus.SUCCEEDED for info in found.values())
+    assert missing == {}
+
+
 def test_concurrent_starts_with_one_key_execute_one_run() -> None:
     async def scenario() -> tuple[set[str], list[str]]:
         store = WorkflowStore()

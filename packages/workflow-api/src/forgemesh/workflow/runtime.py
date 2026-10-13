@@ -15,7 +15,8 @@ Temporal/Cadence 等）都必须满足同一语义，业务模型不与之耦合
 * **版本固定**：运行实例固定其 ``definition_version``，升级定义不影响既有实例。
 * **结果查询**：不确定状态下应先查询真实状态，不得盲目重试不可幂等操作
   （:meth:`WorkflowRuntime.get_run` 返回步骤状态与输出，
-  :meth:`WorkflowRuntime.find_run` 按幂等键查找而不创建运行）。
+  :meth:`WorkflowRuntime.find_run` 按幂等键、:meth:`WorkflowRuntime.find_runs` 按幂等键
+  前缀查找而不创建运行）。
 """
 
 from __future__ import annotations
@@ -175,6 +176,15 @@ class WorkflowRuntime(ABC):
 
         与 :meth:`start` 不同，本方法没有副作用：调用方不确定运行是否存在时（如删除
         资源前取消进行中的部署）据此查询真实状态。默认实现抛出 :class:`NotImplementedError`。
+        """
+        raise NotImplementedError
+
+    async def find_runs(self, key_prefix: str) -> dict[str, RunInfo]:
+        """查找幂等键以 ``key_prefix`` 开头的全部运行实例，不创建。
+
+        返回 ``{幂等键: 快照}``，按运行的创建先后排列；没有匹配时返回空字典。幂等键带
+        版本号等后缀时（如 ``deployment:{uid}:{generation}``），调用方据此找到同一对象的
+        所有运行。默认实现抛出 :class:`NotImplementedError`。
         """
         raise NotImplementedError
 

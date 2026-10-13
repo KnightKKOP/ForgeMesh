@@ -85,6 +85,15 @@ _WORKFLOW_TERMINAL_STATUSES: frozenset[str] = frozenset(
 )
 
 
+def _glob_prefix(prefix: str) -> str:
+    """匹配以 ``prefix`` 开头的 GLOB 模式（区分大小写，前缀中的通配符按字面匹配）。
+
+    GLOB 而不是 LIKE：LIKE 对 ASCII 不区分大小写；以字面前缀开头的 GLOB 可以走
+    ``idempotency_key`` 上的索引。
+    """
+    return "".join(f"[{char}]" if char in "*?[" else char for char in prefix) + "*"
+
+
 def _derive_definition_version(defn: WorkflowDefinition) -> int:
     """根据工作流定义内容派生确定性的定义版本号。
 
@@ -249,6 +258,15 @@ class WorkflowStore:
         ).fetchone()
         return None if row is None else self._get_run_sync(row["run_id"])
 
+    def _get_runs_by_idempotency_key_prefix_sync(self, prefix: str) -> list[dict[str, Any]]:
+        """同步按幂等键前缀查询运行实例，按创建先后排列。"""
+        rows = self._conn.execute(
+            "SELECT run_id FROM workflow_runs WHERE idempotency_key GLOB ? "
+            "ORDER BY created_at, rowid",
+            (_glob_prefix(prefix),),
+        ).fetchall()
+        return [self._get_run_sync(row["run_id"]) for row in rows]
+
     def _update_run_status_sync(self, run_id: str, status: str, error: str | None = None) -> None:
         """同步更新运行状态（校验转移合法性）；``error`` 非空时一并记录失败原因。"""
         row = self._conn.execute(
@@ -401,6 +419,10 @@ class WorkflowStore:
     async def get_run_by_idempotency_key(self, idempotency_key: str) -> dict[str, Any] | None:
         """按幂等键查询运行实例（格式同 :meth:`get_run`）；不存在时返回 ``None``。"""
         return await self._call(self._get_run_by_idempotency_key_sync, idempotency_key)
+
+    async def get_runs_by_idempotency_key_prefix(self, prefix: str) -> list[dict[str, Any]]:
+        """查询幂等键以 ``prefix`` 开头的运行实例（格式同 :meth:`get_run`），按创建先后排列。"""
+        return await self._call(self._get_runs_by_idempotency_key_prefix_sync, prefix)
 
     async def update_run_status(self, run_id: str, status: str, error: str | None = None) -> None:
         """更新运行状态（校验转移合法性）。

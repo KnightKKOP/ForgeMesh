@@ -298,6 +298,31 @@ def test_get_run_by_idempotency_key() -> None:
 
 
 @pytest.mark.unit
+def test_get_runs_by_idempotency_key_prefix() -> None:
+    """按幂等键前缀查询：按创建先后排列，区分大小写，前缀中的通配符按字面匹配。"""
+    store = WorkflowStore()
+    keys = ["d:uid-1:2", "d:uid-1", "d:uid-10:1", "D:uid-1:3", "d:uid-1:1", "d:*:1", "d:[x]:1"]
+    refs = {key: asyncio_run(store.create_run(_make_definition(), {}, key)) for key in keys}
+
+    def found(prefix: str) -> list[str]:
+        runs = asyncio_run(store.get_runs_by_idempotency_key_prefix(prefix))
+        assert [run["run_id"] for run in runs] == [
+            refs[run["idempotency_key"]].run_id for run in runs
+        ]
+        return [run["idempotency_key"] for run in runs]
+
+    assert found("d:uid-1") == ["d:uid-1:2", "d:uid-1", "d:uid-10:1", "d:uid-1:1"]
+    assert found("d:uid-1:") == ["d:uid-1:2", "d:uid-1:1"]
+    assert found("d:*") == ["d:*:1"]
+    assert found("d:[x]") == ["d:[x]:1"]
+    assert found("d:?") == []
+    assert found("x") == []
+    assert asyncio_run(store.get_runs_by_idempotency_key_prefix("d:uid-1:1"))[0] == (
+        asyncio_run(store.get_run(refs["d:uid-1:1"].run_id))
+    )
+
+
+@pytest.mark.unit
 def test_file_database_uses_wal_and_old_files_gain_the_error_column(tmp_path) -> None:
     """文件库启用 WAL；没有 ``error`` 列的旧库打开时补列，已有运行可读。"""
     import sqlite3

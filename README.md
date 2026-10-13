@@ -321,13 +321,13 @@ ForgeMesh 目前处于预览阶段，API 稳定性标注为 `beta`：minor 版�
 以下是 v1.0.0 发布时列出的核心能力，与实现不符或尚未完成的部分在条目后以「现状」注明：
 
 ### 核心控制平面（M2）
-- **资源注册中心**：SQLite 持久化，乐观并发 CAS，租户隔离，分页游标（现状：API 尚未返回分页游标）
+- **资源注册中心**：SQLite 持久化，乐观并发 CAS，租户隔离，分页游标（现状：自 1.1.0 起列表接口返回签名的分页游标 `nextPageToken`）
 - **协调控制器**：9 步声明式闭环（获取→查询→比较→生成候选→策略校验→调度分配→执行→重观察→更新状态）（现状：自 1.1.0 起由控制器自动驱动；同时设置 `FORGEMESH_INVENTORY_FILE` 与 `FORGEMESH_RUNTIME_LAUNCHER` 后，调度、部署、写入 `status.endpoints` 与受控删除形成完整闭环，见[部署推理服务](#部署推理服务)；未设置启动器时，新建的推理服务停在 `Pending`，并报告 `Ready=False`（`SchedulerUnavailable` 或 `WorkflowRuntimeUnavailable`）。控制平面重启后实例不会自动重新启动）
 - **策略引擎**：allow/deny/require_approval 三态决策，配额规则，高风险审批触发
   - 说明：Decision Router 的 `OK/FALLBACK_REQUIRED/FAILED` 是决策路由层的另一组状态，与 Policy 三态不混用
 - **插件管理器**：Manifest 解析校验，生命周期状态机，能力发现，权限授予（现状：自 1.1.0 起注册时验证 Ed25519 签名，权限按管理员的授予判定；控制平面应用尚未加载插件）
 - **审计与 Outbox**：事务性 Outbox，异步事件发布，幂等消费，correlation_id 全链路（现状：组件已实现，尚未接入控制平面的生产路径）
-- **REST API 与 CLI**：资源 CRUD，状态查询，任务管理，租户上下文注入（现状：没有更新接口；CLI 每条命令使用一个新的内存数据库，尚不可用）
+- **REST API 与 CLI**：资源 CRUD，状态查询，任务管理，租户上下文注入（现状：自 1.1.0 起提供 `PUT` / `PATCH` 更新接口（以 `resourceVersion` 或 `ETag` 做乐观并发）；控制平面应用不对外提供工作流运行时，`POST /api/v1/workflows` 返回 `503`；CLI 每条命令使用一个新的内存数据库，尚不可用）
 
 ### 工作流与决策（M3）
 - **工作流引擎**：持久化执行，幂等去重，三级超时，重试策略
@@ -364,7 +364,7 @@ ForgeMesh 目前处于预览阶段，API 稳定性标注为 `beta`：minor 版�
 
 | 类型 | 数量 |
 |------|------|
-| Python 测试 | **1800** |
+| Python 测试 | **2066** |
 | Go 测试 | 134 个测试函数，全部通过 |
 | ruff 检查 | All checks passed |
 

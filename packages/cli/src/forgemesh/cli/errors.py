@@ -33,7 +33,8 @@ class ExitCode(IntEnum):
     """没有收到 HTTP 响应：连接被拒绝、主机名无法解析、TLS 失败或超时。"""
     WAIT_TIMEOUT = 11
     WAIT_FAILED = 12
-    """等待的条件不会再满足：服务进入 ``Failed`` 或正在删除。"""
+    """等待的条件不会满足：服务正在删除，或在当前的 ``spec`` 下进入 ``Failed``（``spec`` 变化之前
+    控制器不会再部署它）。"""
     INTERRUPTED = 130
     """被 Ctrl-C 中断（128 + SIGINT，与 shell 的约定相同）。"""
 

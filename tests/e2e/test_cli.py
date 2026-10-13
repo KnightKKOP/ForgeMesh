@@ -1,7 +1,8 @@
 """CLI 端到端测试：``forgemesh`` 经真实的 HTTP 连接调用控制平面应用（uvicorn，API key 认证，
 一块设备的加速器清单与假启动器），不需要 GPU。
 
-* ``apply`` 创建 → ``wait`` 就绪 → 再次 ``apply`` 不变 → 修改 labels 后 ``configured``；
+* ``apply`` 创建 → ``wait`` 就绪 → 再次 ``apply`` 不变 → 修改 labels 后 ``configured`` → 修改
+  ``spec`` 后 ``configured``，``wait`` 等到控制器以新的实例部署第 2 代 ``spec``；
 * 无法调度的第二个服务；``list`` 逐页读取；``get``；
 * ``delete``：无法调度的服务直接删除（``204``），就绪的服务先进入 ``Terminating``（``202``），
   ``wait --for delete`` 等它消失；
@@ -53,13 +54,15 @@ class Result:
 Cli = Callable[..., Result]
 
 
-def service(name: str, *, count: int = 1, **metadata: Any) -> dict[str, Any]:
+def service(
+    name: str, *, count: int = 1, model: str = "models/llama", **metadata: Any
+) -> dict[str, Any]:
     return {
         "apiVersion": "forgemesh.io/v1alpha1",
         "kind": "InferenceService",
         "metadata": {"name": name, "namespace": "default", **metadata},
         "spec": {
-            "model": {"reference": "models/llama"},
+            "model": {"reference": model},
             "runtime": {"provider": "vllm"},
             "resources": {
                 "accelerator": {"type": "nvidia-gpu", "count": count, "minMemoryGiB": 16}
@@ -140,14 +143,20 @@ def test_a_service_is_applied_deployed_listed_and_deleted_with_the_cli(
 ) -> None:
     llama = tmp_path / "llama.yaml"
     timeout = ("--timeout", str(TIMEOUT_SECONDS))
+    get_llama = ("get", "inferenceservice", "llama", "-n", "default", "-o", "json")
+    labels = {"zone": "b"}
 
     created = cli("apply", "-f", _write(llama, service("llama")))
     ready = cli("wait", "inferenceservice", "llama", "-n", "default", *timeout)
+    deployed = cli(*get_llama)
     unchanged = cli("apply", "-f", str(llama))
-    configured = cli("apply", "-f", _write(llama, service("llama", labels={"zone": "b"})))
+    configured = cli("apply", "-f", _write(llama, service("llama", labels=labels)))
+    changed = service("llama", model="models/llama-3", labels=labels)
+    updated = cli("apply", "-f", _write(llama, changed))
+    redeployed = cli("wait", "inferenceservice", "llama", "-n", "default", *timeout)
+    shown = cli(*get_llama)
     unschedulable = cli("apply", "-f", _write(tmp_path / "big.yaml", service("big", count=2)))
     listed = cli("list", "inferenceservices", "--page-size", "1", "-o", "json")
-    shown = cli("get", "inferenceservice", "llama", "-n", "default", "-o", "json")
     deleted = cli("delete", "inferenceservice", "big", "-n", "default")
     terminating = cli("delete", "inferenceservice", "llama", "-n", "default")
     gone = cli("wait", "inferenceservice", "llama", "-n", "default", "--for", "delete", *timeout)
@@ -155,14 +164,23 @@ def test_a_service_is_applied_deployed_listed_and_deleted_with_the_cli(
 
     assert created.out == "InferenceService default/llama created\n"
     assert ready.out == "InferenceService default/llama is Ready\n"
+    first = json.loads(deployed.out)
+    assert (first["metadata"]["generation"], first["metadata"]["observedGeneration"]) == (1, 1)
     assert unchanged.out == "InferenceService default/llama unchanged\n"
     assert configured.out == "InferenceService default/llama configured\n"
+    assert updated.out == "InferenceService default/llama configured\n"
+    assert redeployed.out == "InferenceService default/llama is Ready\n"
+    llama_service = json.loads(shown.out)
+    metadata, status = llama_service["metadata"], llama_service["status"]
+    assert (metadata["generation"], metadata["observedGeneration"]) == (2, 2)
+    assert (metadata["labels"], metadata["tenantId"]) == (labels, TENANT)
+    assert llama_service["spec"]["model"]["reference"] == "models/llama-3"
+    assert status["phase"] == "Ready"
+    [endpoint] = status["endpoints"]
+    assert endpoint["ready"] is True
+    assert endpoint["instanceId"] != first["status"]["endpoints"][0]["instanceId"]
     assert unschedulable.out == "InferenceService default/big created\n"
     assert [item["metadata"]["name"] for item in json.loads(listed.out)] == ["big", "llama"]
-    llama_service = json.loads(shown.out)
-    assert llama_service["metadata"]["labels"] == {"zone": "b"}
-    assert llama_service["metadata"]["tenantId"] == TENANT
-    assert llama_service["status"]["phase"] == "Ready"
     assert deleted.out == "InferenceService default/big deleted\n"
     assert terminating.out == (
         "InferenceService default/llama is terminating: the controller stops its instance and "
@@ -170,8 +188,9 @@ def test_a_service_is_applied_deployed_listed_and_deleted_with_the_cli(
     )
     assert gone.out == "InferenceService default/llama deleted\n"
     assert (empty.out, empty.err) == ("", "No InferenceService resources found.\n")
-    results = (created, ready, unchanged, configured, unschedulable, listed, shown, deleted)
-    assert [result.code for result in (*results, terminating, gone, empty)] == [0] * 11
+    results = (created, ready, deployed, unchanged, configured, updated, redeployed, shown)
+    results += (unschedulable, listed, deleted)
+    assert [result.code for result in (*results, terminating, gone, empty)] == [0] * 14
     assert all(result.err == "" for result in results)
     assert _errors(caplog) == []
 

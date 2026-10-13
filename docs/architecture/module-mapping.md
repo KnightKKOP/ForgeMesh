@@ -332,12 +332,12 @@
 |---|---|
 | 架构模块 | L1 Access Layer 的命令行入口（architecture.md 3.1 L1） |
 | 当前代码路径 | `packages/cli/src/forgemesh/cli/{main,commands,client,config,documents,errors,output}.py`（共 7 个 `.py`，glob 核对；发行名 `forgemesh-cli`，控制台脚本 `forgemesh`） |
-| 核心契约 | 经 `/api/v1/inference-services` 管理 `InferenceService`：`apply`（`GET` 之后 `POST`，或以读到的 `resourceVersion` / `uid` 为前置条件 `PUT`，`409` 时重新读取再试）、`get`、`describe`、`list`（跟随 `nextPageToken`）、`delete`（受控删除，区分 `204` / `202`）、`wait`（`Ready` 且 `observedGeneration` 不小于 `generation`，或资源消失）；地址取自 `--api-url` / `FORGEMESH_API_URL`（默认网关 `http://127.0.0.1:8081`），key 取自 `--api-key-file` / `FORGEMESH_API_KEY`；错误信封与网关的纯文本 `429` / `502` 映射为按原因区分的退出码（`errors.py` 的 `ExitCode`） |
+| 核心契约 | 经 `/api/v1/inference-services` 管理 `InferenceService`：`apply`（`GET` 之后 `POST`，或以读到的 `resourceVersion` / `uid` 为前置条件 `PUT`，`409` 时重新读取再试）、`get`、`describe`、`list`（跟随 `nextPageToken`）、`delete`（受控删除，区分 `204` / `202`）、`wait`（`Ready`、`Ready=True` 且 `observedGeneration` 等于 `generation`，或资源消失）；地址取自 `--api-url` / `FORGEMESH_API_URL`（默认网关 `http://127.0.0.1:8081`），key 取自 `--api-key-file` / `FORGEMESH_API_KEY`；错误信封与网关的纯文本 `429` / `502` 映射为按原因区分的退出码（`errors.py` 的 `ExitCode`） |
 | 运行形态 | 命令行进程，HTTP 客户端（标准库 `urllib`，不跟随重定向） |
 | 数据所有权 | 无（资源权威状态归控制平面 Registry，CLI 不在本地保存状态） |
 | 允许依赖 | 标准库、PyYAML（`pyproject.toml` 只声明 `pyyaml>=6.0.1`）；与控制平面仅经 HTTP API 交互 |
 | 禁止依赖 | `forgemesh.controlplane` 及其他 ForgeMesh 包、直接打开 SQLite（扫描七验证 ✅，见 3.7） |
-| 测试路径 | `tests/unit/cli/`：`test_commands.py`、`test_client.py`、`test_config.py`、`test_documents.py`、`test_packaging.py`（5 个测试文件，glob 核对；`fakes.py` 以本地 HTTP 服务器模拟 API，`conftest.py` 提供夹具）；端到端 `tests/e2e/test_cli.py`（uvicorn 运行的控制平面应用 + API key + 假启动器：`apply` → `wait` → `list` → `get` → `delete` → `wait --for delete`，以及 API 错误的退出码） |
+| 测试路径 | `tests/unit/cli/`：`test_commands.py`、`test_client.py`、`test_config.py`、`test_documents.py`、`test_packaging.py`（5 个测试文件，glob 核对；`fakes.py` 以本地 HTTP 服务器模拟 API，`conftest.py` 提供夹具）；端到端 `tests/e2e/test_cli.py`（uvicorn 运行的控制平面应用 + API key + 假启动器：`apply` → `wait` → 修改 `spec` 后 `apply` → `wait`（第 2 代 `spec`）→ `get` → `list` → `delete` → `wait --for delete`，以及 API 错误的退出码） |
 | 状态 | 已实现且有测试覆盖 |
 | 演进动作 | 保留；只管理 `InferenceService`，其他 kind 待 API 提供写接口后再加 |
 

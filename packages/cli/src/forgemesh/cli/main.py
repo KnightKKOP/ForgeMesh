@@ -63,7 +63,7 @@ exit codes:
   9    API unavailable (HTTP 502, 503, 504)
   10   no HTTP response: connection refused, unknown host, TLS error, timeout
   11   wait timed out
-  12   wait failed: the service became Failed or is being deleted
+  12   wait failed: the service is being deleted or Failed with its current spec
   130  interrupted
 """
 
@@ -130,7 +130,10 @@ def build_parser() -> argparse.ArgumentParser:
         dest="condition",
         choices=("ready", "delete"),
         default="ready",
-        help="default: ready; fails at once if the service becomes Failed or is being deleted",
+        help=(
+            "default: ready, i.e. phase Ready with its current spec deployed; fails at once if "
+            "the service is being deleted or Failed with its current spec"
+        ),
     )
     wait.add_argument(
         "--timeout",

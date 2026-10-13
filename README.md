@@ -273,7 +273,7 @@ CLI 只管理 `InferenceService`（写作 `inferenceservice` 或 `inferenceservi
 
 文件是 YAML（可以有多个以 `---` 分隔的文档）或 JSON（对象或对象的数组）；省略 `kind` 时视为 `InferenceService`；文档没有 `metadata.namespace` 时使用 `-n`，两者都给出时必须相同。全部文档在发出任何请求之前读取并检查，有一个不合法就不发出请求；某个资源失败时报告错误、继续处理其余的资源，以第一个失败的退出码结束。文档中的 `metadata.tenantId` 作为 `X-Tenant-Id` 发送（与 `--tenant` 不同时报错）：与 key 绑定的租户不符时 API 返回 `403`，资源不会被写进 key 的租户。
 
-**wait**：每秒读取一次资源。`--for ready` 在 `status.phase` 为 `Ready`、`Ready` 条件为 `True` 且控制器已经处理当前的 `spec`（`metadata.observedGeneration` 不小于 `generation`）时成功；控制器处理当前的 `spec` 之后进入 `Failed`，或者资源正在删除时立即失败；超时时报告最后看到的状态。控制器目前不按新的 `spec` 重新部署已经 `Ready` 的服务（见「REST API」），修改这样的服务的 `spec` 之后 `wait` 会等到超时。`--for delete` 在资源不存在时成功（退出码 `0`），输出如 `InferenceService default/llama deleted`：开始等待时资源已经不存在（例如 `delete` 之后控制器在第一次读取之前就删除了它）同样如此，结果不取决于这个先后；因此名称或命名空间写错时也报告成功。读取遇到限流（`429`，按 `Retry-After` 推迟下一次读取）或 `502`–`504` 时继续等待；连接失败只在此前收到过 HTTP 响应时视为暂时故障，第一次请求就连不上时立即失败。
+**wait**：每秒读取一次资源。`--for ready` 在同一次读取中 `status.phase` 为 `Ready`、`Ready` 条件为 `True` 且 `metadata.observedGeneration` 等于 `generation` 时成功，这时服务运行的是当前的 `spec`（见「REST API」）：`spec` 变化之后，服务先以旧的 `observedGeneration` 保持 `Ready`，再经 `Updating` 重新部署，`wait` 等到新的 `spec` 部署完成。资源正在删除，或在当前的 `spec` 下进入 `Failed`（`spec` 变化之前控制器不会再部署它）时立即失败；其他状态都继续等待，如 `Updating`、重新部署中的 `Degraded`，以及 `spec` 变化之后还没重新部署的 `Failed`。超时时报告最后看到的状态：被策略拒绝、等待审批或缺少调度器 / 启动器的更新不写 `status`，服务一直以旧的 `observedGeneration` 停在 `Ready` / `Degraded`，消息说明更新没有开始、原因见控制平面的日志。`--for delete` 在资源不存在时成功（退出码 `0`），输出如 `InferenceService default/llama deleted`：开始等待时资源已经不存在（例如 `delete` 之后控制器在第一次读取之前就删除了它）同样如此，结果不取决于这个先后；因此名称或命名空间写错时也报告成功。读取遇到限流（`429`，按 `Retry-After` 推迟下一次读取）或 `502`–`504` 时继续等待；连接失败只在此前收到过 HTTP 响应时视为暂时故障，第一次请求就连不上时立即失败。
 
 **错误与退出码**：错误消息写到标准错误，以 `Error:` 开头（参数写错时是 argparse 的用法提示）。错误信封显示为 `<message> (HTTP <状态码> <code>[, reason <details.reason>], correlation id <关联 ID>)`，请求校验失败时逐行列出字段与原因；网关自己的纯文本 `429` 与 `502` 分别报告为被网关限流（附上 `Retry-After` 的秒数）与网关连不上控制平面。一次调用的全部请求带同一个随机的 `X-Correlation-Id`，可以用它在网关与控制平面的日志中找到这次调用。`forgemesh --help` 列出同一张退出码表：
 
@@ -291,7 +291,7 @@ CLI 只管理 `InferenceService`（写作 `inferenceservice` 或 `inferenceservi
 | `9` | API 暂时不可用（`502`、`503`、`504`） |
 | `10` | 没有收到 HTTP 响应：连接被拒绝、主机名无法解析、TLS 失败或超时 |
 | `11` | `wait` 超时 |
-| `12` | `wait` 等待的状态不会出现：服务进入 `Failed` 或正在删除 |
+| `12` | `wait` 等待的状态不会出现：服务正在删除，或在当前的 `spec` 下进入 `Failed` |
 | `130` | 被 Ctrl-C 中断 |
 
 | 环境变量 | 默认值 | 说明 |

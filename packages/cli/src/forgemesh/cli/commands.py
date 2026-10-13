@@ -36,6 +36,9 @@ POLL_INTERVAL_SECONDS = 1.0
 _READY = "Ready"
 _FAILED = "Failed"
 _TERMINATING = "Terminating"
+#: 服务中的 phase：``spec`` 变化之后，被策略拦下或缺少调度器 / 启动器的更新不写 ``status``，
+#: 服务以旧的 ``observedGeneration`` 停在这些 phase。
+_SERVING_PHASES = frozenset({_READY, "Degraded"})
 
 
 def cmd_apply(args: argparse.Namespace, client: ApiClient) -> int:
@@ -162,10 +165,14 @@ def cmd_delete(args: argparse.Namespace, client: ApiClient) -> int:
 def cmd_wait(args: argparse.Namespace, client: ApiClient) -> int:
     """``wait KIND NAME``：等资源就绪（``--for ready``）或被删除（``--for delete``）。
 
-    就绪指 ``status.phase`` 为 ``Ready``、``Ready`` 条件为 ``True``，且控制器已处理当前的
-    ``spec``（``observedGeneration`` 不小于 ``generation``）。资源正在删除，或控制器处理当前的
-    ``spec`` 之后进入 ``Failed`` 时立即失败。API 应答过一次之后，限流、``502`` - ``504`` 与连接
-    失败视为暂时故障，继续等待。
+    就绪指同一次读取中 ``status.phase`` 为 ``Ready``、``Ready`` 条件为 ``True``，且
+    ``metadata.observedGeneration`` 等于 ``generation``：``spec`` 变化之后服务先以旧的
+    ``observedGeneration`` 保持 ``Ready``，控制器开始更新的一轮即记下新的 generation、进入
+    ``Updating``，两者同时满足时服务运行的才是当前的 ``spec``。被策略拦下或缺少调度器 / 启动器
+    的更新不写 ``status``，服务一直以旧的 ``observedGeneration`` 停在 ``Ready`` / ``Degraded``，
+    超时的消息说明更新没有开始。资源正在删除，或在当前的 ``spec`` 下进入 ``Failed`` 时立即失败
+    （``spec`` 变化之前控制器不会再部署它）；其余状态继续等待，包括重新部署中的 ``Degraded``。
+    API 应答过一次之后，限流、``502`` - ``504`` 与连接失败视为暂时故障，继续等待。
 
     ``--for delete`` 在资源不存在时成功。开始等待时资源已经不存在，输出与等到它被删除时相同：
     ``delete`` 之后控制器可能在第一次读取之前就删除了资源，结果不能取决于这个先后。
@@ -214,15 +221,12 @@ def cmd_wait(args: argparse.Namespace, client: ApiClient) -> int:
 
 
 def _readiness(service: dict[str, Any]) -> tuple[bool | None, str]:
-    """``(结论, 说明)``：``True`` 已就绪，``False`` 不会再就绪，``None`` 继续等待。"""
+    """``(结论, 说明)``：``True`` 已就绪，``False`` 不会就绪，``None`` 继续等待。"""
     metadata = service["metadata"]
-    status = _status(service)
-    phase = status.get("phase")
+    phase = _status(service).get("phase")
     generation = metadata.get("generation")
-    observed = metadata.get("observedGeneration", status.get("observedGeneration"))
-    current = not isinstance(generation, int) or (
-        isinstance(observed, int) and observed >= generation
-    )
+    observed = metadata.get("observedGeneration")
+    current = isinstance(generation, int) and observed == generation
     condition = ready_condition(service)
     description = f"phase {phase or NONE}"
     if condition is not None:
@@ -231,11 +235,23 @@ def _readiness(service: dict[str, Any]) -> tuple[bool | None, str]:
         detail = ": ".join(str(part) for part in parts if part)
         if detail:
             description += f" ({detail})"
-    if not current:
+    hint = ""
+    if current:
+        if phase == _FAILED:
+            hint = "the controller deploys it again only when its spec changes"
+    elif phase in _SERVING_PHASES:
+        description += (
+            f"; the update to generation {generation} has not started (observed {observed})"
+        )
+        hint = (
+            "an update that the policy denies or holds for approval, or that has no scheduler "
+            "or launcher, does not start; the reason is in the control plane log"
+        )
+    else:
         description += (
             f"; the controller has not processed generation {generation} yet (observed {observed})"
         )
-    description = printable(description)
+    description = printable(description) + (f"\n{hint}" if hint else "")
     if phase == _TERMINATING or (phase == _FAILED and current):
         return False, description
     ready = condition is not None and condition.get("status") == "True"

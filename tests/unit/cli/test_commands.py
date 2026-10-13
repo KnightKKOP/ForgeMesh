@@ -2,8 +2,9 @@
 
 覆盖 ``apply``（创建、以读到的版本更新、不变、冲突重试与放弃、正在删除、并发创建、多文档、
 租户与命名空间、标准输入、``list`` 输出的再次提交）、``get`` / ``describe`` / ``list``（输出格式、
-翻页、命名空间规则）、``delete``（``204`` / ``202``）、``wait``（就绪、``Failed`` 立即失败、
-observedGeneration、超时、暂时故障、``--for delete``、Ctrl-C），以及 key、公共选项与参数校验。
+翻页、命名空间规则）、``delete``（``204`` / ``202``）、``wait``（就绪、``spec`` 更新与重新部署、
+``Failed`` 立即失败、observedGeneration、超时、暂时故障、``--for delete``、Ctrl-C），以及 key、
+公共选项与参数校验。
 """
 
 from __future__ import annotations
@@ -483,6 +484,7 @@ def test_wait_fails_at_once_when_the_service_failed(
     assert result.err == (
         "Error: InferenceService default/llama will not become Ready: phase Failed, "
         "Ready=False (WorkflowFailed: model download failed?[2J)\n"
+        "the controller deploys it again only when its spec changes\n"
     )
     assert clock.sleeps == []
 
@@ -501,38 +503,132 @@ def test_wait_fails_when_the_service_is_being_deleted(
 
 
 @pytest.mark.parametrize(
-    ("phase", "ready"), [("Ready", ("True", "Reconciled")), ("Failed", ("False", "WorkflowFailed"))]
+    ("phase", "ready", "then"),
+    [
+        ("Ready", ("True", "Reconciled"), "Updating"),
+        ("Failed", ("False", "WorkflowFailed"), "Pending"),
+    ],
 )
-def test_wait_ignores_the_outcome_of_an_older_spec(
-    api: FakeApi, cli: Cli, clock: FakeClock, phase: str, ready: tuple[str, str]
+def test_wait_follows_a_spec_change_until_the_new_spec_is_deployed(
+    api: FakeApi, cli: Cli, clock: FakeClock, phase: str, ready: tuple[str, str], then: str
 ) -> None:
-    """spec 更新之后（generation 2），控制器处理它之前的 Ready 或 Failed 都不是结论。"""
+    """spec 更新之后（generation 2），控制器开始处理之前的 Ready 或 Failed 都不是结论；开始处理的
+    一轮即记下新的 generation（Ready 进入 Updating，Failed 回到 Pending），之后还要等部署完成。"""
     api.reply(
         "GET", PATH, 200, resource(document(), phase=phase, ready=ready, generation=2, observed=1)
+    )
+    api.reply(
+        "GET",
+        PATH,
+        200,
+        resource(document(), phase=then, ready=("False", then), generation=2, observed=2),
     )
     api.add(document(), phase="Ready", ready=("True", "Reconciled"), generation=2, observed=2)
 
     result = cli("wait", "inferenceservice", "llama", "-n", "default")
 
     assert (result.code, result.out) == (0, "InferenceService default/llama is Ready\n")
-    assert clock.sleeps == [1.0]
+    assert clock.sleeps == [1.0, 1.0]
 
 
-def test_wait_times_out_with_the_last_state_it_saw(
+def test_wait_keeps_waiting_while_a_degraded_service_is_redeployed(
     api: FakeApi, cli: Cli, clock: FakeClock
 ) -> None:
-    api.add(document(), phase="Ready", ready=("True", "Reconciled"), generation=2, observed=1)
+    """实例丢失之后控制器按退避重新部署 Degraded 的服务，重新部署失败也不是结论。"""
+    api.reply(
+        "GET",
+        PATH,
+        200,
+        resource(document(), phase="Degraded", ready=("False", "InstanceLost"), observed=1),
+    )
+    api.reply(
+        "GET",
+        PATH,
+        200,
+        resource(
+            document(),
+            phase="Degraded",
+            ready=("False", "WorkflowFailed"),
+            message="step 'verify-instance' failed; redeploying the service after a backoff",
+            observed=1,
+        ),
+    )
+    api.add(document(), **READY)
+
+    result = cli("wait", "inferenceservice", "llama", "-n", "default")
+
+    assert (result.code, result.out) == (0, "InferenceService default/llama is Ready\n")
+    assert clock.sleeps == [1.0, 1.0]
+
+
+NOT_STARTED = (
+    "the update to generation 2 has not started (observed 1)\nan update that the policy denies "
+    "or holds for approval, or that has no scheduler or launcher, does not start; the reason is "
+    "in the control plane log"
+)
+
+
+@pytest.mark.parametrize(
+    ("fields", "seen"),
+    [
+        (
+            {"phase": "Ready", "ready": ("True", "Reconciled"), "generation": 2, "observed": 1},
+            f"phase Ready, Ready=True (Reconciled); {NOT_STARTED}",
+        ),
+        (
+            {
+                "phase": "Degraded",
+                "ready": ("False", "InstanceLost"),
+                "generation": 2,
+                "observed": 1,
+            },
+            f"phase Degraded, Ready=False (InstanceLost); {NOT_STARTED}",
+        ),
+        (
+            {"phase": "Pending", "generation": 1, "observed": 0},
+            "phase Pending; the controller has not processed generation 1 yet (observed 0)",
+        ),
+    ],
+    ids=["update-not-started", "degraded-update-not-started", "not-processed"],
+)
+def test_wait_times_out_with_the_last_state_it_saw(
+    api: FakeApi, cli: Cli, clock: FakeClock, fields: dict[str, Any], seen: str
+) -> None:
+    """被拦下的更新不写 status，服务以旧的 observedGeneration 停在 Ready / Degraded，消息说明
+    更新没有开始；其他 phase 只说明控制器还没处理新的 generation。"""
+    api.add(document(), **fields)
 
     result = cli("wait", "inferenceservice", "llama", "-n", "default", "--timeout", "2.5")
 
     assert result.code == ExitCode.WAIT_TIMEOUT
     assert result.err == (
         "Error: timed out after 2.5 s waiting for InferenceService default/llama to become "
-        "Ready; last seen: phase Ready, Ready=True (Reconciled); the controller has not "
-        "processed generation 2 yet (observed 1)\n"
+        f"Ready; last seen: {seen}\n"
     )
     assert clock.sleeps == [1.0, 1.0, 0.5]
     assert len(api.calls) == 4
+
+
+@pytest.mark.parametrize(
+    "generations",
+    [{"generation": 1, "observedGeneration": 2}, {}],
+    ids=["observed-ahead", "not-reported"],
+)
+def test_wait_needs_the_observed_generation_to_equal_the_generation(
+    api: FakeApi, cli: Cli, clock: FakeClock, generations: dict[str, int]
+) -> None:
+    service = resource(document(), **READY)
+    del service["metadata"]["generation"], service["metadata"]["observedGeneration"]
+    service["metadata"].update(generations)
+    api.reply("GET", PATH, 200, service)
+
+    result = cli("wait", "inferenceservice", "llama", "-n", "default", "--timeout", "0")
+
+    assert (result.code, result.out) == (ExitCode.WAIT_TIMEOUT, "")
+    assert result.err.startswith(
+        "Error: timed out after 0 s waiting for InferenceService default/llama to become Ready; "
+        "last seen: phase Ready, Ready=True (Reconciled); "
+    )
 
 
 def test_wait_rides_out_rate_limiting_and_an_unreachable_control_plane(

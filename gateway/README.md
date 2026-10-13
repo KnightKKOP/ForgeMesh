@@ -238,7 +238,7 @@ gateway 2026/10/13 03:53:36 access method=POST path="/api/v1/namespaces/default/
 
 ```
 gateway/
-├── go.mod                          # module + go 1.22（无外部依赖）
+├── go.mod                          # module + go 1.27.0（无外部依赖）
 ├── Makefile                        # build / test / run / fmt / vet
 ├── cmd/gateway/main.go             # 入口：配置 → 路由 → http.Server → 优雅停机
 └── internal/

@@ -106,7 +106,7 @@ forgemesh/
 
 - Python **3.12+**（CI 覆盖 3.12）
 - GNU Make
-- Go **1.22+**（仅当需要开发/构建 `gateway/` 时）
+- Go **1.27+**（仅当需要开发/构建 `gateway/` 时）
 - Docker 与 Docker Compose v2（仅容器部署时）
 - Git
 

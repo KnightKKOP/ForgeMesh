@@ -12,7 +12,7 @@
 
 - Python **3.12+**（CI 覆盖 3.12）
 - GNU Make
-- Go **1.22+**（仅开发 `gateway/` 时需要）
+- Go **1.27+**（仅开发 `gateway/` 时需要；Go 1.21 起的 go 命令默认会按 `gateway/go.mod` 自动下载所需版本。CI 与网关镜像使用同一次版本的最新补丁，见 `.github/workflows/ci.yml` 中的 `GO_VERSION`）
 - Git
 
 ### 1.2 初始化

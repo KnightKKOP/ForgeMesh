@@ -76,7 +76,7 @@
 | 字段 | 内容 |
 |---|---|
 | 架构模块 | Data Plane Gateway（L1 推理流量入口，architecture.md 3.1 L1 / Dev-5） |
-| 当前代码路径 | `gateway/cmd/gateway/main.go`；`gateway/internal/{config,health,metrics,middleware,router,stream,upstream}/`（共 53 个 `.go` 文件，其中 31 个 `_test.go`，glob 核对）；`gateway/go.mod`（`github.com/Mekoforge/ForgeMesh/gateway`，go 1.22）；`gateway/Makefile`、`gateway/README.md` |
+| 当前代码路径 | `gateway/cmd/gateway/main.go`；`gateway/internal/{config,health,metrics,middleware,router,stream,upstream}/`（共 54 个 `.go` 文件，其中 32 个 `_test.go`，glob 核对）；`gateway/go.mod`（`github.com/Mekoforge/ForgeMesh/gateway`，go 1.27.0）；`gateway/Makefile`、`gateway/README.md` |
 | 核心契约 | `/api/v1/` REST + SSE 流式转发（见 openapi.yaml）；中间件链 `Observe → Recovery → Correlation → TraceContext → AccessLog → Authenticate → RateLimit → LimitRequestBody → Route`；API key 认证（ADR-014，`middleware/{authz,apikey}.go`）；上游解析 `upstream/resolver.go`（按命名空间解析 ready 实例、`protocol` → 实例推理路径、合并回源、健康摘流）；实例地址限制 `stream/addrpolicy.go`；`/metrics`（Prometheus 文本格式，不经认证/限流，`metrics/{metrics,gateway}.go`，测试用解析 `metrics/metricstest`）；W3C `traceparent` 沿用/生成并转发、访问日志（`middleware/{observe,tracecontext,accesslog}.go`） |
 | 运行形态 | 独立进程（Go 二进制），经 `GATEWAY_UPSTREAM_URL` 转发至控制平面 |
 | 数据所有权 | 无权威数据（运行态转发；端点解析缓存为派生数据） |
@@ -388,12 +388,12 @@ grep -rn "controlplane" packages/node-agent/src/ --include="*.py" | grep -v egg-
 
 ```bash
 ls gateway/*.go gateway/cmd/... 2>/dev/null | head   # 根级无 *.go，代码在 cmd/ 与 internal/
-find gateway -name "*.go" | wc -l                     # → 53
+find gateway -name "*.go" | wc -l                     # → 54
 find gateway -name "*.py" -o -name "requirements*.txt" | wc -l   # → 0
-cat gateway/go.mod                                     # module github.com/Mekoforge/ForgeMesh/gateway (go 1.22)
+cat gateway/go.mod                                     # module github.com/Mekoforge/ForgeMesh/gateway (go 1.27.0)
 ```
 
-**输出：** 53 个 `.go`（含 31 个 `_test.go`）、0 个 `.py`、无 Python 依赖清单；`go.mod` 无任何第三方 require（仅标准库 + go 1.22）。
+**输出：** 54 个 `.go`（含 32 个 `_test.go`）、0 个 `.py`、无 Python 依赖清单；`go.mod` 无任何第三方 require（仅标准库 + go 1.27.0）。
 
 **结论：✅ 符合** —— 网关与 Python 控制平面为进程边界隔离（HTTP 上游），无语言互操作。
 

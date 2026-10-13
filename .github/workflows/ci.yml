@@ -11,6 +11,11 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  # 网关的 Go 次版本，与 deploy/docker/Dockerfile.gateway 和 gateway/go.mod 的 go 行保持一致。
+  # setup-go 取它的最新补丁版本，标准库的漏洞修复随补丁版本发布；这个次版本停止维护之前一起升级。
+  GO_VERSION: "1.27"
+
 jobs:
   python:
     name: Python ${{ matrix.python-version }} · lint & test
@@ -88,7 +93,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: "1.22"
+          go-version: ${{ env.GO_VERSION }}
           cache: true
           cache-dependency-path: gateway/go.sum
 

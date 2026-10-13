@@ -575,8 +575,9 @@ ForgeMesh 目前处于预览阶段，API 稳定性标注为 `beta`：minor 版�
 
 | 类型 | 数量 |
 |------|------|
-| Python 测试 | **2689** |
-| Go 测试 | 187 个测试函数，全部通过 |
+| Python 测试 | **2698** |
+| Python 覆盖率 | 97.2%（`packages/` 的语句与分支，CI 要求不低于 97%） |
+| Go 测试 | 188 个测试函数，全部通过 |
 | ruff 检查 | All checks passed |
 
 ---

@@ -26,7 +26,7 @@ class LaunchRequest(BaseModel):
     """启动一个推理实例所需的信息（部署工作流的输入，可 JSON 序列化）。
 
     Attributes:
-        instance_key: 实例的幂等键，同一个资源（uid）的部署不变。
+        instance_key: 实例的幂等键，即部署运行的幂等键（资源 uid 的每一代 spec 一个）。
         tenant_id: 资源所属租户。
         resource: 被部署的资源（kind / namespace / name / uid）。
         spec: 资源的期望状态（模型、运行时、加速器申请、副本数）。

@@ -16,28 +16,39 @@
     :func:`~forgemesh.controlplane.reconciler.dedup.allocation_idempotency_key`）与取自
     ``spec.resources.accelerator`` 的调度需求：重放得到同一分配。
 ``Preparing → Deploying``
-    以同一幂等键再次 allocate() 取回分配，然后 WorkflowRuntime.start() 启动部署工作流
+    以同一幂等键再次 allocate() 取回分配，停止资源之前的部署（见下文），然后
+    WorkflowRuntime.start() 启动部署工作流
     （:mod:`forgemesh.controlplane.deployment.workflow`），幂等键为
-    :func:`~forgemesh.controlplane.deployment.workflow.deployment_run_key`（uid），输入是
-    携带分配设备的 :class:`~forgemesh.controlplane.deployment.launcher.LaunchRequest`。
+    :func:`~forgemesh.controlplane.deployment.workflow.deployment_run_key`（uid + generation），
+    输入是携带分配设备的 :class:`~forgemesh.controlplane.deployment.launcher.LaunchRequest`。
 ``Deploying → Verifying → Ready``
-    按同一幂等键 find_run() 查询运行：实例启动后进入 ``Verifying``；运行成功后进入
-    ``Ready``，写入 ``status.endpoints``（取自 ``launch-instance`` 的结果）与 ``Ready=True``。
-    运行未结束时每 ``workflow_poll_interval`` 秒查询一次。注入启动器时，写入 ``Ready``
-    之前先确认实例仍在运行。
+    find_runs() 按幂等键前缀查询当前 generation 的运行：实例启动后进入 ``Verifying``；运行
+    成功后进入 ``Ready``，写入 ``status.endpoints``（取自 ``launch-instance`` 的结果）与
+    ``Ready=True``。运行未结束时每 ``workflow_poll_interval`` 秒查询一次。注入启动器时，写入
+    ``Ready`` 之前先确认实例仍在运行。
 
 只有进入 ``Ready`` 或 ``Failed`` 的一轮返回 ``done=True``（登记去重键）；其余各轮返回
 ``done=False``，同一 generation 的去重键不会挡住下一轮。
 
+部署过程中 spec 变化
+--------------------
+新的 generation 有自己的分配幂等键与部署运行。资源已持有的分配（为之前的 generation 建立）
+满足新的加速器申请时直接复用；不满足时调度器拒绝复用（``ConflictError``），协调器先停止
+资源的实例、释放这个分配，再重新分配。启动部署运行之前总是先经 release provider 停止资源
+之前的部署（取消进行中的运行、停止实例），同一时刻只有一个实例占用分配的设备。
+``Deploying`` / ``Verifying`` 时没有当前 generation 的运行（spec 在部署过程中变化，或运行来自
+1.1.0 之前、幂等键不含 generation）：停止之前的部署、取得分配并启动当前 generation 的运行，
+phase 不变，之后跟踪新的运行，旧的运行不会让服务以旧的 spec 进入 ``Ready``。
+
 失败
 ----
 * 分配失败：停在当前 phase，``Ready=False``（``AllocationFailed``），10 秒后重试。
-* 部署工作流没能启动（运行没能创建或启动）：停在 ``Preparing``，``Ready=False``
-  （``WorkflowStartFailed``），保留分配，按指数退避重试；查询运行失败同样退避重试
-  （``WorkflowLookupFailed``）。
+* 部署工作流没能启动（运行没能创建或启动）：停在当前 phase，``Ready=False``
+  （``WorkflowStartFailed``），保留分配，按指数退避重试；查询运行失败（``WorkflowLookupFailed``）
+  与停止之前的部署失败（``StopFailed``）同样退避重试。
 * 部署运行失败（某一步用尽重试，工作流已补偿、停止了实例）、被取消或超时：
   ``phase=Failed``、``Ready=False``（``WorkflowFailed``，消息含失败的步骤），释放分配。
-  补偿没能停止实例时保留分配，删除资源时再停止实例、释放分配；找不到运行
+  补偿没能停止实例时保留分配，删除资源时再停止实例、释放分配；资源没有任何部署运行
   （``WorkflowRunNotFound``，如工作流数据库被重置）或运行成功却没有报告实例（运行时
   不返回步骤输出）时同样进入 ``Failed`` 并保留分配。
 * 运行成功、实例却已不在运行（如控制平面在运行成功之后、写入 ``Ready`` 之前重启，
@@ -78,17 +89,19 @@ from forgemesh.core.reconciler import ReconcileContext, Reconciler, ReconcileRes
 from forgemesh.core.scheduler import AllocationRef, ResourceRef, ScheduleRequest
 from forgemesh.policy.api import PolicyAction, PolicyEngine
 from forgemesh.resource.inference import AcceleratorSpec, InferencePhase, InferenceService
-from forgemesh.workflow.runtime import RunInfo
+from forgemesh.workflow.runtime import RunInfo, RunRef
 from forgemesh.workflow.states import StepStatus, WorkflowStatus
 
 from ..deployment import (
     LAUNCH_INSTANCE,
+    DeploymentRun,
     LaunchedInstance,
     LaunchRequest,
     RuntimeLauncher,
     deployment_inputs,
     deployment_run_key,
     deployment_workflow,
+    find_deployment_runs,
     launched_instance,
 )
 from ..registry.store import DEFAULT_RELEASE_FINALIZER
@@ -180,12 +193,14 @@ class ReleaseProvider(Protocol):
     """受控释放 Provider 协议（控制平面侧，不绑定具体运行时插件）。
 
     职责：在资源进入 ``Terminating`` 后释放其外部副作用（取消进行中的部署、停止推理
-    实例等，如 :class:`~forgemesh.controlplane.deployment.DeploymentReleaser`）。实现方
-    应保证**幂等**：同一资源重复调用不得产生重复副作用。
+    实例等，如 :class:`~forgemesh.controlplane.deployment.DeploymentReleaser`）；协调器在
+    启动新的部署运行之前同样调用它，停止资源之前部署的实例。实现方应保证**幂等**：
+    同一资源重复调用不得产生重复副作用。
 
     ``release`` 正常返回视为释放成功；抛出任意异常视为释放失败——协调器
-    将保持 ``Terminating`` 并 requeue 重试，**不会**物理删除资源（GPU 不泄漏
-    也不误删）。协议刻意不依赖插件包类型（``plugins/*``），由组装方桥接。
+    将保持 ``Terminating``（或当前 phase）并 requeue 重试，**不会**物理删除资源，也不会
+    启动新的部署（GPU 不泄漏也不误删）。协议刻意不依赖插件包类型（``plugins/*``），由
+    组装方桥接。
     """
 
     async def release(self, resource: Resource) -> None:
@@ -206,7 +221,7 @@ class ReconciliationController(Reconciler):
         decision_provider: 可选决策 Provider（生成候选动作，仅建议非授权）。
         scheduler: 可选调度器（资源分配的唯一执行点）；未注入时，需要分配的
             资源报告 ``Ready=False``（``SchedulerUnavailable``）。
-        workflow_runtime: 可选工作流运行时（执行部署工作流，须实现 ``find_run``，返回
+        workflow_runtime: 可选工作流运行时（执行部署工作流，须实现 ``find_runs``，返回
             的快照须带步骤输出）；未注入时，需要部署的资源报告 ``Ready=False``
             （``WorkflowRuntimeUnavailable``）。
         release_provider: 受控释放 Provider（``Terminating`` 时释放外部副作用）。注入
@@ -415,29 +430,71 @@ class ReconciliationController(Reconciler):
         logger.warning("scheduler allocate failed: %s", exc)
         return _not_ready("AllocationFailed", _describe(exc), requeue_after=10.0)
 
-    async def _schedule(self, ctx: ReconcileContext, service: InferenceService) -> ReconcileResult:
-        """``Scheduling`` 一轮：分配加速器后进入 ``Preparing``。"""
+    async def _allocation(
+        self, ctx: ReconcileContext, service: InferenceService
+    ) -> AllocationRef | ReconcileResult:
+        """取得服务于当前 spec 的分配；失败时返回停在当前 phase 的结果。
+
+        调度器拒绝复用资源为之前的 generation 建立的分配（不满足新的加速器申请）时，先停止
+        资源的实例、释放该分配，再重新分配。
+        """
         try:
-            allocation = await self._allocate(ctx, service)
+            return await self._allocate(ctx, service)
+        except ConflictError as exc:
+            if not await self._holds_previous_allocation(ctx, service):
+                return self._allocation_failed(exc)
         except Exception as exc:  # noqa: BLE001 - 分配失败需可重试
             return self._allocation_failed(exc)
-        devices = ", ".join(f"{d.node_id}/{d.device_id}" for d in allocation.devices)
-        return _progress(
-            InferencePhase.PREPARING,
-            f"allocation {allocation.allocation_id} holds {devices or 'no devices'}",
-            requeue_after=0.0,
+        stopped = await self._stop_previous_deployment(ctx, service)
+        if stopped is not None:
+            return stopped
+        await self._release_allocation(ctx, reason="the accelerator request changed")
+        try:
+            return await self._allocate(ctx, service)
+        except Exception as exc:  # noqa: BLE001 - 分配失败需可重试
+            return self._allocation_failed(exc)
+
+    async def _holds_previous_allocation(
+        self, ctx: ReconcileContext, service: InferenceService
+    ) -> bool:
+        """资源是否持有以另一个幂等键（之前的 generation）建立的 Active 分配。"""
+        get_active = getattr(self._registry, "get_active_allocation", None)
+        if not callable(get_active):
+            return False
+        meta = service.metadata
+        held = await get_active(meta.uid, ctx.tenant_id)
+        return held is not None and held["idempotency_key"] != allocation_idempotency_key(
+            meta.uid, meta.generation
         )
 
-    async def _start_deployment(
+    async def _stop_previous_deployment(
         self, ctx: ReconcileContext, service: InferenceService
-    ) -> ReconcileResult:
-        """``Preparing`` 一轮：取回分配，启动部署工作流后进入 ``Deploying``。"""
+    ) -> ReconcileResult | None:
+        """经 release provider 停止资源已部署的实例；失败时返回停在当前 phase 的结果。"""
+        if self._release_provider is None:
+            return None
         try:
-            allocation = await self._allocate(ctx, service)
-        except Exception as exc:  # noqa: BLE001 - 分配失败需可重试
-            return self._allocation_failed(exc)
-        uid = service.metadata.uid
-        run_key = deployment_run_key(uid)
+            await self._release_provider.release(service)
+        except Exception as exc:  # noqa: BLE001 - 停止失败：不启动新的部署，退避重试
+            delay = self._next_retry_delay(service.metadata.uid)
+            logger.warning(
+                "stopping the previous deployment failed (retrying in %.1fs): %s",
+                delay,
+                _describe(exc),
+            )
+            return _not_ready(
+                "StopFailed",
+                f"the previous deployment could not be stopped: {_describe(exc)}",
+                requeue_after=delay,
+            )
+        return None
+
+    async def _start_run(
+        self, ctx: ReconcileContext, service: InferenceService, allocation: AllocationRef
+    ) -> RunRef | ReconcileResult:
+        """启动当前 generation 的部署运行；失败时返回停在当前 phase 的结果。"""
+        meta = service.metadata
+        run_key = deployment_run_key(meta.uid, meta.generation)
         request = LaunchRequest(
             instance_key=run_key,
             tenant_id=ctx.tenant_id,
@@ -451,26 +508,37 @@ class ReconciliationController(Reconciler):
                 deployment_workflow(), deployment_inputs(request), run_key
             )
         except Exception as exc:  # noqa: BLE001 - 启动失败：保留分配，退避重试
-            delay = self._next_retry_delay(uid)
+            delay = self._next_retry_delay(meta.uid)
             logger.warning(
                 "deployment workflow start failed (retrying in %.1fs): %s", delay, _describe(exc)
             )
             return _not_ready("WorkflowStartFailed", _describe(exc), requeue_after=delay)
-        self._retry_counts.pop(uid, None)
-        return _progress(
-            InferencePhase.DEPLOYING,
-            f"deployment workflow run {run.run_id} started",
-            requeue_after=self._poll_interval,
-        )
+        self._retry_counts.pop(meta.uid, None)
+        return run
 
-    async def _follow_deployment(
-        self, ctx: ReconcileContext, service: InferenceService, phase: str
-    ) -> ReconcileResult:
-        """``Deploying`` / ``Verifying`` 一轮：按幂等键查询部署运行并推进。"""
+    async def _deploy(
+        self, ctx: ReconcileContext, service: InferenceService
+    ) -> RunRef | ReconcileResult:
+        """停止之前的部署，取得分配，启动当前 generation 的部署运行。"""
+        if self._scheduler is None:
+            return _not_ready(
+                "SchedulerUnavailable", "no scheduler is configured to allocate resources", None
+            )
+        stopped = await self._stop_previous_deployment(ctx, service)
+        if stopped is not None:
+            return stopped
+        allocation = await self._allocation(ctx, service)
+        if isinstance(allocation, ReconcileResult):
+            return allocation
+        return await self._start_run(ctx, service, allocation)
+
+    async def _lookup(
+        self, service: InferenceService, generation: int | None = None
+    ) -> list[DeploymentRun] | ReconcileResult:
+        """资源的部署运行（见 :func:`find_deployment_runs`）；查询失败时返回退避重试的结果。"""
         uid = service.metadata.uid
-        run_key = deployment_run_key(uid)
         try:
-            run = await self._workflow.find_run(run_key)
+            return await find_deployment_runs(self._workflow, uid, generation)
         except Exception as exc:  # noqa: BLE001 - 查询失败：保持当前 phase，退避重试
             delay = self._next_retry_delay(uid)
             logger.warning(
@@ -479,15 +547,58 @@ class ReconciliationController(Reconciler):
                 _describe(exc),
             )
             return _not_ready("WorkflowLookupFailed", _describe(exc), requeue_after=delay)
-        self._retry_counts.pop(uid, None)
-        if run is None:
-            # 运行记录丢失：无法确认是否有实例在运行，分配留到删除资源时释放。
-            return await self._fail(
-                ctx,
-                "WorkflowRunNotFound",
-                f"deployment workflow run {run_key!r} not found",
-                release_allocation=False,
-            )
+
+    async def _schedule(self, ctx: ReconcileContext, service: InferenceService) -> ReconcileResult:
+        """``Scheduling`` 一轮：分配加速器后进入 ``Preparing``。"""
+        allocation = await self._allocation(ctx, service)
+        if isinstance(allocation, ReconcileResult):
+            return allocation
+        devices = ", ".join(f"{d.node_id}/{d.device_id}" for d in allocation.devices)
+        return _progress(
+            InferencePhase.PREPARING,
+            f"allocation {allocation.allocation_id} holds {devices or 'no devices'}",
+            requeue_after=0.0,
+        )
+
+    async def _start_deployment(
+        self, ctx: ReconcileContext, service: InferenceService
+    ) -> ReconcileResult:
+        """``Preparing`` 一轮：取回分配，启动当前 generation 的部署运行后进入 ``Deploying``。"""
+        allocation = await self._allocation(ctx, service)
+        if isinstance(allocation, ReconcileResult):
+            return allocation
+        runs = await self._lookup(service, service.metadata.generation)
+        if isinstance(runs, ReconcileResult):
+            return runs
+        if runs:
+            # 上一轮已启动运行，只是没能写入 Deploying。
+            run_id = runs[-1].run.run_id
+        else:
+            stopped = await self._stop_previous_deployment(ctx, service)
+            if stopped is not None:
+                return stopped
+            started = await self._start_run(ctx, service, allocation)
+            if isinstance(started, ReconcileResult):
+                return started
+            run_id = started.run_id
+        return _progress(
+            InferencePhase.DEPLOYING,
+            f"deployment workflow run {run_id} started",
+            requeue_after=self._poll_interval,
+        )
+
+    async def _follow_deployment(
+        self, ctx: ReconcileContext, service: InferenceService, phase: str
+    ) -> ReconcileResult:
+        """``Deploying`` / ``Verifying`` 一轮：查询当前 generation 的部署运行并推进。"""
+        meta = service.metadata
+        runs = await self._lookup(service, meta.generation)
+        if isinstance(runs, ReconcileResult):
+            return runs
+        if not runs:
+            return await self._replace_deployment(ctx, service, phase)
+        self._retry_counts.pop(meta.uid, None)
+        run = runs[-1].run
         instance = launched_instance(run)
         if run.status is WorkflowStatus.SUCCEEDED and instance is not None:
             if phase == InferencePhase.DEPLOYING:
@@ -513,6 +624,36 @@ class ReconciliationController(Reconciler):
         ):
             return self._verifying(instance, requeue_after=self._poll_interval)
         return ReconcileResult(done=False, requeue_after=self._poll_interval)
+
+    async def _replace_deployment(
+        self, ctx: ReconcileContext, service: InferenceService, phase: str
+    ) -> ReconcileResult:
+        """没有当前 generation 的运行：停止之前的部署并部署当前的 spec，phase 不变。"""
+        meta = service.metadata
+        previous = await self._lookup(service)
+        if isinstance(previous, ReconcileResult):
+            return previous
+        if not previous:
+            # 运行记录丢失：无法确认是否有实例在运行，分配留到删除资源时释放。
+            run_key = deployment_run_key(meta.uid, meta.generation)
+            return await self._fail(
+                ctx,
+                "WorkflowRunNotFound",
+                f"deployment workflow run {run_key!r} not found",
+                release_allocation=False,
+            )
+        started = await self._deploy(ctx, service)
+        if isinstance(started, ReconcileResult):
+            return started
+        message = (
+            f"generation {meta.generation} replaces the deployment in progress: "
+            f"deployment workflow run {started.run_id} started"
+        )
+        return ReconcileResult(
+            done=False,
+            requeue_after=self._poll_interval,
+            status_patch={"conditions": [_ready_condition("False", phase, message)]},
+        )
 
     @staticmethod
     def _verifying(instance: LaunchedInstance, requeue_after: float) -> ReconcileResult:

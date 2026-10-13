@@ -8,6 +8,8 @@
   就绪），运行成功却还没写入 ``Ready`` 的服务进入 ``Failed``；
 * 部署工作流没能启动时保留分配并重试；部署失败时实例被停止、分配释放，资源停在
   ``Failed``；补偿没能停止的实例在删除资源时停止；
+* 部署过程中 spec 变化：上一代 spec 的运行被取消，服务以新的 spec 进入 ``Ready``；加速器
+  申请变化、持有的设备不再满足时释放分配、重新分配；
 * 部署中途或 ``Ready`` 之后删除资源：取消运行、停止实例、释放分配、物理删除；
 * 在后台运行的控制器自行完成部署与删除。
 
@@ -35,6 +37,7 @@ from forgemesh.controlplane.deployment import (
     LaunchRequest,
     RuntimeLauncher,
     deployment_run_key,
+    find_deployment_runs,
     launched_instance,
     mark_lost_instances,
 )
@@ -74,9 +77,10 @@ NAMESPACE = "team-a"
 NAME = "svc"
 UID = "uid-1"
 KEY = ResourceKey(TENANT, KIND, NAMESPACE, NAME)
-RUN_KEY = deployment_run_key(UID)
+RUN_KEY = deployment_run_key(UID, 1)
 DEDUP_KEY = compute_dedup_key(KIND, NAMESPACE, NAME, UID, 1, "reconcile").key
 GPU = AllocatedDevice(node_id="node-a", device_id="gpu-0")
+LARGE_GPU = AllocatedDevice(node_id="node-a", device_id="gpu-1")
 
 #: 控制器轮询变更、查询部署运行的间隔（秒）。
 POLL_SECONDS = 0.01
@@ -95,18 +99,33 @@ def _inventory() -> Inventory:
     return Inventory.model_validate_json(json.dumps({"nodes": [node]}))
 
 
+def _two_gpu_inventory() -> Inventory:
+    """单节点的清单：一张 24 GiB 的卡（:data:`GPU`）与一张 80 GiB 的卡（:data:`LARGE_GPU`）。"""
+    devices = [
+        {"id": GPU.device_id, "type": "nvidia-gpu", "memoryGiB": 24},
+        {"id": LARGE_GPU.device_id, "type": "nvidia-gpu", "memoryGiB": 80},
+    ]
+    return Inventory.model_validate_json(
+        json.dumps({"nodes": [{"id": GPU.node_id, "devices": devices}]})
+    )
+
+
+def _spec(model: str = "models/llama", min_memory_gib: int = 16) -> InferenceServiceSpec:
+    return InferenceServiceSpec(
+        model=ModelRef(reference=model),
+        runtime=RuntimeRef(provider="vllm"),
+        resources=ResourcesSpec(
+            accelerator=AcceleratorSpec(type="nvidia-gpu", minMemoryGiB=min_memory_gib)
+        ),
+    )
+
+
 def _service() -> InferenceService:
     return InferenceService(
         metadata=ObjectMeta(
             name=NAME, namespace=NAMESPACE, uid=UID, tenant_id=TENANT, generation=1
         ),
-        spec=InferenceServiceSpec(
-            model=ModelRef(reference="models/llama"),
-            runtime=RuntimeRef(provider="vllm"),
-            resources=ResourcesSpec(
-                accelerator=AcceleratorSpec(type="nvidia-gpu", minMemoryGiB=16)
-            ),
-        ),
+        spec=_spec(),
     )
 
 
@@ -183,7 +202,9 @@ class _ControlPlane:
     去重键存储 → 注册表。
     """
 
-    def __init__(self, db: str, launcher: RuntimeLauncher) -> None:
+    def __init__(
+        self, db: str, launcher: RuntimeLauncher, inventory: Inventory | None = None
+    ) -> None:
         self.launcher = launcher
         self.registry = SQLiteRegistry(db)
         self.processed = ProcessedKeyStore(db)
@@ -192,7 +213,7 @@ class _ControlPlane:
         reconciler = ReconciliationController(
             self.registry,
             DefaultPolicyEngine(authz_rules=[AuthzRule(action="reconcile", effect="allow")]),
-            scheduler=FirstFitScheduler(self.registry, _inventory()),
+            scheduler=FirstFitScheduler(self.registry, inventory or _inventory()),
             workflow_runtime=self.runtime,
             release_provider=DeploymentReleaser(self.runtime, launcher),
             processed_store=self.processed,
@@ -231,14 +252,14 @@ class _ControlPlane:
     async def deploy(self, until: Collection[str] = ("Ready", "Failed")) -> list[str]:
         """逐轮协调直到 phase 属于 ``until``，返回每轮之后变化了的 phase。
 
-        每轮之前等部署运行的后台执行结束，各轮看到的运行状态因此是确定的；运行被阻塞时
-        只能推进到启动它的那一轮（``until`` 含 ``Deploying``）。
+        每轮之前等资源全部部署运行的后台执行结束，各轮看到的运行状态因此是确定的；运行被
+        阻塞时只能推进到启动它的那一轮（``until`` 含 ``Deploying``）。
         """
         phases: list[str] = []
         for _ in range(MAX_PASSES):
-            if (run := await self.runtime.find_run(RUN_KEY)) is not None:
+            for deployment in await find_deployment_runs(self.runtime, UID):
                 async with asyncio.timeout(WAIT_SECONDS):
-                    await self.runtime.wait(run.run_id)
+                    await self.runtime.wait(deployment.run.run_id)
             await self.manager.process(KEY)
             phase = (await self.service()).status.phase.value
             if not phases or phases[-1] != phase:
@@ -250,6 +271,13 @@ class _ControlPlane:
     async def delete(self) -> bool:
         """请求删除资源，返回它是否被直接物理删除（否则进入 ``Terminating``）。"""
         return (await self.registry.request_delete(KIND, NAMESPACE, NAME, TENANT)).deleted
+
+    async def update(self, spec: InferenceServiceSpec) -> int:
+        """像 ``PUT`` 一样替换资源的 spec，返回新的 generation。"""
+        service = await self.registry.update_spec(
+            KIND, NAMESPACE, NAME, TENANT, spec.model_dump(mode="json"), labels={}, annotations={}
+        )
+        return service.metadata.generation
 
 
 def _ready(service: InferenceService) -> tuple[str, str | None, str | None]:
@@ -406,6 +434,109 @@ def test_an_instance_that_compensation_could_not_stop_is_stopped_when_the_servic
             assert launcher.stops == [instance.instance_id]
             assert launcher.running == {}
             await _assert_gone(plane)
+
+    asyncio.run(scenario())
+
+
+# ---------------------------------------------------------------------- #
+# 部署过程中 spec 变化
+# ---------------------------------------------------------------------- #
+
+
+async def _block_deployment(plane: _ControlPlane, blocked: str) -> str:
+    """部署到 ``blocked`` 对应的调用开始、这一轮之后的 phase，返回该 phase。"""
+    plane.launcher.block.add(blocked)
+    await plane.deploy(until={"Deploying"})
+    await plane.launcher.wait_entered(blocked)
+    await plane.manager.process(KEY)
+    return await plane.phase()
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("blocked", "phase"),
+    [("launch", "Deploying"), ("verify", "Verifying")],
+    ids=["while-launching", "while-verifying"],
+)
+def test_a_spec_change_during_the_deployment_deploys_the_new_spec(blocked, phase):
+    """部署进行中 spec 变化：phase 不变，上一代 spec 的运行被取消（补偿停止已启动的实例），
+    新的 generation 以同一分配启动自己的运行与实例；服务以新的 spec 进入 Ready
+    （``observedGeneration`` 即新的 generation）。删除时没有留下任何实例。"""
+    launcher = _ScriptedLauncher()
+    new_spec = _spec(model="models/mistral")
+
+    async def scenario() -> None:
+        async with _ControlPlane(":memory:", launcher) as plane:
+            await plane.registry.put(_service())
+            assert await _block_deployment(plane, blocked) == phase
+            [allocation] = await plane.registry.list_allocations(TENANT)
+
+            assert await plane.update(new_spec) == 2
+            launcher.block.clear()
+            await plane.manager.process(KEY)
+
+            service = await plane.service()
+            [run] = await find_deployment_runs(plane.runtime, UID, 1)
+            assert service.status.phase.value == phase
+            assert _ready(service)[:2] == ("False", phase)
+            assert _ready(service)[2].startswith("generation 2 replaces the deployment in progress")
+            assert run.run.status is WorkflowStatus.CANCELLED
+            assert launcher.cancelled == [blocked]
+
+            assert (await plane.deploy())[-1] == "Ready"
+            service = await plane.service()
+            [instance] = launcher.running.values()
+            assert (launcher.launches[-1].instance_key, launcher.launches[-1].spec) == (
+                deployment_run_key(UID, 2),
+                new_spec,
+            )
+            assert service.status.endpoints == [instance.endpoint()]
+            assert (service.metadata.generation, service.metadata.observed_generation) == (2, 2)
+            assert await plane.registry.list_allocations(TENANT) == [allocation]
+
+            assert await plane.delete() is False
+            await plane.manager.process(KEY)
+            assert launcher.running == {}
+            await _assert_gone(plane)
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("blocked", [None, "verify"], ids=["while-preparing", "while-verifying"])
+def test_an_accelerator_change_during_the_deployment_moves_the_service_to_a_fitting_device(
+    blocked,
+):
+    """部署过程中加速器申请变大（至少 40 GiB），持有的 24 GiB 卡不再满足：之前的部署停止、
+    分配释放，新的分配取得 80 GiB 卡，服务以新的 spec 在那张卡上进入 Ready。"""
+    launcher = _ScriptedLauncher()
+
+    async def scenario() -> None:
+        async with _ControlPlane(":memory:", launcher, _two_gpu_inventory()) as plane:
+            await plane.registry.put(_service())
+            if blocked is None:
+                await plane.deploy(until={"Preparing"})
+            else:
+                assert await _block_deployment(plane, blocked) == "Verifying"
+            [previous] = await plane.registry.list_allocations(TENANT)
+            assert previous["devices"] == [GPU.model_dump()]
+
+            await plane.update(_spec(min_memory_gib=40))
+            launcher.block.clear()
+            await plane.manager.process(KEY)
+            assert (await plane.deploy())[-1] == "Ready"
+
+            allocations = {
+                record["idempotency_key"]: (record["status"], record["devices"])
+                for record in await plane.registry.list_allocations(TENANT)
+            }
+            [instance] = launcher.running.values()
+            assert allocations == {
+                f"{UID}:1": ("Released", [GPU.model_dump()]),
+                f"{UID}:2": ("Active", [LARGE_GPU.model_dump()]),
+            }
+            assert launcher.launches[-1].devices == (LARGE_GPU,)
+            assert (await plane.service()).status.endpoints == [instance.endpoint()]
 
     asyncio.run(scenario())
 

@@ -102,13 +102,14 @@ class _BenchmarkWorkflowRuntime:
     async def start(self, defn, inputs, idempotency_key):  # noqa: ANN001
         return RunRef(run_id=idempotency_key, definition_version=1)
 
-    async def find_run(self, idempotency_key: str) -> RunInfo:
-        return RunInfo(
-            run_id=idempotency_key,
+    async def find_runs(self, key_prefix: str) -> dict[str, RunInfo]:
+        run = RunInfo(
+            run_id=key_prefix,
             status=WorkflowStatus.SUCCEEDED,
             steps={LAUNCH_INSTANCE: StepStatus.SUCCEEDED},
             outputs={LAUNCH_INSTANCE: _INSTANCE.model_dump(mode="json")},
         )
+        return {key_prefix: run}
 
 
 class _BenchmarkRelease:

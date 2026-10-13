@@ -153,15 +153,17 @@ class RecordingWorkflow:
         self.idempotency_keys.append(idempotency_key)
         return RunRef(run_id=idempotency_key, definition_version=1)
 
-    async def find_run(self, idempotency_key: str) -> RunInfo | None:
-        if idempotency_key not in self.idempotency_keys:
-            return None
-        return RunInfo(
-            run_id=idempotency_key,
-            status=WorkflowStatus.SUCCEEDED,
-            steps={LAUNCH_INSTANCE: StepStatus.SUCCEEDED},
-            outputs={LAUNCH_INSTANCE: INSTANCE.model_dump(mode="json")},
-        )
+    async def find_runs(self, key_prefix: str) -> dict[str, RunInfo]:
+        return {
+            key: RunInfo(
+                run_id=key,
+                status=WorkflowStatus.SUCCEEDED,
+                steps={LAUNCH_INSTANCE: StepStatus.SUCCEEDED},
+                outputs={LAUNCH_INSTANCE: INSTANCE.model_dump(mode="json")},
+            )
+            for key in self.idempotency_keys
+            if key.startswith(key_prefix)
+        }
 
 
 class RecordingRelease:

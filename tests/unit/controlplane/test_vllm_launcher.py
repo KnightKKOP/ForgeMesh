@@ -56,7 +56,7 @@ def _request(
     devices: tuple[tuple[str, str], ...] = (("node-a", "gpu-0"),),
 ) -> LaunchRequest:
     return LaunchRequest(
-        instance_key=deployment_run_key(uid),
+        instance_key=deployment_run_key(uid, 1),
         tenant_id="tenant-1",
         resource=ResourceRef(kind="InferenceService", namespace="team-a", name="svc", uid=uid),
         spec=InferenceServiceSpec(

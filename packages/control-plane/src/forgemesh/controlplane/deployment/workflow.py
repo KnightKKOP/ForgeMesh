@@ -1,7 +1,7 @@
 """推理服务的部署工作流：准备模型 → 启动实例 → 验证实例。
 
-协调器以 :func:`deployment_run_key` 为幂等键启动工作流（每个资源 uid 一次运行），运行
-输入是 :func:`deployment_inputs` 包装的
+协调器以 :func:`deployment_run_key` 为幂等键启动工作流（资源 uid 的每一代 spec 一次运行，
+:func:`find_deployment_runs` 找回资源的全部运行），运行输入是 :func:`deployment_inputs` 包装的
 :class:`~forgemesh.controlplane.deployment.launcher.LaunchRequest`。各步骤经
 :class:`DeploymentSteps` 调用 :class:`~forgemesh.controlplane.deployment.launcher.RuntimeLauncher`：
 
@@ -33,10 +33,12 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from typing import Any
 
-from forgemesh.workflow.runtime import RunInfo, Step, WorkflowDefinition
+from forgemesh.workflow.runtime import RunInfo, Step, WorkflowDefinition, WorkflowRuntime
 from forgemesh.workflow.states import StepStatus
 
 from .launcher import LaunchedInstance, LaunchRequest, RuntimeLauncher
@@ -57,6 +59,7 @@ VERIFY_TIMEOUT_SECONDS = 1800
 StepCallable = Callable[[Step, dict[str, Any]], Awaitable[dict[str, Any]]]
 
 _USES_PREFIX = "deployment."
+_RUN_KEY_PREFIX = "deployment:"
 #: ``launch-instance`` 处于这些状态时，它启动的实例可能仍在运行。
 _INSTANCE_MAY_RUN = frozenset(
     {StepStatus.SUCCEEDED, StepStatus.COMPENSATING, StepStatus.COMPENSATION_FAILED}
@@ -89,13 +92,54 @@ def deployment_workflow() -> WorkflowDefinition:
     )
 
 
-def deployment_run_key(uid: str) -> str:
-    """资源 ``uid`` 的部署运行的幂等键，也是实例的幂等键（``LaunchRequest.instance_key``）。
+def deployment_run_key(uid: str, generation: int) -> str:
+    """资源 ``uid`` 第 ``generation`` 代 spec 的部署运行的幂等键，也是实例的幂等键
+    （``LaunchRequest.instance_key``），形如 ``deployment:{uid}:{generation}``。
 
-    不含 generation：还没有更新已部署服务的流程，generation 变化时不会再启动一次部署，
-    删除时也总能找到唯一的那次部署，不会留下无人管理的实例。
+    spec 变化（新的 generation）启动新的运行与新的实例；删除资源或重新部署之前，
+    :func:`find_deployment_runs` 找回资源的全部运行，旧实例不会无人管理。
     """
-    return f"deployment:{uid}"
+    return f"{_RUN_KEY_PREFIX}{uid}:{generation}"
+
+
+@dataclass(frozen=True)
+class DeploymentRun:
+    """资源的一次部署运行。
+
+    Attributes:
+        key: 运行的幂等键。
+        generation: 运行部署的 spec 的 generation；1.1.0 之前的运行（键为
+            ``deployment:{uid}``，不含 generation）为 ``None``。
+        run: 运行快照。
+    """
+
+    key: str
+    generation: int | None
+    run: RunInfo
+
+
+async def find_deployment_runs(
+    runtime: WorkflowRuntime, uid: str, generation: int | None = None
+) -> list[DeploymentRun]:
+    """资源 ``uid`` 的部署运行（不创建），按创建先后排列。
+
+    经 :meth:`~forgemesh.workflow.runtime.WorkflowRuntime.find_runs` 按幂等键前缀查找；给出
+    ``generation`` 时只返回部署这一代 spec 的运行，否则返回全部运行，包括 1.1.0 之前的
+    ``deployment:{uid}``。
+    """
+    prefix = f"{_RUN_KEY_PREFIX}{uid}"
+    pattern = re.compile(rf"{re.escape(prefix)}(?::(\d+))?", re.ASCII)
+    if generation is not None:
+        prefix = f"{prefix}:{generation}"
+    runs = []
+    for key, run in (await runtime.find_runs(prefix)).items():
+        match = pattern.fullmatch(key)
+        if match is None:
+            continue
+        found = int(match[1]) if match[1] is not None else None
+        if generation is None or found == generation:
+            runs.append(DeploymentRun(key=key, generation=found, run=run))
+    return runs
 
 
 def deployment_inputs(request: LaunchRequest) -> dict[str, Any]:
@@ -156,10 +200,12 @@ __all__ = [
     "PREPARE_TIMEOUT_SECONDS",
     "VERIFY_INSTANCE",
     "VERIFY_TIMEOUT_SECONDS",
+    "DeploymentRun",
     "DeploymentSteps",
     "StepCallable",
     "deployment_inputs",
     "deployment_run_key",
     "deployment_workflow",
+    "find_deployment_runs",
     "launched_instance",
 ]

@@ -48,9 +48,25 @@ def _make_event(
     )
 
 
+def _put(outbox: Outbox, *events: OutboxEvent) -> None:
+    """在一个事务中写入事件（put 不自行提交）。"""
+    with outbox.database.transaction():
+        for event in events:
+            outbox.put(event)
+
+
 # ---------------------------------------------------------------------- #
 # Outbox 基本操作
 # ---------------------------------------------------------------------- #
+
+
+@pytest.mark.unit
+def test_put_requires_the_callers_transaction() -> None:
+    """put 不自行提交：事务之外调用被拒绝，不写入事件。"""
+    outbox = Outbox()
+    with pytest.raises(RuntimeError, match="inside the caller's transaction"):
+        outbox.put(_make_event())
+    assert outbox.get_stats() == {}
 
 
 @pytest.mark.unit
@@ -58,7 +74,7 @@ def test_put_and_get_pending() -> None:
     """写入事件后可查到 pending。"""
     outbox = Outbox()
     event = _make_event()
-    outbox.put(event)
+    _put(outbox, event)
 
     pending = outbox.get_pending()
     assert len(pending) == 1
@@ -72,7 +88,7 @@ def test_put_and_get_pending() -> None:
 def test_mark_published() -> None:
     """标记后 status 变为 published。"""
     outbox = Outbox()
-    outbox.put(_make_event())
+    _put(outbox, _make_event())
 
     outbox.mark_published("evt-1")
 
@@ -86,7 +102,7 @@ def test_mark_published() -> None:
 def test_mark_published_already_published() -> None:
     """重复标记抛 ValueError。"""
     outbox = Outbox()
-    outbox.put(_make_event())
+    _put(outbox, _make_event())
     outbox.mark_published("evt-1")
 
     with pytest.raises(ValueError, match="already published"):
@@ -97,7 +113,7 @@ def test_mark_published_already_published() -> None:
 def test_mark_failed() -> None:
     """标记失败。"""
     outbox = Outbox()
-    outbox.put(_make_event())
+    _put(outbox, _make_event())
 
     outbox.mark_failed("evt-1", reason="connection refused")
 
@@ -111,9 +127,9 @@ def test_mark_failed() -> None:
 def test_get_stats() -> None:
     """统计各状态数量。"""
     outbox = Outbox()
-    outbox.put(_make_event("evt-1"))
-    outbox.put(_make_event("evt-2"))
-    outbox.put(_make_event("evt-3"))
+    _put(outbox, _make_event("evt-1"))
+    _put(outbox, _make_event("evt-2"))
+    _put(outbox, _make_event("evt-3"))
 
     outbox.mark_published("evt-1")
     outbox.mark_failed("evt-2")
@@ -133,8 +149,8 @@ def test_get_stats() -> None:
 def test_dispatcher_dispatch_once() -> None:
     """Dispatcher 发布事件并标记。"""
     outbox = Outbox()
-    outbox.put(_make_event("evt-1"))
-    outbox.put(_make_event("evt-2"))
+    _put(outbox, _make_event("evt-1"))
+    _put(outbox, _make_event("evt-2"))
 
     published: list[str] = []
 
@@ -153,7 +169,7 @@ def test_dispatcher_dispatch_once() -> None:
 def test_dispatcher_idempotent() -> None:
     """重复 dispatch 不重复处理。"""
     outbox = Outbox()
-    outbox.put(_make_event("evt-1"))
+    _put(outbox, _make_event("evt-1"))
 
     call_count = 0
 
@@ -174,8 +190,8 @@ def test_dispatcher_idempotent() -> None:
 def test_dispatcher_with_async_publisher() -> None:
     """异步 publisher 回调。"""
     outbox = Outbox()
-    outbox.put(_make_event("evt-1"))
-    outbox.put(_make_event("evt-2"))
+    _put(outbox, _make_event("evt-1"))
+    _put(outbox, _make_event("evt-2"))
 
     published: list[str] = []
 

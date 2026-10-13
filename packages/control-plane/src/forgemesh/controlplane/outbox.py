@@ -91,26 +91,32 @@ class Outbox:
         return self._db
 
     def put(self, event: OutboxEvent) -> None:
-        """写入事件并提交。"""
+        """在调用方的事务中写入事件，不提交：事件随业务写入一起提交或回滚。
 
-        def _put() -> None:
-            self._conn.execute(
-                "INSERT INTO outbox_events (event_id, aggregate_type, aggregate_id, "
-                "event_type, payload, created_at, status) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (
-                    event.event_id,
-                    event.aggregate_type,
-                    event.aggregate_id,
-                    event.event_type,
-                    json.dumps(event.payload, ensure_ascii=False),
-                    event.created_at,
-                    event.status,
-                ),
-            )
-            self._conn.commit()
+        调用方须持有 :attr:`database` 的锁并已开启事务，例如在
+        :meth:`Database.transaction <forgemesh.controlplane.sqlite.Database.transaction>`
+        中，或在 :meth:`Database.call <forgemesh.controlplane.sqlite.Database.call>`
+        执行的写入函数里、业务写入之后。
 
-        self._db.call(_put)
+        Raises:
+            RuntimeError: 连接上没有进行中的事务（事件不会写入）。
+        """
+        if not self._conn.in_transaction:
+            raise RuntimeError("Outbox.put must run inside the caller's transaction")
+        self._conn.execute(
+            "INSERT INTO outbox_events (event_id, aggregate_type, aggregate_id, "
+            "event_type, payload, created_at, status) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                event.event_id,
+                event.aggregate_type,
+                event.aggregate_id,
+                event.event_type,
+                json.dumps(event.payload, ensure_ascii=False),
+                event.created_at,
+                event.status,
+            ),
+        )
 
     def get_pending(self, limit: int = 100) -> list[OutboxEvent]:
         """获取待发布事件，按创建时间升序排列。"""

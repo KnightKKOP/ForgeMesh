@@ -15,6 +15,7 @@
     Pending → Scheduling → Preparing → Deploying → Verifying → Ready
     Ready ↔ Degraded / Updating
     Degraded → Updating（降级的服务 spec 变化时同样经 Updating 重新部署）
+    Failed → Pending（spec 变化时重新部署；没有自动重试）
     任意非终态（含 Failed / Unknown）→ Terminating（删除入口，受控释放）
     任意非终态 → Failed / Unknown
     Terminating → ∅（唯一终态，无出边；finalizer 清空后由注册表物理删除）
@@ -22,7 +23,8 @@
 其中 ``Terminating`` 是**唯一终态**：进入后无任何出边，由协调器驱动
 「受控释放 → 清空 finalizer → 物理删除」闭环（对齐 development-plan 第 7 章）。
 ``Failed`` / ``Unknown`` 不再是吸收态——允许 ``Failed / Unknown → Terminating``
-以便人工清理失败资源（删除入口必须对所有现实状态可达）。
+以便人工清理失败资源（删除入口必须对所有现实状态可达）。``Failed`` 只经
+``Pending`` 重新部署：与新建的资源一样从策略校验开始，不跳过部署流程中的任何一步。
 
 **分配转移语义**（``ALLOCATION_TRANSITIONS``）::
 
@@ -170,6 +172,7 @@ INFERENCE_TRANSITIONS: dict[str, set[str]] = {
     },
     InferencePhase.TERMINATING.value: set(),
     InferencePhase.FAILED.value: {
+        InferencePhase.PENDING.value,
         InferencePhase.TERMINATING.value,
     },
     InferencePhase.UNKNOWN.value: {

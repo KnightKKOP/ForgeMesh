@@ -7,7 +7,8 @@
   不会再分配；实例没有活过重启时，``Ready`` 的服务转为 ``Degraded``（endpoint 标记为未
   就绪），运行成功却还没写入 ``Ready`` 的服务进入 ``Failed``；
 * 部署工作流没能启动时保留分配并重试；部署失败时实例被停止、分配释放，资源停在
-  ``Failed``；补偿没能停止的实例在删除资源时停止；
+  ``Failed``，修改 spec 之后从 ``Pending`` 重新部署；补偿没能停止的实例在删除资源或重新
+  部署时停止；
 * 部署过程中 spec 变化：上一代 spec 的运行被取消，服务以新的 spec 进入 ``Ready``；加速器
   申请变化、持有的设备不再满足时释放分配、重新分配；
 * ``Ready`` 的服务 spec 变化：经 ``Updating`` 停止旧实例、部署新的 spec 后回到 ``Ready``；
@@ -388,7 +389,7 @@ def test_a_workflow_that_fails_to_start_is_retried_with_the_same_allocation(monk
 @pytest.mark.unit
 def test_a_failed_deployment_stops_its_instance_releases_its_allocation_and_stays_failed():
     """验证用尽重试：工作流补偿停止实例，资源进入 Failed（``Ready=False``，消息是失败的
-    步骤），分配释放；Failed 是终态，之后的协调不再部署，删除时直接物理删除。"""
+    步骤），分配释放；没有自动重试，spec 不变时之后的协调不再部署，删除时直接物理删除。"""
     launcher = _ScriptedLauncher()
     launcher.fail.add("verify")
 
@@ -748,6 +749,77 @@ def test_an_update_the_policy_denies_leaves_the_service_serving_until_it_is_allo
 
 
 # ---------------------------------------------------------------------- #
+# 失败之后修改 spec
+# ---------------------------------------------------------------------- #
+
+
+@pytest.mark.unit
+def test_a_failed_service_is_deployed_again_once_its_spec_changes():
+    """部署失败（分配已释放）之后修改 spec：服务回到 Pending，与新建的资源一样逐轮部署，
+    以新的 spec 进入 Ready（``observedGeneration`` 即新的 generation）。"""
+    launcher = _ScriptedLauncher()
+    launcher.fail.add("verify")
+    new_spec = _spec(model="models/mistral")
+
+    async def scenario() -> None:
+        async with _ControlPlane(":memory:", launcher) as plane:
+            await plane.registry.put(_service())
+            assert (await plane.deploy())[-1] == "Failed"
+            launcher.fail.clear()
+
+            assert await plane.update(new_spec) == 2
+            assert await plane.deploy() == [
+                "Pending",
+                "Scheduling",
+                "Preparing",
+                "Deploying",
+                "Verifying",
+                "Ready",
+            ]
+            service = await plane.service()
+            [instance] = launcher.running.values()
+            assert (launcher.launches[-1].instance_key, launcher.launches[-1].spec) == (
+                deployment_run_key(UID, 2),
+                new_spec,
+            )
+            assert service.status.endpoints == [instance.endpoint()]
+            assert (service.metadata.generation, service.metadata.observed_generation) == (2, 2)
+            assert {
+                record["idempotency_key"]: record["status"]
+                for record in await plane.registry.list_allocations(TENANT)
+            } == {f"{UID}:1": "Released", f"{UID}:2": "Active"}
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.unit
+def test_an_instance_left_behind_by_a_failed_deployment_is_stopped_before_the_redeployment():
+    """补偿没能停止实例（服务 Failed、保留分配）之后修改 spec：新的部署复用这份分配，启动
+    新的部署运行之前停止遗留的实例，最后只有新的实例在运行。"""
+    launcher = _ScriptedLauncher()
+    launcher.fail.add("verify")
+    launcher.stop_failures = 1
+
+    async def scenario() -> None:
+        async with _ControlPlane(":memory:", launcher) as plane:
+            await plane.registry.put(_service())
+            assert (await plane.deploy())[-1] == "Failed"
+            [left_behind] = launcher.running.values()
+            [allocation] = await plane.registry.list_allocations(TENANT)
+            launcher.fail.clear()
+
+            await plane.update(_spec(model="models/mistral"))
+            assert (await plane.deploy())[-1] == "Ready"
+            [instance] = launcher.running.values()
+            assert launcher.stops == [left_behind.instance_id]
+            assert instance.instance_id != left_behind.instance_id
+            assert launcher.launches[-1].allocation_id == allocation["id"]
+            assert await plane.registry.list_allocations(TENANT) == [allocation]
+
+    asyncio.run(scenario())
+
+
+# ---------------------------------------------------------------------- #
 # 重放与重启
 # ---------------------------------------------------------------------- #
 
@@ -868,7 +940,7 @@ def test_an_instance_lost_between_a_successful_run_and_ready_fails_the_service(t
                 "False",
                 "InstanceLost",
                 f"instance {instance.instance_id} at {instance.url} is not running any more; "
-                "delete and re-create the service to deploy it again",
+                "change the spec or re-create the service to deploy it again",
             )
             assert await plane.registry.get_active_allocation(UID, TENANT) is None
             assert await plane.registry.allocated_devices() == frozenset()

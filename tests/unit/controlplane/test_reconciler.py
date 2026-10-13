@@ -1135,13 +1135,13 @@ def test_a_failed_run_lookup_keeps_the_phase_and_backs_off():
     [
         (InferencePhase.READY, 2),
         (InferencePhase.DEGRADED, 2),
-        (InferencePhase.FAILED, 1),
+        (InferencePhase.FAILED, 2),
         (InferencePhase.UNKNOWN, 1),
     ],
 )
 def test_services_outside_a_deployment_are_left_alone(phase, observed_generation):
-    """部署之外没有可做的事：spec 没有变化的服务中的资源，以及 Failed（不自动重试）与
-    Unknown。"""
+    """部署之外没有可做的事：spec 没有变化的 Ready / Degraded / Failed（不自动重试），以及
+    Unknown（spec 变化也一样）。"""
     scheduler = MockScheduler()
     workflow = StubWorkflowRuntime()
     controller = _controller(scheduler=scheduler, workflow=workflow)
@@ -1154,6 +1154,37 @@ def test_services_outside_a_deployment_are_left_alone(phase, observed_generation
     assert (result.done, result.requeue_after, result.status_patch) == (True, None, {})
     assert scheduler.allocate_called is False
     assert (workflow.started, workflow.lookups) == ([], [])
+
+
+@pytest.mark.unit
+def test_a_failed_service_whose_spec_changed_goes_back_to_pending():
+    """Failed 且 spec 变化：回到 Pending、清空 endpoint，立即重新排队；这一轮没有副作用，
+    不评估策略（Pending 一轮像对新建的资源一样授权），不登记去重键。"""
+    policy = SequencePolicyEngine("deny")
+    scheduler = MockScheduler()
+    workflow = StubWorkflowRuntime(run=make_run(WorkflowStatus.FAILED))
+    release = StubReleaseProvider()
+    controller = _controller(policy=policy, scheduler=scheduler, workflow=workflow, release=release)
+    service = make_inference_service(
+        phase=InferencePhase.FAILED, generation=2, observed_generation=1
+    )
+    ctx = make_service_context(service)
+
+    result = asyncio.run(controller.reconcile(ctx))
+
+    assert (result.done, result.requeue_after) == (False, 0.0)
+    assert result.status_patch == {
+        "phase": "Pending",
+        "endpoints": [],
+        **_not_ready("Pending", "the spec changed (generation 2); deploying it again"),
+    }
+    assert (policy.calls, scheduler.requests, workflow.lookups, release.released) == (
+        0,
+        [],
+        [],
+        [],
+    )
+    assert ctx.dedup_key not in controller._processed_keys
 
 
 # ---------------------------------------------------------------------- #

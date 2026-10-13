@@ -68,13 +68,15 @@ generation 的运行（spec 在部署过程中变化，或运行来自 1.1.0 之
   不返回步骤输出）时同样进入 ``Failed`` 并保留分配。
 * 运行成功、实例却已不在运行（如控制平面在运行成功之后、写入 ``Ready`` 之前重启，
   实例随进程结束）：``phase=Failed``、``Ready=False``（``InstanceLost``），释放分配。
-* ``Failed`` 是终态：资源状态机只允许它转入 ``Terminating``，协调器不自动重试，删除后
-  重新创建资源即可再次部署。
+* ``Failed`` 不自动重试。spec 变化（``generation`` 大于 ``observedGeneration``）时回到
+  ``Pending``（``Ready=False``，原因 ``Pending``，这一轮没有副作用），之后与新建的资源一样
+  经过策略校验、分配与部署：补偿没能停止的实例在启动新的部署运行之前停止，仍持有的分配
+  满足新的申请时复用。spec 没有变化时删除后重新创建资源即可再次部署。
 
 需要分配或执行工作流、却未注入对应组件时，在任何副作用之前返回 ``Ready=False``
 （``SchedulerUnavailable`` / ``WorkflowRuntimeUnavailable``）。没有 ``metadata.uid`` 的
 资源报告 ``MissingUid``，不是 ``InferenceService`` 的资源报告 ``NotDeployable``。spec 没有
-变化的 ``Ready`` / ``Degraded``，以及 ``Failed`` / ``Unknown`` 的资源没有可做的事。
+变化的 ``Ready`` / ``Degraded`` / ``Failed``，以及 ``Unknown`` 的资源没有可做的事。
 
 终止协调（Terminating，对齐 architecture.md §5.3/§12.4 与 development-plan
 第 7 章删除闭环）
@@ -333,6 +335,8 @@ class ReconciliationController(Reconciler):
         # 注意：失败路径不登记 dedup_key，保证 requeue 重试。
         if phase == InferencePhase.TERMINATING:
             return await self._reconcile_terminating(ctx)
+        if phase == InferencePhase.FAILED:
+            return await self._reconcile_failed(ctx)
 
         diff = self._compute_diff(resource, ctx.observed)
         if not diff["needs_reconcile"]:
@@ -710,7 +714,7 @@ class ReconciliationController(Reconciler):
                     ctx,
                     "InstanceLost",
                     f"instance {instance.instance_id} at {instance.url} is not running any "
-                    "more; delete and re-create the service to deploy it again",
+                    "more; change the spec or re-create the service to deploy it again",
                     release_allocation=True,
                 )
             return await self._ready(ctx, instance)
@@ -839,6 +843,29 @@ class ReconciliationController(Reconciler):
             status_patch={
                 "phase": InferencePhase.FAILED.value,
                 "conditions": [_ready_condition("False", reason, message)],
+            },
+        )
+
+    async def _reconcile_failed(self, ctx: ReconcileContext) -> ReconcileResult:
+        """``Failed`` 一轮：spec 变化时回到 ``Pending`` 重新部署，否则没有可做的事。
+
+        这一轮没有副作用，也不评估策略：``Pending`` 一轮像对新建的资源一样授权这次部署，
+        之前的实例与分配由之后的部署轮次停止、复用或替换。
+        """
+        meta = ctx.resource.metadata
+        if meta.generation <= meta.observed_generation:
+            await self._mark_processed(ctx.dedup_key)
+            return ReconcileResult(done=True)
+        if meta.uid:
+            self._retry_counts.pop(meta.uid, None)
+        message = f"the spec changed (generation {meta.generation}); deploying it again"
+        return ReconcileResult(
+            done=False,
+            requeue_after=0.0,
+            status_patch={
+                "phase": InferencePhase.PENDING.value,
+                "endpoints": [],
+                "conditions": [_ready_condition("False", InferencePhase.PENDING.value, message)],
             },
         )
 
@@ -1011,7 +1038,8 @@ class ReconciliationController(Reconciler):
         * phase 尚未观测到（``None``）或处于部署 / 更新过程中（``Pending`` 到 ``Verifying``、
           ``Updating``）时需要协调；
         * ``Ready`` / ``Degraded`` 只在 spec 变化（``generation`` 大于 ``observedGeneration``）
-          时需要协调（开始更新）；其余 phase（``Failed`` / ``Unknown``）没有可做的事。
+          时需要协调（开始更新）；其余 phase 没有可做的事（:meth:`reconcile` 在此之前处理
+          ``Terminating`` 与 ``Failed``）。
         * ``needs_allocation``：本轮或之后的轮次要调用调度器（``Preparing`` 及之前，以及开始
           更新的一轮）；``needs_workflow``：每一轮都要用到工作流运行时；``requirements``
           为传给调度器的需求（见 :func:`_scheduling_requirements`）。

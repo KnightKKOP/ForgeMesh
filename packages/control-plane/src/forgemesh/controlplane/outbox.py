@@ -6,7 +6,8 @@
 投递语义
 --------
 * **至少一次**：事件发布成功后才标记 ``published``；发布成功、标记之前进程退出时，
-  重启后会再次发布。消费者须按 ``event_id`` 去重（:class:`IdempotentConsumer`）。
+  重启后会再次发布。消费者须按 ``event_id`` 去重（:class:`IdempotentConsumer` 把已处理
+  的事件记在 ``consumed_events`` 表中）。
 * **状态只在数据库中**：``pending`` → ``published``；发布失败时记录失败次数
   ``attempts`` 与最近一次错误 ``last_error``，按指数退避推迟 ``next_attempt_at``
   （:class:`RetryPolicy`）；失败次数达到上限后进入 ``dead``，不再自动重试，可经
@@ -24,6 +25,7 @@ import inspect
 import json
 import logging
 import sqlite3
+import threading
 import time
 import uuid
 from collections.abc import Callable, Iterable
@@ -52,6 +54,15 @@ CREATE TABLE IF NOT EXISTS outbox_events (
     last_error TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_outbox_status ON outbox_events(status, created_at);
+"""
+
+_CONSUMED_SCHEMA_SQL = """\
+CREATE TABLE IF NOT EXISTS consumed_events (
+    consumer TEXT NOT NULL,
+    event_id TEXT NOT NULL,
+    consumed_at REAL NOT NULL,
+    PRIMARY KEY (consumer, event_id)
+);
 """
 
 #: v1.0.0 的 ``outbox_events`` 没有的列（打开存量库时补齐）。
@@ -561,33 +572,87 @@ class Dispatcher:
 
 
 class IdempotentConsumer:
-    """幂等消费者：按 event_id 去重。
+    """幂等消费者：按 event_id 去重，已处理的事件记在 SQLite 中，进程重启后仍然有效。
 
-    重复投递同一 event_id 的事件不会重复执行 handler。
+    handler 正常返回后才记录事件：handler 抛出异常时不记录，再次投递时重新处理。
+    handler 返回之后、记录之前进程退出时，重启后会再处理一次，因此有外部副作用的
+    handler 仍应自身幂等。同一个实例的 :meth:`consume` 串行执行，同一事件不会被
+    并发处理两次。
+
+    Args:
+        name: 消费者名称；不同名称各自去重，可共用一张表。
+        db_path: SQLite 数据库路径，默认 :memory:（只在进程内有效）。
+        database: 共用的数据库；给出时忽略 ``db_path``，:meth:`close` 不关闭它
+            （由创建者关闭）。
+
+    Raises:
+        ValueError: ``name`` 为空。
     """
 
-    def __init__(self) -> None:
-        self._processed_ids: set[str] = set()
+    def __init__(
+        self,
+        name: str = "default",
+        db_path: str = ":memory:",
+        *,
+        database: Database | None = None,
+    ) -> None:
+        if not name:
+            raise ValueError("consumer name must not be empty")
+        self._name = name
+        self._owns_db = database is None
+        self._db = database if database is not None else Database(db_path)
+        self._conn = self._db.conn
+        self._consume_lock = threading.Lock()
+        with self._db.lock:
+            self._conn.executescript(_CONSUMED_SCHEMA_SQL)
+            self._conn.commit()
 
     def is_processed(self, event_id: str) -> bool:
         """检查是否已处理过。"""
-        return event_id in self._processed_ids
+        row = self._db.call(
+            lambda: self._conn.execute(
+                "SELECT 1 FROM consumed_events WHERE consumer = ? AND event_id = ?",
+                (self._name, event_id),
+            ).fetchone()
+        )
+        return row is not None
 
     def consume(self, event: OutboxEvent, handler: Callable[[OutboxEvent], Any]) -> bool:
         """消费事件（幂等）。
 
-        返回 True 表示首次处理，False 表示重复跳过。
+        返回 True 表示首次处理，False 表示重复跳过；handler 的异常原样抛出，
+        事件不记为已处理。
         """
-        if event.event_id in self._processed_ids:
-            return False
-        handler(event)
-        self._processed_ids.add(event.event_id)
-        return True
+        with self._consume_lock:
+            if self.is_processed(event.event_id):
+                return False
+            handler(event)
+
+            def _record() -> None:
+                self._conn.execute(
+                    "INSERT INTO consumed_events (consumer, event_id, consumed_at) "
+                    "VALUES (?, ?, ?) ON CONFLICT (consumer, event_id) DO NOTHING",
+                    (self._name, event.event_id, time.time()),
+                )
+                self._conn.commit()
+
+            self._db.call(_record)
+            return True
 
     @property
     def processed_count(self) -> int:
         """已处理事件数。"""
-        return len(self._processed_ids)
+        row = self._db.call(
+            lambda: self._conn.execute(
+                "SELECT COUNT(*) FROM consumed_events WHERE consumer = ?", (self._name,)
+            ).fetchone()
+        )
+        return int(row[0])
+
+    def close(self) -> None:
+        """关闭数据库连接（共用的 ``database`` 由创建者关闭）。"""
+        if self._owns_db:
+            self._db.close()
 
 
 __all__ = [

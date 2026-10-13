@@ -7,12 +7,10 @@
 * 重复发布：Dispatcher 对同一 Outbox 记录重复发布（发布后标记前崩溃重试）
   时，消费者侧按 eventId 去重，副作用只发生一次；
 * 消费者提交失败：消费者处理成功但确认丢失后，重新投递不产生重复副作用；
+  去重记录持久化，消费者重启后同样成立；
 * 退避重试与死信：发布失败按指数退避重试，目标恢复后最终送达；失败次数达到
   上限后进入 ``dead``、可查询、不再自动重试，可经 ``redrive`` 重新投递；
 * 重启：发布状态只在数据库中，已发布的事件不会再次发布。
-
-记录性测试：``IdempotentConsumer`` 去重状态仅存内存，进程重启后重复投递会
-产生重复副作用；以测试固化当前行为并在 docstring 标注 v1.1 后续期望。
 """
 
 from __future__ import annotations
@@ -216,29 +214,27 @@ def test_redelivery_after_ack_loss_no_duplicate_side_effect() -> None:
 
 
 @pytest.mark.contract
-def test_consumer_dedup_is_in_memory_only_after_restart() -> None:
-    """记录性测试：消费者去重状态仅存内存，重启后重复投递会产生重复副作用。
-
-    当前实现 ``IdempotentConsumer._processed_ids`` 为进程内集合，无持久化。
-    v1.1 期望 eventId 去重状态持久化（如 processed_events 表），
-    使重启后重新投递仍不产生重复副作用；届时本测试应改为断言副作用仅一次。
-    """
+def test_consumer_dedup_survives_restart(tmp_path) -> None:
+    """消费者去重记录持久化：重启后重新投递不产生重复副作用。"""
+    path = str(tmp_path / "consumer.db")
     event = _make_event("evt-restart")
     side_effects: list[str] = []
 
     def handler(ev: OutboxEvent) -> None:
         side_effects.append(ev.event_id)
 
-    consumer_before = IdempotentConsumer()
-    consumer_before.consume(event, handler)  # 重启前已处理过一次
+    consumer_before = IdempotentConsumer("billing", path)
+    assert consumer_before.consume(event, handler) is True  # 重启前已处理过一次
+    consumer_before.close()
 
-    # 模拟进程重启：新实例的内存去重集合为空。
-    consumer_after = IdempotentConsumer()
-    redelivered = consumer_after.consume(event, handler)
-
-    # 当前行为：重复投递被误判为首次，副作用重复执行。
-    assert redelivered is True
-    assert side_effects == ["evt-restart", "evt-restart"]
+    # 模拟进程重启：新实例从数据库读取去重记录。
+    consumer_after = IdempotentConsumer("billing", path)
+    try:
+        assert consumer_after.consume(event, handler) is False
+        assert consumer_after.is_processed("evt-restart") is True
+    finally:
+        consumer_after.close()
+    assert side_effects == ["evt-restart"]
 
 
 # ---------------------------------------------------------------------- #

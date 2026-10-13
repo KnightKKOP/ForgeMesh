@@ -12,7 +12,8 @@
 * Dispatcher 幂等（重复 dispatch 不重复处理）；
 * Dispatcher 异步 publisher 回调；
 * Dispatcher 后台运行：持续发布、数据库错误后继续、停止与超时取消；
-* 幂等消费者首次消费 / 重复消费 / 计数。
+* 幂等消费者首次消费 / 重复消费 / 计数、handler 失败不记录、按名称去重、
+  并发投递只处理一次。
 
 测试以 ``asyncio.run`` 驱动异步方法，不依赖 pytest-asyncio。
 """
@@ -20,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import sqlite3
+import time
 
 import pytest
 from forgemesh.controlplane.outbox import (
@@ -547,3 +549,57 @@ def test_idempotent_consumer_count() -> None:
     assert consumer.processed_count == 3
     assert consumer.is_processed("evt-1") is True
     assert consumer.is_processed("evt-4") is False
+
+
+@pytest.mark.unit
+def test_idempotent_consumer_does_not_record_a_failed_handler() -> None:
+    """handler 抛出异常：事件不记为已处理，再次投递时重新处理。"""
+    consumer = IdempotentConsumer()
+    calls: list[str] = []
+
+    def flaky(ev: OutboxEvent) -> None:
+        calls.append(ev.event_id)
+        if len(calls) == 1:
+            raise RuntimeError("downstream unavailable")
+
+    with pytest.raises(RuntimeError, match="downstream unavailable"):
+        consumer.consume(_make_event(), flaky)
+    assert consumer.is_processed("evt-1") is False
+    assert consumer.consume(_make_event(), flaky) is True
+    assert calls == ["evt-1", "evt-1"]
+
+
+@pytest.mark.unit
+def test_idempotent_consumers_dedupe_per_name_on_a_shared_database() -> None:
+    """不同名称的消费者各自去重；可与 Outbox 共用一个数据库。"""
+    outbox = Outbox()
+    billing = IdempotentConsumer("billing", database=outbox.database)
+    audit = IdempotentConsumer("audit", database=outbox.database)
+
+    assert billing.consume(_make_event(), lambda ev: None) is True
+    assert billing.consume(_make_event(), lambda ev: None) is False
+    assert audit.consume(_make_event(), lambda ev: None) is True
+    billing.close()  # 共用的数据库不随之关闭
+    assert audit.processed_count == 1
+    with pytest.raises(ValueError, match="must not be empty"):
+        IdempotentConsumer("")
+
+
+@pytest.mark.unit
+def test_idempotent_consumer_handles_concurrent_deliveries_once() -> None:
+    """同一事件被并发投递：handler 只执行一次。"""
+    consumer = IdempotentConsumer()
+    calls: list[str] = []
+
+    def slow(ev: OutboxEvent) -> None:
+        calls.append(ev.event_id)
+        time.sleep(0.01)
+
+    async def deliver_concurrently() -> list[bool]:
+        return await asyncio.gather(
+            *(asyncio.to_thread(consumer.consume, _make_event(), slow) for _ in range(8))
+        )
+
+    results = _run(deliver_concurrently())
+    assert sorted(results) == [False] * 7 + [True]
+    assert calls == ["evt-1"]

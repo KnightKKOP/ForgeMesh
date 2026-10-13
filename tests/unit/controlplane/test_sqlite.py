@@ -13,13 +13,14 @@
 from __future__ import annotations
 
 import asyncio
+import functools
 import inspect
 import sqlite3
 import time
 
 import pytest
 from forgemesh.controlplane.audit import AuditLog
-from forgemesh.controlplane.outbox import Outbox, OutboxEvent
+from forgemesh.controlplane.outbox import IdempotentConsumer, Outbox, OutboxEvent
 from forgemesh.controlplane.reconciler import ProcessedKeyStore
 from forgemesh.controlplane.registry import SQLiteRegistry
 from forgemesh.controlplane.sqlite import Database, connect, workflow_db_path
@@ -60,7 +61,15 @@ def test_connect_accepts_memory_database() -> None:
 
 @pytest.mark.unit
 @pytest.mark.parametrize(
-    "open_store", [SQLiteRegistry, ProcessedKeyStore, TaskStore, AuditLog, Outbox]
+    "open_store",
+    [
+        SQLiteRegistry,
+        ProcessedKeyStore,
+        TaskStore,
+        AuditLog,
+        Outbox,
+        pytest.param(functools.partial(IdempotentConsumer, "wal"), id="IdempotentConsumer"),
+    ],
 )
 def test_stores_open_the_database_in_wal_mode(tmp_path, open_store) -> None:
     path = str(tmp_path / "cp.db")

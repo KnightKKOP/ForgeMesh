@@ -575,16 +575,17 @@ def test_wait_for_a_missing_service_fails_with_not_found(
     assert clock.sleeps == []
 
 
-def test_wait_for_delete_returns_once_the_service_is_gone(
+def test_wait_for_delete_reports_the_same_result_whether_or_not_it_saw_the_service(
     api: FakeApi, cli: Cli, clock: FakeClock
 ) -> None:
     api.reply("GET", PATH, 200, resource(document(), phase="Terminating"))
 
-    deleted = cli("wait", "inferenceservice", "llama", "-n", "default", "--for", "delete")
-    missing = cli("wait", "inferenceservice", "llama", "-n", "default", "--for", "delete")
+    observed = cli("wait", "inferenceservice", "llama", "-n", "default", "--for", "delete")
+    already_gone = cli("wait", "inferenceservice", "llama", "-n", "default", "--for", "delete")
 
-    assert (deleted.code, deleted.out) == (0, "InferenceService default/llama deleted\n")
-    assert (missing.code, missing.out) == (0, "InferenceService default/llama not found\n")
+    deleted = Result(ExitCode.OK, "InferenceService default/llama deleted\n", "")
+    assert (observed, already_gone) == (deleted, deleted)
+    assert api.log() == [f"GET {PATH}?namespace=default"] * 3
     assert clock.sleeps == [1.0]
 
 

@@ -54,7 +54,7 @@ exit codes:
   0    success
   1    other errors, e.g. the URL does not serve the ForgeMesh API
   2    invalid arguments, configuration or resource documents (nothing sent)
-  3    not found (HTTP 404)
+  3    not found (HTTP 404); wait --for delete exits 0 instead
   4    conflict (HTTP 409), e.g. the service is being deleted
   5    request rejected (HTTP 400, 405, 413, 415 and other 4xx)
   6    authentication or authorization failed (HTTP 401, 403)

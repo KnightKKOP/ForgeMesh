@@ -166,12 +166,14 @@ def cmd_wait(args: argparse.Namespace, client: ApiClient) -> int:
     ``spec``（``observedGeneration`` 不小于 ``generation``）。资源正在删除，或控制器处理当前的
     ``spec`` 之后进入 ``Failed`` 时立即失败。API 应答过一次之后，限流、``502`` - ``504`` 与连接
     失败视为暂时故障，继续等待。
+
+    ``--for delete`` 在资源不存在时成功。开始等待时资源已经不存在，输出与等到它被删除时相同：
+    ``delete`` 之后控制器可能在第一次读取之前就删除了资源，结果不能取决于这个先后。
     """
     ref = f"{KIND} {resource_ref(args.namespace, args.name)}"
     goal = "become Ready" if args.condition == "ready" else "be deleted"
     deadline = time.monotonic() + args.timeout
     answered = False
-    seen = False
     last = "no response"
     while True:
         delay = POLL_INTERVAL_SECONDS
@@ -180,7 +182,7 @@ def cmd_wait(args: argparse.Namespace, client: ApiClient) -> int:
         except ApiError as exc:
             answered = True
             if exc.not_found and args.condition == "delete":
-                print(f"{ref} deleted" if seen else f"{ref} not found")
+                print(f"{ref} deleted")
                 return ExitCode.OK
             if not exc.transient:
                 raise _not_found_hint(exc, args.namespace) from exc
@@ -191,7 +193,7 @@ def cmd_wait(args: argparse.Namespace, client: ApiClient) -> int:
                 raise
             last = exc.message
         else:
-            answered = seen = True
+            answered = True
             if args.condition == "ready":
                 outcome, last = _readiness(service)
                 if outcome is True:

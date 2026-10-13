@@ -12,9 +12,9 @@ ForgeMesh 控制平面（`forgemesh-control-plane`）把权威状态存放在 SQ
 |------|----|------|------|
 | `forgemesh.db` | `resources` / `allocations` / `allocation_devices` / `resource_changes` | `forgemesh.controlplane.registry.SQLiteRegistry` | 资源对象（spec/status/conditions）、资源分配记录及其占用的设备、控制器读取的变更记录 |
 | `forgemesh.db` | `processed_dedup_keys` | `forgemesh.controlplane.reconciler.dedup.ProcessedKeyStore` | 控制器已处理的去重键 |
-| `forgemesh.workflows.db` | `workflow_runs` / `workflow_steps` | `forgemesh.workflowruntime.store.WorkflowStore` | 每个推理服务（按 `uid`，幂等键 `deployment:{uid}`）的部署工作流运行及其各步骤的状态与结果（含启动的实例 id 与地址） |
+| `forgemesh.workflows.db` | `workflow_runs` / `workflow_steps` | `forgemesh.workflowruntime.store.WorkflowStore` | 每个推理服务每一代 `spec` 的部署工作流运行（幂等键 `deployment:{uid}:{generation}`，实例丢失后重新部署的第 n 次追加 `:{n}`）及其各步骤的状态与结果（含启动的实例 id 与地址） |
 
-两个文件之间没有共同的事务，备份与恢复时把它们当作一组，见 2.6 节。推理实例本身不在任何文件中：它们随控制平面进程结束，恢复之后的情况见 3.5 节。
+两个文件之间没有共同的事务，备份与恢复时把它们当作一组，见 2.6 节。推理实例本身不在任何文件中：它们活不过控制平面的重启，恢复之后的情况见 3.5 节。`vllm-process` / `tgi-process` 启动器还在同一目录下的 `forgemesh.instances.json` 中记录正在运行的实例进程，控制平面被杀死之后，下次启动时据此结束留下的实例；这个文件不需要备份，也不需要随恢复处理（另一次开机的记录被忽略，记录的进程已不在时只删去记录）。
 
 审计日志（`forgemesh.controlplane.audit.AuditLog`）、决策记录（`forgemesh.decision.records.DecisionRecordStore`）等其他 SQLite 存储默认使用内存库，控制平面进程不会打开它们；嵌入方把它们指向文件时，按本文同样的方法逐个备份。
 
@@ -218,7 +218,7 @@ done
 
 例外是两次快照之间才开始部署的服务：注册表快照中它还没有分配（或者根本还不存在），工作流存储快照中却已有它未结束的部署运行，恢复之后控制平面启动时继续这个运行。快照时实例已经启动的，运行在验证实例时失败，服务（若存在）随之进入 `Failed`；还没有启动实例的，运行在两次快照之间分配到的设备上启动实例，而恢复后的注册表没有这份分配，可能把这些设备再分配给其他服务；服务本身不存在时，这个实例没有任何服务引用，一直运行到控制平面下一次停止（之后运行已结束，不会再继续）。需要排除这些情况时，停止控制平面之后再备份。
 
-恢复时两个文件必须取自同一组备份（3.2 的脚本按备份文件名配对，3.4 按目录）。只恢复注册表、保留更新的工作流存储，相当于把两次快照的间隔拉长到备份之后的全部时间，备份之后开始部署的服务都会出现上面的情况。一组备份中没有工作流存储时（备份时还没有部署推理服务），把现有的工作流存储移走（3.2 的脚本与 3.4 的命令都会这样做），控制平面启动时新建一个空的：注册表中仍在部署的服务找不到部署运行，进入 `Failed`（`WorkflowRunNotFound`），删除后重新创建即可。
+恢复时两个文件必须取自同一组备份（3.2 的脚本按备份文件名配对，3.4 按目录）。只恢复注册表、保留更新的工作流存储，相当于把两次快照的间隔拉长到备份之后的全部时间，备份之后开始部署的服务都会出现上面的情况。一组备份中没有工作流存储时（备份时还没有部署推理服务），把现有的工作流存储移走（3.2 的脚本与 3.4 的命令都会这样做），控制平面启动时新建一个空的：注册表中仍在部署的服务找不到部署运行，进入 `Failed`（`WorkflowRunNotFound`），修改 `spec` 或删除后重新创建即可再次部署。
 
 ---
 
@@ -361,10 +361,10 @@ Kubernetes 上先 `kubectl -n forgemesh scale deploy/forgemesh-control-plane --r
 
 ### 3.5 恢复之后的推理服务
 
-恢复总要重启控制平面，而推理实例随控制平面进程结束（`fake` 启动器的实例在控制平面进程内，`vllm-process` 的实例是它的子进程），恢复之后没有任何实例在运行：
+恢复总要重启控制平面，而推理实例活不过控制平面的重启（`fake` 启动器的实例在控制平面进程内；`vllm-process` / `tgi-process` 的实例是它的子进程，控制平面停止时停止它们，控制平面被杀死时留下的在下次启动时结束），恢复之后没有任何实例在运行：
 
-- 恢复前（备份时）`Ready` 的服务在控制平面启动时转为 `Degraded`：`Ready=False`（`InstanceLost`），`status.endpoints` 中的实例标记为 `ready: false`，网关不再转发。控制平面不会自动重新部署，删除后重新创建即可；`Degraded` 的服务在删除之前一直持有分配。
-- 仍在部署的服务从中断处继续：还没有启动实例的照常完成；已经启动了实例的进入 `Failed`（实例已不在运行：验证实例的步骤失败时原因为 `WorkflowFailed`，部署运行已经成功、只是还没写入 `Ready` 时为 `InstanceLost`），删除后重新创建即可。
+- 恢复前（备份时）`Ready` 的服务在控制平面启动时转为 `Degraded`：`Ready=False`（`InstanceLost`），`status.endpoints` 中的实例标记为 `ready: false`，网关不再转发。随后控制器像处理实例丢失一样，以同一个 `spec` 与服务持有的分配重新部署它（备份时就是 `Degraded` 的服务同样如此），新实例通过验证后回到 `Ready`。
+- 仍在部署（含 `Updating`）的服务从中断处继续：还没有启动实例的照常完成；实例已经启动、还在验证的，运行在验证实例时失败，服务进入 `Failed`（`WorkflowFailed`），修改 `spec` 或删除后重新创建即可再次部署；部署运行已经成功、只是还没写入 `Ready` 的重新部署。
 - 注册表与工作流存储不是同一组备份时的情况见 2.6 节。
 
 ---
@@ -396,7 +396,7 @@ Kubernetes 上先 `kubectl -n forgemesh scale deploy/forgemesh-control-plane --r
 - [ ] `/healthz` 探针返回 200
 - [ ] `/readyz` 探针返回 200
 - [ ] 资源注册表：`list` 返回预期资源数量
-- [ ] 推理服务（3.5 节）：备份时 `Ready` 的服务为 `Degraded`（`Ready=False`，`InstanceLost`）；删除并重新创建其中一个，它重新进入 `Ready`
+- [ ] 推理服务（3.5 节）：备份时 `Ready` 的服务经 `Degraded`（`Ready=False`，`InstanceLost`）重新部署，回到 `Ready`，`status.endpoints` 中的 `instanceId` 与备份时不同
 - [ ] 审计日志 / 决策记录（仅当部署把它们持久化到文件时）：`query_by_tenant` / `list_by_tenant` 返回预期记录数量
 
 ### 4.4 数据一致性验证

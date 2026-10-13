@@ -7,8 +7,9 @@
 #   删除 → 资源消失、实例停止 → 同名重新创建（只有一块设备，可见分配已释放）→ 再次对话 →
 #   PUT 修改 spec → Updating → 以新实例回到 Ready（旧实例已停止）→ 再次对话 →
 #   假实例退出（POST /fake/exit）→ Degraded（InstanceLost）→ 重新部署，以新实例回到 Ready →
-#   再次对话 → 重启控制平面：资源仍在，实例随旧进程结束，服务转为 Degraded（InstanceLost）
-#   后重新部署，以新实例回到 Ready → 再次对话 → 删除。
+#   再次对话 → /metrics 计入定期核对发现的丢失与一次重新部署 → 重启控制平面：资源仍在，实例
+#   随旧进程结束，服务转为 Degraded（InstanceLost）后重新部署，以新实例回到 Ready → 再次对话 →
+#   /metrics（随新进程从 0 计数）计入启动时核对发现的丢失与一次重新部署 → 删除。
 #
 # 每一步都有时限，整个闭环只等待状态变化，不依赖网关在某一刻返回的状态码。
 #
@@ -256,6 +257,7 @@ expect_reply "$first_instance"
 echo "ok: the workflow store lives next to the registry"
 
 # 此时只有 smoke-svc：Ready，占用清单中唯一的设备，部署工作流已成功。事件写日志，不会发布失败。
+# 还没有丢失过实例，也没有孤立的分配。
 scrape "control plane /metrics" http://127.0.0.1:8080/metrics \
   'forgemesh_http_requests_total{method="POST",route="/api/v1/inference-services",status="201"} ' \
   'forgemesh_reconcile_total{operation="reconcile",outcome="done"} ' \
@@ -269,7 +271,12 @@ scrape "control plane /metrics" http://127.0.0.1:8080/metrics \
   'forgemesh_outbox_publish_attempts_total{outcome="published"} [1-9]' \
   'forgemesh_outbox_publish_attempts_total{outcome="failed"} 0$' \
   'forgemesh_outbox_events{state="retrying"} 0$' \
-  'forgemesh_outbox_events{state="dead"} 0$'
+  'forgemesh_outbox_events{state="dead"} 0$' \
+  'forgemesh_instance_checks_total{outcome="failed"} 0$' \
+  'forgemesh_instance_check_results_total{check="startup",result="lost"} 0$' \
+  'forgemesh_instance_check_results_total{check="periodic",result="lost"} 0$' \
+  'forgemesh_lost_instance_redeploys_total 0$' \
+  'forgemesh_orphaned_allocation_reclaims_total{outcome="reclaimed"} 0$'
 scrape "gateway /metrics" "$gateway/metrics" \
   'forgemesh_gateway_http_requests_total{route="control_plane",status="401"} 1$' \
   'forgemesh_gateway_http_requests_total{route="inference",status="200"} ' \
@@ -356,6 +363,13 @@ fourth_port=$(endpoint_port)
   || fail "the service still reports the lost instance $third_instance"
 echo "ok: the service was redeployed with a new instance"
 expect_reply "$fourth_instance"
+# 更新与删除都先改变 phase、再停止实例，定期核对只会发现这一次丢失。
+scrape "control plane /metrics after the lost instance" http://127.0.0.1:8080/metrics \
+  'forgemesh_instance_checks_total{outcome="completed"} [1-9]' \
+  'forgemesh_instance_checks_total{outcome="failed"} 0$' \
+  'forgemesh_instance_check_results_total{check="periodic",result="lost"} 1$' \
+  'forgemesh_instance_check_results_total{check="startup",result="lost"} 0$' \
+  'forgemesh_lost_instance_redeploys_total 1$'
 
 # 假实例随控制平面进程结束：启动时服务转为 Degraded（InstanceLost，日志记录丢失的实例），
 # 控制器随后以同一分配重新部署，服务以新实例回到 Ready。
@@ -374,6 +388,14 @@ fifth_instance=$(jq -r '.status.endpoints[0].instanceId' "$resource")
   || fail "the service still reports the lost instance $fourth_instance"
 echo "ok: the service was redeployed with a new instance after the restart"
 expect_reply "$fifth_instance"
+# 计数随新进程从 0 开始：启动时的核对发现了丢失的实例，之后没有再丢失。
+scrape "control plane /metrics after the restart" http://127.0.0.1:8080/metrics \
+  'forgemesh_instance_checks_total{outcome="failed"} 0$' \
+  'forgemesh_instance_check_results_total{check="startup",result="lost"} 1$' \
+  'forgemesh_instance_check_results_total{check="periodic",result="lost"} 0$' \
+  'forgemesh_lost_instance_redeploys_total 1$' \
+  'forgemesh_orphaned_allocation_reclaims_total{outcome="reclaimed"} 0$' \
+  'forgemesh_orphaned_allocation_reclaims_total{outcome="failed"} 0$'
 check "delete the redeployed service" 202 "${auth[@]}" -X DELETE "$service"
 wait_gone
 

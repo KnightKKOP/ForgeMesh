@@ -322,7 +322,7 @@
 | 数据所有权 | 无；控制平面的 SQLite 库（叠加 `docker-compose.fake-runtime.yaml` 时还有工作流存储 `forgemesh.workflows.db`）位于 compose 卷 `control-plane-data` / k8s PVC `forgemesh-control-plane-data`（pgdata 卷属目标态预置，仅 `postgres` profile 使用） |
 | 允许依赖 | — |
 | 禁止依赖 | —（约束：部署不得暗示多副本写同一 SQLite） |
-| 测试路径 | `scripts/compose_smoke.sh`（CI `compose-smoke` job：构建镜像，以两个 compose 文件启动，经网关验证无 key 返回 401，创建 `InferenceService` → `Ready` → 经网关流式对话 → 不带凭证抓取两边的 `/metrics`，带 `traceparent` 的请求在控制平面的错误信封与两边的日志中带同一个 trace-id → 删除（实例端口关闭）→ 同名重新创建并再次对话 → `PUT` 修改 `spec` → `Updating` → 以新实例回到 `Ready` 并再次对话 → 让假实例退出 → `Degraded`（`InstanceLost`）→ 重新部署、回到 `Ready` 并再次对话 → 重启控制平面：资源仍在，服务经 `Degraded`（`InstanceLost`）重新部署、回到 `Ready` 并再次对话 → 删除）；k8s 清单无自动化测试；备份恢复有人工演练清单 |
+| 测试路径 | `scripts/compose_smoke.sh`（CI `compose-smoke` job：构建镜像，以两个 compose 文件启动，经网关验证无 key 返回 401，创建 `InferenceService` → `Ready` → 经网关流式对话 → 不带凭证抓取两边的 `/metrics`，带 `traceparent` 的请求在控制平面的错误信封与两边的日志中带同一个 trace-id → 删除（实例端口关闭）→ 同名重新创建并再次对话 → `PUT` 修改 `spec` → `Updating` → 以新实例回到 `Ready` 并再次对话 → 让假实例退出 → `Degraded`（`InstanceLost`）→ 重新部署、回到 `Ready` 并再次对话，控制平面的 `/metrics` 计入定期核对发现的丢失与重新部署 → 重启控制平面：资源仍在，服务经 `Degraded`（`InstanceLost`）重新部署、回到 `Ready` 并再次对话，`/metrics` 计入启动时核对发现的丢失与重新部署 → 删除）；k8s 清单无自动化测试；备份恢复有人工演练清单 |
 | 状态 | compose 已实现且有测试覆盖；k8s 清单实现待核验（无自动化测试，尚未提供网关清单、ServiceAccount、NetworkPolicy）；运维文档已交付 |
 | 演进动作 | k8s 补网关清单、ServiceAccount 与 NetworkPolicy；A1.5 已核对部署文档含单实例约束；目标态 PostgreSQL 部署属阶段 F |
 

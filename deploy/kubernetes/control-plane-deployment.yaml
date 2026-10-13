@@ -80,6 +80,9 @@ spec:
           env:
             - name: FORGEMESH_HOST
               value: "0.0.0.0"
+            # 设置了启动器时，同目录（数据卷）中还有工作流存储 forgemesh.workflows.db；
+            # vllm-process / tgi-process 还在这里记录实例进程（forgemesh.instances.json），
+            # 写不进时实例启动失败。
             - name: FORGEMESH_DB_PATH
               value: /var/lib/forgemesh/forgemesh.db
             - name: FORGEMESH_API_KEYS_FILE

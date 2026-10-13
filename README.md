@@ -467,13 +467,15 @@ kubectl -n forgemesh exec deployment/forgemesh-control-plane -- python -c \
   "import urllib.request as r; r.urlopen(r.Request('http://127.0.0.1:<端口>/fake/exit', method='POST'))"
 ```
 
-`vllm-process` 启动器在控制平面的容器内以子进程运行 vLLM。仓库没有为它提供清单，也没有在 Kubernetes 上验证过；使用它需要：
+`vllm-process` 与 `tgi-process` 启动器在控制平面的容器内以子进程运行 vLLM / TGI。仓库没有为它们提供清单，也没有在 Kubernetes 上验证过；使用它们需要：
 
-- 装有 vLLM 的控制平面镜像，或用 `FORGEMESH_VLLM_COMMAND` 指向镜像中另一个装有 vLLM 的环境；
+- 装有 vLLM 或 TGI（`text-generation-launcher`）的控制平面镜像，或用 `FORGEMESH_VLLM_COMMAND` / `FORGEMESH_TGI_COMMAND` 指向镜像中另一个装有它们的环境；
 - 为控制平面的容器申请 GPU（例如 NVIDIA device plugin 的 `nvidia.com/gpu`）；加速器清单恰好一个节点，设备 id 是容器内可见的 CUDA 设备序号或 UUID；
-- 根文件系统只读：模型缓存目录（如 `HF_HOME`）挂载可写的卷；按模型调大内存限制；`terminationGracePeriodSeconds` 调到 45 秒以上（默认 30 秒，停止全部实例连同收尾最长约 40 秒）；
-- 按上文设置 `FORGEMESH_VLLM_BIND_HOST=0.0.0.0`、以 Pod IP 作为 `FORGEMESH_VLLM_ADVERTISE_HOST`，并应用 `launcher/network-policy.yaml`；
-- 网络策略不允许控制平面访问外网：vLLM 启动时下载模型，需要为控制平面另加出站策略，或者预先把模型放进挂载的卷、以本地路径作为 `spec.model.reference`。
+- 根文件系统只读：模型缓存目录（如 `HF_HOME`）挂载可写的卷；一个实例使用多块 GPU 时在 `/dev/shm` 挂载 `medium: Memory` 的 emptyDir（容器默认的 `/dev/shm` 只有 64 MiB，vLLM 与 TGI 的多卡通信需要更多共享内存，用量计入内存限制）；按模型调大内存限制；`terminationGracePeriodSeconds` 调到 45 秒以上（默认 30 秒，停止全部实例连同收尾最长约 40 秒）；
+- 按上文把所选启动器的监听地址（`FORGEMESH_VLLM_BIND_HOST` / `FORGEMESH_TGI_BIND_HOST`）设为 `0.0.0.0`、以 Pod IP 作为写进 `status.endpoints` 的主机（`FORGEMESH_VLLM_ADVERTISE_HOST` / `FORGEMESH_TGI_ADVERTISE_HOST`），并应用 `launcher/network-policy.yaml`；
+- 网络策略不允许控制平面访问外网：vLLM 与 TGI 启动时下载模型，需要为控制平面另加出站策略，或者预先把模型放进挂载的卷、以本地路径作为 `spec.model.reference`。
+
+两个启动器把实例进程记在数据库旁的 `forgemesh.instances.json` 中（见「部署推理服务」的「vLLM」），在清单中就是数据卷上的 `/var/lib/forgemesh/forgemesh.instances.json`。写不进这个文件时实例启动失败，`FORGEMESH_DB_PATH` 因此要留在可写的卷上。清单的 Pod 中控制平面是容器的 1 号进程（镜像以 exec 形式启动它），即使它被杀死，内核也会随之结束容器中的实例进程；容器重启之后启动器找不到记录中的进程（只认 pid 与启动时间都一致的进程），不向任何进程发送信号，直接丢弃这些记录。TGI 实例的私有目录建在临时目录下（默认 `/tmp`，清单中是 emptyDir）。
 
 控制平面只有一个副本，所有实例都运行在这一个 Pod 里：只能使用分配给这个 Pod 的 GPU，也就是单个节点上的 GPU，不能把实例调度到其他节点。
 

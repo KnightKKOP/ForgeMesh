@@ -7,7 +7,7 @@
 * 重复 Create 抛 ConflictError；
 * Delete（成功 / NotFound）；
 * 租户隔离（跨租户 Get 抛 NotFoundError）；
-* 分页游标（5 条分 3 页取完）；
+* 分页游标（5 条分 3 页取完；签名游标绑定租户 / kind / 过滤条件、防篡改、重启后有效）；
 * namespace 过滤；
 * generation 自增；
 * resource_version 递增；
@@ -23,10 +23,16 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import sqlite3
+from collections.abc import Callable
 
 import pytest
-from forgemesh.controlplane.registry import DEFAULT_RELEASE_FINALIZER, SQLiteRegistry
+from forgemesh.controlplane.registry import (
+    DEFAULT_RELEASE_FINALIZER,
+    InvalidPageTokenError,
+    SQLiteRegistry,
+)
 from forgemesh.controlplane.registry.models import bump_generation, validate_resource
 from forgemesh.core.errors import ConflictError, InvalidStateTransition, NotFoundError
 from forgemesh.core.objects import ObjectMeta, Resource
@@ -197,19 +203,215 @@ def test_list_with_pagination() -> None:
     for i in range(5):
         _run(reg.put(_make_resource(name=f"res-{i}", namespace="ns")))
 
-    page1 = _run(reg.list(KIND, TENANT_A, namespace="ns", limit=2))
-    assert len(page1) == 2
+    page1 = _run(reg.list_page(KIND, TENANT_A, namespace="ns", limit=2))
+    page2 = _run(
+        reg.list_page(KIND, TENANT_A, namespace="ns", page_token=page1.next_page_token, limit=2)
+    )
+    page3 = _run(
+        reg.list_page(KIND, TENANT_A, namespace="ns", page_token=page2.next_page_token, limit=2)
+    )
 
-    token = SQLiteRegistry._encode_token(page1[-1].metadata.namespace, page1[-1].metadata.name)
-    page2 = _run(reg.list(KIND, TENANT_A, namespace="ns", limit=2, continue_token=token))
-    assert len(page2) == 2
-
-    token = SQLiteRegistry._encode_token(page2[-1].metadata.namespace, page2[-1].metadata.name)
-    page3 = _run(reg.list(KIND, TENANT_A, namespace="ns", limit=2, continue_token=token))
-    assert len(page3) == 1
-
-    all_names = [r.metadata.name for r in page1 + page2 + page3]
+    assert [len(page.items) for page in (page1, page2, page3)] == [2, 2, 1]
+    assert page3.next_page_token is None
+    all_names = [r.metadata.name for page in (page1, page2, page3) for r in page.items]
     assert all_names == ["res-0", "res-1", "res-2", "res-3", "res-4"]
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("count", "limit", "has_more"),
+    [(0, 1, False), (2, 2, False), (2, 3, False), (3, 2, True)],
+)
+def test_list_page_returns_a_token_only_when_more_items_match(
+    count: int, limit: int, has_more: bool
+) -> None:
+    reg = SQLiteRegistry()
+    for i in range(count):
+        _run(reg.put(_make_resource(name=f"res-{i}")))
+
+    page = _run(reg.list_page(KIND, TENANT_A, limit=limit))
+
+    assert len(page.items) == min(count, limit)
+    assert (page.next_page_token is not None) is has_more
+
+
+@pytest.mark.unit
+def test_list_continues_from_a_list_page_token() -> None:
+    reg = SQLiteRegistry()
+    for i in range(3):
+        _run(reg.put(_make_resource(name=f"res-{i}")))
+    first = _run(reg.list_page(KIND, TENANT_A, limit=1))
+
+    rest = _run(reg.list(KIND, TENANT_A, continue_token=first.next_page_token))
+
+    assert [r.metadata.name for r in rest] == ["res-1", "res-2"]
+
+
+@pytest.mark.unit
+def test_list_rejects_an_invalid_continue_token() -> None:
+    reg = SQLiteRegistry()
+    _run(reg.put(_make_resource()))
+
+    with pytest.raises(InvalidPageTokenError):
+        _run(reg.list(KIND, TENANT_A, continue_token="not-a-token"))
+
+
+@pytest.mark.unit
+def test_page_token_does_not_bind_the_page_size() -> None:
+    reg = SQLiteRegistry()
+    for i in range(4):
+        _run(reg.put(_make_resource(name=f"res-{i}")))
+    first = _run(reg.list_page(KIND, TENANT_A, limit=1))
+
+    second = _run(reg.list_page(KIND, TENANT_A, page_token=first.next_page_token, limit=10))
+
+    assert [r.metadata.name for r in second.items] == ["res-1", "res-2", "res-3"]
+    assert second.next_page_token is None
+
+
+@pytest.mark.unit
+def test_list_page_orders_cluster_scoped_resources_first() -> None:
+    reg = SQLiteRegistry()
+    _run(reg.put(_make_resource(name="b", namespace="ns")))
+    _run(reg.put(_make_resource(name="z", namespace=None)))
+    _run(reg.put(_make_resource(name="a", namespace="ns")))
+
+    seen: list[tuple[str | None, str]] = []
+    token = None
+    while True:
+        page = _run(reg.list_page(KIND, TENANT_A, page_token=token, limit=1))
+        seen.extend((r.metadata.namespace, r.metadata.name) for r in page.items)
+        token = page.next_page_token
+        if token is None:
+            break
+
+    assert seen == [(None, "z"), ("ns", "a"), ("ns", "b")]
+
+
+_BOUND_QUERY = {"kind": KIND, "tenant_id": TENANT_A, "namespace": "ns", "labels": {"env": "prod"}}
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "change",
+    [
+        pytest.param({"tenant_id": TENANT_B}, id="other-tenant"),
+        pytest.param({"kind": "Node"}, id="other-kind"),
+        pytest.param({"namespace": "other"}, id="other-namespace"),
+        pytest.param({"namespace": None}, id="all-namespaces"),
+        pytest.param({"labels": None}, id="no-label-selector"),
+        pytest.param({"labels": {"env": "dev"}}, id="other-label-value"),
+        pytest.param({"labels": {"env": "prod", "tier": "web"}}, id="extra-label"),
+    ],
+)
+def test_page_token_is_bound_to_tenant_kind_and_filters(change: dict) -> None:
+    reg = SQLiteRegistry()
+    for tenant_id in (TENANT_A, TENANT_B):
+        for kind in (KIND, "Node"):
+            for i in range(2):
+                resource = _make_resource(
+                    name=f"res-{i}", namespace="ns", tenant_id=tenant_id, kind=kind
+                )
+                resource.metadata.labels = {"env": "prod"}
+                _run(reg.put(resource))
+    token = _run(reg.list_page(**_BOUND_QUERY, limit=1)).next_page_token
+    assert token is not None
+
+    with pytest.raises(InvalidPageTokenError):
+        _run(reg.list_page(**{**_BOUND_QUERY, **change}, page_token=token, limit=1))
+
+
+@pytest.mark.unit
+def test_page_token_ignores_the_order_of_label_selectors() -> None:
+    reg = SQLiteRegistry()
+    for i in range(2):
+        resource = _make_resource(name=f"res-{i}")
+        resource.metadata.labels = {"app": "web", "env": "prod"}
+        _run(reg.put(resource))
+    first = _run(reg.list_page(KIND, TENANT_A, labels={"app": "web", "env": "prod"}, limit=1))
+
+    second = _run(
+        reg.list_page(
+            KIND,
+            TENANT_A,
+            labels={"env": "prod", "app": "web"},
+            page_token=first.next_page_token,
+            limit=1,
+        )
+    )
+
+    assert [r.metadata.name for r in second.items] == ["res-1"]
+
+
+def _b64(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).rstrip(b"=").decode("ascii")
+
+
+def _swap_payload(token: str) -> str:
+    """把载荷换成跳过一个资源的合法载荷，保留原签名。"""
+    payload = _b64(b'{"v":1,"ns":"","name":"res-1"}')
+    return f"{payload}.{token.partition('.')[2]}"
+
+
+def _alter_signature(token: str) -> str:
+    return token[:-1] + ("B" if token.endswith("A") else "A")
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "tamper",
+    [
+        pytest.param(_swap_payload, id="swapped-payload"),
+        pytest.param(_alter_signature, id="altered-signature"),
+        pytest.param(lambda token: token.partition(".")[0], id="missing-signature"),
+        pytest.param(lambda token: f"{token}.extra", id="trailing-data"),
+        pytest.param(lambda token: f"{token}é", id="non-ascii"),
+        pytest.param(lambda token: "", id="empty"),
+        pytest.param(lambda token: "not-a-token", id="garbage"),
+        pytest.param(
+            lambda token: base64.urlsafe_b64encode(b'{"ns": "", "name": "res-0"}').decode(),
+            id="legacy-unsigned-token",
+        ),
+    ],
+)
+def test_tampered_page_tokens_are_rejected(tamper: Callable[[str], str]) -> None:
+    reg = SQLiteRegistry()
+    for i in range(3):
+        _run(reg.put(_make_resource(name=f"res-{i}")))
+    token = _run(reg.list_page(KIND, TENANT_A, limit=1)).next_page_token
+
+    with pytest.raises(InvalidPageTokenError):
+        _run(reg.list_page(KIND, TENANT_A, page_token=tamper(token), limit=1))
+
+
+@pytest.mark.unit
+def test_page_tokens_survive_a_restart(tmp_path) -> None:
+    db_file = str(tmp_path / "registry.db")
+    reg = SQLiteRegistry(db_file)
+    for i in range(3):
+        _run(reg.put(_make_resource(name=f"res-{i}")))
+    token = _run(reg.list_page(KIND, TENANT_A, limit=1)).next_page_token
+    _run(reg.close())
+
+    reopened = SQLiteRegistry(db_file)
+    try:
+        page = _run(reopened.list_page(KIND, TENANT_A, page_token=token, limit=5))
+    finally:
+        _run(reopened.close())
+
+    assert [r.metadata.name for r in page.items] == ["res-1", "res-2"]
+
+
+@pytest.mark.unit
+def test_page_tokens_from_another_database_are_rejected() -> None:
+    issuer, other = SQLiteRegistry(), SQLiteRegistry()
+    for reg in (issuer, other):
+        for i in range(2):
+            _run(reg.put(_make_resource(name=f"res-{i}")))
+    token = _run(issuer.list_page(KIND, TENANT_A, limit=1)).next_page_token
+
+    with pytest.raises(InvalidPageTokenError):
+        _run(other.list_page(KIND, TENANT_A, page_token=token, limit=1))
 
 
 @pytest.mark.unit

@@ -54,6 +54,17 @@ Allocation 持久化
 :meth:`SQLiteRegistry.create_allocation` 在同一个 ``BEGIN IMMEDIATE`` 事务中写入
 分配行与设备行；``release_allocation`` 走 ``ALLOCATION_STATE_MACHINE`` 校验。
 
+分页
+----
+:meth:`SQLiteRegistry.list_page` 按 ``(namespace, name)`` 升序（``namespace`` 为空视为
+``""``）返回一页资源与下一页的不透明游标 ``next_page_token``，格式为 ``<载荷>.<签名>``：
+载荷是 ``{"v": 1, "ns": ..., "name": ...}``（本页最后一个资源的位置）的 base64url 编码
+（无填充），签名是以 ``registry_meta`` 表中持久化的随机密钥对「载荷 + 租户、kind 与过滤
+条件」计算的 HMAC-SHA256（同样 base64url 编码）。游标因此绑定租户、kind 与过滤条件
+（``limit`` 每页可以不同），被篡改或用于另一租户 / kind / 另一组过滤条件时抛
+:class:`InvalidPageTokenError`；密钥随数据库保存，控制平面重启后游标仍然有效。游标记录
+位置而不是快照：翻页期间新建或删除的资源可能出现也可能缺席，全程存在的资源恰好出现一次。
+
 变更记录
 --------
 每次写入 ``resources`` 都在**同一事务**中向 ``resource_changes`` 追加一条
@@ -77,8 +88,11 @@ import asyncio
 import base64
 import builtins
 import contextlib
+import hashlib
+import hmac
 import json
 import logging
+import secrets
 import sqlite3
 import threading
 from collections.abc import Callable, Collection, Iterator, Sequence
@@ -179,7 +193,34 @@ CREATE TABLE IF NOT EXISTS resource_changes (
     change TEXT NOT NULL,
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
+CREATE TABLE IF NOT EXISTS registry_meta (
+    name TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
 """
+
+#: ``registry_meta`` 中保存分页游标签名密钥（hex）的行。
+_PAGE_TOKEN_KEY_NAME = "page_token_key"
+
+#: 分页游标载荷的格式版本。
+_PAGE_TOKEN_VERSION = 1
+
+_INVALID_PAGE_TOKEN = (
+    "invalid page token: it is malformed, was modified, or was issued for "
+    "a different tenant, kind or filter set"
+)
+
+
+def _b64encode(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).rstrip(b"=").decode("ascii")
+
+
+def _b64decode(text: str) -> bytes:
+    return base64.urlsafe_b64decode(text + "=" * (-len(text) % 4))
+
+
+class InvalidPageTokenError(ValueError):
+    """分页游标无效：无法解析、被篡改，或签发给了另一个租户、kind 或另一组过滤条件。"""
 
 
 class ChangeType(StrEnum):
@@ -224,6 +265,19 @@ class ResourceChange:
     seq: int
     key: ResourceKey
     change: ChangeType
+
+
+@dataclass(frozen=True)
+class ResourcePage:
+    """:meth:`SQLiteRegistry.list_page` 返回的一页资源。
+
+    Attributes:
+        items: 本页资源，按 ``(namespace, name)`` 升序（``namespace`` 为空视为 ``""``）。
+        next_page_token: 继续列出下一页的游标；没有更多资源时为 ``None``。
+    """
+
+    items: builtins.list[Resource]
+    next_page_token: str | None = None
 
 
 @dataclass(frozen=True)
@@ -277,6 +331,7 @@ class SQLiteRegistry(ResourceRegistry):
         self._conn.row_factory = sqlite3.Row
         self._lock = threading.RLock()
         self._init_schema()
+        self._page_token_key = self._load_page_token_key()
 
     # ------------------------------------------------------------------ #
     # 内部辅助
@@ -340,6 +395,23 @@ class SQLiteRegistry(ResourceRegistry):
         self._migrate_legacy_allocations()
         self._ensure_identity_index()
         self._conn.commit()
+
+    def _load_page_token_key(self) -> bytes:
+        """读取分页游标的签名密钥；库中还没有时生成并持久化。
+
+        多个进程同时打开同一个新库时，``INSERT OR IGNORE`` 保证只有先写入的密钥生效，
+        各方随后读到的都是同一个值。
+        """
+        query = "SELECT value FROM registry_meta WHERE name=?"
+        row = self._conn.execute(query, (_PAGE_TOKEN_KEY_NAME,)).fetchone()
+        if row is None:
+            self._conn.execute(
+                "INSERT OR IGNORE INTO registry_meta (name, value) VALUES (?, ?)",
+                (_PAGE_TOKEN_KEY_NAME, secrets.token_hex(32)),
+            )
+            self._conn.commit()
+            row = self._conn.execute(query, (_PAGE_TOKEN_KEY_NAME,)).fetchone()
+        return bytes.fromhex(row["value"])
 
     def _migrate_legacy_allocations(self) -> None:
         """删除存量库中不分租户的旧索引 ``idx_allocations_one_active_per_resource``。
@@ -452,20 +524,58 @@ class SQLiteRegistry(ResourceRegistry):
         return f'$.metadata.labels."{key}"'
 
     @staticmethod
-    def _encode_token(namespace: str | None, name: str) -> str:
-        """将分页游标 ``(namespace, name)`` 编码为 opaque base64 字符串。"""
-        payload = json.dumps({"ns": namespace, "name": name}, ensure_ascii=False)
-        return base64.urlsafe_b64encode(payload.encode("utf-8")).decode("ascii")
+    def _page_scope(
+        tenant_id: str, kind: str, namespace: str | None, labels: dict[str, str] | None
+    ) -> str:
+        """分页游标绑定的上下文：租户、kind 与过滤条件（不含 ``limit``）。"""
+        return json.dumps(
+            {
+                "tenant": tenant_id,
+                "kind": kind,
+                "namespace": namespace,
+                "labels": sorted((labels or {}).items()),
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        )
 
-    @staticmethod
-    def _decode_token(token: str) -> tuple[str | None, str]:
-        """解码分页游标，返回 ``(namespace, name)``。"""
+    def _sign_page_token(self, payload: str, scope: str) -> str:
+        message = f"{payload}.{scope}".encode()
+        return _b64encode(hmac.new(self._page_token_key, message, hashlib.sha256).digest())
+
+    def _encode_page_token(self, scope: str, namespace_key: str, name: str) -> str:
+        """把本页最后一个资源的位置编码为签名游标。"""
+        position = {"v": _PAGE_TOKEN_VERSION, "ns": namespace_key, "name": name}
+        payload = _b64encode(
+            json.dumps(position, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+        )
+        return f"{payload}.{self._sign_page_token(payload, scope)}"
+
+    def _decode_page_token(self, token: str, scope: str) -> tuple[str, str]:
+        """校验签名并解码游标，返回 ``(namespace 排序键, name)``。
+
+        Raises:
+            InvalidPageTokenError: 游标无法解析、被篡改，或属于另一个上下文 ``scope``。
+        """
+        # 签发的游标只含 base64url 字符与 "."；先排除非 ASCII 输入，compare_digest 才能比较 str
+        if not token.isascii():
+            raise InvalidPageTokenError(_INVALID_PAGE_TOKEN)
+        payload, _, signature = token.partition(".")
+        if not hmac.compare_digest(signature, self._sign_page_token(payload, scope)):
+            raise InvalidPageTokenError(_INVALID_PAGE_TOKEN)
         try:
-            raw = base64.urlsafe_b64decode(token.encode("ascii")).decode("utf-8")
-            payload = json.loads(raw)
-            return payload["ns"], payload["name"]
-        except (ValueError, KeyError, UnicodeDecodeError) as exc:
-            raise ValueError(f"invalid continue_token: {token!r}") from exc
+            position = json.loads(_b64decode(payload))
+        except ValueError as exc:
+            raise InvalidPageTokenError(_INVALID_PAGE_TOKEN) from exc
+        if not (
+            isinstance(position, dict)
+            and position.get("v") == _PAGE_TOKEN_VERSION
+            and isinstance(position.get("ns"), str)
+            and isinstance(position.get("name"), str)
+        ):
+            raise InvalidPageTokenError(_INVALID_PAGE_TOKEN)
+        return position["ns"], position["name"]
 
     @staticmethod
     def _row_to_resource(row: sqlite3.Row) -> Resource:
@@ -648,24 +758,57 @@ class SQLiteRegistry(ResourceRegistry):
         continue_token: str | None = None,
         limit: int = 100,
     ) -> builtins.list[Resource]:
-        """按 ``kind`` + 可选 ``namespace`` / ``labels`` 过滤列出资源（分页）。
+        """按 ``kind`` + 可选 ``namespace`` / ``labels`` 过滤列出一页资源。
 
-        标签过滤在 SQL 中先于 ``LIMIT`` 执行，保证每页返回的都是匹配项。
+        与 :meth:`list_page` 相同，只是不返回下一页游标；``continue_token`` 必须是
+        :meth:`list_page` 以相同租户、kind 与过滤条件返回的 ``next_page_token``。
         ``watch=True`` 在阶段 P1 暂未实现，抛 :class:`NotImplementedError`。
 
         Raises:
             ValueError: ``limit`` 小于 1，或标签键包含双引号 / 反斜杠。
+            InvalidPageTokenError: ``continue_token`` 无效。
         """
         if watch:
             raise NotImplementedError("watch stream is not implemented in phase P1")
+        page = await self.list_page(
+            kind, tenant_id, namespace, labels, page_token=continue_token, limit=limit
+        )
+        return page.items
+
+    async def list_page(
+        self,
+        kind: str,
+        tenant_id: str,
+        namespace: str | None = None,
+        labels: dict[str, str] | None = None,
+        page_token: str | None = None,
+        limit: int = 100,
+    ) -> ResourcePage:
+        """按 ``kind`` + 可选 ``namespace`` / ``labels`` 过滤列出一页资源与下一页游标。
+
+        结果按 ``(namespace, name)`` 升序（``namespace`` 为空视为 ``""``），标签过滤在 SQL
+        中先于 ``LIMIT`` 执行，保证每页返回的都是匹配项。还有更多匹配项时
+        ``next_page_token`` 非空：以相同的租户、kind 与过滤条件把它作为 ``page_token``
+        传回即得下一页（``limit`` 可以不同），游标格式见模块文档「分页」。
+
+        Raises:
+            ValueError: ``limit`` 小于 1，或标签键包含双引号 / 反斜杠。
+            InvalidPageTokenError: ``page_token`` 无法解析、被篡改，或签发给了另一个租户、
+                kind 或另一组过滤条件。
+        """
         if limit < 1:
             raise ValueError(f"limit must be >= 1, got {limit}")
         label_paths = [
             (self._label_path(key), value) for key, value in sorted((labels or {}).items())
         ]
+        scope = self._page_scope(tenant_id, kind, namespace, labels)
+        after = self._decode_page_token(page_token, scope) if page_token is not None else None
 
-        def _list() -> list[Resource]:
-            sql = "SELECT body FROM resources WHERE tenant_id=? AND kind=?"
+        def _list_page() -> ResourcePage:
+            sql = (
+                "SELECT body, COALESCE(namespace, '') AS ns_key, name FROM resources "
+                "WHERE tenant_id=? AND kind=?"
+            )
             params: list[Any] = [tenant_id, kind]
             if namespace is not None:
                 sql += " AND namespace IS ?"
@@ -673,21 +816,24 @@ class SQLiteRegistry(ResourceRegistry):
             for path, value in label_paths:
                 sql += " AND json_extract(body, ?) = ?"
                 params.extend([path, value])
-            if continue_token is not None:
-                cursor_ns, cursor_name = self._decode_token(continue_token)
-                cursor_ns_key = cursor_ns if cursor_ns is not None else ""
-                # 按 (COALESCE(namespace,''), name) 升序游标推进
+            if after is not None:
+                after_ns_key, after_name = after
                 sql += (
                     " AND (COALESCE(namespace, '') > ?"
                     " OR (COALESCE(namespace, '') = ? AND name > ?))"
                 )
-                params.extend([cursor_ns_key, cursor_ns_key, cursor_name])
+                params.extend([after_ns_key, after_ns_key, after_name])
+            # 多取一行，用来判断是否还有下一页
             sql += " ORDER BY COALESCE(namespace, ''), name LIMIT ?"
-            params.append(limit)
+            params.append(limit + 1)
             rows = self._conn.execute(sql, tuple(params)).fetchall()
-            return [self._row_to_resource(r) for r in rows]
+            items = [self._row_to_resource(row) for row in rows[:limit]]
+            if len(rows) <= limit:
+                return ResourcePage(items)
+            last = rows[limit - 1]
+            return ResourcePage(items, self._encode_page_token(scope, last["ns_key"], last["name"]))
 
-        return await self._run(_list)
+        return await self._run(_list_page)
 
     async def delete(
         self,
@@ -1573,8 +1719,10 @@ __all__ = [
     "SIDE_EFFECT_PHASES",
     "ChangeType",
     "ConflictReason",
+    "InvalidPageTokenError",
     "RequestDeleteResult",
     "ResourceChange",
     "ResourceKey",
+    "ResourcePage",
     "SQLiteRegistry",
 ]

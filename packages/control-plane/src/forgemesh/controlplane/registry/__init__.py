@@ -7,9 +7,11 @@ from .store import (
     SIDE_EFFECT_PHASES,
     ChangeType,
     ConflictReason,
+    InvalidPageTokenError,
     RequestDeleteResult,
     ResourceChange,
     ResourceKey,
+    ResourcePage,
     SQLiteRegistry,
 )
 
@@ -18,8 +20,10 @@ __all__ = [
     "SIDE_EFFECT_PHASES",
     "ChangeType",
     "ConflictReason",
+    "InvalidPageTokenError",
     "RequestDeleteResult",
     "ResourceChange",
     "ResourceKey",
+    "ResourcePage",
     "SQLiteRegistry",
 ]

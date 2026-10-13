@@ -8,7 +8,8 @@
 # 容器内监听全部地址、端口由内核挑选，写进 status.endpoints 的主机是服务名 control-plane；
 # 网关经 /api/v1/namespaces/{ns}/inference/{svc}/chat 转发到容器的私网地址（默认允许）。
 # 实例端口不发布到宿主机。实例随控制平面进程结束：重启控制平面后 Ready 的服务转为
-# Degraded，随后重新部署。
+# Degraded，随后重新部署。在容器内向实例发出 POST /fake/exit 可以让它像进程退出一样结束；
+# 控制器每秒核对一次实例（默认 10 秒），服务很快转为 Degraded 并重新部署。
 services:
   control-plane:
     environment:
@@ -16,5 +17,6 @@ services:
       FORGEMESH_RUNTIME_LAUNCHER: fake
       FORGEMESH_FAKE_LAUNCHER_BIND_HOST: 0.0.0.0
       FORGEMESH_FAKE_LAUNCHER_ADVERTISE_HOST: control-plane
+      FORGEMESH_INSTANCE_CHECK_INTERVAL_SECONDS: "1"
     volumes:
       - ./fake-runtime-inventory.json:/etc/forgemesh/inventory.json:ro

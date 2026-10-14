@@ -143,8 +143,10 @@ def main() -> int:
         for err in errors:
             print(f"ERROR: {err}", file=sys.stderr)
         return 1
-    print(f"OK: OpenAPI {doc.get('openapi')} 语义校验通过（{op_count} 个 operation，"
-          "operationId 唯一、$ref 可解析、响应族完备）")
+    print(
+        f"OK: OpenAPI {doc.get('openapi')} 语义校验通过（{op_count} 个 operation，"
+        "operationId 唯一、$ref 可解析、响应族完备）"
+    )
     return 0
 
 

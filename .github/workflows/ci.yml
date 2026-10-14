@@ -56,6 +56,10 @@ jobs:
       - name: Ruff lint
         run: python -m ruff check .
 
+      # 与 make fmt 的结果不一致时失败；Markdown 不检查（见 pyproject.toml）。
+      - name: Ruff format
+        run: python -m ruff format --check .
+
       # 总覆盖率低于 pyproject.toml 中的 fail_under 时失败。
       - name: Pytest (coverage floor)
         run: python -m pytest --cov

@@ -139,9 +139,7 @@ def test_update_step_status() -> None:
     ref = asyncio_run(store.create_run(defn, {}, "key-step"))
 
     # Pending → Running
-    asyncio_run(
-        store.update_step_status(ref.run_id, "prepare", StepStatus.RUNNING.value)
-    )
+    asyncio_run(store.update_step_status(ref.run_id, "prepare", StepStatus.RUNNING.value))
     statuses = asyncio_run(store.get_step_statuses(ref.run_id))
     assert statuses["prepare"] == StepStatus.RUNNING
 
@@ -166,9 +164,7 @@ def test_update_step_status_invalid_transition() -> None:
     ref = asyncio_run(store.create_run(defn, {}, "key-step-invalid"))
 
     with pytest.raises(InvalidStateTransition):
-        asyncio_run(
-            store.update_step_status(ref.run_id, "prepare", StepStatus.SUCCEEDED.value)
-        )
+        asyncio_run(store.update_step_status(ref.run_id, "prepare", StepStatus.SUCCEEDED.value))
 
 
 # --------------------------------------------------------------------------- #

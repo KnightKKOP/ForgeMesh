@@ -173,10 +173,12 @@ class ServiceVerifier:
         """
         smoke_ok = await self.smoke_test(config.endpoint, config.test_prompt)
         latency_ms = await self.measure_latency(
-            config.endpoint, config.num_requests,
+            config.endpoint,
+            config.num_requests,
         )
         error_rate = await self.measure_error_rate(
-            config.endpoint, config.num_requests,
+            config.endpoint,
+            config.num_requests,
         )
 
         # 冒烟响应文本（再发一次以取文本，避免影响上述测量计数）。

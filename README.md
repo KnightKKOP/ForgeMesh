@@ -130,7 +130,7 @@ make test
 make test-unit       # 仅单元测试
 make test-contract   # 仅契约测试
 make coverage        # 全部测试 + 总覆盖率下限（与 CI 相同）
-make lint            # ruff 静态检查
+make lint            # ruff 静态检查与格式检查（与 CI 相同）
 make fmt             # ruff 自动修复与格式化
 make audit           # pip-audit 检查第三方依赖的已知漏洞（与 CI 相同，需要网络）
 make clean           # 清理构建与缓存产物
@@ -578,7 +578,7 @@ ForgeMesh 目前处于预览阶段，API 稳定性标注为 `beta`：minor 版�
 | Python 测试 | **2698** |
 | Python 覆盖率 | 97.2%（`packages/` 的语句与分支，CI 要求不低于 97%） |
 | Go 测试 | 188 个测试函数，全部通过 |
-| ruff 检查 | All checks passed |
+| ruff | `ruff check` 与 `ruff format --check` 均通过 |
 
 ---
 

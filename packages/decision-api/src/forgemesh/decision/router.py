@@ -164,8 +164,7 @@ class DecisionRouter:
                 status="FAILED",
                 attempts=[],
                 error=(
-                    f"high-risk request (risk_level={req.risk_level}) "
-                    "requires fallback providers"
+                    f"high-risk request (risk_level={req.risk_level}) requires fallback providers"
                 ),
             )
 

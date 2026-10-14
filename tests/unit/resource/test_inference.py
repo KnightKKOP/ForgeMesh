@@ -73,9 +73,7 @@ def test_status_default_factory_is_isolated() -> None:
     first = _make_service()
     second = _make_service()
 
-    first.status.conditions.append(
-        Condition(type="Ready", status="True", reason="Deployed")
-    )
+    first.status.conditions.append(Condition(type="Ready", status="True", reason="Deployed"))
 
     assert len(first.status.conditions) == 1
     assert second.status.conditions == []
@@ -136,9 +134,7 @@ def test_extra_field_forbidden() -> None:
 
 def test_status_can_be_provided_explicitly() -> None:
     """可显式提供 status；phase 接受字符串字面量。"""
-    service = _make_service(
-        status=InferenceServiceStatus(phase="Ready", observedGeneration=3)
-    )
+    service = _make_service(status=InferenceServiceStatus(phase="Ready", observedGeneration=3))
     assert service.status.phase is InferencePhase.READY
     assert service.status.observedGeneration == 3
 

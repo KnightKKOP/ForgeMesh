@@ -153,9 +153,7 @@ def _coerce_step(status: StepStatus | str) -> StepStatus:
         raise InvalidStateTransition(f"unknown step status: {status!r}") from exc
 
 
-def validate_workflow_transition(
-    cur: WorkflowStatus | str, to: WorkflowStatus | str
-) -> None:
+def validate_workflow_transition(cur: WorkflowStatus | str, to: WorkflowStatus | str) -> None:
     """校验工作流状态转移是否合法。
 
     Args:
@@ -170,14 +168,10 @@ def validate_workflow_transition(
     to_s = _coerce_workflow(to)
     allowed = WORKFLOW_TRANSITIONS.get(cur_s, set())
     if to_s not in allowed:
-        raise InvalidStateTransition(
-            f"illegal workflow transition: {cur_s.value} -> {to_s.value}"
-        )
+        raise InvalidStateTransition(f"illegal workflow transition: {cur_s.value} -> {to_s.value}")
 
 
-def validate_step_transition(
-    cur: StepStatus | str, to: StepStatus | str
-) -> None:
+def validate_step_transition(cur: StepStatus | str, to: StepStatus | str) -> None:
     """校验步骤状态转移是否合法。
 
     Args:
@@ -192,9 +186,7 @@ def validate_step_transition(
     to_s = _coerce_step(to)
     allowed = STEP_TRANSITIONS.get(cur_s, set())
     if to_s not in allowed:
-        raise InvalidStateTransition(
-            f"illegal step transition: {cur_s.value} -> {to_s.value}"
-        )
+        raise InvalidStateTransition(f"illegal step transition: {cur_s.value} -> {to_s.value}")
 
 
 __all__ = [

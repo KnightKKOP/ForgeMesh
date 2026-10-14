@@ -239,8 +239,16 @@ def test_update_approval_status_not_found() -> None:
 def test_list_pending_approvals_tenant_isolation() -> None:
     """待审批列表按租户隔离。"""
     store = DecisionRecordStore()
-    asyncio.run(store.save(_make_record(record_id="t1-pending", tenant_id="t1", approval_status=APPROVAL_PENDING)))
-    asyncio.run(store.save(_make_record(record_id="t2-pending", tenant_id="t2", approval_status=APPROVAL_PENDING)))
+    asyncio.run(
+        store.save(
+            _make_record(record_id="t1-pending", tenant_id="t1", approval_status=APPROVAL_PENDING)
+        )
+    )
+    asyncio.run(
+        store.save(
+            _make_record(record_id="t2-pending", tenant_id="t2", approval_status=APPROVAL_PENDING)
+        )
+    )
 
     t1_pending = asyncio.run(store.list_pending_approvals("t1"))
     assert len(t1_pending) == 1

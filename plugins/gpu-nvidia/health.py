@@ -65,14 +65,18 @@ async def _default_check(device_index: int) -> dict[str, Any]:
     """默认设备检查：通过 pynvml 采集指标，不可用返回空 dict。"""
     try:
         import pynvml as nvml  # noqa: PLC0415
+
         nvml.nvmlInit()
         handle = nvml.nvmlDeviceGetHandleByIndex(device_index)
         temp = int(nvml.nvmlDeviceGetTemperature(handle, nvml.NVML_TEMPERATURE_GPU))
         util = nvml.nvmlDeviceGetUtilizationRates(handle)
         mem = nvml.nvmlDeviceGetMemoryInfo(handle)
-        ecc = int(nvml.nvmlDeviceGetTotalEccErrors(
-            handle, nvml.NVML_SINGLE_BIT_ECC_ERROR,
-        ))
+        ecc = int(
+            nvml.nvmlDeviceGetTotalEccErrors(
+                handle,
+                nvml.NVML_SINGLE_BIT_ECC_ERROR,
+            )
+        )
         nvml.nvmlShutdown()
     except Exception:
         return {}

@@ -36,9 +36,7 @@ class DecisionRequest(BaseModel):
     risk_level: Literal["low", "medium", "high"] = Field(
         default="low", description="风险等级（low/medium/high），高风险触发降级保护"
     )
-    deadline_ms: int = Field(
-        default=2000, ge=1, description="决策时限（毫秒），超时视为失败"
-    )
+    deadline_ms: int = Field(default=2000, ge=1, description="决策时限（毫秒），超时视为失败")
 
 
 class DecisionCandidate(BaseModel):

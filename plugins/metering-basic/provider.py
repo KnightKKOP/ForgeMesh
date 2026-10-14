@@ -42,9 +42,7 @@ class MeteringProvider:
         """
         await self._store.record(record)
 
-    async def get_summary(
-        self, tenant_id: str, start: float, end: float
-    ) -> UsageSummary:
+    async def get_summary(self, tenant_id: str, start: float, end: float) -> UsageSummary:
         """获取指定租户在 ``[start, end)`` 时间范围内的聚合统计。
 
         Args:
@@ -57,9 +55,7 @@ class MeteringProvider:
         """
         return await self._store.aggregate(tenant_id, start, end)
 
-    async def correct_usage(
-        self, original_id: str, correction: UsageRecord
-    ) -> None:
+    async def correct_usage(self, original_id: str, correction: UsageRecord) -> None:
         """修正计量：新增一条 ``correction_of`` 记录指向原记录，原记录保留（IVT-10）。
 
         Args:

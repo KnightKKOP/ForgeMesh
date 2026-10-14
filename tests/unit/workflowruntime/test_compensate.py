@@ -125,9 +125,7 @@ def test_compensate_success() -> None:
 
     executor.registry.register("a", handler)
 
-    defn = WorkflowDefinition(
-        name="flow", steps=[Step(id="a", uses="x")]
-    )
+    defn = WorkflowDefinition(name="flow", steps=[Step(id="a", uses="x")])
     results = asyncio.run(executor.compensate(defn, ["a"], {"a": {}}))
 
     assert results["a"] == StepStatus.COMPENSATED
@@ -146,9 +144,7 @@ def test_compensate_failure() -> None:
 
     executor.registry.register("a", failing_handler)
 
-    defn = WorkflowDefinition(
-        name="flow", steps=[Step(id="a", uses="x")]
-    )
+    defn = WorkflowDefinition(name="flow", steps=[Step(id="a", uses="x")])
     results = asyncio.run(executor.compensate(defn, ["a"], {"a": {}}))
 
     assert results["a"] == StepStatus.COMPENSATION_FAILED

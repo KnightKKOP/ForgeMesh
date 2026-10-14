@@ -199,9 +199,7 @@ class WorkflowRuntime(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    async def signal(
-        self, run_id: str, name: str, payload: dict[str, Any]
-    ) -> None:
+    async def signal(self, run_id: str, name: str, payload: dict[str, Any]) -> None:
         """向运行实例投递外部信号，唤醒处于 ``WAITING`` 的步骤/审批。
 
         Args:

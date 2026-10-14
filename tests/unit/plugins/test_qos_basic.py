@@ -217,7 +217,6 @@ def test_evaluate_priority_default_when_missing() -> None:
     config = QoSConfig(max_concurrent=10)
     provider = QoSProvider(config)
 
-
     req: dict[str, object] = {"request_id": "r1", "tenant_id": "t1"}
     result = _run(provider.evaluate(req))
     assert result.priority == "NORMAL"

@@ -228,9 +228,7 @@ class TgiRuntimeProvider:
     ) -> None:
         self._launcher: InstanceLauncher = launcher or _default_launcher
         self._http: HttpClient = http_client or _default_http_client
-        self._release_lease_fn: LeaseReleaser = (
-            lease_releaser or _default_release_lease
-        )
+        self._release_lease_fn: LeaseReleaser = lease_releaser or _default_release_lease
         self._verify_allocation_fn: AllocationVerifier = (
             allocation_verifier or _default_verify_allocation
         )

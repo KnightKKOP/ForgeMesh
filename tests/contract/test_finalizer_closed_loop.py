@@ -80,9 +80,7 @@ def _make_inference_service(
 
 def _stored_phase(reg: SQLiteRegistry, name: str = "svc-1") -> str | None:
     """直读 DB 列取 phase（与既有单测一致的证据口径）。"""
-    row = reg._conn.execute(
-        "SELECT phase FROM resources WHERE name=?", (name,)
-    ).fetchone()
+    row = reg._conn.execute("SELECT phase FROM resources WHERE name=?", (name,)).fetchone()
     return row["phase"] if row is not None else None
 
 
@@ -96,9 +94,7 @@ def _stored_version(reg: SQLiteRegistry, name: str = "svc-1") -> int | None:
 
 def _stored_finalizers(reg: SQLiteRegistry, name: str = "svc-1") -> list[str]:
     """直读 DB 列取 finalizers。"""
-    row = reg._conn.execute(
-        "SELECT finalizers FROM resources WHERE name=?", (name,)
-    ).fetchone()
+    row = reg._conn.execute("SELECT finalizers FROM resources WHERE name=?", (name,)).fetchone()
     return json.loads(row["finalizers"]) if row is not None else []
 
 
@@ -236,9 +232,7 @@ def test_release_failure_keeps_terminating_then_retry_completes() -> None:
         # 第二轮：释放成功 → 闭环完成（幂等重入）
         recovered = StubReleaseProvider()
         retry_controller = _make_controller(reg, release_provider=recovered)
-        second = _run(
-            retry_controller.reconcile(_terminating_context(reg, dedup_key="term-retry"))
-        )
+        second = _run(retry_controller.reconcile(_terminating_context(reg, dedup_key="term-retry")))
 
         assert recovered.released == ["svc-1"]
         assert second.done is True

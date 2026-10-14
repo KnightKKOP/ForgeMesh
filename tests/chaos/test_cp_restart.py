@@ -99,11 +99,7 @@ def test_restart_preserves_step_status(tmp_path: pytest.TempPathFactory) -> None
     store = WorkflowStore(str(db_file))
     ref = _run(store.create_run(defn, {}, "key-1"))
     _run(store.update_step_status(ref.run_id, "s1", StepStatus.RUNNING.value))
-    _run(
-        store.update_step_status(
-            ref.run_id, "s1", StepStatus.SUCCEEDED.value, {"ok": True}
-        )
-    )
+    _run(store.update_step_status(ref.run_id, "s1", StepStatus.SUCCEEDED.value, {"ok": True}))
     _run(store.close())
 
     restarted = WorkflowStore(str(db_file))

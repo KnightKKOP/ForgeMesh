@@ -44,9 +44,7 @@ def validate_dag(steps: list[Step]) -> None:
                 in_degree[step.id] += 1
 
     # Kahn 拓扑排序。
-    queue: deque[str] = deque(
-        sid for sid, deg in in_degree.items() if deg == 0
-    )
+    queue: deque[str] = deque(sid for sid, deg in in_degree.items() if deg == 0)
     processed = 0
     while queue:
         node = queue.popleft()

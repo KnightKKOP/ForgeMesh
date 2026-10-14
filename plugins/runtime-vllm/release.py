@@ -88,9 +88,7 @@ class ResourceReleaser:
         lease_releaser: LeaseReleaser | None = None,
         allocation_verifier: AllocationVerifier | None = None,
     ) -> None:
-        self._release_lease_fn: LeaseReleaser = (
-            lease_releaser or _default_release_lease
-        )
+        self._release_lease_fn: LeaseReleaser = lease_releaser or _default_release_lease
         self._verify_allocation_fn: AllocationVerifier = (
             allocation_verifier or _default_verify_allocation
         )

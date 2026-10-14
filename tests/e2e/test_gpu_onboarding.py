@@ -124,9 +124,7 @@ def test_onboarding_full_loop() -> None:
     handler = MockOnboardingHandler()
 
     results = asyncio.run(
-        _no_retry_executor().execute_workflow(
-            defn, inputs, "key-full-loop", handler
-        )
+        _no_retry_executor().execute_workflow(defn, inputs, "key-full-loop", handler)
     )
 
     # 全部 6 步按序执行
@@ -152,9 +150,7 @@ def test_onboarding_discover_failure() -> None:
 
     with pytest.raises(RuntimeError, match="discover"):
         asyncio.run(
-            _no_retry_executor().execute_workflow(
-                defn, inputs, "key-discover-fail", handler
-            )
+            _no_retry_executor().execute_workflow(defn, inputs, "key-discover-fail", handler)
         )
 
     # 仅 discover 执行，后续 5 步未执行
@@ -171,9 +167,7 @@ def test_onboarding_validate_failure() -> None:
 
     with pytest.raises(RuntimeError, match="validate"):
         asyncio.run(
-            _no_retry_executor().execute_workflow(
-                defn, inputs, "key-validate-fail", handler
-            )
+            _no_retry_executor().execute_workflow(defn, inputs, "key-validate-fail", handler)
         )
 
     # discover + validate 执行，后续 4 步未执行
@@ -189,11 +183,7 @@ def test_onboarding_verify_failure() -> None:
     handler = MockOnboardingHandler(fail_at="verify")
 
     with pytest.raises(RuntimeError, match="verify"):
-        asyncio.run(
-            _no_retry_executor().execute_workflow(
-                defn, inputs, "key-verify-fail", handler
-            )
-        )
+        asyncio.run(_no_retry_executor().execute_workflow(defn, inputs, "key-verify-fail", handler))
 
     # discover → validate → prepare → deploy → verify 执行，commit 未执行
     assert handler.executed == ["discover", "validate", "prepare", "deploy", "verify"]
@@ -214,9 +204,7 @@ def test_onboarding_with_workflow_executor() -> None:
 
     # 使用默认执行器（含默认重试策略）
     executor = WorkflowExecutor()
-    results = asyncio.run(
-        executor.execute_workflow(defn, inputs, "key-executor", handler)
-    )
+    results = asyncio.run(executor.execute_workflow(defn, inputs, "key-executor", handler))
 
     # 全部 6 步执行
     assert handler.executed == wf.ONBOARDING_STEPS
@@ -255,9 +243,7 @@ def test_onboarding_persist_and_recover() -> None:
 
     # 3. 模拟执行 discover 和 validate（步骤状态 Pending → Running → Succeeded）
     for step_id in ("discover", "validate"):
-        asyncio.run(
-            store.update_step_status(ref.run_id, step_id, StepStatus.RUNNING.value)
-        )
+        asyncio.run(store.update_step_status(ref.run_id, step_id, StepStatus.RUNNING.value))
         asyncio.run(
             store.update_step_status(
                 ref.run_id,
@@ -284,9 +270,7 @@ def test_onboarding_persist_and_recover() -> None:
     # 7. 恢复后继续执行剩余步骤
     remaining = ["prepare", "deploy", "verify", "commit"]
     for step_id in remaining:
-        asyncio.run(
-            store.update_step_status(ref.run_id, step_id, StepStatus.RUNNING.value)
-        )
+        asyncio.run(store.update_step_status(ref.run_id, step_id, StepStatus.RUNNING.value))
         asyncio.run(
             store.update_step_status(
                 ref.run_id,

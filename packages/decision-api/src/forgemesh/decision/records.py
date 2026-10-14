@@ -106,12 +106,9 @@ class DecisionRecordStore:
     @staticmethod
     def _serialize_candidates(candidates: list[DecisionCandidate]) -> str:
         """序列化候选列表为 JSON。"""
-        return json.dumps(
-            [c.model_dump() for c in candidates], ensure_ascii=False
-        )
+        return json.dumps([c.model_dump() for c in candidates], ensure_ascii=False)
 
     @staticmethod
-
     def _serialize_chosen(chosen: DecisionCandidate | None) -> str | None:
         """序列化选中候选为 JSON。"""
         if chosen is None:
@@ -135,8 +132,7 @@ class DecisionRecordStore:
             provider_version=row["provider_version"],
             operation=row["operation"],
             candidates=[
-                DecisionCandidate.model_validate(item)
-                for item in json.loads(row["candidates"])
+                DecisionCandidate.model_validate(item) for item in json.loads(row["candidates"])
             ],
             chosen=self._deserialize_chosen(row["chosen"]),
             success=bool(row["success"]),
@@ -186,20 +182,15 @@ class DecisionRecordStore:
             raise NotFoundError(f"decision record not found: {record_id}")
         return self._row_to_record(row)
 
-    def _list_by_tenant_sync(
-        self, tenant_id: str, limit: int = 100
-    ) -> list[DecisionRecord]:
+    def _list_by_tenant_sync(self, tenant_id: str, limit: int = 100) -> list[DecisionRecord]:
         """同步按租户列出记录。"""
         rows = self._conn.execute(
-            "SELECT * FROM decision_records WHERE tenant_id = ? "
-            "ORDER BY created_at DESC LIMIT ?",
+            "SELECT * FROM decision_records WHERE tenant_id = ? ORDER BY created_at DESC LIMIT ?",
             (tenant_id, limit),
         ).fetchall()
         return [self._row_to_record(r) for r in rows]
 
-    def _list_pending_approvals_sync(
-        self, tenant_id: str
-    ) -> list[DecisionRecord]:
+    def _list_pending_approvals_sync(self, tenant_id: str) -> list[DecisionRecord]:
         """同步列出待审批记录。"""
         rows = self._conn.execute(
             "SELECT * FROM decision_records "
@@ -209,9 +200,7 @@ class DecisionRecordStore:
         ).fetchall()
         return [self._row_to_record(r) for r in rows]
 
-    def _update_approval_status_sync(
-        self, record_id: str, status: str
-    ) -> None:
+    def _update_approval_status_sync(self, record_id: str, status: str) -> None:
         """同步更新审批状态。"""
         row = self._conn.execute(
             "SELECT 1 FROM decision_records WHERE record_id = ?",
@@ -245,25 +234,15 @@ class DecisionRecordStore:
         """
         return await asyncio.to_thread(self._get_sync, record_id)
 
-    async def list_by_tenant(
-        self, tenant_id: str, limit: int = 100
-    ) -> list[DecisionRecord]:
+    async def list_by_tenant(self, tenant_id: str, limit: int = 100) -> list[DecisionRecord]:
         """按租户列出决策记录（按创建时间降序）。"""
-        return await asyncio.to_thread(
-            self._list_by_tenant_sync, tenant_id, limit
-        )
+        return await asyncio.to_thread(self._list_by_tenant_sync, tenant_id, limit)
 
-    async def list_pending_approvals(
-        self, tenant_id: str
-    ) -> list[DecisionRecord]:
+    async def list_pending_approvals(self, tenant_id: str) -> list[DecisionRecord]:
         """列出指定租户的待审批决策记录。"""
-        return await asyncio.to_thread(
-            self._list_pending_approvals_sync, tenant_id
-        )
+        return await asyncio.to_thread(self._list_pending_approvals_sync, tenant_id)
 
-    async def update_approval_status(
-        self, record_id: str, status: str
-    ) -> None:
+    async def update_approval_status(self, record_id: str, status: str) -> None:
         """更新决策记录的审批状态。
 
         Args:
@@ -273,9 +252,7 @@ class DecisionRecordStore:
         Raises:
             NotFoundError: 记录不存在。
         """
-        await asyncio.to_thread(
-            self._update_approval_status_sync, record_id, status
-        )
+        await asyncio.to_thread(self._update_approval_status_sync, record_id, status)
 
     async def close(self) -> None:
         """关闭数据库连接。"""

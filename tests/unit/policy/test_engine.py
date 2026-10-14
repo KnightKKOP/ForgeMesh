@@ -11,6 +11,7 @@
 * 有条件授权 → allow + 条件约束；
 * PolicyDecision 的 policy_id / approvers 审计字段。
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -171,14 +172,10 @@ def test_tenant_isolation_in_authz() -> None:
         ],
     )
     # team-a 有 allow 规则 → allow
-    result_a = _run(
-        engine.check(ctx=None, action=_action("inference.deploy", tenant_id="team-a"))
-    )
+    result_a = _run(engine.check(ctx=None, action=_action("inference.deploy", tenant_id="team-a")))
     assert result_a.decision == "allow"
     # team-b 无匹配规则 → 默认拒绝
-    result_b = _run(
-        engine.check(ctx=None, action=_action("inference.deploy", tenant_id="team-b"))
-    )
+    result_b = _run(engine.check(ctx=None, action=_action("inference.deploy", tenant_id="team-b")))
     assert result_b.decision == "deny"
 
 

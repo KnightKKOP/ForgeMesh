@@ -10,6 +10,7 @@
 * :class:`PriorityQueue` —— 优先级队列，按 :class:`Priority` 排序、同优先级 FIFO。
 * :class:`QoSManager` —— 准入管理器，组合优先级 + 限流 + 全局并发数判断。
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -229,9 +230,7 @@ class QoSManager:
                     )
             # 3. 占用并发槽
             self._total_concurrent += 1
-            self._concurrent[request.tenant_id] = (
-                self._concurrent.get(request.tenant_id, 0) + 1
-            )
+            self._concurrent[request.tenant_id] = self._concurrent.get(request.tenant_id, 0) + 1
             return QoSDecision(
                 allowed=True,
                 reason="admitted",

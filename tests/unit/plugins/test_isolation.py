@@ -74,9 +74,7 @@ class TestIsolationPolicy:
         assert policy.resolve(TrustLevel.VERIFIED) == IsolationMode.RESTRICTED_RPC
 
     def test_custom_mapping(self) -> None:
-        policy = IsolationPolicy(
-            mapping={TrustLevel.TRUSTED: IsolationMode.RESTRICTED_RPC}
-        )
+        policy = IsolationPolicy(mapping={TrustLevel.TRUSTED: IsolationMode.RESTRICTED_RPC})
 
         assert policy.resolve(TrustLevel.TRUSTED) == IsolationMode.RESTRICTED_RPC
 

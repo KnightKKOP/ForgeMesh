@@ -36,9 +36,7 @@ class SlowProvider(DecisionProvider):
 
     async def decide(self, req: DecisionRequest) -> Sequence[DecisionCandidate]:
         await asyncio.sleep(0.5)
-        return [
-            DecisionCandidate(candidate_id="slow-1", action="schedule.slow")
-        ]
+        return [DecisionCandidate(candidate_id="slow-1", action="schedule.slow")]
 
 
 class FastProvider(DecisionProvider):
@@ -48,9 +46,7 @@ class FastProvider(DecisionProvider):
     provider_version = "0.0.1"
 
     async def decide(self, req: DecisionRequest) -> Sequence[DecisionCandidate]:
-        return [
-            DecisionCandidate(candidate_id="fast-1", action="schedule.fast")
-        ]
+        return [DecisionCandidate(candidate_id="fast-1", action="schedule.fast")]
 
 
 class EmptyProvider(DecisionProvider):
@@ -169,9 +165,7 @@ def test_high_risk_fallback_required_when_candidate_from_fallback() -> None:
         timeout_seconds=0.05,
     )
 
-    result = asyncio.get_event_loop().run_until_complete(
-        router.route(_request(risk_level="high"))
-    )
+    result = asyncio.get_event_loop().run_until_complete(router.route(_request(risk_level="high")))
 
     # 候选仍返回供人工/上游决策，但不设置 chosen、不自动采用
     assert result.status == "FALLBACK_REQUIRED"
@@ -192,9 +186,7 @@ def test_high_risk_ok_when_primary_succeeds() -> None:
         timeout_seconds=0.05,
     )
 
-    result = asyncio.get_event_loop().run_until_complete(
-        router.route(_request(risk_level="high"))
-    )
+    result = asyncio.get_event_loop().run_until_complete(router.route(_request(risk_level="high")))
 
     assert result.status == "OK"
     assert result.success is True
@@ -210,9 +202,7 @@ def test_high_risk_without_fallback_provider_fails() -> None:
         timeout_seconds=0.05,
     )
 
-    result = asyncio.get_event_loop().run_until_complete(
-        router.route(_request(risk_level="high"))
-    )
+    result = asyncio.get_event_loop().run_until_complete(router.route(_request(risk_level="high")))
 
     assert result.status == "FAILED"
     assert result.success is False
@@ -248,9 +238,7 @@ def test_deadline_ms_tighter_than_global_timeout() -> None:
         timeout_seconds=5.0,
     )
 
-    result = asyncio.get_event_loop().run_until_complete(
-        router.route(_request(deadline_ms=50))
-    )
+    result = asyncio.get_event_loop().run_until_complete(router.route(_request(deadline_ms=50)))
 
     # SlowProvider 睡 0.5s，被 50ms 请求时限打断 → 备用成功
     assert result.status == "OK"
@@ -266,9 +254,7 @@ def test_deadline_ms_looser_than_global_timeout() -> None:
         timeout_seconds=0.05,
     )
 
-    result = asyncio.get_event_loop().run_until_complete(
-        router.route(_request(deadline_ms=5000))
-    )
+    result = asyncio.get_event_loop().run_until_complete(router.route(_request(deadline_ms=5000)))
 
     assert result.status == "OK"
     assert result.chosen is not None

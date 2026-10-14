@@ -76,7 +76,8 @@ CREATE INDEX IF NOT EXISTS idx_runs_idempotency ON workflow_runs(idempotency_key
 
 #: 工作流终态集合（无出边），用于 ``list_pending_runs`` 过滤。
 _WORKFLOW_TERMINAL_STATUSES: frozenset[str] = frozenset(
-    s.value for s in (
+    s.value
+    for s in (
         WorkflowStatus.SUCCEEDED,
         WorkflowStatus.FAILED,
         WorkflowStatus.CANCELLED,
@@ -160,8 +161,7 @@ class WorkflowStore:
         """同步创建运行实例（幂等）。"""
         # 幂等检查：同一 idempotency_key 已存在则返回已有实例。
         existing = self._conn.execute(
-            "SELECT run_id, definition_version FROM workflow_runs "
-            "WHERE idempotency_key = ?",
+            "SELECT run_id, definition_version FROM workflow_runs WHERE idempotency_key = ?",
             (idempotency_key,),
         ).fetchone()
         if existing is not None:
@@ -302,9 +302,7 @@ class WorkflowStore:
             (run_id, step_id),
         ).fetchone()
         if row is None:
-            raise NotFoundError(
-                f"step not found: run_id={run_id}, step_id={step_id}"
-            )
+            raise NotFoundError(f"step not found: run_id={run_id}, step_id={step_id}")
 
         cur_status = row["status"]
         # 校验转移合法性。
@@ -314,14 +312,19 @@ class WorkflowStore:
         started_at = row["started_at"]
         if status == StepStatus.RUNNING.value and started_at is None:
             started_at = now
-        finished_at = now if status in (
-            StepStatus.SUCCEEDED.value,
-            StepStatus.FAILED.value,
-            StepStatus.SKIPPED.value,
-            StepStatus.CANCELLED.value,
-            StepStatus.COMPENSATED.value,
-            StepStatus.COMPENSATION_FAILED.value,
-        ) else None
+        finished_at = (
+            now
+            if status
+            in (
+                StepStatus.SUCCEEDED.value,
+                StepStatus.FAILED.value,
+                StepStatus.SKIPPED.value,
+                StepStatus.CANCELLED.value,
+                StepStatus.COMPENSATED.value,
+                StepStatus.COMPENSATION_FAILED.value,
+            )
+            else None
+        )
 
         attempt_count = row["attempt_count"]
         if status == StepStatus.RUNNING.value:
@@ -343,9 +346,7 @@ class WorkflowStore:
     def _list_pending_runs_sync(self) -> list[dict[str, Any]]:
         """同步列出非终态运行（用于恢复）。"""
         rows = self._conn.execute(
-            "SELECT * FROM workflow_runs "
-            "WHERE status NOT IN (?, ?, ?, ?) "
-            "ORDER BY created_at",
+            "SELECT * FROM workflow_runs WHERE status NOT IN (?, ?, ?, ?) ORDER BY created_at",
             tuple(_WORKFLOW_TERMINAL_STATUSES),
         ).fetchall()
         return [

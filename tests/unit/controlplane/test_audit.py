@@ -11,6 +11,7 @@
 * ``put`` 只在调用方的事务中写入，``record`` 自行提交；与业务存储共用数据库；
 * 存量库补齐 ``key_id`` / ``namespace`` 列。
 """
+
 from __future__ import annotations
 
 import sqlite3

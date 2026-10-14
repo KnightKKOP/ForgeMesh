@@ -587,9 +587,7 @@ def test_check_permissions_granted() -> None:
     assert mgr.check_permissions(pid, {"device.read"}) is True
     assert mgr.check_permissions(pid, {"device.read", "device.partition"}) is True
     # 全部权限
-    assert mgr.check_permissions(
-        pid, {"device.read", "device.partition", "metering.read"}
-    ) is True
+    assert mgr.check_permissions(pid, {"device.read", "device.partition", "metering.read"}) is True
 
 
 @pytest.mark.unit

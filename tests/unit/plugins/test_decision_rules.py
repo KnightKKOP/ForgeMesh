@@ -129,12 +129,8 @@ def test_provider_decide_returns_all_matching_candidates() -> None:
 @pytest.mark.unit
 def test_provider_decide_no_match_returns_empty() -> None:
     """无规则匹配时应返回空列表（非 None）。"""
-    provider = RulesProvider(
-        rules=[Rule(name="r1", condition=lambda req: False, action="act-1")]
-    )
-    result = list(
-        asyncio.get_event_loop().run_until_complete(provider.decide(_request()))
-    )
+    provider = RulesProvider(rules=[Rule(name="r1", condition=lambda req: False, action="act-1")])
+    result = list(asyncio.get_event_loop().run_until_complete(provider.decide(_request())))
     assert result == []
 
 
@@ -142,9 +138,7 @@ def test_provider_decide_no_match_returns_empty() -> None:
 def test_provider_decide_no_rules_returns_empty() -> None:
     """无规则时 decide 应返回空列表。"""
     provider = RulesProvider()
-    result = list(
-        asyncio.get_event_loop().run_until_complete(provider.decide(_request()))
-    )
+    result = list(asyncio.get_event_loop().run_until_complete(provider.decide(_request())))
     assert result == []
 
 
@@ -184,17 +178,13 @@ def test_router_integration_fallback_when_no_match() -> None:
         provider_id = "fallback"
         provider_version = "0.0.1"
 
-        async def decide(
-            self, req: DecisionRequest
-        ) -> Sequence[DecisionCandidate]:
+        async def decide(self, req: DecisionRequest) -> Sequence[DecisionCandidate]:
             return [DecisionCandidate(candidate_id="fb-1", action="schedule.cpu")]
 
     empty_provider = RulesProvider(
         rules=[Rule(name="r1", condition=lambda req: False, action="act-1")]
     )
-    router = DecisionRouter(
-        providers=[empty_provider, FallbackProvider()], timeout_seconds=1.0
-    )
+    router = DecisionRouter(providers=[empty_provider, FallbackProvider()], timeout_seconds=1.0)
     result = asyncio.get_event_loop().run_until_complete(router.route(_request()))
     assert result.success is True
     assert result.chosen is not None

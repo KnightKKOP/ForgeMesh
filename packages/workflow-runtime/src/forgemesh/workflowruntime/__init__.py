@@ -49,9 +49,7 @@ class WorkflowProvider(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    async def approve(
-        self, *, run_id: str, step_id: str, tenant_id: str, approver: str
-    ) -> None:
+    async def approve(self, *, run_id: str, step_id: str, tenant_id: str, approver: str) -> None:
         """对等待人工审批的高风险步骤进行审批。"""
         raise NotImplementedError
 
@@ -100,9 +98,7 @@ class ReferenceWorkflowProvider(WorkflowProvider):
             return {"runId": run_id, "state": "Unknown", "tenantId": tenant_id}
         return {"runId": run_id, **record}
 
-    async def approve(
-        self, *, run_id: str, step_id: str, tenant_id: str, approver: str
-    ) -> None:
+    async def approve(self, *, run_id: str, step_id: str, tenant_id: str, approver: str) -> None:
         raise NotImplementedError("阶段 0 占位：审批流程尚未实现。")
 
     async def cancel(self, *, run_id: str, tenant_id: str, reason: str = "") -> None:

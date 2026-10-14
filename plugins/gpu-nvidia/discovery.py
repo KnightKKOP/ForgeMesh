@@ -81,18 +81,21 @@ async def _default_enumerate() -> list[dict[str, Any]]:
     """
     try:
         import pynvml as nvml  # noqa: PLC0415
+
         nvml.nvmlInit()
         count = nvml.nvmlDeviceGetCount()
         devices: list[dict[str, Any]] = []
         for index in range(count):
             handle = nvml.nvmlDeviceGetHandleByIndex(index)
             mem = nvml.nvmlDeviceGetMemoryInfo(handle)
-            devices.append({
-                "index": index,
-                "name": _decode(nvml.nvmlDeviceGetName(handle)),
-                "uuid": _decode(nvml.nvmlDeviceGetUUID(handle)),
-                "memory_bytes": int(mem.total),
-            })
+            devices.append(
+                {
+                    "index": index,
+                    "name": _decode(nvml.nvmlDeviceGetName(handle)),
+                    "uuid": _decode(nvml.nvmlDeviceGetUUID(handle)),
+                    "memory_bytes": int(mem.total),
+                }
+            )
         nvml.nvmlShutdown()
     except Exception:
         return []

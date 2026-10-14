@@ -180,18 +180,45 @@ def test_list_by_tenant_empty() -> None:
 def test_aggregate_statistics() -> None:
     """aggregate 应正确统计总 Token / 成功失败数 / 延迟。"""
     store = UsageStore()
-    _run(store.record(_record(
-        record_id="r1", input_tokens=100, output_tokens=50, cached_tokens=10,
-        success=True, latency_ms=200.0, created_at=1000.0,
-    )))
-    _run(store.record(_record(
-        record_id="r2", input_tokens=200, output_tokens=100, cached_tokens=20,
-        success=True, latency_ms=400.0, created_at=1500.0,
-    )))
-    _run(store.record(_record(
-        record_id="r3", input_tokens=50, output_tokens=20, cached_tokens=0,
-        success=False, latency_ms=100.0, created_at=1800.0,
-    )))
+    _run(
+        store.record(
+            _record(
+                record_id="r1",
+                input_tokens=100,
+                output_tokens=50,
+                cached_tokens=10,
+                success=True,
+                latency_ms=200.0,
+                created_at=1000.0,
+            )
+        )
+    )
+    _run(
+        store.record(
+            _record(
+                record_id="r2",
+                input_tokens=200,
+                output_tokens=100,
+                cached_tokens=20,
+                success=True,
+                latency_ms=400.0,
+                created_at=1500.0,
+            )
+        )
+    )
+    _run(
+        store.record(
+            _record(
+                record_id="r3",
+                input_tokens=50,
+                output_tokens=20,
+                cached_tokens=0,
+                success=False,
+                latency_ms=100.0,
+                created_at=1800.0,
+            )
+        )
+    )
 
     summary = _run(store.aggregate("tenant-a", 1000.0, 2000.0))
     assert isinstance(summary, UsageSummary)
@@ -293,12 +320,26 @@ def test_correct_duplicate_correction_id_raises_conflict() -> None:
 def test_multi_tenant_isolation() -> None:
     """不同租户的记录互不可见（list / aggregate 均隔离）。"""
     store = UsageStore()
-    _run(store.record(_record(
-        record_id="a1", tenant_id="alpha", input_tokens=100, created_at=100.0,
-    )))
-    _run(store.record(_record(
-        record_id="b1", tenant_id="beta", input_tokens=200, created_at=100.0,
-    )))
+    _run(
+        store.record(
+            _record(
+                record_id="a1",
+                tenant_id="alpha",
+                input_tokens=100,
+                created_at=100.0,
+            )
+        )
+    )
+    _run(
+        store.record(
+            _record(
+                record_id="b1",
+                tenant_id="beta",
+                input_tokens=200,
+                created_at=100.0,
+            )
+        )
+    )
 
     alpha_list = _run(store.list_by_tenant("alpha"))
     assert [r.record_id for r in alpha_list] == ["a1"]

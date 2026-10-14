@@ -530,6 +530,7 @@ class ScaffoldTemplate:
         Raises:
             ScaffoldError: 模板中存在 ``context`` 未提供的占位符。
         """
+
         def _replace(match: re.Match[str]) -> str:
             key = match.group(1)
             if key not in context:
@@ -612,9 +613,7 @@ class ScaffoldGenerator:
     @staticmethod
     def _validate_name(name: str) -> None:
         if not _VALID_NAME_RE.match(name):
-            raise ScaffoldError(
-                f"invalid plugin name: {name!r} (must match [a-z][a-z0-9-]*)"
-            )
+            raise ScaffoldError(f"invalid plugin name: {name!r} (must match [a-z][a-z0-9-]*)")
 
     @staticmethod
     def _assert_no_placeholders(files: list[tuple[Path, str]]) -> None:

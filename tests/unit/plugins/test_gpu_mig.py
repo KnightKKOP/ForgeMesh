@@ -492,10 +492,7 @@ def test_concurrent_create_on_same_gpu_does_not_oversubscribe_slices() -> None:
     profile = MIG_PROFILES["1g.5gb"]  # 各 1 切片
 
     async def run_concurrent() -> list[Any]:
-        tasks = [
-            manager.create_instance(0, profile, f"tenant-{i}")
-            for i in range(8)
-        ]
+        tasks = [manager.create_instance(0, profile, f"tenant-{i}") for i in range(8)]
         return await asyncio.gather(*tasks, return_exceptions=True)
 
     results = _run(run_concurrent())
@@ -516,10 +513,7 @@ def test_concurrent_create_on_different_gpus_do_not_block_each_other() -> None:
     manager = MigManager(gpu_capability_provider=_cap_provider(total_compute_slices=1))
 
     async def run_concurrent() -> list[Any]:
-        tasks = [
-            manager.create_instance(i, MIG_PROFILES["1g.5gb"], f"t-{i}")
-            for i in range(4)
-        ]
+        tasks = [manager.create_instance(i, MIG_PROFILES["1g.5gb"], f"t-{i}") for i in range(4)]
         return await asyncio.gather(*tasks, return_exceptions=True)
 
     results = _run(run_concurrent())

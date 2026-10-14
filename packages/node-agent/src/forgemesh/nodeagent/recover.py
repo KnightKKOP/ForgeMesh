@@ -74,9 +74,7 @@ class RecoveryManager:
         for ex in running_executions:
             state = await server.get_execution_state(ex.execution_id)
             action, reason = self._decide(state)
-            actions.append(
-                RecoveryAction(task_id=ex.task_id, action=action, reason=reason)
-            )
+            actions.append(RecoveryAction(task_id=ex.task_id, action=action, reason=reason))
         return actions
 
     @staticmethod

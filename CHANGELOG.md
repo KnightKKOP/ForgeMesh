@@ -9,6 +9,7 @@
 
 - SQLite 单实例部署约束文档：`deploy/docker/docker-compose.yaml` 顶部注释（ADR-013：仅允许单控制平面实例写同一权威库，不得扩展 replicas）与 [docs/operations/backup-restore.md](docs/operations/backup-restore.md) 新增"单实例写入约束"小节（含升级流程：停写 → 备份 → 升级 → 恢复）。
 - 新增 [docs/architecture/v1.1-development-plan.md](docs/architecture/v1.1-development-plan.md)（阶段 A–E 可信基线计划）与 [docs/architecture/module-mapping.md](docs/architecture/module-mapping.md)（逻辑模块 ↔ 真实代码路径映射，含依赖边界 import 循证）。
+- 新增 [docs/architecture/roadmap.md](docs/architecture/roadmap.md)：1.1.0 之后的路线图。阶段 4（执行面与 MaaS 基础）与阶段 5（生产规模与正式版）按迭代列出主题、依赖与验收，附 architecture.md 第 20 节的正式版验收表，以及 #8–#22 的 PR 描述与 ADR-014 中遗留问题的归属。
 - 新增 CI 校验脚本：`scripts/validate_manifests.py`（JSON Schema metaschema 自校验 + 10 插件 manifest 实例校验）、`scripts/openapi_semantic_check.py`（operationId 唯一 / $ref 可解析 / 响应完整性）、`scripts/check_metadata_consistency.py`（requires-python>=3.12、描述禁 skeleton/placeholder）、`scripts/plugin_entrypoint_smoke.py`（插件入口进程内冒烟）。
 - 新增契约 / 混沌 / 兼容测试 122 项（1115 vs 993）：Registry CAS 并发 / 租户过滤 / 重启恢复（19）、Workflow 恢复版本固定 / 取消补偿 + Outbox 事务 / 幂等 / 死信（12）、10 插件发布链路 conformance——manifest/isolation 一致性 + 四类 Provider 契约 + 卸载安全（91）。
 - 控制平面可运行入口：`control-plane` 包新增控制台脚本 `forgemesh-control-plane`（`forgemesh.controlplane.app:main`）；权威存储路径取自 `FORGEMESH_DB_PATH`（默认 `forgemesh.db`），监听地址取自 `FORGEMESH_HOST` / `FORGEMESH_PORT`（默认 `127.0.0.1:8080`），启动方式见 README「运行控制平面」。

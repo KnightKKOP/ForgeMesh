@@ -1,6 +1,6 @@
 # ForgeMesh 开发计划（Development Plan）
 
-> **状态说明（2026-10-11）**：本计划描述的 M0–M6 已于 v1.0.0 全部交付（见 [CHANGELOG](../../CHANGELOG.md) 与 [v1.0 发布记录](../releases/v1.0.md)）。v1.0.1 修订与 v1.1 可信基线计划见 [v1.1-development-plan.md](v1.1-development-plan.md)；模块与真实代码路径的映射见 [module-mapping.md](module-mapping.md)。本文其余内容保留为历史规划基线，不再要求重复实施。
+> **状态说明（2026-10-11）**：本计划描述的 M0–M6 已于 v1.0.0 全部交付（见 [CHANGELOG](../../CHANGELOG.md) 与 [v1.0 发布记录](../releases/v1.0.md)）。v1.0.1 修订与 v1.1 可信基线计划见 [v1.1-development-plan.md](v1.1-development-plan.md)；模块与真实代码路径的映射见 [module-mapping.md](module-mapping.md)；1.1.0 之后的路线图见 [roadmap.md](roadmap.md)。本文其余内容保留为历史规划基线，不再要求重复实施。
 
 > Development Plan · v2.0 · 2026-10-10 · 派生自上游架构基线文档《ForgeMesh 最终版架构设计文档.md》（v1.0）
 

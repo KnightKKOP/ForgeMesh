@@ -6,6 +6,7 @@ ForgeMesh 不是 GPU 自动部署脚本的集合，也不是"仅靠 LLM 执行�
 
 - 上游架构基线：[`docs/architecture/architecture.md`](docs/architecture/architecture.md)
 - 开发计划（WBS / 里程碑 / 接口契约）：[`docs/architecture/development-plan.md`](docs/architecture/development-plan.md)
+- 路线图（1.1.0 之后的阶段与迭代）：[`docs/architecture/roadmap.md`](docs/architecture/roadmap.md)
 - 架构决策记录（ADR）：[`docs/design-decisions/`](docs/design-decisions/)
 - 变更日志：[`CHANGELOG.md`](CHANGELOG.md)
 - v1.0 发布记录：[`docs/releases/v1.0.md`](docs/releases/v1.0.md)
@@ -86,10 +87,13 @@ forgemesh/
 ├── scripts/                    # CI 校验脚本（manifest/OpenAPI/元数据/插件冒烟）
 │
 └── docs/
-    ├── architecture/           # 架构基线与开发计划
+    ├── architecture/           # 架构基线、开发计划、模块映射与路线图
     │   ├── architecture.md
-    │   └── development-plan.md
-    ├── design-decisions/       # ADR 索引与 ADR-001~012
+    │   ├── development-plan.md
+    │   ├── v1.1-development-plan.md
+    │   ├── module-mapping.md
+    │   └── roadmap.md
+    ├── design-decisions/       # ADR 索引与 ADR-001~014
     ├── governance/             # 弃用政策
     ├── operations/             # 备份与灾备
     ├── plugin-development/     # 插件开发指南
@@ -612,8 +616,10 @@ ForgeMesh 通过可插拔架构支持 6 种插件类型：
 | M5 | P4 | ✅ 完成 | 生产级治理 |
 | M6 | P5 | ✅ 完成 | 扩展与生态（v1.0.0 发布） |
 | v1.1 | — | ✅ 已交付 | 可信基线（阶段 A–E），见 [`v1.1-development-plan.md`](docs/architecture/v1.1-development-plan.md) |
+| 1.1.0 | 阶段 1–3 | ✅ 已合入 | #5–#23：数据正确性、认证与控制器；推理服务的最小闭环；资源的生命周期、可观测性与工程化（尚未发布） |
+| 1.1.0 之后 | 阶段 4–5 | 计划中 | 执行面与 MaaS 基础；生产规模与正式版。见 [`roadmap.md`](docs/architecture/roadmap.md) |
 
-> 里程碑定义与准入/准出条件（DoD）见 [`development-plan.md`](docs/architecture/development-plan.md)。
+> 里程碑定义与准入/准出条件（DoD）见 [`development-plan.md`](docs/architecture/development-plan.md)；1.1.0 之后的阶段、迭代与验收见 [`roadmap.md`](docs/architecture/roadmap.md)。
 
 ---
 

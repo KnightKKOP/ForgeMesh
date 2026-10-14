@@ -84,6 +84,7 @@ ForgeMesh 不负责重新实现整个基础设施生态。
 - 不自行开发 GPU 驱动或通用容器运行时。
 - 不重新实现 vLLM 等推理引擎。
 - 不把 Kubernetes 作为唯一的执行后端。
+- 不在 Kubernetes 上重新实现已有的推理编排与请求调度框架（如 KServe、Kthena），而是把它们作为执行后端（见 10.4）。
 - 不要求所有插件都运行在同一个进程内。
 - 不要求所有决策必须由 JEV 或 LLM 完成。
 - 不让 LLM 绕过权限、配额、资源调度和安全检查。
@@ -142,7 +143,7 @@ ForgeMesh 采用六个逻辑层次。
 
 REST API · CLI · Web Console · SDK · Data Plane Gateway（Go）· 推理流量入口
 
-统一外部入口、身份认证和 API 兼容性；数据平面网关承担推理请求路由、流式转发与实例健康摘流
+统一外部入口、身份认证和 API 兼容性；数据平面网关承担推理请求路由、流式转发与实例健康摘流，并在模型服务场景中执行配额与计量（见 11.5）
 
 ### L2 · Core Control Plane
 
@@ -164,9 +165,9 @@ GPU · Runtime · Model · MIG · Quantization · QoS · Metering
 
 ### L5 · Execution Plane
 
-Node Agent · Kubernetes · Container Runtime · GPU · Inference Services
+Node Agent · 进程与容器启动器 · Kubernetes 推理后端（Kthena / KServe）· GPU · Inference Services
 
-实际资源操作与状态反馈
+实际资源操作与状态反馈；执行后端屏蔽实例运行在哪里（见 10.4）
 
 ### L6 · Platform Infrastructure
 
@@ -203,7 +204,7 @@ flowchart TB
   end
   subgraph L5["L5 · Execution Plane"]
     NA["Node Agent"]
-    RT["Kubernetes · Container Runtime"]
+    RT["进程与容器启动器 · Kubernetes 推理后端（Kthena / KServe）"]
     INS["Inference Services"]
   end
   subgraph L6["L6 · Platform Infrastructure"]
@@ -887,6 +888,27 @@ Agent 只接受有类型的任务，例如：
 
 Agent 断线重连后必须查询未完成任务的真实状态，再决定是否重试。不能仅因为控制平面没有收到结果，就认定原操作失败。
 
+## 10.4 执行后端
+
+控制平面经启动器契约 `RuntimeLauncher` 部署推理实例：`prepare`（可选）、`launch`、`verify` 与 `stop` 都必须幂等，`stop` 必须在有限时间内返回；`is_running` 只查看启动器自己的记录，报告实例是否仍在运行；可选的 `start` 与 `aclose` 在应用启动与关闭时调用。部署工作流（准备模型 → 启动实例 → 验证实例）只经过这个契约操作实例，协调器、调度器与网关都不依赖具体的执行后端。
+
+| 执行后端 | 实例运行在哪里 | 状态 |
+| -------- | -------------- | ---- |
+| `fake` | 控制平面进程内的 OpenAI 兼容桩服务 | 已实现，供 CI 与本地开发 |
+| `vllm-process`、`tgi-process` | 控制平面所在主机上的子进程 | 已实现 |
+| `container` | 主机上的容器（Docker / Podman） | 计划中（[路线图](roadmap.md) 4.1-B） |
+| 经 Node Agent 的远程实例 | 远程节点，经受认证的任务协议（10.2、10.3） | 计划中（路线图 4.2-D） |
+| `kthena`、`kserve` | Kubernetes 集群中由 Kthena 的 `ModelServing` 或 KServe 的 `LLMInferenceService` 承载的工作负载 | 计划中（路线图 4.1-B） |
+
+与 Kubernetes 原生推理框架的分工：KServe 与 Kthena 已经在 Kubernetes 上提供多副本、多机并行、prefill / decode 分离、按推理指标扩缩与 KV cache 感知的请求调度。ForgeMesh 不在 Kubernetes 上重新实现这些能力，而是把它们作为执行后端：
+
+- 控制平面把 `InferenceService` 的期望状态翻译成后端的资源（Kthena 的 `ModelServing`、`ModelServer` 与 `ModelRoute`，或 KServe 的 `LLMInferenceService`），读回状态与入口地址，写入 `status`。
+- 资源的权威状态、策略与审批、配额、计量与审计仍由 ForgeMesh 负责（不变量一）。后端是执行者，它报告的状态与其他执行结果一样需要重新观察，不能被无条件视为真实状态（3.3 第 6 条）。
+- 多副本、扩缩与实例选择：在 Kubernetes 后端上由后端承担，在 ForgeMesh 自己的启动器上由 ForgeMesh 实现；两种情况下，对外的资源语义相同。
+- GPU 的发现、预检与健康，以及不运行 Kubernetes 的环境（裸机、单机、边缘），仍由 Node Agent 与 ForgeMesh 自己的启动器负责。
+
+各层的完整分工、参考的设计点与对应的迭代见 [roadmap.md](roadmap.md) 1.2 节。
+
 # 11. 多租户、调度、QoS 与计量
 
 ## 11.1 多租户边界
@@ -945,6 +967,15 @@ Agent 断线重连后必须查询未完成任务的真实状态，再决定是�
 6. 跨资源池优化。
 
 GPU 抢占、服务迁移和动态 MIG 重配置应作为独立能力设计，不应在基础调度尚未稳定时默认启用。
+
+## 11.5 模型服务（MaaS）的接入
+
+ForgeMesh 面向的一种使用方式是模型即服务：调用方按模型名使用 OpenAI 兼容的接口，平台负责租户隔离、配额、计量、路由与扩缩。在 11.1 至 11.4 的基础上，约定以下边界：
+
+- **接入**：数据平面网关是推理流量的唯一入口。1.1.0 按命名空间与服务名路由（`/api/v1/namespaces/{ns}/inference/{svc}/chat`），实例的协议由 `status.endpoints` 中的 `protocol` 声明（`openai-chat`、`tgi-generate`）。计划中的 `/v1/models`、`/v1/chat/completions` 等接口按请求中的模型名路由，模型的抽象需要另行 ADR（[路线图](roadmap.md) 4.3-B）。
+- **认证、配额与计量只执行一次**：网关完成认证（ADR-014）与按 key 和模型的 RPM / TPM 配额检查之后，才把请求交给实例或后端，并在响应返回时计量 token（11.3）。转发给 Kubernetes 后端的 router 或网关时，关闭或放宽它们自己的限流，避免重复计数，并把已认证的主体传给后端。
+- **计量口径**：用量取自响应与流中的 `usage`，按 11.3 追加记录；不论请求由哪个后端处理，口径都相同。
+- **放置**：同一个模型可以由多个集群或后端提供。放置由决策 Provider 提出，由 Policy 与 Scheduler 授权（不变量三）；网关按放置结果与后端的健康状态路由与故障转移（路线图 4.4-E）。
 
 # 12. 数据模型与一致性
 
@@ -1402,7 +1433,7 @@ Foundation
 ## 20.6 已知限制
 
 - `InferenceServiceStatus.endpoints`（实例地址、`ready`、`protocol`）已进入资源模型、JSON Schema 与 OpenAPI，可经 status 子资源写入，网关按 `protocol` 映射实例上的推理路径。控制平面只在设置了加速器清单（`FORGEMESH_INVENTORY_FILE`）与启动器（`FORGEMESH_RUNTIME_LAUNCHER`）时部署实例、写入实例地址；未设置时服务停在 `Pending`（`Ready=False`），网关对推理请求明确返回 503，不静默降级。
-- 启动器有三种：控制平面进程内的假实例（`fake`，供 CI 与本地开发）与控制平面所在主机上的 vLLM / TGI 子进程（`vllm-process` / `tgi-process`，清单只能有这一个节点）；还没有容器、Kubernetes 或经 Node Agent 的远程启动。每个服务只部署一个实例（`spec.availability.replicas` 不生效），更新先停止旧实例再部署新的 `spec`，期间服务不可用。实例活不过控制平面的重启：重启之前 `Ready` 的服务转为 `Degraded`（`InstanceLost`）后重新部署。控制器只向启动器核对实例是否仍在运行，不探测实例能否服务请求。
+- 启动器有三种：控制平面进程内的假实例（`fake`，供 CI 与本地开发）与控制平面所在主机上的 vLLM / TGI 子进程（`vllm-process` / `tgi-process`，清单只能有这一个节点）；还没有容器、Kubernetes 或经 Node Agent 的远程启动（计划见 10.4 与路线图 4.1-B、4.2-D）。每个服务只部署一个实例（`spec.availability.replicas` 不生效），更新先停止旧实例再部署新的 `spec`，期间服务不可用。实例活不过控制平面的重启：重启之前 `Ready` 的服务转为 `Degraded`（`InstanceLost`）后重新部署。控制器只向启动器核对实例是否仍在运行，不探测实例能否服务请求。
 
 # 附录 A. 状态转移矩阵
 
@@ -1485,9 +1516,10 @@ ForgeMesh 的最终架构不是“把所有东西都做成插件”，而是建�
 - Scheduler 选择并安全分配资源。
 - Plugin System 扩展硬件、运行时和领域能力。
 - Node Agent 在受控权限下执行节点操作。
+- 执行后端屏蔽实例运行在哪里：本机进程、容器、远程节点，或 Kubernetes 上的 Kthena / KServe。
 - Audit / Observability 让所有关键行为可追踪、可诊断。
 
-最重要的是，不要让某个具体框架、工作流引擎、LLM 或 GPU 厂商决定整个系统的架构。公共契约、状态一致性、执行可靠性和安全边界才是项目长期应该守住的部分。
+最重要的是，不要让某个具体框架、工作流引擎、LLM 或 GPU 厂商决定整个系统的架构。公共契约、状态一致性、执行可靠性和安全边界才是项目长期应该守住的部分。在 Kubernetes 上借用 KServe、Kthena 的推理编排也遵循这一点：执行能力可以借用，状态、治理与租户边界由 ForgeMesh 守住。
 
 这就是建议作为 ForgeMesh 后续设计、开发、代码评审和社区贡献依据的最终架构基线。
 
@@ -1499,3 +1531,4 @@ ForgeMesh 的最终架构不是“把所有东西都做成插件”，而是建�
 | v1.0（仓库内修订） | 2026-10-10 至 2026-10-13 | 随实现补充：ADR-013（SQLite 先行）、受控删除与 finalizer（5.3、5.6）、Allocation 的唯一约束（12.4）、性能基准（18.1）、已知限制（20.6）与附录 A 的状态转移矩阵 |
 | v1.1 | 2026-10-14 | 去掉复制时带入的对话文字与界面标签；三张示意图改为 mermaid 源码（原图是本机文件路径与 GitHub 不渲染的 data URI）；代码块标注语言 |
 | v1.1 | 2026-10-14 | 与 ADR-013、ADR-014 及 1.1.0 的实现对齐：ADR 总表补上 ADR-014；权威存储的表述（3.1、3.2、4.2、16.1）改为 SQLite 先行；单写者阶段的控制器部署（5.5）；1.1.0 的 API、认证、事件与转发安全（13.1、13.2、14.1）；可观测性的实现状态（15.1、16.1）；仓库结构（17.1）按实际目录更正；第 19 节标明为原始路线并指向 roadmap.md；第 20 节的 ADR 范围与验收进度 |
+| v1.1 | 2026-10-14 | 新增执行后端（10.4）与模型服务的接入（11.5），写明与 KServe、Kthena 的分工；非目标（1.3）、分层与总体架构图（3.1、3.2）、已知限制（20.6）与架构结论同步 |

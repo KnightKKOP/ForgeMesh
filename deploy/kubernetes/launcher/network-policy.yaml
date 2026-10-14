@@ -1,0 +1,47 @@
+# 启用启动器（FORGEMESH_RUNTIME_LAUNCHER）时与 ../network-policies.yaml 一起应用。
+#
+# fake、vllm-process 与 tgi-process 的推理实例都运行在控制平面的 Pod 内，监听内核挑选的临时端口
+# （Pod 网络命名空间的 net.ipv4.ip_local_port_range，Linux 默认 32768-60999）；网关按
+# status.endpoints 直接连接 Pod IP 上的这些端口。这里只允许网关访问它们；控制平面对实例的
+# 健康检查走 Pod 内的回环地址，不受网络策略限制。
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: forgemesh-inference-instances
+  namespace: forgemesh
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: control-plane
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: gateway
+      ports:
+        - protocol: TCP
+          port: 32768
+          endPort: 60999
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: forgemesh-gateway-to-instances
+  namespace: forgemesh
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: gateway
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: control-plane
+      ports:
+        - protocol: TCP
+          port: 32768
+          endPort: 60999

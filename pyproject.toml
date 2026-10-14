@@ -49,6 +49,10 @@ source = ["packages"]
 omit = ["*/tests/*", "*/__init__.py"]
 
 [tool.coverage.report]
+# 总覆盖率下限（`pytest --cov` 与 `coverage report` 都会检查），只升不降。precision 同时是
+# 比较之前取整的位数：默认的 0 会把 96.5% 取整成 97% 而通过。
+fail_under = 97
+precision = 2
 show_missing = true
 skip_covered = false
 exclude_lines = [

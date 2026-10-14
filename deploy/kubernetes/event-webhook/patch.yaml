@@ -1,0 +1,29 @@
+# 把资源变更事件 POST 到 webhook（strategic merge patch），不设置时事件写进控制平面的日志：
+#
+#   kubectl -n forgemesh create secret generic forgemesh-event-webhook \
+#     --from-file=token=./webhook-token
+#   kubectl apply -f deploy/kubernetes/event-webhook/network-policy.yaml
+#   kubectl -n forgemesh patch deployment forgemesh-control-plane \
+#     --patch-file deploy/kubernetes/event-webhook/patch.yaml
+#
+# 应用之前把 FORGEMESH_EVENT_WEBHOOK_URL 改成接收方的地址（http / https，不得含用户信息与片段）。
+# token 取自 Secret forgemesh-event-webhook 的键 token，以 Authorization: Bearer 发送；Secret
+# 不存在时不设置这个变量，不发送 token。取值非法时控制平面拒绝启动（见 README「运行控制平面」）。
+# 默认的网络策略只允许控制平面访问集群 DNS：还要按接收方修改并应用 network-policy.yaml，否则每次
+# 发送都超时，事件失败 10 次之后不再自动发送（dead）。
+spec:
+  template:
+    spec:
+      containers:
+        - name: control-plane
+          env:
+            - name: FORGEMESH_EVENT_WEBHOOK_URL
+              value: https://events.example.com/forgemesh
+            - name: FORGEMESH_EVENT_WEBHOOK_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: forgemesh-event-webhook
+                  key: token
+                  optional: true
+            - name: FORGEMESH_EVENT_WEBHOOK_TIMEOUT_SECONDS
+              value: "5"

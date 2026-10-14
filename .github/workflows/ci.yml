@@ -11,6 +11,11 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  # 网关的 Go 次版本，与 deploy/docker/Dockerfile.gateway 和 gateway/go.mod 的 go 行保持一致。
+  # setup-go 取它的最新补丁版本，标准库的漏洞修复随补丁版本发布；这个次版本停止维护之前一起升级。
+  GO_VERSION: "1.27"
+
 jobs:
   python:
     name: Python ${{ matrix.python-version }} · lint & test
@@ -51,8 +56,28 @@ jobs:
       - name: Ruff lint
         run: python -m ruff check .
 
-      - name: Pytest
-        run: python -m pytest
+      # 总覆盖率低于 pyproject.toml 中的 fail_under 时失败。
+      - name: Pytest (coverage floor)
+        run: python -m pytest --cov
+
+  package-imports:
+    name: Packages · fresh-venv imports
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      # 上面的 python job 把全部包装进同一个环境，漏声明的依赖会被兄弟包或
+      # requirements-dev.txt 掩盖；这里每个包各用一个全新的虚拟环境，只装它声明的依赖。
+      - name: Import every module of each package
+        run: python scripts/check_package_imports.py
 
   go:
     name: Go gateway · build & test
@@ -68,7 +93,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: "1.22"
+          go-version: ${{ env.GO_VERSION }}
           cache: true
           cache-dependency-path: gateway/go.sum
 
@@ -89,6 +114,39 @@ jobs:
 
       - name: Go test (race detector)
         run: go test -race ./...
+
+  dependency-audit:
+    name: Dependencies · vulnerability audit
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      # setup-go 的缓存键只取决于 Go 版本与 go.sum，会与 go job 争用同一个缓存。
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: false
+
+      # 审计 make install 实际安装的第三方依赖。工具版本与忽略列表在根 Makefile 中，
+      # 已知漏洞的处理规则见 SECURITY.md 3.1。
+      - name: pip-audit (make install environment)
+        run: |
+          make install
+          make audit
+
+      # pip-audit 失败时同样运行，两边的结果都要看到。
+      - name: govulncheck (gateway)
+        if: ${{ !cancelled() }}
+        run: make -C gateway vulncheck
 
   compose-smoke:
     name: Compose · end-to-end smoke
@@ -168,7 +226,7 @@ jobs:
             echo "ERROR: $missing ADR file(s) missing"
             exit 1
           fi
-          file_count=$(ls "$adr_dir"/adr-*.md | wc -l | tr -d ' ')
+          file_count=$(find "$adr_dir" -maxdepth 1 -name 'adr-*.md' -type f | wc -l | tr -d ' ')
           if [ "$file_count" -lt "$indexed_count" ]; then
             echo "ERROR: $file_count ADR file(s) on disk but $indexed_count referenced in README.md"
             exit 1

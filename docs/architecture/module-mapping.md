@@ -47,7 +47,7 @@
 | 15 | QoS / Metering | `plugins/qos-basic`、`metering-basic` | 插件 | 已实现且有测试覆盖 |
 | 16 | 持久化 | `control-plane/registry/store.py` 等（SQLite-first） | 进程内（SQLite 文件） | 已实现且有测试覆盖 |
 | 17 | 开发与 CI | `Makefile`、根 `pyproject.toml`、`.github/workflows/ci.yml` | 开发工具链 | 已实现（细节见小节） |
-| 18 | 部署与运维 | `deploy/`、`docs/operations/` | 部署工件 + 运维文档 | compose 已实现且有测试覆盖；k8s 清单实现待核验（见 2.18） |
+| 18 | 部署与运维 | `deploy/`、`docs/operations/` | 部署工件 + 运维文档 | compose 已实现且有测试覆盖；k8s 清单已人工验证、无自动化测试（见 2.18） |
 | 19 | 命令行工具 | `packages/cli/` | 命令行进程（REST API 客户端） | 已实现且有测试覆盖 |
 
 > 插件共 **10 个**（含 `decision-typesafe-jev`，PR #3 已合入 main），全部在 `plugins/` 平铺目录，每个目录都是 Python 包（`__init__.py` + `manifest.yaml` + 实现模块），由 `api/schemas/plugin-manifest.schema.json` 约束。清单 `spec.entrypoint`（`<模块>:<类>`，如 `provider:RulesProvider`、`deploy:VLLMDeployer`）由 `forgemesh.plugin.loader` 在当前进程内加载；插件都在宿主进程内运行，没有进程隔离（`isolation` 只能声明 `in-process`，见偏差 D3）。
@@ -76,7 +76,7 @@
 | 字段 | 内容 |
 |---|---|
 | 架构模块 | Data Plane Gateway（L1 推理流量入口，architecture.md 3.1 L1 / Dev-5） |
-| 当前代码路径 | `gateway/cmd/gateway/main.go`；`gateway/internal/{config,health,metrics,middleware,router,stream,upstream}/`（共 53 个 `.go` 文件，其中 31 个 `_test.go`，glob 核对）；`gateway/go.mod`（`github.com/Mekoforge/ForgeMesh/gateway`，go 1.22）；`gateway/Makefile`、`gateway/README.md` |
+| 当前代码路径 | `gateway/cmd/gateway/main.go`；`gateway/internal/{config,health,metrics,middleware,router,stream,upstream}/`（共 54 个 `.go` 文件，其中 32 个 `_test.go`，glob 核对）；`gateway/go.mod`（`github.com/Mekoforge/ForgeMesh/gateway`，go 1.27.0）；`gateway/Makefile`、`gateway/README.md` |
 | 核心契约 | `/api/v1/` REST + SSE 流式转发（见 openapi.yaml）；中间件链 `Observe → Recovery → Correlation → TraceContext → AccessLog → Authenticate → RateLimit → LimitRequestBody → Route`；API key 认证（ADR-014，`middleware/{authz,apikey}.go`）；上游解析 `upstream/resolver.go`（按命名空间解析 ready 实例、`protocol` → 实例推理路径、合并回源、健康摘流）；实例地址限制 `stream/addrpolicy.go`；`/metrics`（Prometheus 文本格式，不经认证/限流，`metrics/{metrics,gateway}.go`，测试用解析 `metrics/metricstest`）；W3C `traceparent` 沿用/生成并转发、访问日志（`middleware/{observe,tracecontext,accesslog}.go`） |
 | 运行形态 | 独立进程（Go 二进制），经 `GATEWAY_UPSTREAM_URL` 转发至控制平面 |
 | 数据所有权 | 无权威数据（运行态转发；端点解析缓存为派生数据） |
@@ -301,13 +301,13 @@
 | 字段 | 内容 |
 |---|---|
 | 架构模块 | 开发工具链与持续集成 |
-| 当前代码路径 | `Makefile`（target：`install` / `deps` / `test` / `test-unit` / `test-contract` / `lint` / `fmt` / `clean`，实测核对）；根 `pyproject.toml`（**仅 ruff/pytest/coverage 工具配置，不含打包配置**——monorepo + PEP 420 命名空间包，各子包自带 pyproject）；`.github/workflows/ci.yml`（四 job：`python` 矩阵 lint+pytest（未 await 的协程视为失败）、`go` gofmt+vet+build+`go test -race`、`compose-smoke` 构建镜像并以假启动器端到端冒烟推理服务闭环、`architecture-docs` 校验 OpenAPI/Schema/ADR）；`requirements-dev.txt`；根 `conftest.py`；`gateway/Makefile` |
+| 当前代码路径 | `Makefile`（target：`install` / `deps` / `test` / `test-unit` / `test-contract` / `coverage` / `lint` / `fmt` / `audit` / `clean`，实测核对）；根 `pyproject.toml`（**仅 ruff/pytest/coverage 工具配置，不含打包配置**——monorepo + PEP 420 命名空间包，各子包自带 pyproject；coverage 含总覆盖率下限 `fail_under`）；`.github/workflows/ci.yml`（六 job：`python` 矩阵 lint+pytest（未 await 的协程视为失败，总覆盖率不低于 `fail_under`）、`package-imports` 把每个包装进只带声明依赖的全新虚拟环境并导入全部模块（`scripts/check_package_imports.py`）、`go` gofmt+vet+build+`go test -race`（Go 版本取 workflow 的 `GO_VERSION`）、`dependency-audit` 以 pip-audit 审计 `make install` 的环境并以 govulncheck 检查网关、`compose-smoke` 构建镜像并以假启动器端到端冒烟推理服务闭环、`architecture-docs` 校验 OpenAPI/Schema/ADR）；`requirements-dev.txt`；根 `conftest.py`；`gateway/Makefile`（含 `vulncheck`）；已知漏洞的处理规则见 `SECURITY.md` 3.1 |
 | 核心契约 | 子包统一模板（README「统一子包模板」+ CONTRIBUTING）；`requires-python >= 3.12` 基线（WP-A1.3 统一） |
 | 运行形态 | 开发期工具 + CI 流水线（push 触发，`ci-${{ github.ref }}` 分组去重） |
 | 数据所有权 | 无 |
 | 允许依赖 | 开发依赖（ruff/pytest/coverage/jsonschema 等） |
 | 禁止依赖 | — |
-| 测试路径 | CI 即验证载体；本地基线 `python -m pytest tests/ -q` → 993 passed（2026-10-11） |
+| 测试路径 | CI 即验证载体；本地基线 `python -m pytest tests/ -q` → 993 passed（2026-10-11）；导入检查脚本的测试 `tests/unit/scripts/test_check_package_imports.py` |
 | 状态 | 已实现且验证（Python 侧本地全绿；Go 侧以 CI `go` job 为准，本机无工具链） |
 | 演进动作 | 保留；WP-A2 计划补强：ADR 动态校验、manifest 实例校验、OpenAPI 语义校验、元数据一致性、插件入口冒烟 |
 
@@ -316,15 +316,15 @@
 | 字段 | 内容 |
 |---|---|
 | 架构模块 | 部署拓扑与运维文档（L6 平台基础设施落地） |
-| 当前代码路径 | `deploy/docker/{Dockerfile.control-plane,Dockerfile.gateway}`（均以非 root 用户运行：控制平面 uid 10001，网关 distroless `nonroot`）与根目录 `.dockerignore`；`deploy/docker/docker-compose.yaml`（control-plane + gateway，只发布在 127.0.0.1；postgres 在 `postgres` profile 中、默认不启动；含 ADR-013 单实例注记；不设置加速器清单与启动器，不部署推理实例）与叠加文件 `deploy/docker/docker-compose.fake-runtime.yaml`（一块虚构设备的清单 `deploy/docker/fake-runtime-inventory.json` + 假启动器，不需要 GPU 的推理服务闭环）；`deploy/kubernetes/{namespace,control-plane-deployment}.yaml`（replicas: 1、`strategy: Recreate`、数据库在 PVC 上、key 文件来自 Secret `forgemesh-api-keys`；不设置加速器清单与启动器，不部署推理实例）；`scripts/compose_smoke.sh`；`docs/operations/backup-restore.md`（RPO≤5min / RTO≤15min、在线备份与恢复演练）；示例 `examples/single-node/{inference-service,plugin-vllm}.yaml`、`examples/multi-tenant/tenant-quota.yaml` |
+| 当前代码路径 | `deploy/docker/{Dockerfile.control-plane,Dockerfile.gateway}`（均以非 root 用户运行：控制平面 uid 10001，网关 distroless `nonroot`）与根目录 `.dockerignore`；`deploy/docker/docker-compose.yaml`（control-plane + gateway，只发布在 127.0.0.1；postgres 在 `postgres` profile 中、默认不启动；含 ADR-013 单实例注记；不设置加速器清单与启动器，不部署推理实例）与叠加文件 `deploy/docker/docker-compose.fake-runtime.yaml`（一块虚构设备的清单 `deploy/docker/fake-runtime-inventory.json` + 假启动器，不需要 GPU 的推理服务闭环）；`deploy/kubernetes/{namespace,control-plane-deployment,gateway-deployment,network-policies}.yaml`（控制平面 replicas: 1、`strategy: Recreate`、数据库在 PVC 上；网关无状态；两者共用 Secret `forgemesh-api-keys` 中的 key 文件，各用不挂载 token 的 ServiceAccount；NetworkPolicy 默认拒绝，只放行 DNS、网关访问控制平面 8080 与任何来源访问网关 8081；不设置加速器清单与启动器，不部署推理实例）与 `deploy/kubernetes/launcher/`（推理实例端口的 NetworkPolicy、启用加速器清单与 `fake` 启动器的补丁）、`deploy/kubernetes/monitoring/`（可选：允许 Prometheus 抓取两边 `/metrics` 的 NetworkPolicy）、`deploy/kubernetes/event-webhook/`（可选：资源变更事件 webhook 的环境变量补丁与控制平面访问接收方的出站 NetworkPolicy）；`scripts/compose_smoke.sh`；`docs/operations/backup-restore.md`（RPO≤5min / RTO≤15min、在线备份与恢复演练）；示例 `examples/single-node/{inference-service,plugin-vllm}.yaml`、`examples/multi-tenant/tenant-quota.yaml` |
 | 核心契约 | ADR-013 单控制平面实例约束：compose 不扩展 control-plane；k8s 清单 `replicas: 1` 且更新策略为 `Recreate`（旧 Pod 退出后才启动新 Pod，更新期间不会有两个写者）；控制平面只使用 SQLite，postgres 为目标态预置 |
 | 运行形态 | 容器镜像（Dockerfile）+ 部署工件（YAML）+ 运维文档（Markdown） |
 | 数据所有权 | 无；控制平面的 SQLite 库（叠加 `docker-compose.fake-runtime.yaml` 时还有工作流存储 `forgemesh.workflows.db`）位于 compose 卷 `control-plane-data` / k8s PVC `forgemesh-control-plane-data`（pgdata 卷属目标态预置，仅 `postgres` profile 使用） |
 | 允许依赖 | — |
 | 禁止依赖 | —（约束：部署不得暗示多副本写同一 SQLite） |
-| 测试路径 | `scripts/compose_smoke.sh`（CI `compose-smoke` job：构建镜像，以两个 compose 文件启动，经网关验证无 key 返回 401，创建 `InferenceService` → `Ready` → 经网关流式对话 → 不带凭证抓取两边的 `/metrics`，带 `traceparent` 的请求在控制平面的错误信封与两边的日志中带同一个 trace-id → 删除（实例端口关闭）→ 同名重新创建并再次对话 → `PUT` 修改 `spec` → `Updating` → 以新实例回到 `Ready` 并再次对话 → 让假实例退出 → `Degraded`（`InstanceLost`）→ 重新部署、回到 `Ready` 并再次对话，控制平面的 `/metrics` 计入定期核对发现的丢失与重新部署 → 重启控制平面：资源仍在，服务经 `Degraded`（`InstanceLost`）重新部署、回到 `Ready` 并再次对话，`/metrics` 计入启动时核对发现的丢失与重新部署 → 删除）；k8s 清单无自动化测试；备份恢复有人工演练清单 |
-| 状态 | compose 已实现且有测试覆盖；k8s 清单实现待核验（无自动化测试，尚未提供网关清单、ServiceAccount、NetworkPolicy）；运维文档已交付 |
-| 演进动作 | k8s 补网关清单、ServiceAccount 与 NetworkPolicy；A1.5 已核对部署文档含单实例约束；目标态 PostgreSQL 部署属阶段 F |
+| 测试路径 | `scripts/compose_smoke.sh`（CI `compose-smoke` job：构建镜像，以两个 compose 文件启动，经网关验证无 key 返回 401，创建 `InferenceService` → `Ready` → 经网关流式对话 → 不带凭证抓取两边的 `/metrics`，带 `traceparent` 的请求在控制平面的错误信封与两边的日志中带同一个 trace-id → 删除（实例端口关闭）→ 同名重新创建并再次对话 → `PUT` 修改 `spec` → `Updating` → 以新实例回到 `Ready` 并再次对话 → 让假实例退出 → `Degraded`（`InstanceLost`）→ 重新部署、回到 `Ready` 并再次对话，控制平面的 `/metrics` 计入定期核对发现的丢失与重新部署 → 重启控制平面：资源仍在，服务经 `Degraded`（`InstanceLost`）重新部署、回到 `Ready` 并再次对话，`/metrics` 计入启动时核对发现的丢失与重新部署 → 删除）；k8s 清单无自动化测试，2026-10-13 在 kind（Calico nftables 模式）上人工验证：经网关的认证请求、网络策略的放行与拒绝、Prometheus 抓取两边 `/metrics` 的策略（只放行带标签的 Prometheus Pod）与 README 中的抓取配置、`fake` 启动器经网关的闭环（流式对话、`PATCH` 更新、`/fake/exit` 演练实例丢失、Pod 重建后重新部署）、事件 webhook 的补丁与出站策略；`tgi-process` 只以替身命令验证了启动器在 Pod 中的机制（实例记录、私有目录、控制平面被杀死后重新部署）；备份恢复有人工演练清单 |
+| 状态 | compose 已实现且有测试覆盖；k8s 清单（控制平面、网关、ServiceAccount、NetworkPolicy、`fake` 启动器补丁、指标抓取与事件 webhook 的可选清单）已人工验证、无自动化测试，`vllm-process` / `tgi-process` 启动器在 k8s 上未以真实的 vLLM / TGI 验证；运维文档已交付 |
+| 演进动作 | k8s 清单的自动化验证（如 CI 中的 kind 集群）与镜像发布；A1.5 已核对部署文档含单实例约束；目标态 PostgreSQL 部署属阶段 F |
 
 ### 2.19 命令行工具（cli）
 
@@ -388,12 +388,12 @@ grep -rn "controlplane" packages/node-agent/src/ --include="*.py" | grep -v egg-
 
 ```bash
 ls gateway/*.go gateway/cmd/... 2>/dev/null | head   # 根级无 *.go，代码在 cmd/ 与 internal/
-find gateway -name "*.go" | wc -l                     # → 53
+find gateway -name "*.go" | wc -l                     # → 54
 find gateway -name "*.py" -o -name "requirements*.txt" | wc -l   # → 0
-cat gateway/go.mod                                     # module github.com/Mekoforge/ForgeMesh/gateway (go 1.22)
+cat gateway/go.mod                                     # module github.com/Mekoforge/ForgeMesh/gateway (go 1.27.0)
 ```
 
-**输出：** 53 个 `.go`（含 31 个 `_test.go`）、0 个 `.py`、无 Python 依赖清单；`go.mod` 无任何第三方 require（仅标准库 + go 1.22）。
+**输出：** 54 个 `.go`（含 32 个 `_test.go`）、0 个 `.py`、无 Python 依赖清单；`go.mod` 无任何第三方 require（仅标准库 + go 1.27.0）。
 
 **结论：✅ 符合** —— 网关与 Python 控制平面为进程边界隔离（HTTP 上游），无语言互操作。
 

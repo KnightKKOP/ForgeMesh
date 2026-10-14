@@ -238,7 +238,7 @@ gateway 2026/10/13 03:53:36 access method=POST path="/api/v1/namespaces/default/
 
 ```
 gateway/
-├── go.mod                          # module + go 1.22（无外部依赖）
+├── go.mod                          # module + go 1.27.0（无外部依赖）
 ├── Makefile                        # build / test / run / fmt / vet
 ├── cmd/gateway/main.go             # 入口：配置 → 路由 → http.Server → 优雅停机
 └── internal/
@@ -287,12 +287,15 @@ key 与 key 文件条目由控制平面工具生成（见根 README「运行控�
 python -m forgemesh.controlplane.keygen --tenant acme --subject ci-bot
 ```
 
-CI 门禁：
+CI 门禁（`.github/workflows/ci.yml` 的 `go` 与 `dependency-audit` job，Go 版本取其中的 `GO_VERSION`）：
 
 ```bash
 cd gateway
+test -z "$(gofmt -l .)"
+go vet ./...
 go build ./...
-go test ./...
+go test -race ./...
+make vulncheck       # govulncheck：代码实际调用到的已知漏洞（含标准库），见 SECURITY.md 3.1
 ```
 
 ---

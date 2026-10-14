@@ -1,0 +1,41 @@
+# 试用推理服务的完整闭环，不需要 GPU：为控制平面加上加速器清单与 fake 启动器
+# （strategic merge patch，与 deploy/docker/docker-compose.fake-runtime.yaml 对应）。
+#
+#   kubectl -n forgemesh create configmap forgemesh-inventory \
+#     --from-file=inventory.json=deploy/docker/fake-runtime-inventory.json
+#   kubectl apply -f deploy/kubernetes/launcher/network-policy.yaml
+#   kubectl -n forgemesh patch deployment forgemesh-control-plane \
+#     --patch-file deploy/kubernetes/launcher/fake-runtime-patch.yaml
+#
+# 每个实例是控制平面进程内的 OpenAI 兼容桩服务，监听 Pod 的全部地址、端口由内核挑选；写进
+# status.endpoints 的主机是 Pod IP（Service 只转发 8080 端口，不能写 Service 名）。实例随
+# Pod 结束：Pod 重建之后 Ready 的服务转为 Degraded，随后以新实例重新部署。在 Pod 内向实例
+# 发出 POST /fake/exit 可以让它像进程退出一样结束；控制器每秒核对一次实例（默认 10 秒），
+# 服务很快转为 Degraded 并重新部署。清单挂载在 /etc/forgemesh-inventory，不能挂在只读的
+# key 文件目录 /etc/forgemesh 之下。
+spec:
+  template:
+    spec:
+      containers:
+        - name: control-plane
+          env:
+            - name: FORGEMESH_INVENTORY_FILE
+              value: /etc/forgemesh-inventory/inventory.json
+            - name: FORGEMESH_RUNTIME_LAUNCHER
+              value: fake
+            - name: FORGEMESH_FAKE_LAUNCHER_BIND_HOST
+              value: "0.0.0.0"
+            - name: FORGEMESH_FAKE_LAUNCHER_ADVERTISE_HOST
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: FORGEMESH_INSTANCE_CHECK_INTERVAL_SECONDS
+              value: "1"
+          volumeMounts:
+            - name: inventory
+              mountPath: /etc/forgemesh-inventory
+              readOnly: true
+      volumes:
+        - name: inventory
+          configMap:
+            name: forgemesh-inventory

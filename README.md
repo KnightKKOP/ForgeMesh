@@ -106,7 +106,7 @@ forgemesh/
 
 - Python **3.12+**（CI 覆盖 3.12）
 - GNU Make
-- Go **1.22+**（仅当需要开发/构建 `gateway/` 时）
+- Go **1.27+**（仅当需要开发/构建 `gateway/` 时）
 - Docker 与 Docker Compose v2（仅容器部署时）
 - Git
 
@@ -129,8 +129,10 @@ make test
 ```bash
 make test-unit       # 仅单元测试
 make test-contract   # 仅契约测试
+make coverage        # 全部测试 + 总覆盖率下限（与 CI 相同）
 make lint            # ruff 静态检查
 make fmt             # ruff 自动修复与格式化
+make audit           # pip-audit 检查第三方依赖的已知漏洞（与 CI 相同，需要网络）
 make clean           # 清理构建与缓存产物
 ```
 
@@ -395,7 +397,87 @@ scripts/compose_smoke.sh   # 端到端冒烟（CI 同样执行）
 
 只用 `docker-compose.yaml` 时控制平面没有清单与启动器，新建的服务停在 `Pending`（`SchedulerUnavailable`）。`docker-compose.fake-runtime.yaml` 为控制平面加上清单 `deploy/docker/fake-runtime-inventory.json`（一个节点、一块设备 `gpu-0`）与 `fake` 启动器：实例在控制平面容器内监听全部地址，写进 `status.endpoints` 的主机是服务名 `control-plane`，网关经 compose 网络连接它（私网地址默认允许），实例端口不发布到宿主机。`scripts/compose_smoke.sh` 用这两个文件经网关走完闭环：无 key 的请求返回 `401`；创建 → `Ready`（一个就绪的 `openai-chat` 端点）→ 流式对话到达实例、以 `[DONE]` 结束 → 不带凭证抓取两边的 `/metrics`，带 `traceparent` 的请求在两边的日志与错误信封中带同一个 trace-id（见「可观测性」）→ 删除后资源消失、实例停止监听 → 同名重新创建（只有一块设备，可见分配已释放）→ 再次对话到达新实例 → 以 `PUT` 修改 `spec` → `Updating` → 以新实例回到 `Ready`（`observedGeneration` 为 `2`，旧实例停止监听）并再次对话 → 让实例退出（在控制平面容器内 `POST /fake/exit`）→ `Degraded`（`InstanceLost`）→ 重新部署，以新实例回到 `Ready` 并再次对话，控制平面的 `/metrics` 计入定期核对发现的一次丢失与一次重新部署 → 重启控制平面：资源仍在，服务转为 `Degraded`（`InstanceLost`）后重新部署，以新实例回到 `Ready` 并再次对话，`/metrics`（随新进程从 0 计数）计入启动时核对发现的一次丢失与一次重新部署 → 删除。叠加文件把核对实例的间隔设为 1 秒；每一步都有时限，只等待状态变化，不依赖网关在某一刻返回的状态码。
 
-控制平面的 SQLite 数据库（部署推理服务时还有工作流存储 `forgemesh.workflows.db`）在 compose 卷 `control-plane-data` 中。Kubernetes 清单见 `deploy/kubernetes/`：数据库放在 PersistentVolumeClaim 上，key 文件来自 Secret `forgemesh-api-keys`，更新策略为 `Recreate`，保证任何时刻只有一个控制平面写数据库（ADR-013）；清单没有设置加速器清单与启动器，不部署推理实例。容器中的备份与恢复见 [备份与灾备演练](docs/operations/backup-restore.md) 2.5 / 3.4 节。
+控制平面的 SQLite 数据库（部署推理服务时还有工作流存储 `forgemesh.workflows.db`）在 compose 卷 `control-plane-data` 中。容器中的备份与恢复见 [备份与灾备演练](docs/operations/backup-restore.md) 2.5 / 3.4 节。
+
+### Kubernetes 部署
+
+`deploy/kubernetes/` 中的清单把控制平面与网关部署在命名空间 `forgemesh` 中。控制平面的数据库放在 PersistentVolumeClaim 上（应是块存储），副本数固定为 1、更新策略为 `Recreate`，保证任何时刻只有一个控制平面写数据库（ADR-013）；网关无状态，可以增加副本，限流按副本各自计算。两者共用 Secret `forgemesh-api-keys` 中的 key 文件，各以专用的 ServiceAccount 运行、不挂载 token（都不访问 Kubernetes API），以非 root 用户、只读根文件系统、去掉全部 capability 运行，满足 Pod Security 的 `restricted` 级别。
+
+```bash
+# 1. 构建镜像并推送到集群能拉取的镜像仓库，相应修改两个 Deployment 的 image
+#    （kind 可以直接 kind load docker-image forgemesh/control-plane:0.0.1 forgemesh/gateway:0.0.1）
+docker build -f deploy/docker/Dockerfile.control-plane -t forgemesh/control-plane:0.0.1 .
+docker build -f deploy/docker/Dockerfile.gateway -t forgemesh/gateway:0.0.1 .
+# 2. 命名空间与 key 文件（生成方法见「运行控制平面」）
+kubectl apply -f deploy/kubernetes/namespace.yaml
+kubectl -n forgemesh create secret generic forgemesh-api-keys --from-file=api-keys.json
+# 3. 控制平面、网关与网络策略；网关的 /readyz 在控制平面就绪之后才通过
+kubectl apply -f deploy/kubernetes/
+kubectl -n forgemesh rollout status deployment/forgemesh-gateway
+# 4. 经网关调用：集群外的调用方经 Ingress 或 LoadBalancer 访问 Service forgemesh-gateway（8081），这里用端口转发
+kubectl -n forgemesh port-forward service/forgemesh-gateway 8081:8081 &
+curl -s -H "Authorization: Bearer fmk_…" http://127.0.0.1:8081/api/v1/inference-services
+```
+
+**网络策略**（`network-policies.yaml`）：默认拒绝命名空间内全部 Pod 的入站与出站流量，只放行全部 Pod 访问集群 DNS（`kube-system` 中 `k8s-app: kube-dns` 的 Pod）、网关访问控制平面的 8080 端口、任何来源访问网关的 8081 端口。集群内的其他工作负载因此不能直接访问控制平面，改为访问 `forgemesh-gateway:8081`，API 路径不变。kubelet 的探针与 `kubectl exec` / `cp` / `port-forward` 不受网络策略限制，容器中的备份与恢复照常进行。NetworkPolicy 只在执行它的 CNI（如 Calico、Cilium）上生效，其他 CNI 静默忽略。命名空间中新增的工作负载同样默认拒绝，需要为它另写策略；集群 DNS 的标签或端口不同（例如使用 NodeLocal DNSCache）时修改 `forgemesh-allow-dns`；调用方只经 Ingress 控制器访问时，可以把网关的入站来源收窄到 Ingress 控制器所在的命名空间。`kubectl apply -f deploy/kubernetes/` 不包括子目录，下文的 `launcher/`、`monitoring/` 与 `event-webhook/` 按需另行应用。
+
+**指标抓取**：控制平面（8080）与网关（8081）的 `/metrics` 不要求认证，只输出跨租户聚合的指标（见「可观测性」），但仍能反映整体负载。默认的策略下只有网关能访问控制平面，而网关不转发 `/metrics`，从 Pod 网络抓取不到控制平面；网关的 `/metrics` 与探针和 API 共用对任何来源开放的 8081 端口，经 Ingress 暴露网关时只路由 `/api/v1/`，不要把整个端口暴露到公网。可选的 `monitoring/network-policy.yaml` 允许命名空间 `monitoring` 中带有 `app.kubernetes.io/name: prometheus` 标签的 Pod 访问这两个端口：应用之前把两条策略的 `namespaceSelector` 与 `podSelector` 改成自己的 Prometheus 所在的命名空间与它的 Pod 的标签。网关的那条在收窄了网关的入站来源之后才起作用。NetworkPolicy 按端口而不是路径放行，这些 Pod 也能直接调用控制平面的 API（仍须 API key），不经过网关的限流与请求体上限。Prometheus 应按 Pod 抓取，不经 Service：网关有多个副本时，经 Service 每次抓到的是不同副本的计数。例如（Prometheus 需要读取命名空间 `forgemesh` 中 EndpointSlice、Service 与 Pod 的 RBAC 权限）：
+
+```yaml
+scrape_configs:
+  - job_name: forgemesh
+    kubernetes_sd_configs:
+      - role: endpointslice
+        namespaces:
+          names: [forgemesh]
+    relabel_configs:
+      - source_labels: [__meta_kubernetes_service_name]
+        regex: forgemesh-control-plane|forgemesh-gateway
+        action: keep
+```
+
+**资源变更事件的 webhook**：资源变更事件默认写进控制平面的日志（见「运行控制平面」）。`event-webhook/patch.yaml` 为控制平面设置 `FORGEMESH_EVENT_WEBHOOK_URL`（应用之前改成接收方的地址）、`FORGEMESH_EVENT_WEBHOOK_TOKEN`（取自 Secret `forgemesh-event-webhook` 的键 `token`，Secret 不存在时不发送 token）与 `FORGEMESH_EVENT_WEBHOOK_TIMEOUT_SECONDS`。默认的策略只允许控制平面出站访问集群 DNS，还要应用 `event-webhook/network-policy.yaml`。NetworkPolicy 不能按域名放行：接收方在集群内时把规则改成它的命名空间、Pod 的标签与容器端口，在集群外时改成它的 IP 地址段与端口；地址不固定的接收方改经出站代理发送（控制平面遵循 `HTTPS_PROXY` / `HTTP_PROXY` / `NO_PROXY`），规则改为允许访问代理。缺少出站规则时每次发送都超时，事件失败 10 次之后不再自动发送（`dead`）；放行之后按[备份与灾备演练](docs/operations/backup-restore.md)第 5 节重新投递，命令以 `kubectl -n forgemesh exec deployment/forgemesh-control-plane -- python -c "…"` 执行，数据库路径为 `/var/lib/forgemesh/forgemesh.db`。
+
+```bash
+kubectl -n forgemesh create secret generic forgemesh-event-webhook --from-file=token=./webhook-token
+# 先按接收方修改 event-webhook/network-policy.yaml 的规则与 patch.yaml 中的地址
+kubectl apply -f deploy/kubernetes/event-webhook/network-policy.yaml
+kubectl -n forgemesh patch deployment forgemesh-control-plane \
+  --patch-file deploy/kubernetes/event-webhook/patch.yaml
+```
+
+**加速器清单与启动器**：控制平面的 Deployment 没有设置 `FORGEMESH_INVENTORY_FILE` 与 `FORGEMESH_RUNTIME_LAUNCHER`，新建的服务停在 `Pending`（`SchedulerUnavailable`）。在 Kubernetes 上启用它们（变量见「运行控制平面」与「部署推理服务」）：
+
+- 加速器清单放在 ConfigMap 中，挂载到 `/etc/forgemesh` 以外的目录（`/etc/forgemesh` 是 key 文件 Secret 的只读挂载点），`FORGEMESH_INVENTORY_FILE` 指向挂载的文件。控制平面只在启动时读取清单，修改 ConfigMap 之后执行 `kubectl -n forgemesh rollout restart deployment/forgemesh-control-plane`。
+- 推理实例运行在控制平面的 Pod 内，监听内核挑选的临时端口（Linux 默认 32768–60999），网关直接连接 Pod IP：启动器的监听地址设为 `0.0.0.0`，写进 `status.endpoints` 的主机用 Downward API 取 Pod IP（Service 只转发 8080，不能写 Service 名）。同时应用 `launcher/network-policy.yaml`，允许网关访问这些端口；修改了 Pod 的 `net.ipv4.ip_local_port_range` 时相应修改端口范围。
+- 实例随 Pod 结束：更新 Deployment、Pod 被驱逐或节点故障之后，新的 Pod 启动时 `Ready` 的服务转为 `Degraded`（`InstanceLost`），随后以新实例重新部署（见「部署推理服务」）。
+
+不需要 GPU 的试用，与 `docker-compose.fake-runtime.yaml` 对应（一块虚构设备的清单与 `fake` 启动器，每秒核对一次实例）：
+
+```bash
+kubectl -n forgemesh create configmap forgemesh-inventory \
+  --from-file=inventory.json=deploy/docker/fake-runtime-inventory.json
+kubectl apply -f deploy/kubernetes/launcher/network-policy.yaml
+kubectl -n forgemesh patch deployment forgemesh-control-plane \
+  --patch-file deploy/kubernetes/launcher/fake-runtime-patch.yaml
+# 之后按「部署推理服务」经网关创建服务、对话、删除，以 Authorization 头代替 X-Tenant-Id
+# 演练实例丢失：在控制平面的容器内向实例的端口（status.endpoints 中地址的端口）发出 POST /fake/exit，
+# 服务在下一次核对时转为 Degraded（InstanceLost），随后以新实例重新部署、回到 Ready
+kubectl -n forgemesh exec deployment/forgemesh-control-plane -- python -c \
+  "import urllib.request as r; r.urlopen(r.Request('http://127.0.0.1:<端口>/fake/exit', method='POST'))"
+```
+
+`vllm-process` 与 `tgi-process` 启动器在控制平面的容器内以子进程运行 vLLM / TGI。仓库没有为它们提供清单，也没有在 Kubernetes 上验证过；使用它们需要：
+
+- 装有 vLLM 或 TGI（`text-generation-launcher`）的控制平面镜像，或用 `FORGEMESH_VLLM_COMMAND` / `FORGEMESH_TGI_COMMAND` 指向镜像中另一个装有它们的环境；
+- 为控制平面的容器申请 GPU（例如 NVIDIA device plugin 的 `nvidia.com/gpu`）；加速器清单恰好一个节点，设备 id 是容器内可见的 CUDA 设备序号或 UUID；
+- 根文件系统只读：模型缓存目录（如 `HF_HOME`）挂载可写的卷；一个实例使用多块 GPU 时在 `/dev/shm` 挂载 `medium: Memory` 的 emptyDir（容器默认的 `/dev/shm` 只有 64 MiB，vLLM 与 TGI 的多卡通信需要更多共享内存，用量计入内存限制）；按模型调大内存限制；`terminationGracePeriodSeconds` 调到 45 秒以上（默认 30 秒，停止全部实例连同收尾最长约 40 秒）；
+- 按上文把所选启动器的监听地址（`FORGEMESH_VLLM_BIND_HOST` / `FORGEMESH_TGI_BIND_HOST`）设为 `0.0.0.0`、以 Pod IP 作为写进 `status.endpoints` 的主机（`FORGEMESH_VLLM_ADVERTISE_HOST` / `FORGEMESH_TGI_ADVERTISE_HOST`），并应用 `launcher/network-policy.yaml`；
+- 网络策略不允许控制平面访问外网：vLLM 与 TGI 启动时下载模型，需要为控制平面另加出站策略，或者预先把模型放进挂载的卷、以本地路径作为 `spec.model.reference`。
+
+两个启动器把实例进程记在数据库旁的 `forgemesh.instances.json` 中（见「部署推理服务」的「vLLM」），在清单中就是数据卷上的 `/var/lib/forgemesh/forgemesh.instances.json`。写不进这个文件时实例启动失败，`FORGEMESH_DB_PATH` 因此要留在可写的卷上。清单的 Pod 中控制平面是容器的 1 号进程（镜像以 exec 形式启动它），即使它被杀死，内核也会随之结束容器中的实例进程；容器重启之后启动器找不到记录中的进程（只认 pid 与启动时间都一致的进程），不向任何进程发送信号，直接丢弃这些记录。TGI 实例的私有目录建在临时目录下（默认 `/tmp`，清单中是 emptyDir）。
+
+控制平面只有一个副本，所有实例都运行在这一个 Pod 里：只能使用分配给这个 Pod 的 GPU，也就是单个节点上的 GPU，不能把实例调度到其他节点。
 
 ### 可观测性
 
@@ -406,7 +488,7 @@ curl -s http://127.0.0.1:8080/metrics   # 控制平面
 curl -s http://127.0.0.1:8081/metrics   # 网关
 ```
 
-两个 `/metrics` 与探针一样不要求认证，网关也不对它限流。输出只有跨租户聚合的计数与耗时：标签只取路由模板（网关为路由类别）、方法、状态码与固定的枚举值（加速器类型取自运维配置的清单），不含租户、服务名、命名空间、uid、路径或实例地址；每个指标最多 200 个标签组合，超出的计入标签全为 `overflow` 的一个序列。控制平面的 `/metrics` 不在 `/api/v1` 之下，网关不转发它。指标仍能反映整体负载，不要经公网入口暴露这两个端点，只让 Prometheus 所在的网络访问（compose 只发布在 `127.0.0.1`）。
+两个 `/metrics` 与探针一样不要求认证，网关也不对它限流。输出只有跨租户聚合的计数与耗时：标签只取路由模板（网关为路由类别）、方法、状态码与固定的枚举值（加速器类型取自运维配置的清单），不含租户、服务名、命名空间、uid、路径或实例地址；每个指标最多 200 个标签组合，超出的计入标签全为 `overflow` 的一个序列。控制平面的 `/metrics` 不在 `/api/v1` 之下，网关不转发它。指标仍能反映整体负载，不要经公网入口暴露这两个端点，只让 Prometheus 所在的网络访问（compose 只发布在 `127.0.0.1`，Kubernetes 见「Kubernetes 部署」的「指标抓取」）。
 
 控制平面的指标（网关的指标见 [gateway/README.md](gateway/README.md)「可观测性」）：
 
@@ -493,8 +575,9 @@ ForgeMesh 目前处于预览阶段，API 稳定性标注为 `beta`：minor 版�
 
 | 类型 | 数量 |
 |------|------|
-| Python 测试 | **2689** |
-| Go 测试 | 187 个测试函数，全部通过 |
+| Python 测试 | **2698** |
+| Python 覆盖率 | 97.2%（`packages/` 的语句与分支，CI 要求不低于 97%） |
+| Go 测试 | 188 个测试函数，全部通过 |
 | ruff 检查 | All checks passed |
 
 ---

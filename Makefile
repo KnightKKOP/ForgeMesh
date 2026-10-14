@@ -9,6 +9,8 @@
 # 常用目标：
 #   make install   创建 .venv，安装全部子包（editable）+ 开发依赖
 #   make test      运行全部测试（pytest）
+#   make coverage  运行全部测试并检查覆盖率下限（与 CI 相同）
+#   make audit     用 pip-audit 检查 .venv 中第三方依赖的已知漏洞（与 CI 相同）
 #   make lint      ruff 静态检查
 #   make fmt       ruff 自动修复 + 格式化
 #   make clean     清理构建与缓存产物
@@ -19,9 +21,16 @@ VENV    ?= .venv
 VENV_PY := $(VENV)/bin/python
 VENV_PIP:= $(VENV)/bin/pip
 
+# pip-audit 装在单独的虚拟环境中，它自己的依赖不混进被审计的 .venv。
+PIP_AUDIT_VERSION ?= 2.10.1
+AUDIT_VENV        ?= build/pip-audit
+# 尚无修复版本、或经评估不影响 ForgeMesh 的漏洞，写成 --ignore-vuln <ID>，并在这里注释
+# 包、原因与移除条件（见 SECURITY.md 3.1）。
+PIP_AUDIT_IGNORE  :=
+
 .DEFAULT_GOAL := help
 
-.PHONY: help install deps test test-unit test-contract lint fmt clean
+.PHONY: help install deps test test-unit test-contract coverage audit lint fmt clean
 
 help:
 	@echo "ForgeMesh 顶层命令："
@@ -29,6 +38,8 @@ help:
 	@echo "  make test           运行全部测试（pytest）"
 	@echo "  make test-unit      仅运行单元测试"
 	@echo "  make test-contract  仅运行契约测试"
+	@echo "  make coverage       运行全部测试并检查覆盖率下限（与 CI 相同）"
+	@echo "  make audit          用 pip-audit 检查 .venv 中第三方依赖的已知漏洞（与 CI 相同）"
 	@echo "  make lint           ruff 静态检查"
 	@echo "  make fmt            ruff 自动修复与格式化"
 	@echo "  make clean          清理构建与缓存产物"
@@ -73,6 +84,19 @@ test-unit:
 
 test-contract:
 	$(VENV_PY) -m pytest tests/contract
+
+coverage:
+	$(VENV_PY) -m pytest --cov
+
+# 审计 make install 装进 $(VENV) 的依赖：PIPAPI_PYTHON_LOCATION 让 pip-audit 列出该解释器
+# 环境中的包（路径不能解析符号链接，否则指向的是基础解释器）。本仓库的 forgemesh-* 包以
+# editable 方式安装、不在 PyPI 上，跳过。
+audit:
+	@test -x $(VENV_PY) || { echo "ERROR: $(VENV_PY) 不存在，先运行 make install"; exit 1; }
+	$(PY) -m venv $(AUDIT_VENV)
+	$(AUDIT_VENV)/bin/pip install -q --disable-pip-version-check pip-audit==$(PIP_AUDIT_VERSION)
+	PIPAPI_PYTHON_LOCATION=$(abspath $(VENV_PY)) $(AUDIT_VENV)/bin/pip-audit \
+		--skip-editable --progress-spinner off $(PIP_AUDIT_IGNORE)
 
 lint:
 	$(VENV_PY) -m ruff check .

@@ -2,7 +2,9 @@
 #   docker build -f deploy/docker/Dockerfile.gateway -t forgemesh/gateway:0.0.1 .
 #
 # 静态编译（网关只依赖标准库），运行在 distroless 镜像中，用户为 nonroot（uid 65532）。
-FROM golang:1.22 AS build
+# 标准库编译进二进制，它的漏洞修复随 Go 补丁版本发布：构建镜像使用与 CI 相同的 Go 次版本
+# （.github/workflows/ci.yml 中的 GO_VERSION）的最新补丁，重新构建镜像即可取得修复。
+FROM golang:1.27 AS build
 
 WORKDIR /src
 COPY gateway/ ./

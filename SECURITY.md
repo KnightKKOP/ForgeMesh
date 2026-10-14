@@ -93,8 +93,15 @@ ForgeMesh 通过插件与多组件扩展，供应链完整性是重点防护面�
 
 ### 3.1 依赖与构建
 
-- 依赖版本在 CI 中固定与缓存，变更需评审。
-- CI 对 Python（ruff/pytest）与 Go（`go build`/`go test`）执行构建与测试门禁。
+- Python 依赖只声明版本下限（个别另有上限，如 `pydantic>=2,<3`），仓库中没有锁文件：`make install`、CI 与镜像构建都安装满足约束的最新版本。依赖变更需评审。
+- CI 门禁：Python 执行 `ruff check` 与 `pytest`（总覆盖率不得低于 `pyproject.toml` 中的 `fail_under`），并把每个包装进全新的虚拟环境、只带它声明的依赖，导入它的全部模块（`scripts/check_package_imports.py`）；Go 网关执行 `gofmt`、`go vet`、`go build` 与 `go test -race`。
+- 依赖漏洞扫描（CI `dependency-audit` job；本地为 `make audit` 与 `make -C gateway vulncheck`，工具版本固定在这两个 Makefile 中）：
+  - `pip-audit` 审计 `make install` 装进 `.venv` 的全部第三方包（含开发工具）；本仓库的 `forgemesh-*` 包以 editable 方式安装、不在 PyPI 上，不审计。发现任何已知漏洞即失败。
+  - `govulncheck` 只报告网关代码实际调用到的漏洞，包括标准库。网关只依赖标准库，标准库编译进二进制，修复随 Go 补丁版本发布：CI 与网关镜像使用同一个 Go 次版本（`.github/workflows/ci.yml` 中的 `GO_VERSION`）的最新补丁，这个次版本停止维护之前升级。本地运行时检查 go.mod 选定的工具链：默认的 go 命令比 `gateway/go.mod` 的 go 行旧时切换到其中的版本（`go1.27.0`），会报告此后的补丁已修复的漏洞；与 CI 一致可设置 `GOTOOLCHAIN` 为这个次版本的最新补丁（如 `GOTOOLCHAIN=go1.27.2`）。
+- 已知漏洞的处理：
+  - 有修复版本时升级：Python 依赖提高下限，或放宽阻止升级的上限；Go 标准库的修复发布之后，重新运行 CI、重新构建镜像（`docker build --pull`）即可取得，修复只在更新的次版本中提供时，一起升级 `GO_VERSION`、`deploy/docker/Dockerfile.gateway` 与 `gateway/go.mod` 的 go 行。
+  - Python 依赖的漏洞尚无修复版本，或经评估不影响 ForgeMesh（例如有漏洞的功能没有被使用）时，在根 `Makefile` 的 `PIP_AUDIT_IGNORE` 中以 `--ignore-vuln <ID>` 列出，注释写明包、原因与移除条件，经评审合入；修复版本可用之后移除。目前这个列表为空。
+  - govulncheck 没有忽略机制。标准库的漏洞通常与修复版本同时公布；尚无修复时 job 保持失败，由维护者决定改写调用方式绕开，还是等待修复。
 - 定期更新依赖并及时响应上游安全公告。
 
 ### 3.2 插件与制品签名

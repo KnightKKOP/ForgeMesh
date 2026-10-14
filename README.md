@@ -87,10 +87,13 @@ forgemesh/
 ├── scripts/                    # CI 校验脚本（manifest/OpenAPI/元数据/插件冒烟）
 │
 └── docs/
-    ├── architecture/           # 架构基线与开发计划
+    ├── architecture/           # 架构基线、开发计划、模块映射与路线图
     │   ├── architecture.md
-    │   └── development-plan.md
-    ├── design-decisions/       # ADR 索引与 ADR-001~012
+    │   ├── development-plan.md
+    │   ├── v1.1-development-plan.md
+    │   ├── module-mapping.md
+    │   └── roadmap.md
+    ├── design-decisions/       # ADR 索引与 ADR-001~014
     ├── governance/             # 弃用政策
     ├── operations/             # 备份与灾备
     ├── plugin-development/     # 插件开发指南

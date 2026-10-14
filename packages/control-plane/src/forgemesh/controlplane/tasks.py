@@ -8,8 +8,10 @@
   EXEC 等任意命令类型**（ADR-009）。
 * **幂等**：:class:`TaskStore.create` 以 ``idempotency_key`` 为唯一约束，同一键
   重复创建返回已有任务，不产生新记录（断线重连去重）。
-* **SQLite 持久化**：与 :class:`WorkflowStore` 风格一致，所有异步方法通过
-  :func:`asyncio.to_thread` 包装同步 sqlite3 调用，``check_same_thread=False``。
+* **SQLite 持久化**：所有异步方法经
+  :meth:`Database.run <forgemesh.controlplane.sqlite.Database.run>` 在工作线程中持锁
+  执行同步 sqlite3 调用；可与 Outbox 等存储共用一个
+  :class:`~forgemesh.controlplane.sqlite.Database`（同一把锁串行化同一个连接）。
 * **去重器**：:class:`TaskDeduplicator` 提供进程内轻量去重（与 SQLite 幂等互补，
   用于下发前的快速判重）。
 """
@@ -24,7 +26,7 @@ from enum import StrEnum
 from forgemesh.core.errors import NotFoundError
 from pydantic import BaseModel, ConfigDict
 
-from .sqlite import connect
+from .sqlite import Database
 
 # ---------------------------------------------------------------------- #
 # 枚举
@@ -143,17 +145,19 @@ CREATE INDEX IF NOT EXISTS idx_tasks_agent_status ON tasks(agent_id, status);
 class TaskStore:
     """基于 SQLite 的任务持久化存储。
 
-    与 :class:`forgemesh.workflowruntime.WorkflowStore` 风格一致：所有异步方法
-    通过 :func:`asyncio.to_thread` 在独立线程执行同步 sqlite3 调用。
+    所有异步方法在工作线程中持 :class:`~forgemesh.controlplane.sqlite.Database` 的锁
+    执行同步 sqlite3 调用，抛出异常时回滚未提交的写入。
 
     Args:
         db_path: SQLite 数据库文件路径，默认 ``:memory:``（内存库，单测友好）。
+        database: 与其他存储共用的数据库；给出时忽略 ``db_path``，:meth:`close`
+            不关闭它（由创建者关闭）。
     """
 
-    def __init__(self, db_path: str = ":memory:") -> None:
-        self._db_path = db_path
-        self._conn = connect(db_path)
-        self._conn.row_factory = sqlite3.Row
+    def __init__(self, db_path: str = ":memory:", *, database: Database | None = None) -> None:
+        self._owns_db = database is None
+        self._db = database if database is not None else Database(db_path)
+        self._conn = self._db.conn
         self._init_schema()
 
     # ------------------------------------------------------------------ #
@@ -162,8 +166,9 @@ class TaskStore:
 
     def _init_schema(self) -> None:
         """创建表与索引（幂等）。"""
-        self._conn.executescript(_SCHEMA_SQL)
-        self._conn.commit()
+        with self._db.lock:
+            self._conn.executescript(_SCHEMA_SQL)
+            self._conn.commit()
 
     @staticmethod
     def _now() -> float:
@@ -189,7 +194,7 @@ class TaskStore:
         )
 
     # ------------------------------------------------------------------ #
-    # 同步实现（由 async 方法通过 asyncio.to_thread 调用）
+    # 同步实现（由 async 方法经 Database.run 持锁调用）
     # ------------------------------------------------------------------ #
 
     def _create_sync(self, task: Task) -> Task:
@@ -294,8 +299,9 @@ class TaskStore:
         return self._row_to_task(row)
 
     def _close_sync(self) -> None:
-        """同步关闭连接。"""
-        self._conn.close()
+        """同步关闭连接（共用的 ``database`` 由创建者关闭）。"""
+        if self._owns_db:
+            self._db.close()
 
     # ------------------------------------------------------------------ #
     # 公开异步 API
@@ -313,7 +319,7 @@ class TaskStore:
         Returns:
             写入后的任务（含时间戳）；或同幂等键的既有任务。
         """
-        return await asyncio.to_thread(self._create_sync, task)
+        return await self._db.run(self._create_sync, task)
 
     async def get(self, task_id: str) -> Task:
         """查询单个任务。
@@ -321,7 +327,7 @@ class TaskStore:
         Raises:
             NotFoundError: 任务不存在。
         """
-        return await asyncio.to_thread(self._get_sync, task_id)
+        return await self._db.run(self._get_sync, task_id)
 
     async def update_status(
         self,
@@ -334,7 +340,7 @@ class TaskStore:
         Raises:
             NotFoundError: 任务不存在。
         """
-        await asyncio.to_thread(self._update_status_sync, task_id, status, result)
+        await self._db.run(self._update_status_sync, task_id, status, result)
 
     async def list_pending(self, agent_id: str | None = None) -> list[Task]:
         """列出待执行（非终态）任务。
@@ -345,16 +351,16 @@ class TaskStore:
         Returns:
             按 ``created_at`` 升序排列的待执行任务列表。
         """
-        return await asyncio.to_thread(self._list_pending_sync, agent_id)
+        return await self._db.run(self._list_pending_sync, agent_id)
 
     async def list_by_idempotency_key(self, idempotency_key: str) -> Task | None:
         """按幂等键查询任务，不存在返回 ``None``。"""
-        return await asyncio.to_thread(
+        return await self._db.run(
             self._list_by_idempotency_key_sync, idempotency_key
         )
 
     async def close(self) -> None:
-        """关闭数据库连接。"""
+        """关闭数据库连接（共用的 ``database`` 由创建者关闭）。"""
         await asyncio.to_thread(self._close_sync)
 
 

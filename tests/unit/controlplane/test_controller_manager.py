@@ -16,12 +16,17 @@ from typing import Any
 import pytest
 from forgemesh.controlplane.controller import ControllerManager, WorkQueue
 from forgemesh.controlplane.deployment import LAUNCH_INSTANCE, LaunchedInstance
+from forgemesh.controlplane.outbox import OutboxEvent
 from forgemesh.controlplane.reconciler import (
     ProcessedKeyStore,
     ReconciliationController,
     compute_dedup_key,
 )
-from forgemesh.controlplane.registry import ResourceKey, SQLiteRegistry
+from forgemesh.controlplane.registry import (
+    DEFAULT_RELEASE_FINALIZER,
+    ResourceKey,
+    SQLiteRegistry,
+)
 from forgemesh.core.errors import NotFoundError
 from forgemesh.core.objects import Condition, ObjectMeta, Resource
 from forgemesh.core.scheduler import AllocationRef, ScheduleRequest
@@ -107,6 +112,17 @@ class ConcurrentWritePolicy:
         if self._bump_generation:
             current.metadata.generation += 1
         await self._registry.put(current, expected_version=current.metadata.resourceVersion)
+        return PolicyDecision(decision="allow", reason="ok")
+
+
+class RecordingPolicy:
+    """放行并记录每次协调的关联 ID。"""
+
+    def __init__(self) -> None:
+        self.correlation_ids: list[str] = []
+
+    async def check(self, ctx, action):  # noqa: ANN001
+        self.correlation_ids.append(ctx.correlation_id)
         return PolicyDecision(decision="allow", reason="ok")
 
 
@@ -422,6 +438,53 @@ def test_deleted_service_is_released_and_removed() -> None:
         return release.released
 
     assert _run(scenario()) == ["svc"]
+
+
+@pytest.mark.unit
+def test_status_write_emits_an_event_with_the_correlation_id_of_the_reconcile() -> None:
+    async def scenario() -> tuple[list[str], list[OutboxEvent]]:
+        registry = SQLiteRegistry()
+        await registry.put(_service(), correlation_id="corr-create")
+        policy = RecordingPolicy()
+        await _manager(registry, policy=policy).process(_key())
+        events = registry.outbox.get_pending()
+        await registry.close()
+        return policy.correlation_ids, events
+
+    [correlation_id], (created, status) = _run(scenario())
+    assert created.payload["correlationId"] == "corr-create"
+    assert status.event_type == "inference.service.status_updated"
+    assert status.payload["correlationId"] == correlation_id
+    [ready] = status.payload["data"]["resource"]["status"]["conditions"]
+    assert ready["reason"] == "SchedulerUnavailable"
+
+
+@pytest.mark.unit
+def test_finalizer_removal_and_its_status_share_the_correlation_id_of_the_reconcile() -> None:
+    async def scenario() -> list[OutboxEvent]:
+        registry = SQLiteRegistry()
+        service = _service(phase=InferencePhase.READY)
+        service.finalizers = [DEFAULT_RELEASE_FINALIZER, "example.com/cleanup"]
+        await registry.put(service)
+        await registry.request_delete(KIND, NAMESPACE, "svc", TENANT, correlation_id="corr-delete")
+        await _manager(registry, release=RecordingRelease()).process(_key())
+        events = registry.outbox.get_pending()
+        await registry.close()
+        return events
+
+    events = _run(scenario())
+    assert [event.event_type for event in events] == [
+        "inference.service.created",
+        "inference.service.terminating",
+        "inference.service.updated",
+        "inference.service.status_updated",
+    ]
+    _, terminating, updated, status = (event.payload for event in events)
+    assert terminating["correlationId"] == "corr-delete"
+    assert updated["data"]["resource"]["finalizers"] == ["example.com/cleanup"]
+    assert updated["correlationId"] == status["correlationId"] != "corr-delete"
+    [waiting] = status["data"]["resource"]["status"]["conditions"]
+    assert waiting["reason"] == "WaitingFinalizers"
 
 
 @pytest.mark.unit

@@ -7,20 +7,15 @@
 * 重复发布：Dispatcher 对同一 Outbox 记录重复发布（发布后标记前崩溃重试）
   时，消费者侧按 eventId 去重，副作用只发生一次；
 * 消费者提交失败：消费者处理成功但确认丢失后，重新投递不产生重复副作用；
-* 死信/重放：发布失败的记录进入持久失败状态（事实上的死信态）、可查询、
-  不再被自动重试，且可通过重置状态手动重放。
-
-记录性测试：实现当前存在两处与 Outbox 模式理想语义的差距，按任务约定
-不改源码，仅以测试固化当前行为并在 docstring 标注 v1.1 后续期望：
-（1）``Outbox.put`` 内部自动 commit，使外部事务的 rollback 失效；
-（2）``IdempotentConsumer`` 去重状态仅存内存，进程重启后重复投递会
-产生重复副作用。
+  去重记录持久化，消费者重启后同样成立；
+* 退避重试与死信：发布失败按指数退避重试，目标恢复后最终送达；失败次数达到
+  上限后进入 ``dead``、可查询、不再自动重试，可经 ``redrive`` 重新投递；
+* 重启：发布状态只在数据库中，已发布的事件不会再次发布。
 """
 
 from __future__ import annotations
 
 import asyncio
-import json
 import sqlite3
 
 import pytest
@@ -29,7 +24,9 @@ from forgemesh.controlplane.outbox import (
     IdempotentConsumer,
     Outbox,
     OutboxEvent,
+    RetryPolicy,
 )
+from forgemesh.controlplane.sqlite import Database
 
 
 def _run(coro):
@@ -54,14 +51,20 @@ def _make_event(
     )
 
 
+def _put(outbox: Outbox, event: OutboxEvent) -> None:
+    """单独写入一个事件（put 不自行提交，由事务提交）。"""
+    with outbox.database.transaction():
+        outbox.put(event)
+
+
 def _open_shared_outbox(db_file) -> tuple[Outbox, sqlite3.Connection]:
     """打开共享连接的 Outbox 并初始化业务表。
 
-    实现提供的事务集成方式即 ``Outbox(conn=...)`` 共享同一 SQLite 连接，
-    业务状态与事件记录在该连接的同一事务上下文中写入。
+    实现提供的事务集成方式即 ``Outbox(database=...)`` 与业务存储共用一个
+    :class:`Database`，业务状态与事件记录在该连接的同一事务上下文中写入。
     """
-    conn = sqlite3.connect(str(db_file), check_same_thread=False)
-    outbox = Outbox(conn=conn)
+    outbox = Outbox(database=Database(str(db_file)))
+    conn = outbox.database.conn
     conn.execute(
         "CREATE TABLE IF NOT EXISTS biz_services (id TEXT PRIMARY KEY, status TEXT NOT NULL)"
     )
@@ -80,15 +83,14 @@ def test_commit_path_business_and_event_same_transaction(tmp_path) -> None:
     outbox, conn = _open_shared_outbox(tmp_path / "outbox-commit.db")
     reader = sqlite3.connect(str(tmp_path / "outbox-commit.db"))
 
-    # 业务事务：先写业务状态，再经共享连接写入事件；put 的 commit 是
-    # 唯一提交点，两者在同一个事务中提交。
-    conn.execute("BEGIN")
-    conn.execute("INSERT INTO biz_services (id, status) VALUES ('svc-1', 'Active')")
+    # 业务事务：先写业务状态，再经共享连接写入事件；事务结束是唯一提交点。
+    with outbox.database.transaction():
+        conn.execute("INSERT INTO biz_services (id, status) VALUES ('svc-1', 'Active')")
+        outbox.put(_make_event("evt-commit"))
 
-    # 提交点之前：业务变更对外部连接不可见（仍在事务中）。
-    assert reader.execute("SELECT COUNT(*) FROM biz_services").fetchone()[0] == 0
-
-    outbox.put(_make_event("evt-commit"))
+        # 提交点之前：业务变更与事件对外部连接都不可见（仍在事务中）。
+        assert reader.execute("SELECT COUNT(*) FROM biz_services").fetchone()[0] == 0
+        assert reader.execute("SELECT COUNT(*) FROM outbox_events").fetchone()[0] == 0
 
     # 提交点之后：业务状态与事件同时对同一数据库的其他连接可见。
     assert reader.execute("SELECT COUNT(*) FROM biz_services").fetchone()[0] == 1
@@ -100,33 +102,14 @@ def test_commit_path_business_and_event_same_transaction(tmp_path) -> None:
 
 @pytest.mark.contract
 def test_rollback_path_no_residual_event(tmp_path) -> None:
-    """同事务回滚：业务回滚时 Outbox 记录不残留。
-
-    说明：``put`` 自带 commit，无法参与外部事务回滚（见
-    ``test_put_auto_commit_commits_ambient_transaction`` 的记录性断言），
-    故此处按实现提供的共享连接 + 事务上下文，以与 ``put`` 等价的写入
-    语义构造同一事务，验证 Outbox 模式的核心不变量。
-    """
+    """同事务回滚：业务写入在事件之后失败时，业务状态与事件记录一并撤销。"""
     outbox, conn = _open_shared_outbox(tmp_path / "outbox-rollback.db")
 
-    conn.execute("BEGIN")
-    conn.execute("INSERT INTO biz_services (id, status) VALUES ('svc-2', 'Active')")
-    event = _make_event("evt-rollback")
-    conn.execute(
-        "INSERT INTO outbox_events (event_id, aggregate_type, aggregate_id, "
-        "event_type, payload, created_at, status) VALUES (?, ?, ?, ?, ?, ?, ?)",
-        (
-            event.event_id,
-            event.aggregate_type,
-            event.aggregate_id,
-            event.event_type,
-            json.dumps(event.payload, ensure_ascii=False),
-            event.created_at,
-            event.status,
-        ),
-    )
-    # 业务侧失败：整体回滚，业务状态与事件记录一并撤销。
-    conn.rollback()
+    with pytest.raises(sqlite3.IntegrityError), outbox.database.transaction():
+        conn.execute("INSERT INTO biz_services (id, status) VALUES ('svc-2', 'Active')")
+        outbox.put(_make_event("evt-rollback"))
+        # 业务侧失败（主键冲突）：整个事务回滚。
+        conn.execute("INSERT INTO biz_services (id, status) VALUES ('svc-2', 'Active')")
 
     assert conn.execute("SELECT COUNT(*) FROM biz_services").fetchone()[0] == 0
     assert outbox.get_pending() == []  # Outbox 记录不残留
@@ -135,25 +118,31 @@ def test_rollback_path_no_residual_event(tmp_path) -> None:
 
 
 @pytest.mark.contract
-def test_put_auto_commit_commits_ambient_transaction(tmp_path) -> None:
-    """记录性测试：put 内部自动 commit，使外部事务的 rollback 失效。
-
-    Outbox 模式要求事件与业务状态在同一事务中原子提交/回滚；当前 ``put``
-    的实现会在业务事务中途创建提交点，之后调用方 rollback 无法撤销业务
-    变更或事件（两者均残留）。v1.1 期望 ``put`` 支持由调用方控制事务边界
-    （如去内部 commit / 提供 savepoint 语义），使本测试可改为断言回滚成功。
-    """
+def test_put_leaves_the_commit_to_the_caller(tmp_path) -> None:
+    """put 不在业务事务中途提交：调用方 rollback 同时撤销业务变更与事件。"""
     outbox, conn = _open_shared_outbox(tmp_path / "outbox-put.db")
 
     conn.execute("BEGIN")
     conn.execute("INSERT INTO biz_services (id, status) VALUES ('svc-3', 'Active')")
     outbox.put(_make_event("evt-put"))
-    conn.rollback()  # 模拟业务侧失败，尝试整体回滚
+    assert conn.in_transaction
+    conn.rollback()  # 模拟业务侧失败，整体回滚
 
-    # 当前行为：put 的内部 commit 已提交整个事务，rollback 无效，
-    # 业务变更与事件均残留。
-    assert conn.execute("SELECT COUNT(*) FROM biz_services").fetchone()[0] == 1
-    assert [e.event_id for e in outbox.get_pending()] == ["evt-put"]
+    assert conn.execute("SELECT COUNT(*) FROM biz_services").fetchone()[0] == 0
+    assert outbox.get_pending() == []
+    conn.close()
+
+
+@pytest.mark.contract
+def test_put_outside_a_transaction_is_rejected(tmp_path) -> None:
+    """事务之外的 put 被拒绝：不会留下无人提交、随后被别的提交连带提交的事件。"""
+    outbox, conn = _open_shared_outbox(tmp_path / "outbox-no-tx.db")
+
+    with pytest.raises(RuntimeError, match="inside the caller's transaction"):
+        outbox.put(_make_event("evt-orphan"))
+
+    assert not conn.in_transaction
+    assert outbox.get_stats() == {}
     conn.close()
 
 
@@ -167,7 +156,7 @@ def test_duplicate_publish_consumer_idempotent(tmp_path) -> None:
     """重复发布：同一记录发布两次（发布后标记前崩溃重试），副作用仅一次。"""
     outbox = Outbox(str(tmp_path / "outbox-dup.db"))
     event = _make_event("evt-dup")
-    outbox.put(event)
+    _put(outbox, event)
 
     consumer = IdempotentConsumer()
     deliveries: list[str] = []  # 投递记录（publisher 被调用即记一次）
@@ -225,75 +214,115 @@ def test_redelivery_after_ack_loss_no_duplicate_side_effect() -> None:
 
 
 @pytest.mark.contract
-def test_consumer_dedup_is_in_memory_only_after_restart() -> None:
-    """记录性测试：消费者去重状态仅存内存，重启后重复投递会产生重复副作用。
-
-    当前实现 ``IdempotentConsumer._processed_ids`` 为进程内集合，无持久化。
-    v1.1 期望 eventId 去重状态持久化（如 processed_events 表），
-    使重启后重新投递仍不产生重复副作用；届时本测试应改为断言副作用仅一次。
-    """
+def test_consumer_dedup_survives_restart(tmp_path) -> None:
+    """消费者去重记录持久化：重启后重新投递不产生重复副作用。"""
+    path = str(tmp_path / "consumer.db")
     event = _make_event("evt-restart")
     side_effects: list[str] = []
 
     def handler(ev: OutboxEvent) -> None:
         side_effects.append(ev.event_id)
 
-    consumer_before = IdempotentConsumer()
-    consumer_before.consume(event, handler)  # 重启前已处理过一次
+    consumer_before = IdempotentConsumer("billing", path)
+    assert consumer_before.consume(event, handler) is True  # 重启前已处理过一次
+    consumer_before.close()
 
-    # 模拟进程重启：新实例的内存去重集合为空。
-    consumer_after = IdempotentConsumer()
-    redelivered = consumer_after.consume(event, handler)
-
-    # 当前行为：重复投递被误判为首次，副作用重复执行。
-    assert redelivered is True
-    assert side_effects == ["evt-restart", "evt-restart"]
+    # 模拟进程重启：新实例从数据库读取去重记录。
+    consumer_after = IdempotentConsumer("billing", path)
+    try:
+        assert consumer_after.consume(event, handler) is False
+        assert consumer_after.is_processed("evt-restart") is True
+    finally:
+        consumer_after.close()
+    assert side_effects == ["evt-restart"]
 
 
 # ---------------------------------------------------------------------- #
-# 语义四：死信/重放
+# 语义四：退避重试、死信与重新投递
 # ---------------------------------------------------------------------- #
 
 
 @pytest.mark.contract
-def test_failed_event_is_dead_and_queryable(tmp_path) -> None:
-    """死信语义（记录性）：发布失败进入持久 failed 态，可查询且不再自动重试。
+def test_publish_failure_is_retried_with_backoff_until_delivered(tmp_path) -> None:
+    """注入发布失败：事件按指数退避重试，发布目标恢复后最终送达。"""
+    outbox = Outbox(str(tmp_path / "outbox-retry.db"))
+    _put(outbox, _make_event("evt-retry"))
+    start = 2e9
+    now = [start]
+    attempts: list[float] = []
 
-    当前实现无重试计数与独立死信队列：publisher 一次失败即 ``mark_failed``，
-    事件脱离 pending 队列（不再被后续轮次自动重发），``failed`` 即事实上的
-    死信状态。v1.1 期望按最大重试次数退避重试、超限后进入显式死信队列。
-    """
+    def flaky_publisher(ev: OutboxEvent) -> None:
+        attempts.append(now[0] - start)
+        if len(attempts) < 3:
+            raise ConnectionError("broker unreachable")
+
+    dispatcher = Dispatcher(outbox, flaky_publisher, clock=lambda: now[0])
+    for _ in range(8):  # 每 0.5 秒一轮
+        _run(dispatcher.dispatch_once())
+        now[0] += 0.5
+
+    # 两次失败后分别等待 1 秒、2 秒：重试发生在 +1 秒与 +3 秒，第三次送达。
+    assert attempts == [0.0, 1.0, 3.0]
+    assert outbox.get_stats() == {"published": 1}
+
+
+@pytest.mark.contract
+def test_event_is_dead_after_the_retry_limit(tmp_path, caplog) -> None:
+    """失败次数达到上限：进入 dead，可查询（含次数与原因）、记录错误日志，不再自动重试。"""
     outbox = Outbox(str(tmp_path / "outbox-dead.db"))
-    outbox.put(_make_event("evt-dead"))
+    _put(outbox, _make_event("evt-dead"))
+    now = [2e9]
     attempts: list[str] = []
 
     def broken_publisher(ev: OutboxEvent) -> None:
         attempts.append(ev.event_id)
         raise RuntimeError("broker unreachable")
 
-    dispatcher = Dispatcher(outbox, broken_publisher)
-    count = _run(dispatcher.dispatch_once())
+    dispatcher = Dispatcher(
+        outbox, broken_publisher, retry=RetryPolicy(max_attempts=3), clock=lambda: now[0]
+    )
+    for _ in range(6):  # 每轮都已过退避时间
+        assert _run(dispatcher.dispatch_once()) == 0
+        now[0] += 3600
 
-    # 发布失败：本轮无成功处理，事件进入持久 failed 状态且可查询。
-    assert count == 0
-    assert outbox.get_stats() == {"failed": 1}
-    assert outbox.get_pending() == []  # 脱离待发布队列
-
-    # 后续轮次不再自动重试（attempts 不再增长）——无无限重发。
-    assert _run(dispatcher.dispatch_once()) == 0
-    assert attempts == ["evt-dead"]
+    assert attempts == ["evt-dead"] * 3
+    assert outbox.get_stats() == {"dead": 1}
+    assert outbox.get_pending() == []
+    [dead] = outbox.list_dead()
+    assert (dead.event_id, dead.attempts) == ("evt-dead", 3)
+    assert dead.last_error == "RuntimeError: broker unreachable"
+    assert "evt-dead (Created) is dead after 3 failed attempts" in caplog.text
 
 
 @pytest.mark.contract
-def test_manual_replay_failed_event(tmp_path) -> None:
-    """手动重放（记录性）：failed 记录可经状态重置重放并成功发布。
+def test_restart_does_not_redeliver_published_events(tmp_path) -> None:
+    """进程重启：已发布的事件不再发布，只发布重启前尚未发布的事件。"""
+    path = str(tmp_path / "outbox-restart.db")
+    deliveries: list[str] = []
 
-    当前实现无官方 replay API，重放路径为经共享连接将 failed 重置为
-    pending 后由 Dispatcher 重新分发。v1.1 期望提供显式 replay/dead-letter
-    API；届时本测试应改用正式接口。
-    """
+    def publisher(ev: OutboxEvent) -> None:
+        deliveries.append(ev.event_id)
+
+    outbox = Outbox(path)
+    _put(outbox, _make_event("evt-before"))
+    assert _run(Dispatcher(outbox, publisher).dispatch_once()) == 1
+    _put(outbox, _make_event("evt-after"))
+    _run(outbox.close())
+
+    restarted = Outbox(path)
+    try:
+        assert _run(Dispatcher(restarted, publisher).dispatch_once()) == 1
+        assert _run(Dispatcher(restarted, publisher).dispatch_once()) == 0
+    finally:
+        _run(restarted.close())
+    assert deliveries == ["evt-before", "evt-after"]
+
+
+@pytest.mark.contract
+def test_redrive_dead_event(tmp_path) -> None:
+    """重新投递：dead 事件经 ``redrive`` 放回队列后成功发布，副作用恰好一次。"""
     outbox = Outbox(str(tmp_path / "outbox-replay.db"))
-    outbox.put(_make_event("evt-replay"))
+    _put(outbox, _make_event("evt-replay"))
 
     consumer = IdempotentConsumer()
     deliveries: list[str] = []
@@ -308,18 +337,14 @@ def test_manual_replay_failed_event(tmp_path) -> None:
             raise RuntimeError("transient broker failure")  # 首次投递失败
         consumer.consume(ev, handler)  # 重放投递成功送达消费者
 
-    # 首轮发布失败：进入死信（failed）状态，未产生副作用。
-    failed_round = Dispatcher(outbox, flaky_publisher)
+    # 首轮发布失败且不再重试：进入 dead，未产生副作用。
+    failed_round = Dispatcher(outbox, flaky_publisher, retry=RetryPolicy(max_attempts=1))
     assert _run(failed_round.dispatch_once()) == 0
-    assert outbox.get_stats() == {"failed": 1}
+    assert outbox.get_stats() == {"dead": 1}
     assert side_effects == []
 
-    # 手动重放：通过 Outbox 暴露的共享连接重置状态（模拟运维重放动作）。
-    outbox.conn.execute(
-        "UPDATE outbox_events SET status = 'pending' WHERE event_id = ?",
-        ("evt-replay",),
-    )
-    outbox.conn.commit()
+    # 运维重新投递。
+    assert outbox.redrive(["evt-replay"]) == 1
     assert [e.event_id for e in outbox.get_pending()] == ["evt-replay"]
 
     replay_round = Dispatcher(outbox, flaky_publisher)

@@ -7,14 +7,18 @@
 * 按租户查询；
 * limit 生效；
 * 审计事件包含全字段（actor/action/outcome/details）；
-* correlation_id 全链路贯穿：create→allocate→deploy 完整链可查。
+* correlation_id 全链路贯穿：create→allocate→deploy 完整链可查；
+* ``put`` 只在调用方的事务中写入，``record`` 自行提交；与业务存储共用数据库；
+* 存量库补齐 ``key_id`` / ``namespace`` 列。
 """
 from __future__ import annotations
 
+import sqlite3
 import time
 
 import pytest
 from forgemesh.controlplane.audit import AuditEvent, AuditLog
+from forgemesh.controlplane.sqlite import Database
 
 TENANT_A = "tenant-a"
 CORRELATION_ID = "corr-1234"
@@ -216,3 +220,84 @@ def test_correlation_id_tracing() -> None:
     assert chain[0].details == {"replicas": 2}
     assert chain[1].details == {"allocated": 2, "device": "A100"}
     assert chain[2].details == {"image": "vllm:v0.6", "port": 8080}
+
+
+# ---------------------------------------------------------------------- #
+# 事务与共用数据库
+# ---------------------------------------------------------------------- #
+
+
+@pytest.mark.unit
+def test_put_requires_the_callers_transaction() -> None:
+    """put 不自行提交：没有进行中的事务时拒绝写入。"""
+    log = AuditLog()
+    with pytest.raises(RuntimeError, match="transaction"):
+        log.put(_make_event())
+    assert log.query_by_tenant(TENANT_A) == []
+
+
+@pytest.mark.unit
+def test_put_commits_or_rolls_back_with_the_caller() -> None:
+    """put 的记录随调用方的事务一起提交或回滚。"""
+    log = AuditLog()
+    kept, dropped = _make_event(action="create"), _make_event(action="delete")
+    with log.database.transaction():
+        log.put(kept)
+    with pytest.raises(RuntimeError, match="boom"), log.database.transaction():
+        log.put(dropped)
+        raise RuntimeError("boom")
+
+    assert [e.audit_id for e in log.query_by_tenant(TENANT_A)] == [kept.audit_id]
+
+
+@pytest.mark.unit
+def test_principal_fields_round_trip() -> None:
+    """凭证 id 与命名空间随记录保存。"""
+    log = AuditLog()
+    log.record(_make_event().model_copy(update={"key_id": "key-a", "namespace": "team-a"}))
+
+    [got] = log.query_by_correlation(CORRELATION_ID)
+    assert (got.key_id, got.namespace) == ("key-a", "team-a")
+
+
+@pytest.mark.unit
+def test_shared_database_is_closed_by_its_owner() -> None:
+    """共用的数据库由创建者关闭：AuditLog.close 不关闭它。"""
+    database = Database()
+    log = AuditLog(database=database)
+    log.record(_make_event())
+    log.close()
+
+    assert database.conn.execute("SELECT COUNT(*) FROM audit_events").fetchone()[0] == 1
+    database.close()
+
+
+@pytest.mark.unit
+def test_legacy_table_gets_the_new_columns(tmp_path) -> None:
+    """v1.0.0 的 audit_events 没有 key_id / namespace：打开时补齐，旧记录保留。"""
+    path = str(tmp_path / "audit.db")
+    conn = sqlite3.connect(path)
+    conn.executescript(
+        """
+        CREATE TABLE audit_events (
+            audit_id TEXT PRIMARY KEY, correlation_id TEXT NOT NULL, tenant_id TEXT NOT NULL,
+            actor TEXT, action TEXT NOT NULL, resource_type TEXT NOT NULL,
+            resource_id TEXT NOT NULL, outcome TEXT NOT NULL, details TEXT,
+            timestamp REAL NOT NULL
+        );
+        INSERT INTO audit_events VALUES
+            ('old', 'corr-old', 'tenant-a', 'bob', 'create', 'InferenceService', 'svc',
+             'success', NULL, 1.0);
+        """
+    )
+    conn.close()
+
+    log = AuditLog(path)
+    log.record(_make_event().model_copy(update={"key_id": "key-a", "namespace": "team-a"}))
+    reopened = AuditLog(path)
+
+    old, new = sorted(reopened.query_by_tenant(TENANT_A), key=lambda e: e.timestamp)
+    assert (old.audit_id, old.actor, old.key_id, old.namespace) == ("old", "bob", None, None)
+    assert (new.key_id, new.namespace) == ("key-a", "team-a")
+    log.close()
+    reopened.close()

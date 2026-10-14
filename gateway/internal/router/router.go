@@ -8,6 +8,7 @@
 //	ANY  /api/v1/inference-services[/...]      反代到 Python 控制平面
 //	ANY  /api/v1/workflows[/...]               反代到 Python 控制平面
 //	ANY  /api/v1/decisions[/...]               反代到 Python 控制平面
+//	ANY  /api/v1/audit-events[/...]            反代到 Python 控制平面
 //	ANY  /api/v1/namespaces/{ns}/inference/{svc}/chat
 //	                                          SSE 流式代理（服务经 Resolver 解析为
 //	                                          ready 实例，轮询分发，按实例协议映射
@@ -43,6 +44,7 @@ var proxyRoutes = []string{
 	"/api/v1/inference-services",
 	"/api/v1/workflows",
 	"/api/v1/decisions",
+	"/api/v1/audit-events",
 }
 
 // 流式（SSE）代理路由：{ns} 为命名空间，{svc} 为推理服务名。

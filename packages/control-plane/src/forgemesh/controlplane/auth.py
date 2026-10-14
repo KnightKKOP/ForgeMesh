@@ -70,6 +70,8 @@ class Principal(BaseModel):
         subject: 主体标识（服务账号、用户等）。
         tenant_id: 凭证绑定的租户，多租户隔离的权威来源。
         scopes: 授予的 scope；``*`` 表示全部。
+        key_id: 凭证标识（key 文件中的 ``id``，记入审计记录）；``dev`` 模式没有凭证，为
+            ``None``。
     """
 
     model_config = ConfigDict(frozen=True)
@@ -77,6 +79,7 @@ class Principal(BaseModel):
     subject: str
     tenant_id: str
     scopes: frozenset[str] = frozenset()
+    key_id: str | None = None
 
     def has_scope(self, scope: str) -> bool:
         """是否持有 ``scope``（持有 ``*`` 视为持有全部 scope）。"""
@@ -232,7 +235,10 @@ class ApiKeyAuthenticator:
                 f"{self._tenant_header} does not match the tenant bound to the credentials"
             )
         return Principal(
-            subject=entry.subject, tenant_id=entry.tenant_id, scopes=frozenset(entry.scopes)
+            subject=entry.subject,
+            tenant_id=entry.tenant_id,
+            scopes=frozenset(entry.scopes),
+            key_id=entry.id,
         )
 
 

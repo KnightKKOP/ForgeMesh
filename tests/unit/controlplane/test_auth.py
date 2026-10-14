@@ -9,7 +9,11 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from forgemesh.controlplane import app as app_module
 from forgemesh.controlplane.api import create_api_router
-from forgemesh.controlplane.api.dependencies import init_registry, reset_authenticator
+from forgemesh.controlplane.api.dependencies import (
+    get_registry,
+    init_registry,
+    reset_authenticator,
+)
 from forgemesh.controlplane.api.errors import install_exception_handlers
 from forgemesh.controlplane.app import create_app
 from forgemesh.controlplane.auth import (
@@ -77,6 +81,7 @@ def test_header_authenticator_requires_a_tenant() -> None:
     principal = HeaderAuthenticator().authenticate({"x-tenant-id": " acme "})
     assert principal.tenant_id == "acme"
     assert principal.has_scope("write")
+    assert principal.key_id is None
 
 
 @pytest.mark.unit
@@ -86,7 +91,7 @@ def test_api_key_binds_tenant_subject_and_scopes() -> None:
     principal = authenticator.authenticate(_bearer(KEY_A))
     read_only = authenticator.authenticate(_bearer(KEY_READ_ONLY))
 
-    assert (principal.tenant_id, principal.subject) == ("tenant-a", "alice")
+    assert (principal.tenant_id, principal.subject, principal.key_id) == ("tenant-a", "alice", "a")
     assert principal.has_scope("read") and principal.has_scope("write")
     assert read_only.has_scope("read") and not read_only.has_scope("write")
 
@@ -298,6 +303,95 @@ def test_read_only_credentials_cannot_write(api_client) -> None:
     assert deleted.status_code == 403
     assert (replaced.status_code, patched.status_code) == (403, 403)
     assert api_client.get("/api/v1/inference-services", headers=_bearer(KEY_A)).json()["count"] == 1
+
+
+@pytest.mark.unit
+def test_api_writes_are_audited_with_the_principal(api_client) -> None:
+    created = api_client.post(
+        "/api/v1/inference-services",
+        json=BODY,
+        headers=_bearer(KEY_A, **{"X-Correlation-Id": "corr-create"}),
+    )
+    deleted = api_client.delete(
+        "/api/v1/inference-services/llama",
+        params={"namespace": "default"},
+        headers=_bearer(KEY_A, **{"X-Correlation-Id": "corr-delete"}),
+    )
+
+    assert (created.status_code, deleted.status_code) == (201, 204)
+    registry = get_registry()
+    records = sorted(registry.audit_log.query_by_tenant("tenant-a"), key=lambda e: e.timestamp)
+    assert [(r.action, r.correlation_id) for r in records] == [
+        ("create", "corr-create"),
+        ("delete", "corr-delete"),
+    ]
+    for record in records:
+        assert (record.tenant_id, record.actor, record.key_id) == ("tenant-a", "alice", "a")
+        assert (record.resource_type, record.namespace, record.resource_id) == (
+            "InferenceService",
+            "default",
+            "llama",
+        )
+        event = registry.outbox.get(record.details["eventId"])
+        assert event is not None
+        assert event.payload["correlationId"] == record.correlation_id
+    assert registry.audit_log.query_by_tenant("tenant-b") == []
+
+
+@pytest.mark.unit
+def test_updates_are_audited_with_the_principal(api_client) -> None:
+    path = "/api/v1/inference-services/llama"
+    namespace = {"namespace": "default"}
+    document = api_client.post(
+        "/api/v1/inference-services", json=BODY, headers=_bearer(KEY_A)
+    ).json()
+    # 不以创建时的版本为前置条件：控制器可能已写入 status。
+    del document["metadata"]["resourceVersion"]
+    document["spec"]["model"]["reference"] = "models/mistral"
+
+    replaced = api_client.put(
+        path, params=namespace, json=document, headers=_bearer(KEY_A, **{"X-Correlation-Id": "c-1"})
+    )
+    patched = api_client.patch(
+        path,
+        params=namespace,
+        content=json.dumps({"metadata": {"labels": {"team": "search"}}}),
+        headers=_bearer(
+            KEY_A, **{"Content-Type": "application/merge-patch+json", "X-Correlation-Id": "c-2"}
+        ),
+    )
+
+    assert (replaced.status_code, patched.status_code) == (200, 200)
+    create, *updates = sorted(
+        get_registry().audit_log.query_by_tenant("tenant-a"), key=lambda e: e.timestamp
+    )
+    assert create.action == "create"
+    assert [(r.action, r.correlation_id) for r in updates] == [("update", "c-1"), ("update", "c-2")]
+    for record, response in zip(updates, (replaced, patched), strict=True):
+        assert (record.actor, record.key_id, record.namespace, record.resource_id) == (
+            "alice",
+            "a",
+            "default",
+            "llama",
+        )
+        version = int(response.json()["metadata"]["resourceVersion"])
+        assert record.details["resourceVersion"] == version
+
+
+@pytest.mark.unit
+def test_rejected_api_writes_are_not_audited(api_client) -> None:
+    path = "/api/v1/inference-services"
+    api_client.post(path, json=BODY, headers=_bearer(KEY_A))
+
+    duplicate = api_client.post(path, json=BODY, headers=_bearer(KEY_A))
+    read_only = api_client.delete(
+        f"{path}/llama", params={"namespace": "default"}, headers=_bearer(KEY_READ_ONLY)
+    )
+    missing = api_client.delete(f"{path}/missing", headers=_bearer(KEY_A))
+
+    assert (duplicate.status_code, read_only.status_code, missing.status_code) == (409, 403, 404)
+    [record] = get_registry().audit_log.query_by_tenant("tenant-a")
+    assert (record.action, record.actor) == ("create", "alice")
 
 
 @pytest.mark.unit

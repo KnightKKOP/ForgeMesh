@@ -12,11 +12,13 @@ ForgeMesh 控制平面（`forgemesh-control-plane`）把权威状态存放在 SQ
 |------|----|------|------|
 | `forgemesh.db` | `resources` / `allocations` / `allocation_devices` / `resource_changes` | `forgemesh.controlplane.registry.SQLiteRegistry` | 资源对象（spec/status/conditions）、资源分配记录及其占用的设备、控制器读取的变更记录 |
 | `forgemesh.db` | `processed_dedup_keys` | `forgemesh.controlplane.reconciler.dedup.ProcessedKeyStore` | 控制器已处理的去重键 |
+| `forgemesh.db` | `outbox_events` / `audit_events` | `forgemesh.controlplane.outbox.Outbox` / `forgemesh.controlplane.audit.AuditLog`（与 `SQLiteRegistry` 共用连接） | 资源变更事件（待发布、`dead` 与 7 天内已发布的）与 API 写入的审计记录，与资源在同一个事务中写入 |
+| `forgemesh.db` | `registry_meta` | `forgemesh.controlplane.pagetokens`（`SQLiteRegistry` 与 `AuditLog` 打开数据库时创建） | 列表分页游标（资源列表与审计记录列表）的签名密钥 |
 | `forgemesh.workflows.db` | `workflow_runs` / `workflow_steps` | `forgemesh.workflowruntime.store.WorkflowStore` | 每个推理服务每一代 `spec` 的部署工作流运行（幂等键 `deployment:{uid}:{generation}`，实例丢失后重新部署的第 n 次追加 `:{n}`）及其各步骤的状态与结果（含启动的实例 id 与地址） |
 
 两个文件之间没有共同的事务，备份与恢复时把它们当作一组，见 2.6 节。推理实例本身不在任何文件中：它们活不过控制平面的重启，恢复之后的情况见 3.5 节。`vllm-process` / `tgi-process` 启动器还在同一目录下的 `forgemesh.instances.json` 中记录正在运行的实例进程，控制平面被杀死之后，下次启动时据此结束留下的实例；这个文件不需要备份，也不需要随恢复处理（另一次开机的记录被忽略，记录的进程已不在时只删去记录）。
 
-审计日志（`forgemesh.controlplane.audit.AuditLog`）、决策记录（`forgemesh.decision.records.DecisionRecordStore`）等其他 SQLite 存储默认使用内存库，控制平面进程不会打开它们；嵌入方把它们指向文件时，按本文同样的方法逐个备份。
+决策记录（`forgemesh.decision.records.DecisionRecordStore`）等其他 SQLite 存储默认使用内存库，控制平面进程不会打开它们；嵌入方把它们指向文件时，按本文同样的方法逐个备份。
 
 ### RPO / RTO 目标
 
@@ -367,6 +369,15 @@ Kubernetes 上先 `kubectl -n forgemesh scale deploy/forgemesh-control-plane --r
 - 仍在部署（含 `Updating`）的服务从中断处继续：还没有启动实例的照常完成；实例已经启动、还在验证的，运行在验证实例时失败，服务进入 `Failed`（`WorkflowFailed`），修改 `spec` 或删除后重新创建即可再次部署；部署运行已经成功、只是还没写入 `Ready` 的重新部署。
 - 注册表与工作流存储不是同一组备份时的情况见 2.6 节。
 
+### 3.6 恢复之后的事件与审计记录
+
+资源变更事件（`outbox_events`）与审计记录（`audit_events`）和资源在同一个文件中、由同一个事务写入，恢复之后三者是同一时刻的状态：
+
+- 备份之后的资源写入连同它们的事件与审计记录一起丢失。
+- 备份时仍待发布的事件在控制平面启动后发布，其中包括备份之后已经送达过的：接收方会再次收到它们（事件本就至少投递一次），按 `eventId` 去重即可。
+- 备份时已是 `dead` 的事件仍为 `dead`，需要时按第 5 节重新投递。
+- 控制平面启动后服务转为 `Degraded` 并重新部署（3.5 节）：这些 status 写入照常写入新的事件（`inference.service.status_updated`），与其他控制器的写入一样不写审计记录。
+
 ---
 
 ## 4. 灾备演练检查清单
@@ -384,7 +395,7 @@ Kubernetes 上先 `kubectl -n forgemesh scale deploy/forgemesh-control-plane --r
 - [ ] 控制平面运行且有写入时，执行 `forgemesh-backup.sh` 生成一份备份（容器部署按 2.5 节）
 - [ ] 验证备份文件摘要：`sha256sum -c <backup>.db.sha256` 通过
 - [ ] 验证备份完整性：`PRAGMA integrity_check` 返回 `ok`
-- [ ] 验证备份可打开：`sqlite3 <backup>.db ".tables"` 列出 `allocation_devices`、`allocations`、`processed_dedup_keys`、`resource_changes`、`resources`
+- [ ] 验证备份可打开：`sqlite3 <backup>.db ".tables"` 列出 `allocation_devices`、`allocations`、`audit_events`、`outbox_events`、`processed_dedup_keys`、`registry_meta`、`resource_changes`、`resources`
 - [ ] 部署推理服务时：同一组备份中有工作流存储（时间戳相同的 `forgemesh.workflows-<时间戳>.db`，容器部署为同一目录中的 `forgemesh.workflows.db`），`.tables` 列出 `workflow_runs`、`workflow_steps`
 - [ ] 验证备份数据行数与源库一致（抽样表）
 
@@ -397,13 +408,14 @@ Kubernetes 上先 `kubectl -n forgemesh scale deploy/forgemesh-control-plane --r
 - [ ] `/readyz` 探针返回 200
 - [ ] 资源注册表：`list` 返回预期资源数量
 - [ ] 推理服务（3.5 节）：备份时 `Ready` 的服务经 `Degraded`（`Ready=False`，`InstanceLost`）重新部署，回到 `Ready`，`status.endpoints` 中的 `instanceId` 与备份时不同
-- [ ] 审计日志 / 决策记录（仅当部署把它们持久化到文件时）：`query_by_tenant` / `list_by_tenant` 返回预期记录数量
+- [ ] 审计记录：`GET /api/v1/audit-events` 返回备份时已有的记录
+- [ ] 决策记录（仅当部署把它持久化到文件时）：`list_by_tenant` 返回预期记录数量
 
 ### 4.4 数据一致性验证
 
 - [ ] **租户隔离**：跨租户 `get` 返回 `NotFoundError`（IVT-7）
 - [ ] **审计可追溯**：`query_by_correlation` 返回完整调用链
-- [ ] **correlation_id 贯计贯穿**：审计事件与决策记录的 correlation_id 一致
+- [ ] **correlation_id 贯穿**：审计事件与决策记录的 correlation_id 一致
 - [ ] **密钥脱敏**：日志中敏感字段均为 `"***"`，无明文泄露
 - [ ] **资源版本连续**：`resourceVersion` 无跳跃（除已知 CAS 冲突）
 
@@ -433,6 +445,20 @@ Kubernetes 上先 `kubectl -n forgemesh scale deploy/forgemesh-control-plane --r
 | 误删资源 | 用户报告 / 审计日志确认 | 从误删前备份恢复（需停服） |
 | 注册表与工作流存储来自不同的备份 | 恢复后仍在部署的服务进入 `Failed`（`WorkflowRunNotFound`），或设备被注册表之外的实例占用（2.6 节） | 停止控制平面，从同一组备份重新恢复两个文件 |
 | 租户数据串扰 | 安全测试失败 | 立即从备份恢复 + 排查隔离边界缺陷 |
+| 事件接收方（webhook）长时间不可用 | ERROR 日志 `outbox event … is dead after 10 failed attempts` | 修复接收方后重新投递 `dead` 事件（见下） |
+
+`dead` 事件不再自动发送。下面的命令只改动 `outbox_events` 中的 `dead` 行（一次短事务），可以在控制平面运行时执行，Dispatcher 在下一轮发布放回队列的事件。路径须与 `FORGEMESH_DB_PATH` 一致（路径写错时会新建一个空库）：
+
+```bash
+# 列出 dead 事件（最多 100 条）：id、类型、失败次数与最近一次错误
+.venv/bin/python -c "
+from forgemesh.controlplane.outbox import Outbox
+for e in Outbox('./forgemesh.db').list_dead(): print(e.event_id, e.event_type, e.attempts, e.last_error)"
+# 全部放回待发布队列（失败次数清零），输出放回的事件数
+.venv/bin/python -c "from forgemesh.controlplane.outbox import Outbox; print(Outbox('./forgemesh.db').redrive())"
+```
+
+容器部署中以 `docker compose -f deploy/docker/docker-compose.yaml exec control-plane python -c "…"` 执行同样的命令，数据库路径为 `/var/lib/forgemesh/forgemesh.db`。
 
 ---
 

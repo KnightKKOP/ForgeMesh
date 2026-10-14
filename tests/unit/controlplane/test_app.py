@@ -1,23 +1,27 @@
 """控制平面应用入口测试：真实路由已挂载、存储可配置、探针反映存储状态、控制器随应用运行、
 配置加速器清单时启用调度器、配置启动器时启用部署、启动时结束上次运行留下的实例进程、定期
-核对实例并回收孤立的分配（完整闭环见 ``tests/e2e/test_closed_loop.py``）。"""
+核对实例并回收孤立的分配（完整闭环见 ``tests/e2e/test_closed_loop.py``）、Outbox 事件随应用
+发布（webhook 见 ``test_publishers.py``）。"""
 
 from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import signal
 import sqlite3
 import subprocess
 import sys
 import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
 from forgemesh.controlplane import app as app_module
+from forgemesh.controlplane import publishers
 from forgemesh.controlplane.api.dependencies import (
     ComponentNotReadyError,
     get_authenticator,
@@ -30,6 +34,8 @@ from forgemesh.controlplane.auth import AUTH_MODE_DEV, AUTH_MODE_ENV
 from forgemesh.controlplane.controller import ControllerManager
 from forgemesh.controlplane.deployment import FakeLauncher, LauncherConfigError
 from forgemesh.controlplane.deployment import config as launcher_config
+from forgemesh.controlplane.outbox import Dispatcher, Outbox, OutboxEvent, OutboxStatus
+from forgemesh.controlplane.publishers import EVENT_LOGGER_NAME, EventConfigError
 from forgemesh.controlplane.registry import SQLiteRegistry
 from forgemesh.controlplane.scheduler import INVENTORY_FILE_ENV, InventoryConfigError
 from forgemesh.core.scheduler import AllocatedDevice, ResourceRef
@@ -40,6 +46,7 @@ from forgemesh.workflowruntime.store import WorkflowStore
 LAUNCHER_ENVS = [
     getattr(launcher_config, name) for name in launcher_config.__all__ if name.endswith("_ENV")
 ]
+EVENT_ENVS = [getattr(publishers, name) for name in publishers.__all__ if name.endswith("_ENV")]
 
 HEADERS = {"X-Tenant-Id": "acme"}
 BODY = {
@@ -57,7 +64,7 @@ BODY = {
 def _reset_components(monkeypatch):
     monkeypatch.setenv(AUTH_MODE_ENV, AUTH_MODE_DEV)
     monkeypatch.delenv(INVENTORY_FILE_ENV, raising=False)
-    for name in LAUNCHER_ENVS:
+    for name in [*LAUNCHER_ENVS, *EVENT_ENVS]:
         monkeypatch.delenv(name, raising=False)
     reset_runtime_components()
     yield
@@ -549,3 +556,216 @@ def test_failed_controller_start_releases_the_registry_and_authenticator(
     [registry] = closed
     with pytest.raises(sqlite3.ProgrammingError):
         asyncio.run(registry.ping())
+
+
+def _wait_for_event(
+    published: Callable[[], list[dict[str, Any]]],
+    event_type: str,
+    name: str = "llama",
+    timeout: float = 5.0,
+) -> dict[str, Any]:
+    """轮询直到 ``published()`` 中出现 ``name`` 的 ``event_type`` 事件，返回它的信封。"""
+    deadline = time.monotonic() + timeout
+    while True:
+        for envelope in published():
+            if envelope["eventType"] == event_type and envelope["data"]["name"] == name:
+                return envelope
+        assert time.monotonic() < deadline, f"no {event_type} event was published for {name}"
+        time.sleep(0.02)
+
+
+async def _outbox_event(db_file: Path, event_id: str) -> OutboxEvent | None:
+    outbox = Outbox(str(db_file))
+    try:
+        return outbox.get(event_id)
+    finally:
+        await outbox.close()
+
+
+@pytest.mark.unit
+def test_the_app_publishes_outbox_events_while_it_runs(tmp_path, monkeypatch) -> None:
+    db_file = tmp_path / "cp.db"
+    monkeypatch.setattr(app_module, "EVENT_POLL_INTERVAL_SECONDS", 0.05)
+    received: list[dict[str, Any]] = []
+    app = create_app(db_path=str(db_file), event_publisher=lambda e: received.append(e.payload))
+
+    with TestClient(app) as client:
+        created = client.post("/api/v1/inference-services", json=BODY, headers=HEADERS)
+        assert created.status_code == 201
+        envelope = _wait_for_event(lambda: list(received), "inference.service.created")
+
+    assert envelope["resourceUid"] == created.json()["metadata"]["uid"]
+    published = asyncio.run(_outbox_event(db_file, envelope["eventId"]))
+    assert published is not None
+    assert published.status == OutboxStatus.PUBLISHED
+
+
+@pytest.mark.unit
+def test_events_stored_while_the_app_was_down_are_published_once(tmp_path, monkeypatch) -> None:
+    """启动后发布停机期间写入的事件；已发布的事件在下次启动后不再发布（按创建时间发布，
+    它若仍待发布，会先于新事件发出）。"""
+    db_file = tmp_path / "cp.db"
+    monkeypatch.setattr(app_module, "EVENT_POLL_INTERVAL_SECONDS", 0.05)
+    asyncio.run(_store_service(db_file))
+    first: list[dict[str, Any]] = []
+    second: list[dict[str, Any]] = []
+
+    with TestClient(
+        create_app(db_path=str(db_file), event_publisher=lambda e: first.append(e.payload))
+    ):
+        stored = _wait_for_event(lambda: list(first), "inference.service.created")
+    with TestClient(
+        create_app(db_path=str(db_file), event_publisher=lambda e: second.append(e.payload))
+    ) as client:
+        mistral = {**BODY, "metadata": {"name": "mistral", "namespace": "default"}}
+        created = client.post("/api/v1/inference-services", json=mistral, headers=HEADERS)
+        assert created.status_code == 201
+        _wait_for_event(lambda: list(second), "inference.service.created", name="mistral")
+
+    assert stored["resourceUid"] == "uid-llama"
+    assert stored["eventId"] not in [envelope["eventId"] for envelope in second]
+
+
+@pytest.mark.unit
+def test_events_are_logged_when_no_webhook_is_configured(tmp_path, monkeypatch, caplog) -> None:
+    caplog.set_level(logging.INFO, logger=EVENT_LOGGER_NAME)
+    caplog.set_level(logging.INFO, logger=app_module.__name__)
+    monkeypatch.setattr(app_module, "EVENT_POLL_INTERVAL_SECONDS", 0.05)
+
+    def logged() -> list[dict[str, Any]]:
+        records = [r for r in list(caplog.records) if r.name == EVENT_LOGGER_NAME]
+        return [json.loads(record.getMessage()) for record in records]
+
+    with TestClient(create_app(db_path=str(tmp_path / "cp.db"))) as client:
+        created = client.post("/api/v1/inference-services", json=BODY, headers=HEADERS)
+        assert created.status_code == 201
+        envelope = _wait_for_event(logged, "inference.service.created")
+
+    assert envelope["tenantId"] == "acme"
+    assert f"outbox events are published with LogPublisher(logger={EVENT_LOGGER_NAME!r})" in (
+        caplog.messages
+    )
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("launcher", [None, "fake"], ids=["no-launcher", "fake-launcher"])
+def test_the_dispatcher_runs_from_before_recovery_until_the_registry_closes(
+    tmp_path, monkeypatch, launcher
+) -> None:
+    """Dispatcher 在恢复部署、核对实例之前启动；关闭时在控制器（含定期核对实例与回收分配的
+    任务）、工作流运行时与启动器之后，关闭数据库之前停止。"""
+    calls: list[str] = []
+
+    def record(owner: Any, name: str, label: str) -> None:
+        original = getattr(owner, name)
+
+        async def wrapper(*args: Any, **kwargs: Any) -> Any:
+            calls.append(label)
+            return await original(*args, **kwargs)
+
+        monkeypatch.setattr(owner, name, wrapper)
+
+    start = Dispatcher.start
+
+    def recording_start(self: Dispatcher) -> asyncio.Task[None]:
+        calls.append("dispatcher.start")
+        return start(self)
+
+    monkeypatch.setattr(Dispatcher, "start", recording_start)
+    record(FakeLauncher, "start", "launcher.start")
+    record(LocalWorkflowRuntime, "recover", "runtime.recover")
+    record(app_module, "check_instances", "check_instances")
+    record(ControllerManager, "start", "controller.start")
+    record(ControllerManager, "stop", "controller.stop")
+    record(LocalWorkflowRuntime, "aclose", "runtime.aclose")
+    record(FakeLauncher, "aclose", "launcher.aclose")
+    record(Dispatcher, "shutdown", "dispatcher.shutdown")
+    record(SQLiteRegistry, "close", "registry.close")
+    if launcher is not None:
+        monkeypatch.setenv(INVENTORY_FILE_ENV, str(_write_inventory(tmp_path)))
+        monkeypatch.setenv(launcher_config.RUNTIME_LAUNCHER_ENV, launcher)
+
+    with TestClient(create_app(db_path=str(tmp_path / "cp.db"))):
+        started = list(calls)
+
+    recovery = ["launcher.start", "runtime.recover", "check_instances"] if launcher else []
+    released = ["runtime.aclose", "launcher.aclose"] if launcher else []
+    assert started == ["dispatcher.start", *recovery, "controller.start"]
+    assert calls[len(started) :] == [
+        "controller.stop",
+        *released,
+        "dispatcher.shutdown",
+        "registry.close",
+    ]
+
+
+@pytest.mark.unit
+def test_the_degraded_status_written_at_startup_is_published(tmp_path, monkeypatch) -> None:
+    """启动时核对实例写下的事件同样发布：上次运行的实例没能活过重启，服务转为 ``Degraded``，
+    随后以新的实例回到 Ready。"""
+    db_file = tmp_path / "cp.db"
+    monkeypatch.setattr(app_module, "EVENT_POLL_INTERVAL_SECONDS", 0.05)
+    monkeypatch.setattr(app_module, "WORKFLOW_POLL_INTERVAL_SECONDS", 0.05)
+    monkeypatch.setenv(INVENTORY_FILE_ENV, str(_write_inventory(tmp_path)))
+    monkeypatch.setenv(launcher_config.RUNTIME_LAUNCHER_ENV, "fake")
+    with TestClient(create_app(db_path=str(db_file), event_publisher=lambda e: None)) as client:
+        created = client.post("/api/v1/inference-services", json=BODY, headers=HEADERS)
+        assert created.status_code == 201
+        first = _wait_for_instance(client)
+    received: list[dict[str, Any]] = []
+
+    with TestClient(
+        create_app(db_path=str(db_file), event_publisher=lambda e: received.append(e.payload))
+    ) as client:
+        _wait_for_instance(client, other_than=first["instanceId"])
+        degraded = _wait_for_event(
+            lambda: [e for e in list(received) if e["data"]["phase"] == "Degraded"],
+            "inference.service.status_updated",
+        )
+
+    conditions = {c["type"]: c for c in degraded["data"]["resource"]["status"]["conditions"]}
+    assert conditions["Ready"]["reason"] == "InstanceLost"
+    assert "did not survive the control plane restart" in conditions["Ready"]["message"]
+    [endpoint] = degraded["data"]["resource"]["status"]["endpoints"]
+    assert (endpoint["instanceId"], endpoint["ready"]) == (first["instanceId"], False)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("settings", "message"),
+    [
+        pytest.param(
+            {"FORGEMESH_EVENT_WEBHOOK_URL": "https://user:s3cret@hooks.example.com/"},
+            "FORGEMESH_EVENT_WEBHOOK_URL must not contain user information",
+            id="credentials-in-url",
+        ),
+        pytest.param(
+            {"FORGEMESH_EVENT_WEBHOOK_TOKEN": "s3cret"},
+            "FORGEMESH_EVENT_WEBHOOK_TOKEN only applies to the webhook publisher",
+            id="token-without-url",
+        ),
+        pytest.param(
+            {
+                "FORGEMESH_EVENT_WEBHOOK_URL": "https://hooks.example.com/",
+                "FORGEMESH_EVENT_WEBHOOK_TIMEOUT_SECONDS": "0",
+            },
+            "FORGEMESH_EVENT_WEBHOOK_TIMEOUT_SECONDS='0' must be a number of seconds",
+            id="zero-timeout",
+        ),
+    ],
+)
+def test_app_refuses_to_start_with_an_invalid_event_setting(
+    tmp_path, monkeypatch, settings, message
+) -> None:
+    db_file = tmp_path / "cp.db"
+    for name, value in settings.items():
+        monkeypatch.setenv(name, value)
+
+    with (
+        pytest.raises(EventConfigError, match=message) as excinfo,
+        TestClient(create_app(db_path=str(db_file))),
+    ):
+        pass
+
+    assert "s3cret" not in str(excinfo.value)
+    assert not db_file.exists()

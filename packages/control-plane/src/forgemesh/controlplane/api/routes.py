@@ -14,6 +14,7 @@
 * ``POST   /workflows``                   —— 启动工作流运行（development-plan 5.4）
 * ``POST   /decisions``                   —— 结构化决策（决策≠授权，development-plan 5.5）
 * ``GET    /resources``                   —— 通用资源列表（按 kind 过滤，分页同上）
+* ``GET    /audit-events``                —— 当前租户的审计记录（最新的在前，分页同上）
 
 租户取自已验证的凭证（见 :func:`.dependencies.get_principal` 与
 :mod:`forgemesh.controlplane.auth`），作为多租户隔离的权威来源，覆盖请求体中的
@@ -27,8 +28,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from collections.abc import Callable
+from datetime import UTC, datetime
 from typing import Any
 from uuid import uuid4
 
@@ -39,14 +42,17 @@ from forgemesh.core.objects import Resource
 from forgemesh.decision.provider import DecisionRequest as InternalDecisionRequest
 from forgemesh.resource.inference import InferenceService
 from forgemesh.workflow.runtime import WorkflowDefinition
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, ValidationError
 
 from ..app import error_envelope
+from ..audit import AuditEvent
+from ..auth import Principal
 from ..registry import ConflictReason, InvalidPageTokenError, SQLiteRegistry
 from .dependencies import (
     ComponentNotReadyError,
     get_correlation_id,
     get_decision_router,
+    get_principal,
     get_tenant_id,
     get_workflow_runtime,
     require_read,
@@ -76,6 +82,11 @@ INITIAL_GENERATION = 1
 
 #: 列表接口单页条数上限。
 MAX_LIST_LIMIT = 1000
+
+_INVALID_PAGE_TOKEN = (
+    "invalid pageToken: it is malformed, was modified, or was issued for "
+    "a different tenant or filter set"
+)
 
 #: PUT / PATCH 在读取与写入之间遇到并发写入（如控制器写 status）时重新读取并重试，
 #: 这是总尝试次数。
@@ -147,12 +158,7 @@ async def _list_response(
             kind, tenant_id, namespace=namespace, page_token=page_token or None, limit=limit
         )
     except InvalidPageTokenError as exc:
-        raise ApiError(
-            400,
-            "BAD_REQUEST",
-            "invalid pageToken: it is malformed, was modified, or was issued for "
-            "a different tenant or filter set",
-        ) from exc
+        raise ApiError(400, "BAD_REQUEST", _INVALID_PAGE_TOKEN) from exc
     body: dict[str, Any] = {
         "items": [resource.model_dump(by_alias=True, mode="json") for resource in page.items],
         "count": len(page.items),
@@ -180,13 +186,14 @@ def _resource_response(resource: Resource, status_code: int = 200) -> JSONRespon
 async def create_inference_service(
     body: dict[str, Any],
     tenant_id: str = Depends(get_tenant_id),
+    principal: Principal = Depends(get_principal),
     registry: SQLiteRegistry = Depends(require_registry),
     correlation_id: str = Depends(get_correlation_id),
 ) -> Any:
     """创建推理服务（201，附 ``ETag``）。
 
     请求体不合法（缺少 ``spec``、kind 不匹配、未知的顶层字段等）返回 400；同名资源已存在
-    返回 409。
+    返回 409。创建成功时在同一事务中写入资源变更事件与审计记录（调用主体与关联 ID）。
     """
     try:
         resource = _build_inference_service(body, tenant_id)
@@ -201,7 +208,7 @@ async def create_inference_service(
     except ValueError as exc:
         return _error_response(400, "BAD_REQUEST", str(exc), correlation_id)
     try:
-        created = await registry.put(resource)
+        created = await registry.put(resource, correlation_id=correlation_id, principal=principal)
     except ConflictError as exc:
         return _error_response(409, "CONFLICT", str(exc), correlation_id)
     return _resource_response(created, status_code=201)
@@ -251,12 +258,16 @@ async def _update_inference_service(
     namespace: str | None,
     if_match: list[str] | None,
     document_for: Callable[[dict[str, Any]], Any],
+    *,
+    principal: Principal,
+    correlation_id: str,
 ) -> JSONResponse:
     """PUT / PATCH 的共同流程：读取当前资源 → 生成更新文档 → 检查 → CAS 写入。
 
     ``document_for`` 由当前资源的 JSON 表示得到更新文档。客户端的前置条件每一轮都对照
     这一轮读到的资源检查，写入以读到的 uid 与版本为条件；读取之后资源被并发修改（如
     控制器写入 status）时重新读取再来一轮，不会覆盖并发写入，也不会绕过前置条件。
+    有变化的写入在同一事务中写入资源变更事件与审计记录（调用主体与关联 ID）。
     """
     condition = parse_if_match(if_match)
     for _ in range(_UPDATE_ATTEMPTS):
@@ -282,6 +293,8 @@ async def _update_inference_service(
                 annotations=desired.annotations,
                 expected_version=current.metadata.resourceVersion,
                 expected_uid=current.metadata.uid,
+                correlation_id=correlation_id,
+                principal=principal,
             )
         except NotFoundError as exc:
             raise ApiError(404, "NOT_FOUND", f"InferenceService '{name}' not found") from exc
@@ -301,18 +314,28 @@ async def replace_inference_service(
     name: str,
     body: dict[str, Any],
     tenant_id: str = Depends(get_tenant_id),
+    principal: Principal = Depends(get_principal),
     registry: SQLiteRegistry = Depends(require_registry),
     namespace: str | None = None,
     if_match: list[str] | None = Header(default=None, alias="If-Match"),
+    correlation_id: str = Depends(get_correlation_id),
 ) -> JSONResponse:
     """整体替换推理服务的 ``spec``、labels 与 annotations（200，附 ``ETag``）。
 
     文档规则见 :mod:`.updates`：只有 ``spec`` 变化时 ``generation`` 递增，没有变化的请求
-    不写库。错误：文档不合法或试图修改不可变字段 400；不存在 404；资源处于 Terminating，
-    或 uid / resourceVersion / If-Match 前置条件不满足 409（``details.reason``）。
+    不写库（也不写事件与审计记录）。错误：文档不合法或试图修改不可变字段 400；不存在 404；
+    资源处于 Terminating，或 uid / resourceVersion / If-Match 前置条件不满足 409
+    （``details.reason``）。
     """
     return await _update_inference_service(
-        registry, tenant_id, name, namespace, if_match, lambda _current: body
+        registry,
+        tenant_id,
+        name,
+        namespace,
+        if_match,
+        lambda _current: body,
+        principal=principal,
+        correlation_id=correlation_id,
     )
 
 
@@ -331,9 +354,11 @@ async def patch_inference_service(
     name: str,
     request: Request,
     tenant_id: str = Depends(get_tenant_id),
+    principal: Principal = Depends(get_principal),
     registry: SQLiteRegistry = Depends(require_registry),
     namespace: str | None = None,
     if_match: list[str] | None = Header(default=None, alias="If-Match"),
+    correlation_id: str = Depends(get_correlation_id),
 ) -> JSONResponse:
     """以 JSON Merge Patch（RFC 7386）更新推理服务（200，附 ``ETag``）。
 
@@ -362,6 +387,8 @@ async def patch_inference_service(
         namespace,
         if_match,
         lambda current: apply_merge_patch(current, patch),
+        principal=principal,
+        correlation_id=correlation_id,
     )
 
 
@@ -369,6 +396,7 @@ async def patch_inference_service(
 async def delete_inference_service(
     name: str,
     tenant_id: str = Depends(get_tenant_id),
+    principal: Principal = Depends(get_principal),
     registry: SQLiteRegistry = Depends(require_registry),
     namespace: str | None = None,
     correlation_id: str = Depends(get_correlation_id),
@@ -382,10 +410,17 @@ async def delete_inference_service(
       → 清空 finalizer → 释放分配 → 物理删除」；响应体
       ``{"name": ..., "phase": "Terminating"}``。
 
-    不存在时返回 HTTP 404（不变）。
+    不存在时返回 HTTP 404（不变）。受理时在同一事务中写入资源变更事件与审计记录。
     """
     try:
-        result = await registry.request_delete("InferenceService", namespace, name, tenant_id)
+        result = await registry.request_delete(
+            "InferenceService",
+            namespace,
+            name,
+            tenant_id,
+            correlation_id=correlation_id,
+            principal=principal,
+        )
     except NotFoundError as exc:
         raise HTTPException(status_code=404, detail=f"InferenceService '{name}' not found") from exc
     except ConflictError as exc:
@@ -424,6 +459,76 @@ async def list_resources(
             )
         return {"items": [], "count": 0}
     return await _list_response(registry, kind, tenant_id, namespace, page_token, limit)
+
+
+# ------------------------------------------------------------------ #
+# 审计记录端点
+# ------------------------------------------------------------------ #
+
+
+class AuditRecordResponse(BaseModel):
+    """一条审计记录（对齐 OpenAPI ``AuditEvent``）。"""
+
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    audit_id: str = Field(alias="auditId")
+    occurred_at: AwareDatetime = Field(alias="occurredAt")
+    tenant_id: str = Field(alias="tenantId")
+    actor: str | None
+    key_id: str | None = Field(alias="keyId")
+    correlation_id: str = Field(alias="correlationId")
+    action: str
+    resource_type: str = Field(alias="resourceType")
+    namespace: str | None
+    resource_id: str = Field(alias="resourceId")
+    outcome: str
+    details: dict[str, Any] | None
+
+    @classmethod
+    def from_event(cls, event: AuditEvent) -> AuditRecordResponse:
+        """由存储的审计记录构造：时间戳转为 UTC 的 ``occurredAt``。"""
+        occurred_at = datetime.fromtimestamp(event.timestamp, UTC)
+        return cls(**event.model_dump(exclude={"timestamp"}), occurred_at=occurred_at)
+
+
+@router.get("/audit-events", dependencies=[Depends(require_read)])
+async def list_audit_events(
+    tenant_id: str = Depends(get_tenant_id),
+    registry: SQLiteRegistry = Depends(require_registry),
+    correlation_filter: str | None = Query(default=None, alias="correlationId"),
+    limit: int = 100,
+    page_token: str | None = Query(default=None, alias="pageToken"),
+    correlation_id: str = Depends(get_correlation_id),
+) -> Any:
+    """列出当前租户的审计记录，最新的在前（可选按 ``correlationId`` 过滤）。
+
+    响应带 ``nextPageToken`` 时还有下一页：以相同的 ``correlationId`` 把它作为 ``pageToken``
+    传回（``limit`` 可以不同）；``pageToken`` / ``correlationId`` 为空串时视为未给出。
+    ``limit`` 超出 1–1000，或 ``pageToken`` 无效、被篡改、签发给了另一租户 / 另一个过滤条件
+    时返回 400。
+    """
+    if (invalid := _invalid_limit(limit, correlation_id)) is not None:
+        return invalid
+    try:
+        page = await asyncio.to_thread(
+            registry.audit_log.list_page,
+            tenant_id,
+            limit=limit,
+            page_token=page_token or None,
+            correlation_id=correlation_filter or None,
+        )
+    except InvalidPageTokenError as exc:
+        raise ApiError(400, "BAD_REQUEST", _INVALID_PAGE_TOKEN) from exc
+    body: dict[str, Any] = {
+        "items": [
+            AuditRecordResponse.from_event(event).model_dump(mode="json", by_alias=True)
+            for event in page.items
+        ],
+        "count": len(page.items),
+    }
+    if page.next_page_token is not None:
+        body["nextPageToken"] = page.next_page_token
+    return body
 
 
 # ------------------------------------------------------------------ #

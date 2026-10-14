@@ -4,7 +4,8 @@
 
 * **配额隔离**：租户 A 超配额不影响租户 B 的配额决策。
 * **注册表隔离**：租户 A 的资源对租户 B 不可见（list / get / delete 均隔离）。
-* **审计隔离**：租户 A 的审计记录对租户 B 不可见。
+* **审计隔离**：租户 A 的审计记录对租户 B 不可见（存储查询与
+  ``GET /api/v1/audit-events``，含按 correlationId 过滤与分页令牌）。
 * **决策记录隔离**：租户 A 的决策记录对租户 B 不可见。
 * **诊断包隔离**：诊断包只返回请求租户的数据，绝不泄露其他租户信息。
 * **跨租户访问**：跨租户 get / delete 一律返回 NotFoundError，不泄露存在性。
@@ -19,7 +20,10 @@ import time
 from typing import Any
 
 import pytest
+from fastapi.testclient import TestClient
+from forgemesh.controlplane.app import create_app
 from forgemesh.controlplane.audit import AuditEvent, AuditLog
+from forgemesh.controlplane.auth import ApiKeyAuthenticator, ApiKeyEntry, hash_api_key
 from forgemesh.controlplane.diagnostics import DiagnosticCollector
 from forgemesh.controlplane.registry import SQLiteRegistry
 from forgemesh.core.errors import NotFoundError
@@ -192,6 +196,61 @@ def test_audit_tenant_isolation() -> None:
     # 租户 B 查询结果中不含租户 A 的 resource_id
     resource_ids_b = {r.resource_id for r in records_b}
     assert "res-a" not in resource_ids_b
+
+
+def _service_body(name: str) -> dict[str, Any]:
+    """经 API 创建推理服务的最小请求体。"""
+    return {
+        "kind": KIND,
+        "metadata": {"name": name, "namespace": "team"},
+        "spec": {
+            "model": {"reference": "models/demo"},
+            "runtime": {"provider": "vllm"},
+            "resources": {"accelerator": {"type": "nvidia-gpu", "minMemoryGiB": 16}},
+        },
+    }
+
+
+@pytest.mark.unit
+def test_audit_api_tenant_isolation(tmp_path) -> None:
+    """审计查询接口只返回凭证所属租户的记录：按租户 A 的关联 ID 过滤、使用租户 A 的分页
+    令牌或伪造租户头，都拿不到租户 A 的记录。"""
+    key_a, key_b = "fmk_isolation-key-a", "fmk_isolation-key-b"
+    authenticator = ApiKeyAuthenticator(
+        [
+            ApiKeyEntry(id="a", sha256=hash_api_key(key_a), tenantId=TENANT_A, subject="alice"),
+            ApiKeyEntry(id="b", sha256=hash_api_key(key_b), tenantId=TENANT_B, subject="bob"),
+        ]
+    )
+    headers_a = {"Authorization": f"Bearer {key_a}"}
+    headers_b = {"Authorization": f"Bearer {key_b}"}
+    url = "/api/v1/audit-events"
+
+    app = create_app(db_path=str(tmp_path / "cp.db"), authenticator=authenticator)
+    with TestClient(app) as client:
+        for headers, name in ((headers_a, "svc-a1"), (headers_a, "svc-a2"), (headers_b, "svc-b")):
+            created = client.post(
+                "/api/v1/inference-services",
+                json=_service_body(name),
+                headers={**headers, "X-Correlation-Id": f"corr-{name}"},
+            )
+            assert created.status_code == 201
+
+        page_a = client.get(url, params={"limit": 1}, headers=headers_a).json()
+        listed_b = client.get(url, headers=headers_b).json()
+        filtered_b = client.get(url, params={"correlationId": "corr-svc-a1"}, headers=headers_b)
+        token_of_a = client.get(
+            url, params={"pageToken": page_a["nextPageToken"]}, headers=headers_b
+        )
+        spoofed = client.get(url, headers={**headers_b, "X-Tenant-Id": TENANT_A})
+
+    assert page_a["items"][0]["tenantId"] == TENANT_A
+    assert [(i["tenantId"], i["resourceId"]) for i in listed_b["items"]] == [(TENANT_B, "svc-b")]
+    assert filtered_b.json()["items"] == []
+    assert token_of_a.status_code == 400
+    assert spoofed.status_code == 403
+    for response in (filtered_b, token_of_a, spoofed):
+        assert "svc-a" not in response.text
 
 
 # --------------------------------------------------------------------------- #

@@ -19,7 +19,6 @@ package stream
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -31,6 +30,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/Mekoforge/ForgeMesh/gateway/internal/metrics"
+	"github.com/Mekoforge/ForgeMesh/gateway/internal/middleware"
 	"github.com/Mekoforge/ForgeMesh/gateway/internal/upstream"
 )
 
@@ -62,6 +63,7 @@ type Proxy struct {
 	tenantHeader string
 	client       *http.Client
 	logger       *log.Logger
+	metrics      *metrics.Gateway
 	rr           atomic.Uint64 // 轮询计数器
 }
 
@@ -105,11 +107,15 @@ func New(resolver Resolver, tenantHeader string, policy AddressPolicy, logger *l
 	}
 }
 
+// SetMetrics 设置记录首字节时间与实例错误的指标，须在开始处理请求前调用。
+func (p *Proxy) SetMetrics(m *metrics.Gateway) { p.metrics = m }
+
 // ServeHTTP 解析 {ns}/{svc} → 选择实例 → 转发单个流式请求。
 func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	start := time.Now()
 	svc := upstream.ServiceRef{Namespace: r.PathValue("ns"), Name: r.PathValue("svc")}
 	if svc.Name == "" {
-		writeJSONError(w, http.StatusBadRequest, "MISSING_SERVICE", "路径缺少推理服务名 {svc}")
+		middleware.WriteError(w, r, http.StatusBadRequest, "MISSING_SERVICE", "路径缺少推理服务名 {svc}")
 		return
 	}
 	tenantID := r.Header.Get(p.tenantHeader)
@@ -117,14 +123,15 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	resolveCtx := upstream.WithAuthorization(r.Context(), r.Header.Get("Authorization"))
 	endpoints, err := p.resolver.Resolve(resolveCtx, svc, tenantID)
 	if err != nil {
-		p.logger.Printf("stream resolve error: corr=%s svc=%s tenant=%s err=%v",
-			r.Header.Get("X-Correlation-ID"), svc, tenantID, err)
+		p.logger.Printf("stream resolve error: corr=%s trace=%s svc=%s tenant=%s err=%v",
+			middleware.CorrelationIDFromContext(r.Context()), middleware.TraceIDFromContext(r.Context()),
+			svc, tenantID, err)
 		status, code := classifyResolveError(err)
-		writeJSONError(w, status, code, err.Error())
+		middleware.WriteError(w, r, status, code, err.Error())
 		return
 	}
 	if len(endpoints) == 0 {
-		writeJSONError(w, http.StatusServiceUnavailable, "NO_HEALTHY_UPSTREAM",
+		middleware.WriteError(w, r, http.StatusServiceUnavailable, "NO_HEALTHY_UPSTREAM",
 			"推理服务 "+svc.String()+" 当前没有可用实例")
 		return
 	}
@@ -134,26 +141,28 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	target, err := url.Parse(endpoint.URL)
 	path, known := endpoint.Protocol.Path()
 	if err != nil || target.Scheme == "" || target.Host == "" || !known {
-		p.logger.Printf("stream invalid endpoint: corr=%s svc=%s endpoint=%q protocol=%q err=%v",
-			r.Header.Get("X-Correlation-ID"), svc, endpoint.URL, endpoint.Protocol, err)
+		p.logger.Printf("stream invalid endpoint: corr=%s trace=%s svc=%s endpoint=%q protocol=%q err=%v",
+			middleware.CorrelationIDFromContext(r.Context()), middleware.TraceIDFromContext(r.Context()),
+			svc, endpoint.URL, endpoint.Protocol, err)
 		p.resolver.ReportFailure(endpoint.URL)
-		writeJSONError(w, http.StatusBadGateway, "INVALID_UPSTREAM",
+		p.metrics.UpstreamError(metrics.UpstreamInstance, metrics.ErrorInvalidEndpoint)
+		middleware.WriteError(w, r, http.StatusBadGateway, "INVALID_UPSTREAM",
 			"实例地址或协议非法: "+endpoint.URL)
 		return
 	}
 
-	p.forward(w, r, buildUpstreamURL(target, path, r.URL.RawQuery), endpoint.URL)
+	p.forward(w, r, buildUpstreamURL(target, path, r.URL.RawQuery), endpoint.URL, start)
 }
 
-// forward 执行单次流式转发，并依据结果向 Resolver 上报健康度。
-func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, upstreamURL, endpoint string) {
+// forward 执行单次流式转发，并依据结果向 Resolver 上报健康度；start 是开始处理请求的时间。
+func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, upstreamURL, endpoint string, start time.Time) {
 	// 使用客户端请求的 context：客户端断开时，Go 运行时会取消该 context，
 	// 进而取消这里的上游请求，实现“断连即取消上游”。
 	ctx := r.Context()
 
 	req, err := http.NewRequestWithContext(ctx, r.Method, upstreamURL, r.Body)
 	if err != nil {
-		http.Error(w, http.StatusText(http.StatusBadGateway), http.StatusBadGateway)
+		middleware.WriteError(w, r, http.StatusBadGateway, "INVALID_UPSTREAM", "实例地址非法: "+endpoint)
 		return
 	}
 	req.Header = copyForwardHeaders(r.Header)
@@ -166,19 +175,23 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, upstreamURL, end
 	if err != nil {
 		var tooLarge *http.MaxBytesError
 		if errors.As(err, &tooLarge) {
-			writeJSONError(w, http.StatusRequestEntityTooLarge, "REQUEST_TOO_LARGE",
+			middleware.WriteError(w, r, http.StatusRequestEntityTooLarge, "REQUEST_TOO_LARGE",
 				fmt.Sprintf("请求体超过 %d 字节", tooLarge.Limit))
 			return
 		}
-		p.logger.Printf("stream upstream error: corr=%s path=%s endpoint=%s err=%v",
-			r.Header.Get("X-Correlation-ID"), r.URL.Path, endpoint, err)
+		p.logger.Printf("stream upstream error: corr=%s trace=%s path=%s endpoint=%s err=%v",
+			middleware.CorrelationIDFromContext(ctx), middleware.TraceIDFromContext(ctx), r.URL.Path, endpoint, err)
 		p.resolver.ReportFailure(endpoint)
 		if errors.Is(err, ErrAddressNotAllowed) {
-			writeJSONError(w, http.StatusBadGateway, "INSTANCE_ADDRESS_NOT_ALLOWED",
+			p.metrics.UpstreamError(metrics.UpstreamInstance, metrics.ErrorAddressNotAllowed)
+			middleware.WriteError(w, r, http.StatusBadGateway, "INSTANCE_ADDRESS_NOT_ALLOWED",
 				"实例地址不在允许连接的范围内: "+endpoint)
 			return
 		}
-		http.Error(w, http.StatusText(http.StatusBadGateway), http.StatusBadGateway)
+		if ctx.Err() == nil {
+			p.metrics.UpstreamError(metrics.UpstreamInstance, metrics.ErrorConnect)
+		}
+		middleware.WriteError(w, r, http.StatusBadGateway, "UPSTREAM_UNAVAILABLE", "推理实例不可用: "+endpoint)
 		return
 	}
 	defer resp.Body.Close()
@@ -188,7 +201,7 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, upstreamURL, end
 	upstreamFailed := resp.StatusCode >= 500
 	if upstreamFailed {
 		p.resolver.ReportFailure(endpoint)
-
+		p.metrics.UpstreamError(metrics.UpstreamInstance, metrics.ErrorStatus)
 	}
 
 	// 透传上游头，但剔除 hop-by-hop 头，避免连接语义污染。
@@ -200,7 +213,8 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, upstreamURL, end
 		dst[k] = append([]string(nil), vs...)
 	}
 	// 成功响应强制流式语义；错误响应保留实例的 Content-Type，客户端才能按格式解析错误体。
-	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+	succeeded := resp.StatusCode >= 200 && resp.StatusCode < 300
+	if succeeded {
 		dst.Set("Content-Type", "text/event-stream")
 	}
 	dst.Set("Cache-Control", "no-cache")
@@ -215,6 +229,8 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, upstreamURL, end
 		flusher.Flush() // 尽早把响应头推给客户端，建立流通道
 	}
 
+	// 首字节时间只统计成功的流：错误响应体不是推理输出。
+	awaitingFirstByte := succeeded
 	buf := make([]byte, readBufferSize)
 	for {
 		n, readErr := resp.Body.Read(buf)
@@ -227,6 +243,10 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, upstreamURL, end
 			if flusher != nil {
 				flusher.Flush()
 			}
+			if awaitingFirstByte {
+				awaitingFirstByte = false
+				p.metrics.ObserveFirstByte(time.Since(start))
+			}
 		}
 		if readErr != nil {
 			// 客户端断开导致上游请求被取消：属客户端行为，不计实例健康度。
@@ -235,9 +255,11 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, upstreamURL, end
 			}
 			if readErr != io.EOF {
 				// 上游流中途异常终止：计一次实例失败。
-				p.logger.Printf("stream read error: corr=%s path=%s endpoint=%s err=%v",
-					r.Header.Get("X-Correlation-ID"), r.URL.Path, endpoint, readErr)
+				p.logger.Printf("stream read error: corr=%s trace=%s path=%s endpoint=%s err=%v",
+					middleware.CorrelationIDFromContext(ctx), middleware.TraceIDFromContext(ctx),
+					r.URL.Path, endpoint, readErr)
 				p.resolver.ReportFailure(endpoint)
+				p.metrics.UpstreamError(metrics.UpstreamInstance, metrics.ErrorBody)
 				return
 			}
 			// 流完整读尽：实例工作正常（5xx 响应已单独计失败，不覆盖）。
@@ -267,24 +289,6 @@ func classifyResolveError(err error) (int, string) {
 	default:
 		return http.StatusBadGateway, "UPSTREAM_RESOLVE_FAILED"
 	}
-}
-
-// writeJSONError 输出与控制平面错误信封风格对齐的 JSON 错误体：
-//
-//	{"error":{"code":"...","message":"..."}}
-func writeJSONError(w http.ResponseWriter, status int, code, message string) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	body := struct {
-		Error struct {
-			Code    string `json:"code"`
-			Message string `json:"message"`
-		} `json:"error"`
-	}{}
-	body.Error.Code = code
-	body.Error.Message = message
-	// 序列化失败只可能源于内部构造，忽略并保留已写出的状态码。
-	_ = json.NewEncoder(w).Encode(body)
 }
 
 // buildUpstreamURL 拼接实例基路径与协议的推理路径（避免出现双斜杠），并带上查询串。

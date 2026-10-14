@@ -18,7 +18,7 @@ class ExitCode(IntEnum):
     USAGE = 2
     """参数、配置或资源文档不合法，没有发出请求（与 argparse 的用法错误相同）。"""
     NOT_FOUND = 3
-    """API 报告资源不存在（``404`` 错误信封）。"""
+    """API 报告资源不存在（``404`` 错误信封，错误码 ``NOT_FOUND``）。"""
     CONFLICT = 4
     REJECTED = 5
     """API 拒绝了请求：``400``、``405``、``413``、``415`` 等其他 4xx。"""
@@ -86,8 +86,8 @@ class ApiError(CliError):
 
     Attributes:
         status: HTTP 状态码。
-        code: 错误信封的 ``error.code``；响应不是错误信封（如网关的纯文本 ``429`` / ``502``）
-            时为 ``None``。
+        code: 错误信封的 ``error.code``；响应不是错误信封（如反向代理的纯文本 ``502``）时为
+            ``None``。
         reason: 错误信封的 ``details.reason``（如 ``409`` 的 ``ResourceVersionMismatch``）。
         retry_after: ``Retry-After`` 响应头给出的秒数。
     """
@@ -103,7 +103,7 @@ class ApiError(CliError):
     ) -> None:
         exit_code = exit_code_for_status(status)
         if exit_code is ExitCode.NOT_FOUND and code != "NOT_FOUND":
-            # 不是 API 的 404（如网关没有路由的路径）：地址错了，不能让脚本以为资源不存在
+            # 不是 API 的 404（如网关或控制平面没有路由的路径）：地址错了，不能让脚本以为资源不存在
             exit_code = ExitCode.ERROR
         super().__init__(message, exit_code)
         self.status = status
@@ -113,7 +113,8 @@ class ApiError(CliError):
 
     @property
     def not_found(self) -> bool:
-        """资源不存在：``404`` 错误信封，而不是不提供 API 的地址返回的 ``404``。"""
+        """资源不存在：错误码为 ``NOT_FOUND`` 的 ``404``，而不是网关与控制平面对没有路由的路径
+        返回的 ``ROUTE_NOT_FOUND`` 或不提供 API 的地址返回的 ``404``。"""
         return self.status == 404 and self.code == "NOT_FOUND"
 
     @property

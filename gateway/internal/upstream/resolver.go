@@ -2,7 +2,8 @@
 //
 // 数据源：控制平面 GET /api/v1/inference-services/{svc}[?namespace={ns}]（携带
 // X-Tenant-Id 与调用方的 Authorization，控制平面据此独立校验调用方，见
-// WithAuthorization），从响应 status.endpoints[] 取就绪实例的地址与协议
+// WithAuthorization；并携带 middleware.TraceContext 确定的 traceparent），
+// 从响应 status.endpoints[] 取就绪实例的地址与协议
 // （如 {"url": "http://10.0.0.1:8000", "protocol": "openai-chat"}）。
 //
 // 设计要点：
@@ -33,6 +34,9 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/Mekoforge/ForgeMesh/gateway/internal/metrics"
+	"github.com/Mekoforge/ForgeMesh/gateway/internal/middleware"
 )
 
 // 解析失败的哨兵错误，调用方通过 errors.Is 分类转成对应的 HTTP 状态码。
@@ -144,8 +148,8 @@ type cacheEntry struct {
 }
 
 // lookup 是一次进行中的控制平面查询，同一个缓存 key 的并发未命中共用它；
-// done 关闭之后 endpoints / err 只读。查询使用发起者的凭证，等待者共用结果与共用
-// 缓存的语义相同：网关已对每个调用方校验过凭证、租户与 read scope。
+// done 关闭之后 endpoints / err 只读。查询使用发起者的凭证（与 traceparent），等待者共用
+// 结果与共用缓存的语义相同：网关已对每个调用方校验过凭证、租户与 read scope。
 type lookup struct {
 	done      chan struct{}
 	endpoints []Endpoint
@@ -167,6 +171,7 @@ type Resolver struct {
 	cooldown         time.Duration
 	failureThreshold int
 	logger           *log.Logger
+	metrics          *metrics.Gateway
 
 	mu       sync.Mutex
 	cache    map[string]cacheEntry      // key: 见 cacheKey
@@ -206,6 +211,9 @@ func NewResolver(controlPlaneURL string, client *http.Client, ttl, cooldown time
 	}
 }
 
+// SetMetrics 设置记录查询结果与控制平面错误的指标，须在开始处理请求前调用。
+func (r *Resolver) SetMetrics(m *metrics.Gateway) { r.metrics = m }
+
 // Resolve 返回服务的健康实例 endpoint 列表（已过滤冷却期内的实例）。
 //
 // 返回哨兵错误：ErrServiceNotFound / ErrNotReady / ErrNoEndpoints /
@@ -217,10 +225,14 @@ func (r *Resolver) Resolve(ctx context.Context, svc ServiceRef, tenantID string)
 	r.mu.Lock()
 	if entry, ok := r.cache[key]; ok && time.Now().Before(entry.expiry) {
 		defer r.mu.Unlock()
+		r.metrics.ResolverLookup(metrics.LookupHit)
 		return r.healthyLocked(entry.endpoints, entry.err, svc, tenantID)
 	}
 	l, running := r.inflight[key]
-	if !running {
+	if running {
+		r.metrics.ResolverLookup(metrics.LookupCoalesced)
+	} else {
+		r.metrics.ResolverLookup(metrics.LookupMiss)
 		l = &lookup{done: make(chan struct{})}
 		r.inflight[key] = l
 		// 查询不随发起它的调用方取消：其他等待者与缓存还需要结果。
@@ -293,9 +305,13 @@ func (r *Resolver) fetch(ctx context.Context, svc ServiceRef, tenantID string) (
 	if auth, _ := ctx.Value(authorizationKey{}).(string); auth != "" {
 		req.Header.Set("Authorization", auth)
 	}
+	if traceparent := middleware.TraceparentFromContext(ctx); traceparent != "" {
+		req.Header.Set(middleware.TraceparentHeader, traceparent)
+	}
 
 	resp, err := r.client.Do(req)
 	if err != nil {
+		r.metrics.UpstreamError(metrics.UpstreamControlPlane, metrics.ErrorConnect)
 		return nil, fmt.Errorf("resolver: 查询控制平面失败 (svc=%s): %w", svc, err)
 	}
 	defer resp.Body.Close()
@@ -306,16 +322,21 @@ func (r *Resolver) fetch(ctx context.Context, svc ServiceRef, tenantID string) (
 	case resp.StatusCode == http.StatusForbidden:
 		return nil, fmt.Errorf("%w: svc=%s tenant=%s", ErrForbidden, svc, tenantID)
 	case resp.StatusCode < 200 || resp.StatusCode >= 300:
+		if resp.StatusCode >= 500 {
+			r.metrics.UpstreamError(metrics.UpstreamControlPlane, metrics.ErrorStatus)
+		}
 		return nil, fmt.Errorf("resolver: 控制平面返回异常状态 %d (svc=%s)", resp.StatusCode, svc)
 	}
 
 	body, err := io.ReadAll(io.LimitReader(resp.Body, maxResolveBodySize))
 	if err != nil {
+		r.metrics.UpstreamError(metrics.UpstreamControlPlane, metrics.ErrorBody)
 		return nil, fmt.Errorf("resolver: 读取控制平面响应失败 (svc=%s): %w", svc, err)
 	}
 
 	var payload inferenceServicePayload
 	if err := json.Unmarshal(body, &payload); err != nil {
+		r.metrics.UpstreamError(metrics.UpstreamControlPlane, metrics.ErrorBody)
 		return nil, fmt.Errorf("resolver: 解析控制平面响应失败 (svc=%s): %w", svc, err)
 	}
 
@@ -367,6 +388,32 @@ func (r *Resolver) ReportSuccess(endpoint string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	delete(r.health, endpoint)
+}
+
+// InstanceStates 返回未过期的缓存条目中不同实例 URL 的个数：unhealthy 处于冷却期（被摘流），
+// healthy 为其余实例。
+func (r *Resolver) InstanceStates() (healthy, unhealthy int) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	now := time.Now()
+	seen := make(map[string]bool)
+	for _, entry := range r.cache {
+		if !now.Before(entry.expiry) {
+			continue
+		}
+		for _, ep := range entry.endpoints {
+			if seen[ep.URL] {
+				continue
+			}
+			seen[ep.URL] = true
+			if h, ok := r.health[ep.URL]; ok && now.Before(h.unhealthyUntil) {
+				unhealthy++
+			} else {
+				healthy++
+			}
+		}
+	}
+	return healthy, unhealthy
 }
 
 // filterHealthyLocked 过滤冷却期内的 endpoint（调用方须持有 r.mu）。

@@ -159,6 +159,8 @@ curl -s -H "Authorization: Bearer fmk_…" http://127.0.0.1:8080/api/v1/inferenc
 | `FORGEMESH_DB_PATH` | `forgemesh.db` | SQLite 权威存储文件；同一文件只允许一个控制平面实例写入（ADR-013）。以 WAL 模式打开，运行时旁边有 `-wal` / `-shm` 文件，不能直接复制文件做备份，见 [备份与灾备演练](docs/operations/backup-restore.md)。设置了 `FORGEMESH_RUNTIME_LAUNCHER` 时，部署工作流的运行记录在同目录的第二个文件中（`forgemesh.db` → `forgemesh.workflows.db`），两个文件一起备份与恢复；`vllm-process` / `tgi-process` 还在同目录记录实例进程（`forgemesh.instances.json`，不需要备份，见「部署推理服务」） |
 | `FORGEMESH_HOST` | `127.0.0.1` | 监听地址 |
 | `FORGEMESH_PORT` | `8080` | 监听端口 |
+| `FORGEMESH_LOG_FORMAT` | `json` | 日志格式：`json`（每行一个 JSON 对象）或 `text`，写到标准错误，见「可观测性」；不区分大小写，其他取值拒绝启动 |
+| `FORGEMESH_LOG_LEVEL` | `INFO` | 日志级别：`DEBUG` / `INFO` / `WARNING` / `ERROR`，不区分大小写，其他取值拒绝启动；资源变更事件的日志不受它影响 |
 | `FORGEMESH_INVENTORY_FILE` | — | 静态加速器清单（JSON，格式见下），设置后启用首次适配调度器；文件不可读或格式非法时拒绝启动，修改后需重启。未设置时不启用调度器 |
 | `FORGEMESH_INSTANCE_CHECK_INTERVAL_SECONDS` | `10` | 部署推理服务时控制器核对实例是否仍在运行的间隔（秒）：实例退出之后，下一次核对把服务转为 `Degraded` 并重新部署（见「部署推理服务」）。须为有限的正数，不论是否设置了启动器都校验，非法时拒绝启动 |
 | `FORGEMESH_RUNTIME_LAUNCHER` | — | 推理实例启动器，设置后部署推理服务（见「部署推理服务」）：`fake`（控制平面进程内的 OpenAI 兼容桩服务，不需要 GPU，供 CI 与本地开发）、`vllm-process`（本机上的 vLLM 子进程）或 `tgi-process`（本机上的 TGI 子进程），不区分大小写。必须同时设置 `FORGEMESH_INVENTORY_FILE`；取值未知、缺少清单或所选启动器的配置非法时拒绝启动。未设置时不部署。下面各启动器的变量只在选中该启动器时读取，空白值视同未设置 |
@@ -193,11 +195,11 @@ curl -s -H "Authorization: Bearer fmk_…" http://127.0.0.1:8080/api/v1/inferenc
 
 控制平面启动后会自动协调 `InferenceService`：新建、修改或请求删除的资源在 0.5 秒内被处理，协调结果写入 `status.conditions`（例如 `Ready=False` 及其原因）。未设置 `FORGEMESH_INVENTORY_FILE` 时，新建的服务会停在 `Pending`，并带有 `Ready=False`（`SchedulerUnavailable`）条件；只设置清单、未设置 `FORGEMESH_RUNTIME_LAUNCHER` 时，条件为 `Ready=False`（`WorkflowRuntimeUnavailable`），协调器在分配之前停下，不占用设备。两者都设置后，资源每轮推进一个 phase（`Pending` → `Scheduling` → `Preparing` → `Deploying` → `Verifying` → `Ready`）：分配设备，运行部署工作流（准备模型 → 启动实例 → 验证实例），成功后写入 `status.endpoints` 与 `Ready=True`，网关随即可以转发对话；`spec` 变化时经 `Updating` 重新部署（见下文「更新」）；实例丢失时服务转为 `Degraded` 并重新部署；部署失败时资源进入 `Failed`，不自动重试，修改 `spec` 或删除后重新创建即可再次部署；删除时先取消部署、停止实例，再释放分配。每个服务只部署一个实例（`spec.availability.replicas` 不生效）。控制器与 API 运行在同一个进程中，是权威存储的唯一写者（ADR-013）：请以单进程运行，不要使用 `uvicorn --workers` 或多副本。设置了启动器时 `POST /api/v1/workflows` 同样返回 `503`（`WORKFLOW_RUNTIME_UNAVAILABLE`）：部署工作流的运行时只供协调器使用，不对外开放。
 
-每次资源写入（经 API、控制器或启动时的实例核对）都在同一个事务中记下一条资源变更事件（信封见 `api/schemas/event.schema.json`，如 `inference.service.created`、`inference.service.status_updated`），控制平面在后台发布：默认写日志（logger `forgemesh.events`，每个事件一行 JSON，没有配置 logging 时写标准输出），设置 `FORGEMESH_EVENT_WEBHOOK_URL` 后 `POST` 到 webhook。事件至少投递一次，接收方按 `eventId`（webhook 请求头 `X-Forgemesh-Event-Id`）去重；发送失败时按 1 秒起翻倍、最长 300 秒的间隔重试，失败 10 次后不再发送（`dead`，记一条 ERROR 日志），修复接收方后可以重新投递，见[备份与灾备演练](docs/operations/backup-restore.md)第 5 节。经 API 创建、更新（`PUT` / `PATCH`）与删除资源时，同一事务还写入一条审计记录（租户、主体、key id、correlation id），可用 `GET /api/v1/audit-events` 查询（见下文 REST API）。
+每次资源写入（经 API、控制器或启动时的实例核对）都在同一个事务中记下一条资源变更事件（信封见 `api/schemas/event.schema.json`，如 `inference.service.created`、`inference.service.status_updated`），控制平面在后台发布：默认写日志（logger `forgemesh.events`，每个事件一行 JSON；以 `forgemesh-control-plane` 运行时与其他日志一起写到标准错误，见「可观测性」，没有配置 logging 时写标准输出），设置 `FORGEMESH_EVENT_WEBHOOK_URL` 后 `POST` 到 webhook。事件至少投递一次，接收方按 `eventId`（webhook 请求头 `X-Forgemesh-Event-Id`）去重；发送失败时按 1 秒起翻倍、最长 300 秒的间隔重试，失败 10 次后不再发送（`dead`，记一条 ERROR 日志），修复接收方后可以重新投递，见[备份与灾备演练](docs/operations/backup-restore.md)第 5 节。经 API 创建、更新（`PUT` / `PATCH`）与删除资源时，同一事务还写入一条审计记录（租户、主体、key id、correlation id），可用 `GET /api/v1/audit-events` 查询（见下文 REST API）。
 
 ### REST API
 
-控制平面的 REST API 以 `/api/v1` 为前缀，契约是 [api/openapi/openapi.yaml](api/openapi/openapi.yaml)。契约测试 `tests/contract/test_openapi_contract.py` 双向核对应用提供的路由、参数、请求体与状态码（探针除外），并逐一调用每个操作、校验响应符合契约：修改路由时须同步修改契约。网关把 `/api/v1/inference-services`、`/api/v1/resources`、`/api/v1/audit-events`、`/api/v1/workflows`、`/api/v1/decisions` 及其子路径的请求（任意方法，连同查询串、请求头与请求体）转发给控制平面。错误响应都是错误信封 `{"error": {"code", "message", "correlationId", "details"}}`，`correlationId` 回显请求头 `X-Correlation-Id`（经网关访问时由网关补上）。
+控制平面的 REST API 以 `/api/v1` 为前缀，契约是 [api/openapi/openapi.yaml](api/openapi/openapi.yaml)。契约测试 `tests/contract/test_openapi_contract.py` 双向核对应用提供的路由、参数、请求体与状态码（探针除外），并逐一调用每个操作、校验响应符合契约：修改路由时须同步修改契约。网关把 `/api/v1/inference-services`、`/api/v1/resources`、`/api/v1/audit-events`、`/api/v1/workflows`、`/api/v1/decisions` 及其子路径的请求（任意方法，连同查询串、请求头与请求体）转发给控制平面。错误响应都是错误信封 `{"error": {"code", "message", "correlationId", "traceId", "details"}}`，`correlationId` 回显请求头 `X-Correlation-Id`（经网关访问时由网关补上），`traceId` 是这个请求的 trace-id（见「可观测性」）。资源不存在的 `404` 错误码为 `NOT_FOUND`；路径不匹配任何端点（如多了一段前缀）的 `404` 错误码为 `ROUTE_NOT_FOUND`，与网关相同，客户端据此区分资源不存在与地址错误。
 
 | 端点 | 说明 |
 | --- | --- |
@@ -281,14 +283,14 @@ CLI 只管理 `InferenceService`（写作 `inferenceservice` 或 `inferenceservi
 
 **wait**：每秒读取一次资源。`--for ready` 在同一次读取中 `status.phase` 为 `Ready`、`Ready` 条件为 `True` 且 `metadata.observedGeneration` 等于 `generation` 时成功，这时服务运行的是当前的 `spec`（见「REST API」）：`spec` 变化之后，服务先以旧的 `observedGeneration` 保持 `Ready`，再经 `Updating` 重新部署，`wait` 等到新的 `spec` 部署完成。资源正在删除，或在当前的 `spec` 下进入 `Failed`（`spec` 变化之前控制器不会再部署它）时立即失败；其他状态都继续等待，如 `Updating`、重新部署中的 `Degraded`，以及 `spec` 变化之后还没重新部署的 `Failed`。超时时报告最后看到的状态：被策略拒绝、等待审批或缺少调度器 / 启动器的更新不写 `status`，服务一直以旧的 `observedGeneration` 停在 `Ready` / `Degraded`，消息说明更新没有开始、原因见控制平面的日志。`--for delete` 在资源不存在时成功（退出码 `0`），输出如 `InferenceService default/llama deleted`：开始等待时资源已经不存在（例如 `delete` 之后控制器在第一次读取之前就删除了它）同样如此，结果不取决于这个先后；因此名称或命名空间写错时也报告成功。读取遇到限流（`429`，按 `Retry-After` 推迟下一次读取）或 `502`–`504` 时继续等待；连接失败只在此前收到过 HTTP 响应时视为暂时故障，第一次请求就连不上时立即失败。
 
-**错误与退出码**：错误消息写到标准错误，以 `Error:` 开头（参数写错时是 argparse 的用法提示）。错误信封显示为 `<message> (HTTP <状态码> <code>[, reason <details.reason>], correlation id <关联 ID>)`，请求校验失败时逐行列出字段与原因；网关自己的纯文本 `429` 与 `502` 分别报告为被网关限流（附上 `Retry-After` 的秒数）与网关连不上控制平面。一次调用的全部请求带同一个随机的 `X-Correlation-Id`，可以用它在网关与控制平面的日志中找到这次调用。`forgemesh --help` 列出同一张退出码表：
+**错误与退出码**：错误消息写到标准错误，以 `Error:` 开头（参数写错时是 argparse 的用法提示）。错误信封显示为 `<message> (HTTP <状态码> <code>[, reason <details.reason>], correlation id <关联 ID>)`，请求校验失败时逐行列出字段与原因，带 `Retry-After` 时（如网关限流的 `429`）附上秒数。不是错误信封的响应报告状态码：纯文本的 `429` 与 `502`（如网关前面的反向代理返回的）报告为被限流与连不上上游，其他附上正文的第一行。一次调用的全部请求带同一个随机的 `X-Correlation-Id`，可以用它在网关与控制平面的日志中找到这次调用。`forgemesh --help` 列出同一张退出码表：
 
 | 退出码 | 含义 |
 | --- | --- |
 | `0` | 成功 |
-| `1` | 其他错误，如地址不提供 ForgeMesh API（不是错误信封的 `404`、重定向）或响应无法解析 |
+| `1` | 其他错误，如地址不提供 ForgeMesh API（错误码不是 `NOT_FOUND` 的 `404`，如网关与控制平面对没有匹配路由的路径返回的 `ROUTE_NOT_FOUND`；重定向）或响应无法解析 |
 | `2` | 参数、配置或资源文档不合法，没有发出请求 |
-| `3` | 资源不存在（`404`）；`wait --for delete` 此时以 `0` 成功 |
+| `3` | 资源不存在（`404 NOT_FOUND`）；`wait --for delete` 此时以 `0` 成功 |
 | `4` | 冲突（`409`），如资源正在删除，或 `apply` 的 5 次尝试都遇到并发修改 |
 | `5` | 请求被拒绝（`400`、`405`、`413`、`415` 等其他 4xx） |
 | `6` | 认证或授权失败（`401`、`403`） |
@@ -391,9 +393,53 @@ docker compose -f deploy/docker/docker-compose.yaml \
 scripts/compose_smoke.sh   # 端到端冒烟（CI 同样执行）
 ```
 
-只用 `docker-compose.yaml` 时控制平面没有清单与启动器，新建的服务停在 `Pending`（`SchedulerUnavailable`）。`docker-compose.fake-runtime.yaml` 为控制平面加上清单 `deploy/docker/fake-runtime-inventory.json`（一个节点、一块设备 `gpu-0`）与 `fake` 启动器：实例在控制平面容器内监听全部地址，写进 `status.endpoints` 的主机是服务名 `control-plane`，网关经 compose 网络连接它（私网地址默认允许），实例端口不发布到宿主机。`scripts/compose_smoke.sh` 用这两个文件经网关走完闭环：无 key 的请求返回 `401`；创建 → `Ready`（一个就绪的 `openai-chat` 端点）→ 流式对话到达实例、以 `[DONE]` 结束 → 删除后资源消失、实例停止监听 → 同名重新创建（只有一块设备，可见分配已释放）→ 再次对话到达新实例 → 以 `PUT` 修改 `spec` → `Updating` → 以新实例回到 `Ready`（`observedGeneration` 为 `2`，旧实例停止监听）并再次对话 → 让实例退出（在控制平面容器内 `POST /fake/exit`）→ `Degraded`（`InstanceLost`）→ 重新部署，以新实例回到 `Ready` 并再次对话 → 重启控制平面：资源仍在，服务转为 `Degraded`（`InstanceLost`）后重新部署，以新实例回到 `Ready` 并再次对话 → 删除。叠加文件把核对实例的间隔设为 1 秒；每一步都有时限，只等待状态变化，不依赖网关在某一刻返回的状态码。
+只用 `docker-compose.yaml` 时控制平面没有清单与启动器，新建的服务停在 `Pending`（`SchedulerUnavailable`）。`docker-compose.fake-runtime.yaml` 为控制平面加上清单 `deploy/docker/fake-runtime-inventory.json`（一个节点、一块设备 `gpu-0`）与 `fake` 启动器：实例在控制平面容器内监听全部地址，写进 `status.endpoints` 的主机是服务名 `control-plane`，网关经 compose 网络连接它（私网地址默认允许），实例端口不发布到宿主机。`scripts/compose_smoke.sh` 用这两个文件经网关走完闭环：无 key 的请求返回 `401`；创建 → `Ready`（一个就绪的 `openai-chat` 端点）→ 流式对话到达实例、以 `[DONE]` 结束 → 不带凭证抓取两边的 `/metrics`，带 `traceparent` 的请求在两边的日志与错误信封中带同一个 trace-id（见「可观测性」）→ 删除后资源消失、实例停止监听 → 同名重新创建（只有一块设备，可见分配已释放）→ 再次对话到达新实例 → 以 `PUT` 修改 `spec` → `Updating` → 以新实例回到 `Ready`（`observedGeneration` 为 `2`，旧实例停止监听）并再次对话 → 让实例退出（在控制平面容器内 `POST /fake/exit`）→ `Degraded`（`InstanceLost`）→ 重新部署，以新实例回到 `Ready` 并再次对话，控制平面的 `/metrics` 计入定期核对发现的一次丢失与一次重新部署 → 重启控制平面：资源仍在，服务转为 `Degraded`（`InstanceLost`）后重新部署，以新实例回到 `Ready` 并再次对话，`/metrics`（随新进程从 0 计数）计入启动时核对发现的一次丢失与一次重新部署 → 删除。叠加文件把核对实例的间隔设为 1 秒；每一步都有时限，只等待状态变化，不依赖网关在某一刻返回的状态码。
 
 控制平面的 SQLite 数据库（部署推理服务时还有工作流存储 `forgemesh.workflows.db`）在 compose 卷 `control-plane-data` 中。Kubernetes 清单见 `deploy/kubernetes/`：数据库放在 PersistentVolumeClaim 上，key 文件来自 Secret `forgemesh-api-keys`，更新策略为 `Recreate`，保证任何时刻只有一个控制平面写数据库（ADR-013）；清单没有设置加速器清单与启动器，不部署推理实例。容器中的备份与恢复见 [备份与灾备演练](docs/operations/backup-restore.md) 2.5 / 3.4 节。
+
+### 可观测性
+
+控制平面与网关各自在 `/metrics` 以 Prometheus 文本格式（0.0.4）输出指标，不依赖第三方库：
+
+```bash
+curl -s http://127.0.0.1:8080/metrics   # 控制平面
+curl -s http://127.0.0.1:8081/metrics   # 网关
+```
+
+两个 `/metrics` 与探针一样不要求认证，网关也不对它限流。输出只有跨租户聚合的计数与耗时：标签只取路由模板（网关为路由类别）、方法、状态码与固定的枚举值（加速器类型取自运维配置的清单），不含租户、服务名、命名空间、uid、路径或实例地址；每个指标最多 200 个标签组合，超出的计入标签全为 `overflow` 的一个序列。控制平面的 `/metrics` 不在 `/api/v1` 之下，网关不转发它。指标仍能反映整体负载，不要经公网入口暴露这两个端点，只让 Prometheus 所在的网络访问（compose 只发布在 `127.0.0.1`）。
+
+控制平面的指标（网关的指标见 [gateway/README.md](gateway/README.md)「可观测性」）：
+
+| 指标 | 类型 | 说明 |
+| --- | --- | --- |
+| `forgemesh_http_requests_total{method,route,status}` | counter | HTTP 请求数；`route` 为路由模板（如 `/api/v1/inference-services/{name}`），未匹配路由的请求为 `unmatched` |
+| `forgemesh_http_request_duration_seconds{method,route}` | histogram | 处理 HTTP 请求的耗时 |
+| `forgemesh_reconcile_total{operation,outcome}` | counter | 协调次数；`operation` 为 `reconcile` / `recover`（`Degraded`）/ `reclaim`（`Failed`）/ `terminate`（`Terminating`），`outcome` 为 `done` / `requeue` / `wait` / `conflict` / `error` |
+| `forgemesh_reconcile_duration_seconds{operation}` | histogram | 一次协调的耗时，含 status 回写 |
+| `forgemesh_controller_retries_total` | counter | 协调抛出异常、按退避重新排队的次数 |
+| `forgemesh_controller_queue_depth{state}` | gauge | 工作队列中的键数：`ready`（可立即处理）/ `delayed`（等待延迟到期）/ `processing` |
+| `forgemesh_deployments_total{outcome,reason}` | counter | 推理服务进入 `Ready`（`outcome="ready"`）或 `Failed`（`outcome="failed"`）的次数，`reason` 为 `Ready` 条件的原因 |
+| `forgemesh_instance_checks_total{outcome}` | counter | 控制器定期核对实例的次数：`completed` / `failed`（下一个周期重试）；启动时的核对不计入（它失败时控制平面不会启动） |
+| `forgemesh_instance_check_results_total{check,result}` | counter | 核对实例得出结论的服务数：`check` 为 `startup`（启动时）/ `periodic`（定期）；`result` 为 `lost`（实例已不在运行，服务转为 `Degraded`）/ `back`（`Degraded` 服务的实例全部又在运行，交给协调器转回 `Ready`，转回之前每次核对都计入）/ `conflict`（服务在核对期间被修改或删除，没有报告） |
+| `forgemesh_lost_instance_redeploys_total` | counter | 为实例已不在运行的服务启动重新部署运行的次数；退避期间推迟的协调不计入 |
+| `forgemesh_orphaned_allocation_reclaims_total{outcome}` | counter | 回收孤立分配的次数：`reclaimed`（实例已停止，分配已过期）/ `failed`（没能停止实例，分配保留，下一次全量同步之后重试） |
+| `forgemesh_inference_services{phase}` | gauge | 各阶段的推理服务数 |
+| `forgemesh_allocations_active{accelerator_type}` | gauge | Active 分配数，按其设备在清单中的类型 |
+| `forgemesh_accelerator_devices{accelerator_type,state}` | gauge | 清单中的设备数，`state` 为 `free` / `allocated`；未配置清单时没有样本 |
+| `forgemesh_workflow_runs{status}` | gauge | 各状态的部署工作流运行数；未设置启动器时没有样本 |
+| `forgemesh_outbox_events{state}` | gauge | 未发布的资源变更事件数：`pending`（尚未发布失败过）/ `retrying`（发布失败过，等待重试）/ `dead`（失败次数达到上限，不再自动重试，重新投递见[备份与恢复](docs/operations/backup-restore.md)第 5 节） |
+| `forgemesh_outbox_publish_attempts_total{outcome}` | counter | 发布事件的尝试次数，在结果写入数据库之后计数：`published` / `failed`（将重试）/ `dead`（最后一次失败）；三个取值都从 0 开始输出 |
+| `forgemesh_database_lock_wait_seconds` | histogram | 控制平面数据库的一次操作等待连接锁的时间：注册中心、Outbox（含事件发布）与审计记录共用这个连接与锁（不含 SQLite 内部的忙等待） |
+
+核对实例、重新部署与回收孤立分配的四个计数器的每个标签组合都从 0 开始输出，未设置启动器时保持为 0。
+
+**追踪上下文与日志**：网关沿用请求中合法的 W3C `traceparent`，否则生成一个，随请求转发给控制平面与推理实例。控制平面按同样的规则读取 `traceparent`（直连控制平面的请求同样适用），并沿用 `X-Correlation-Id`（缺失时生成，审计记录与资源变更事件使用同一个关联 ID），这个请求的日志与错误信封（`{"error": {"code", "message", "correlationId", "traceId", …}}`）都带上 trace-id 与关联 ID，一次请求在网关与控制平面的日志里可以按 trace-id 对上。控制平面的日志写到标准错误，默认每行一个 JSON 对象，uvicorn 的访问日志也是如此：
+
+```json
+{"time": "2026-10-13T03:53:36.002Z", "level": "INFO", "logger": "uvicorn.access", "message": "127.0.0.1:38956 - \"GET /api/v1/inference-services/llama HTTP/1.1\" 200", "trace_id": "4bf92f3577b34da6a3ce929d0e0e4736", "correlation_id": "ad1cd525116940f682ea882c0c7a6b67"}
+```
+
+`FORGEMESH_LOG_FORMAT=text` 时每行为 `时间 级别 logger trace=<trace-id> corr=<关联 ID> 消息`（UTC 时间，缺失的 ID 记为 `-`）。资源变更事件（logger `forgemesh.events`）也以这个格式输出，消息是事件信封的 JSON；它固定为 `INFO`，不受 `FORGEMESH_LOG_LEVEL` 影响。网关的访问日志见 [gateway/README.md](gateway/README.md)「可观测性」。两边都不记录 span，也不导出追踪（OTLP 导出尚未实现）；`forgemesh.controlplane.observability` 中的内存记录器（`MetricsRecorder` / `TraceRecorder`）不经 `/metrics` 输出。
 
 ---
 
@@ -429,7 +475,7 @@ ForgeMesh 目前处于预览阶段，API 稳定性标注为 `beta`：minor 版�
 ### 生产级治理（M5）
 - **配额与 QoS**：多租户配额策略，服务优先级排队，限流
 - **Token 计量**：追加式 UsageRecord，计量修正事件
-- **可观测性**：OpenTelemetry 接入，8 类关键指标，敏感数据过滤（现状：指标与追踪只记录在内存中，没有 Prometheus / OTLP 导出）
+- **可观测性**：OpenTelemetry 接入，8 类关键指标，敏感数据过滤（现状：自 1.1.0 起控制平面与网关在 `/metrics` 以 Prometheus 文本格式输出跨租户聚合的指标，按 W3C `traceparent` 传递 trace-id 并写进日志与错误信封；没有接入 OpenTelemetry SDK，不记录 span，也没有 OTLP 导出）
 - **诊断包**：统一诊断聚合（资源/工作流/插件/决策/日志），按租户权限受限
 - **插件安全**：制品签名验证，隔离宿主（受限 RPC），升级兼容性（现状：自 1.1.0 起制品使用 Ed25519 签名，注册时验签；受限 RPC 宿主尚未实现，插件都在宿主进程内运行，清单只能声明 `in-process`）
 - **安全测试**：租户隔离，插件权限，密钥脱敏，灾备文档
@@ -447,8 +493,8 @@ ForgeMesh 目前处于预览阶段，API 稳定性标注为 `beta`：minor 版�
 
 | 类型 | 数量 |
 |------|------|
-| Python 测试 | **2584** |
-| Go 测试 | 136 个测试函数，全部通过 |
+| Python 测试 | **2689** |
+| Go 测试 | 187 个测试函数，全部通过 |
 | ruff 检查 | All checks passed |
 
 ---

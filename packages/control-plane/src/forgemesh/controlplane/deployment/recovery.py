@@ -26,6 +26,8 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
+from enum import StrEnum
 from typing import TYPE_CHECKING
 
 from forgemesh.core.errors import ConflictError, NotFoundError
@@ -47,6 +49,27 @@ DEFAULT_INSTANCE_CHECK_INTERVAL_SECONDS = 10.0
 _KIND = "InferenceService"
 
 
+class InstanceCheckResult(StrEnum):
+    """:func:`check_instances` 对一个服务的结论（``on_result`` 收到的参数）。"""
+
+    #: ``Ready`` 服务的实例已不在运行，服务已转为 ``Degraded``。
+    LOST = "lost"
+    #: ``Degraded`` 服务的实例全部在运行（实例回来了），交给协调器转回 ``Ready``。
+    BACK = "back"
+    #: 实例已不在运行，但服务在核对期间被修改或删除，没有报告。
+    CONFLICT = "conflict"
+
+
+class ReclaimOutcome(StrEnum):
+    """:func:`reclaim_orphaned_allocations` 对一个孤立分配的处理结果（``on_result`` 收到的
+    参数）。"""
+
+    #: 停止了所属 uid 的部署，分配已过期。
+    RECLAIMED = "reclaimed"
+    #: 没能停止所属 uid 的部署，分配保留，下次回收时重试。
+    FAILED = "failed"
+
+
 def _describe(endpoint: Endpoint) -> str:
     if endpoint.instanceId is None:
         return f"the instance at {endpoint.url}"
@@ -58,7 +81,11 @@ async def _running(launcher: RuntimeLauncher, endpoint: Endpoint) -> bool:
 
 
 async def check_instances(
-    registry: SQLiteRegistry, launcher: RuntimeLauncher, *, after_restart: bool = False
+    registry: SQLiteRegistry,
+    launcher: RuntimeLauncher,
+    *,
+    after_restart: bool = False,
+    on_result: Callable[[InstanceCheckResult], None] | None = None,
 ) -> list[ResourceKey]:
     """核对 ``Ready`` / ``Degraded`` 服务的实例，返回要交给协调器处理的服务。
 
@@ -70,8 +97,14 @@ async def check_instances(
       协调器转回 ``Ready``。
 
     写入以读到的版本做 CAS，资源在此期间被修改或删除时跳过它；不修改
-    ``observedGeneration``。
+    ``observedGeneration``。``on_result`` 以每个服务的结论调用（如计入指标），实例都在运行的
+    服务没有结论。
     """
+
+    def report(result: InstanceCheckResult) -> None:
+        if on_result is not None:
+            on_result(result)
+
     found: list[ResourceKey] = []
     for key in await registry.list_resource_keys([_KIND]):
         try:
@@ -85,6 +118,7 @@ async def check_instances(
         endpoints = resource.status.endpoints
         if phase == InferencePhase.DEGRADED:
             if endpoints and all([await _running(launcher, endpoint) for endpoint in endpoints]):
+                report(InstanceCheckResult.BACK)
                 found.append(key)
             continue
         if phase != InferencePhase.READY:
@@ -135,6 +169,7 @@ async def check_instances(
                 key.tenant_id,
                 exc,
             )
+            report(InstanceCheckResult.CONFLICT)
             continue
         logger.warning(
             "service degraded, its instance is gone: %s; kind=%s namespace=%s name=%s uid=%s "
@@ -146,20 +181,30 @@ async def check_instances(
             meta.uid,
             key.tenant_id,
         )
+        report(InstanceCheckResult.LOST)
         found.append(key)
     return found
 
 
 async def reclaim_orphaned_allocations(
-    registry: SQLiteRegistry, releaser: DeploymentReleaser
+    registry: SQLiteRegistry,
+    releaser: DeploymentReleaser,
+    *,
+    on_result: Callable[[ReclaimOutcome], None] | None = None,
 ) -> list[str]:
     """回收归属资源（同租户、同 uid）已不存在的 Active 分配，返回回收的分配 id。
 
     逐个分配：先经 ``releaser`` 取消这个 uid 的部署运行、停止实例，再把分配标记为
     ``Expired``，设备随之空闲。停止失败时保留分配，下次回收时重试；uid 的部署运行也已不在
     （如工作流数据库被重置）时无从停止实例，分配照样回收。标记与再次确认归属资源不存在在同一
-    条语句中完成。
+    条语句中完成。``on_result`` 以每个分配的处理结果调用（如计入指标），分配在此期间已不是
+    Active 时没有结果。
     """
+
+    def report(outcome: ReclaimOutcome) -> None:
+        if on_result is not None:
+            on_result(outcome)
+
     reclaimed: list[str] = []
     for allocation in await registry.list_orphaned_allocations():
         allocation_id = allocation["id"]
@@ -176,6 +221,7 @@ async def reclaim_orphaned_allocations(
                 uid,
                 exc,
             )
+            report(ReclaimOutcome.FAILED)
             continue
         if not await registry.expire_orphaned_allocation(allocation_id):
             continue
@@ -188,6 +234,7 @@ async def reclaim_orphaned_allocations(
             uid,
             devices or "none",
         )
+        report(ReclaimOutcome.RECLAIMED)
         reclaimed.append(allocation_id)
     return reclaimed
 
@@ -195,6 +242,8 @@ async def reclaim_orphaned_allocations(
 __all__ = [
     "DEFAULT_INSTANCE_CHECK_INTERVAL_SECONDS",
     "INSTANCE_LOST_REASON",
+    "InstanceCheckResult",
+    "ReclaimOutcome",
     "check_instances",
     "reclaim_orphaned_allocations",
 ]

@@ -107,3 +107,16 @@ def test_shutdown_releases_waiting_workers_and_ignores_new_keys() -> None:
 def test_invalid_backoff_settings_are_rejected(kwargs) -> None:
     with pytest.raises(ValueError):
         WorkQueue(**kwargs)
+
+
+@pytest.mark.unit
+def test_depth_counts_ready_delayed_and_processing_keys() -> None:
+    async def scenario() -> dict[str, int]:
+        queue: WorkQueue[str] = WorkQueue()
+        queue.add("a")
+        queue.add("b")
+        queue.add_after("c", 60)
+        assert await queue.get() == "a"
+        return queue.depth()
+
+    assert _run(scenario()) == {"ready": 1, "delayed": 1, "processing": 1}

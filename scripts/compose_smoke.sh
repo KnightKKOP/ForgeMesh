@@ -3,11 +3,13 @@
 # deploy/docker/docker-compose.fake-runtime.yaml（一块设备的加速器清单 + 假启动器，不需要 GPU）
 # 启动控制平面与网关，经网关走完推理服务的闭环：
 #   创建 → Ready（status.endpoints 指向假实例）→ 经网关流式对话（SSE，以 [DONE] 结束）→
+#   抓取控制平面与网关的 /metrics（不带凭证，不含租户数据）→ traceparent 经网关到达控制平面 →
 #   删除 → 资源消失、实例停止 → 同名重新创建（只有一块设备，可见分配已释放）→ 再次对话 →
 #   PUT 修改 spec → Updating → 以新实例回到 Ready（旧实例已停止）→ 再次对话 →
 #   假实例退出（POST /fake/exit）→ Degraded（InstanceLost）→ 重新部署，以新实例回到 Ready →
-#   再次对话 → 重启控制平面：资源仍在，实例随旧进程结束，服务转为 Degraded（InstanceLost）
-#   后重新部署，以新实例回到 Ready → 再次对话 → 删除。
+#   再次对话 → /metrics 计入定期核对发现的丢失与一次重新部署 → 重启控制平面：资源仍在，实例
+#   随旧进程结束，服务转为 Degraded（InstanceLost）后重新部署，以新实例回到 Ready → 再次对话 →
+#   /metrics（随新进程从 0 计数）计入启动时核对发现的丢失与一次重新部署 → 删除。
 #
 # 每一步都有时限，整个闭环只等待状态变化，不依赖网关在某一刻返回的状态码。
 #
@@ -175,6 +177,37 @@ endpoint_port() {
   jq -r '.status.endpoints[0].url | split(":") | last' "$resource"
 }
 
+# scrape <说明> <URL> <模式...>：不带凭证抓取一次 /metrics 写入 $metrics。每个模式（基本正则）
+# 都要匹配某个样本行的开头；输出不得含租户、服务名、key 或实例 id。
+scrape() {
+  local description=$1 url=$2 pattern content_type
+  shift 2
+  content_type=$(curl -sf --max-time 30 -o "$metrics" -w '%{content_type}' "$url") \
+    || fail "$description: GET $url failed"
+  [[ "$content_type" == "text/plain; version=0.0.4"* ]] \
+    || fail "$description: unexpected content type $content_type"
+  for pattern in "$@"; do
+    grep -q "^$pattern" "$metrics" || fail "$description: no sample matches ^$pattern"
+  done
+  if grep -qF -e smoke -e "$key" -e "$first_instance" "$metrics"; then
+    fail "$description: the output contains tenant data"
+  fi
+  echo "ok: $description"
+}
+
+# logged <服务> <模式>：服务的日志中有一行匹配该基本正则（日志可能稍晚于响应写出，因此重试）。
+logged() {
+  local log="$work/$1.log"
+  for _ in $(seq 1 10); do
+    "${compose[@]}" logs --no-color "$1" > "$log"
+    if grep -q -- "$2" "$log"; then
+      return 0
+    fi
+    sleep 0.5
+  done
+  return 1
+}
+
 "${compose[@]}" build
 
 # keygen 输出的第 2 行是 key，最后一行是 key 文件条目。
@@ -196,6 +229,7 @@ resource="$work/resource.json"
 update="$work/update.json"
 headers="$work/headers.txt"
 stream="$work/stream.txt"
+metrics="$work/metrics.txt"
 body='{"kind": "InferenceService", "metadata": {"name": "smoke-svc", "namespace": "default"},
   "spec": {"model": {"reference": "models/llama"}, "runtime": {"provider": "vllm"},
   "resources": {"accelerator": {"type": "nvidia-gpu", "minMemoryGiB": 16}}}}'
@@ -221,6 +255,50 @@ expect_reply "$first_instance"
 "${compose[@]}" exec -T control-plane test -f /var/lib/forgemesh/forgemesh.workflows.db \
   || fail "the workflow store is not next to the registry"
 echo "ok: the workflow store lives next to the registry"
+
+# 此时只有 smoke-svc：Ready，占用清单中唯一的设备，部署工作流已成功。事件写日志，不会发布失败。
+# 还没有丢失过实例，也没有孤立的分配。
+scrape "control plane /metrics" http://127.0.0.1:8080/metrics \
+  'forgemesh_http_requests_total{method="POST",route="/api/v1/inference-services",status="201"} ' \
+  'forgemesh_reconcile_total{operation="reconcile",outcome="done"} ' \
+  'forgemesh_reconcile_duration_seconds_count{operation="reconcile"} ' \
+  'forgemesh_controller_queue_depth{state="ready"} ' \
+  'forgemesh_deployments_total{outcome="ready",reason="Reconciled"} 1$' \
+  'forgemesh_inference_services{phase="Ready"} 1$' \
+  'forgemesh_allocations_active{accelerator_type="nvidia-gpu"} 1$' \
+  'forgemesh_accelerator_devices{accelerator_type="nvidia-gpu",state="free"} 0$' \
+  'forgemesh_workflow_runs{status="Succeeded"} 1$' \
+  'forgemesh_outbox_publish_attempts_total{outcome="published"} [1-9]' \
+  'forgemesh_outbox_publish_attempts_total{outcome="failed"} 0$' \
+  'forgemesh_outbox_events{state="retrying"} 0$' \
+  'forgemesh_outbox_events{state="dead"} 0$' \
+  'forgemesh_instance_checks_total{outcome="failed"} 0$' \
+  'forgemesh_instance_check_results_total{check="startup",result="lost"} 0$' \
+  'forgemesh_instance_check_results_total{check="periodic",result="lost"} 0$' \
+  'forgemesh_lost_instance_redeploys_total 0$' \
+  'forgemesh_orphaned_allocation_reclaims_total{outcome="reclaimed"} 0$'
+scrape "gateway /metrics" "$gateway/metrics" \
+  'forgemesh_gateway_http_requests_total{route="control_plane",status="401"} 1$' \
+  'forgemesh_gateway_http_requests_total{route="inference",status="200"} ' \
+  'forgemesh_gateway_stream_first_byte_seconds_count ' \
+  'forgemesh_gateway_resolver_lookups_total{result="miss"} ' \
+  'forgemesh_gateway_rate_limited_total 0$' \
+  'forgemesh_gateway_instances{state="healthy"} '
+
+# 合法的 traceparent 经网关原样转发：控制平面的错误信封与日志、网关的访问日志都带其中的
+# trace-id。
+trace_id=4bf92f3577b34da6a3ce929d0e0e4736
+code=$(curl -s --max-time 30 -o "$resource" -w '%{http_code}' "${auth[@]}" \
+  -H "traceparent: 00-$trace_id-00f067aa0ba902b7-01" "$services/no-such-svc?namespace=default")
+[[ "$code" == 404 ]] || fail "read a missing service: expected HTTP 404, got $code"
+# shellcheck disable=SC2016 # $id 是 jq 变量
+expect "the control plane error envelope carries the forwarded trace id" \
+  '.error.traceId == $id' --arg id "$trace_id"
+logged gateway "access method=GET .* status=404 .* trace=$trace_id\$" \
+  || fail "the gateway access log does not carry the trace id"
+logged control-plane "\"trace_id\": \"$trace_id\"" \
+  || fail "the control plane logs do not carry the trace id"
+echo "ok: the gateway and control plane logs carry the trace id"
 
 check "delete through the gateway" 202 "${auth[@]}" -X DELETE "$service"
 wait_gone
@@ -285,6 +363,13 @@ fourth_port=$(endpoint_port)
   || fail "the service still reports the lost instance $third_instance"
 echo "ok: the service was redeployed with a new instance"
 expect_reply "$fourth_instance"
+# 更新与删除都先改变 phase、再停止实例，定期核对只会发现这一次丢失。
+scrape "control plane /metrics after the lost instance" http://127.0.0.1:8080/metrics \
+  'forgemesh_instance_checks_total{outcome="completed"} [1-9]' \
+  'forgemesh_instance_checks_total{outcome="failed"} 0$' \
+  'forgemesh_instance_check_results_total{check="periodic",result="lost"} 1$' \
+  'forgemesh_instance_check_results_total{check="startup",result="lost"} 0$' \
+  'forgemesh_lost_instance_redeploys_total 1$'
 
 # 假实例随控制平面进程结束：启动时服务转为 Degraded（InstanceLost，日志记录丢失的实例），
 # 控制器随后以同一分配重新部署，服务以新实例回到 Ready。
@@ -303,6 +388,14 @@ fifth_instance=$(jq -r '.status.endpoints[0].instanceId' "$resource")
   || fail "the service still reports the lost instance $fourth_instance"
 echo "ok: the service was redeployed with a new instance after the restart"
 expect_reply "$fifth_instance"
+# 计数随新进程从 0 开始：启动时的核对发现了丢失的实例，之后没有再丢失。
+scrape "control plane /metrics after the restart" http://127.0.0.1:8080/metrics \
+  'forgemesh_instance_checks_total{outcome="failed"} 0$' \
+  'forgemesh_instance_check_results_total{check="startup",result="lost"} 1$' \
+  'forgemesh_instance_check_results_total{check="periodic",result="lost"} 0$' \
+  'forgemesh_lost_instance_redeploys_total 1$' \
+  'forgemesh_orphaned_allocation_reclaims_total{outcome="reclaimed"} 0$' \
+  'forgemesh_orphaned_allocation_reclaims_total{outcome="failed"} 0$'
 check "delete the redeployed service" 202 "${auth[@]}" -X DELETE "$service"
 wait_gone
 

@@ -7,7 +7,8 @@
   不会再分配；
 * 实例丢失（没有活过重启，或自行退出）：``Ready`` 的服务转为 ``Degraded``（endpoint 标记
   为未就绪），在同一分配上重新部署后回到 ``Ready``，运行成功却还没写入 ``Ready`` 的服务
-  同样重新部署；重新部署按退避，失败时说明原因；实例回来了的服务直接回到 ``Ready``；
+  同样重新部署；重新部署按退避，失败时说明原因；实例回来了的服务直接回到 ``Ready``；核对的
+  结论与启动的重新部署计入指标，退避期间推迟的协调不计入；
 * 部署工作流没能启动时保留分配并重试；部署失败时实例被停止、分配释放，资源停在
   ``Failed``，修改 spec 之后从 ``Pending`` 重新部署；补偿没能停止的实例在之后的一轮停止
   （然后释放分配），或在删除资源、重新部署时停止；
@@ -16,7 +17,7 @@
 * ``Ready`` 的服务 spec 变化：经 ``Updating`` 停止旧实例、部署新的 spec 后回到 ``Ready``；
   更新失败时进入 ``Failed``；策略拒绝更新时服务保持原样；
 * 部署中途或 ``Ready`` 之后删除资源：取消运行、停止实例、释放分配、物理删除；绕过受控
-  删除的资源，回收时停止它的实例、让分配过期；
+  删除的资源，回收时停止它的实例、让分配过期（按结果计数）；
 * 在后台运行的控制器自行完成部署与删除，定期核对实例时发现实例退出，自行重新部署。
 
 测试以 ``asyncio.run`` 驱动异步方法，不依赖 pytest-asyncio。“重启”在同一个事件循环中
@@ -42,6 +43,7 @@ from forgemesh.controlplane.deployment import (
     DeploymentReleaser,
     DeploymentSteps,
     InMemoryLauncher,
+    InstanceCheckResult,
     LaunchedInstance,
     LaunchRequest,
     RuntimeLauncher,
@@ -51,6 +53,7 @@ from forgemesh.controlplane.deployment import (
     launched_instance,
     reclaim_orphaned_allocations,
 )
+from forgemesh.controlplane.metrics import MetricsRegistry
 from forgemesh.controlplane.reconciler import (
     REDEPLOY_BACKOFF_RESET_SECONDS,
     ProcessedKeyStore,
@@ -60,6 +63,7 @@ from forgemesh.controlplane.reconciler import (
 from forgemesh.controlplane.registry import ResourceKey, SQLiteRegistry
 from forgemesh.controlplane.scheduler import FirstFitScheduler, Inventory
 from forgemesh.controlplane.sqlite import workflow_db_path
+from forgemesh.controlplane.telemetry import ControllerMetrics, InstanceCheck
 from forgemesh.core.errors import ConflictError, NotFoundError
 from forgemesh.core.objects import ObjectMeta
 from forgemesh.core.scheduler import AllocatedDevice
@@ -83,6 +87,8 @@ from forgemesh.workflowruntime.exec import StepExecutor, WorkflowExecutor
 from forgemesh.workflowruntime.runtime import LocalWorkflowRuntime
 from forgemesh.workflowruntime.store import WorkflowStore
 
+from .exposition import parse
+
 KIND = "InferenceService"
 TENANT = "tenant-a"
 NAMESPACE = "team-a"
@@ -100,6 +106,13 @@ POLL_SECONDS = 0.01
 MAX_PASSES = 10
 #: 等待后台任务到达某一点的上限（秒）：出错时测试失败而不是挂起。
 WAIT_SECONDS = 5.0
+#: 核对实例、重新部署与回收孤立分配的计数器（见 :mod:`forgemesh.controlplane.telemetry`）。
+RUNTIME_COUNTERS = (
+    "forgemesh_instance_checks_total",
+    "forgemesh_instance_check_results_total",
+    "forgemesh_lost_instance_redeploys_total",
+    "forgemesh_orphaned_allocation_reclaims_total",
+)
 
 
 def _inventory() -> Inventory:
@@ -227,7 +240,8 @@ class _ControlPlane:
     进入时调用 ``recover()`` 与 ``check_instances(after_restart=True)``（返回值存于
     :attr:`recovered` 与 :attr:`lost`）；退出时按应用的顺序关闭：控制器 → 工作流运行时 →
     启动器 → 工作流存储 → 去重键存储 → 注册表。``clock`` 为协调器重新部署退避所用的时钟；
-    控制器管理器运行时每隔 ``instance_check_interval`` 秒核对一次实例。
+    控制器管理器运行时每隔 ``instance_check_interval`` 秒核对一次实例。核对实例、重新部署与
+    回收与应用一样计入 :attr:`metrics`（见 :meth:`counted`）。
     """
 
     def __init__(
@@ -249,6 +263,8 @@ class _ControlPlane:
                 authz_rules=[AuthzRule(action="reconcile", effect="allow")]
             )
         release = DeploymentReleaser(self.runtime, launcher)
+        self.metrics = MetricsRegistry()
+        self._controller_metrics = metrics = ControllerMetrics(self.metrics)
         reconciler = ReconciliationController(
             self.registry,
             policy,
@@ -260,21 +276,40 @@ class _ControlPlane:
             workflow_poll_interval=POLL_SECONDS,
             launcher=launcher,
             clock=clock,
+            on_redeploy=metrics.lost_instance_redeployed,
         )
         self.manager = ControllerManager(
             self.registry,
             reconciler,
             poll_interval=POLL_SECONDS,
-            instance_check=functools.partial(check_instances, self.registry, launcher),
+            instance_check=functools.partial(
+                check_instances,
+                self.registry,
+                launcher,
+                on_result=functools.partial(metrics.instance_check_result, InstanceCheck.PERIODIC),
+            ),
             instance_check_interval=instance_check_interval,
-            reclaim=functools.partial(reclaim_orphaned_allocations, self.registry, release),
+            reclaim=functools.partial(
+                reclaim_orphaned_allocations,
+                self.registry,
+                release,
+                on_result=metrics.reclaim_attempted,
+            ),
+            metrics=metrics,
         )
         self.recovered: list[str] = []
         self.lost: list[ResourceKey] = []
 
     async def __aenter__(self) -> _ControlPlane:
         self.recovered = await self.runtime.recover()
-        self.lost = await check_instances(self.registry, self.launcher, after_restart=True)
+        self.lost = await check_instances(
+            self.registry,
+            self.launcher,
+            after_restart=True,
+            on_result=functools.partial(
+                self._controller_metrics.instance_check_result, InstanceCheck.STARTUP
+            ),
+        )
         return self
 
     async def __aexit__(self, *exc_info: object) -> None:
@@ -287,6 +322,18 @@ class _ControlPlane:
 
     async def service(self) -> InferenceService:
         return await self.registry.get(KIND, NAMESPACE, NAME, TENANT)
+
+    def counted(self) -> dict[tuple[str, ...], float]:
+        """:data:`RUNTIME_COUNTERS` 中不为 0 的序列：``(指标名, 标签值...)`` → 取值，指标名去掉
+        ``forgemesh_`` 前缀与 ``_total`` 后缀。"""
+        families = parse(self.metrics.render())
+        counted: dict[tuple[str, ...], float] = {}
+        for name in RUNTIME_COUNTERS:
+            short = name.removeprefix("forgemesh_").removesuffix("_total")
+            for sample in families[name].samples:
+                if sample.value:
+                    counted[(short, *sample.labels.values())] = sample.value
+        return counted
 
     async def phase(self) -> str | None:
         """资源的 phase；资源已删除时为 ``None``。"""
@@ -1018,6 +1065,7 @@ def test_an_instance_lost_between_a_successful_run_and_ready_is_deployed_again(t
             assert (await plane.service()).status.endpoints == [instance.endpoint()]
             assert await plane.registry.list_allocations(TENANT) == [allocation]
             assert await plane.processed.seen(DEDUP_KEY)
+            assert plane.counted() == {("lost_instance_redeploys",): 1}
         return lost
 
     lost = asyncio.run(scenario())
@@ -1039,6 +1087,7 @@ def test_a_ready_service_whose_instance_did_not_survive_a_restart_is_deployed_ag
             await plane.deploy()
             [endpoint] = (await plane.service()).status.endpoints
             [allocation] = await plane.registry.list_allocations(TENANT)
+            assert plane.counted() == {}
 
         async with _ControlPlane(db, fresh) as plane:
             assert plane.lost == [KEY]
@@ -1055,6 +1104,10 @@ def test_a_ready_service_whose_instance_did_not_survive_a_restart_is_deployed_ag
             assert await plane.deploy() == ["Degraded", "Ready"]
             [redeployed] = (await plane.service()).status.endpoints
             assert await plane.registry.list_allocations(TENANT) == [allocation]
+            assert plane.counted() == {
+                ("instance_check_results", "startup", "lost"): 1,
+                ("lost_instance_redeploys",): 1,
+            }
         return endpoint, redeployed
 
     endpoint, redeployed = asyncio.run(scenario())
@@ -1100,7 +1153,8 @@ def test_only_the_endpoints_whose_instance_is_gone_are_marked_not_ready():
 
 @pytest.mark.unit
 def test_a_service_changed_while_its_instances_are_checked_is_left_alone(monkeypatch):
-    """检查期间资源被修改（CAS 冲突）：跳过它，不覆盖新的状态。"""
+    """检查期间资源被修改（CAS 冲突）：跳过它，不覆盖新的状态，结论为 ``conflict``。"""
+    results: list[InstanceCheckResult] = []
 
     async def scenario() -> None:
         async with _ControlPlane(":memory:", _ScriptedLauncher()) as plane:
@@ -1111,11 +1165,15 @@ def test_a_service_changed_while_its_instances_are_checked_is_left_alone(monkeyp
                 raise ConflictError("changed meanwhile")
 
             monkeypatch.setattr(plane.registry, "update_status", conflict)
-            assert await check_instances(plane.registry, _ScriptedLauncher()) == []
+            lost = await check_instances(
+                plane.registry, _ScriptedLauncher(), on_result=results.append
+            )
+            assert lost == []
             monkeypatch.undo()
             assert await plane.phase() == "Ready"
 
     asyncio.run(scenario())
+    assert results == [InstanceCheckResult.CONFLICT]
 
 
 # ---------------------------------------------------------------------- #
@@ -1184,19 +1242,24 @@ def test_a_service_whose_instance_exits_is_degraded_and_deployed_again_on_its_al
 
 @pytest.mark.unit
 def test_a_degraded_service_whose_instance_is_back_returns_to_ready_without_a_redeployment():
-    """实例回来了（启动器又报告它在运行）：检查实例时交给控制器，服务以原来的实例回到
-    Ready，不停止、不启动实例；实例仍不在运行时检查不再报告这个服务。"""
+    """实例回来了（启动器又报告它在运行）：检查实例时交给控制器（结论为 ``back``），服务以
+    原来的实例回到 Ready，不停止、不启动实例；实例仍不在运行时检查不再报告这个服务，也没有
+    结论。"""
     launcher = _ScriptedLauncher()
+    results: list[InstanceCheckResult] = []
 
     async def scenario() -> None:
         async with _ControlPlane(":memory:", launcher) as plane:
             await plane.registry.put(_service())
             await plane.deploy()
             instance = await _lose_the_instance(plane, launcher)
-            assert await check_instances(plane.registry, launcher) == []
+            check = functools.partial(
+                check_instances, plane.registry, launcher, on_result=results.append
+            )
+            assert await check() == []
 
             launcher.down.clear()
-            assert await check_instances(plane.registry, launcher) == [KEY]
+            assert await check() == [KEY]
             assert await plane.phase() == "Degraded"
             await plane.manager.process(KEY)
 
@@ -1204,18 +1267,21 @@ def test_a_degraded_service_whose_instance_is_back_returns_to_ready_without_a_re
             assert service.status.phase.value == "Ready"
             assert service.status.endpoints == [instance.endpoint()]
             assert (len(launcher.launches), launcher.stops) == (1, [])
+            assert plane.counted() == {}
 
     asyncio.run(scenario())
+    assert results == [InstanceCheckResult.BACK]
 
 
 @pytest.mark.unit
 def test_redeployments_back_off_up_to_a_bound_and_start_over_after_a_quiet_period():
     """同一代 spec 反复丢失实例：第一次立即重新部署，之后与上一次开始至少相隔 10 秒、每次
-    翻倍、最多 300 秒，等待期间不启动运行；上一次开始已过 600 秒时再丢失实例立即重新部署。"""
+    翻倍、最多 300 秒，等待期间不启动运行（也不计入重新部署）；上一次开始已过 600 秒时再丢失
+    实例立即重新部署。"""
     launcher = _ScriptedLauncher()
     clock = _Clock()
 
-    async def scenario() -> list[int]:
+    async def scenario() -> tuple[list[int], dict[tuple[str, ...], float]]:
         async with _ControlPlane(":memory:", launcher, clock=clock) as plane:
             await plane.registry.put(_service())
             await plane.deploy()
@@ -1233,9 +1299,11 @@ def test_redeployments_back_off_up_to_a_bound_and_start_over_after_a_quiet_perio
             await _lose_the_instance(plane, launcher)
             assert await plane.deploy() == ["Degraded", "Ready"]
             runs = await find_deployment_runs(plane.runtime, UID)
-            return [deployment.attempt for deployment in runs]
+            return [deployment.attempt for deployment in runs], plane.counted()
 
-    assert asyncio.run(scenario()) == list(range(1, 11))
+    attempts, counted = asyncio.run(scenario())
+    assert attempts == list(range(1, 11))
+    assert counted == {("lost_instance_redeploys",): 9}
 
 
 @pytest.mark.unit
@@ -1276,6 +1344,7 @@ def test_a_failed_redeployment_reports_why_and_is_retried_after_the_backoff():
             assert (await plane.service()).status.endpoints == [instance.endpoint()]
             assert [d.attempt for d in await find_deployment_runs(plane.runtime, UID)] == [1, 2, 3]
             assert await plane.registry.list_allocations(TENANT) == [allocation]
+            assert plane.counted() == {("lost_instance_redeploys",): 2}
 
     asyncio.run(scenario())
 
@@ -1344,7 +1413,8 @@ def test_deleting_a_ready_service_stops_its_instance_and_releases_its_allocation
 @pytest.mark.parametrize("stop_failures", [0, 1])
 def test_the_allocation_of_a_service_removed_without_its_release_is_reclaimed(stop_failures):
     """资源绕过受控删除被物理删除（``delete()``）：回收孤立的分配先停止它的实例，再让分配
-    过期（设备空闲）；停止失败时保留分配，下一次回收重试。资源仍存在时回收不触碰它的分配。"""
+    过期（设备空闲）；停止失败时保留分配，下一次回收重试。资源仍存在时回收不触碰它的分配。
+    每个孤立分配的每次回收按结果计数。"""
     launcher = _ScriptedLauncher()
 
     async def scenario() -> None:
@@ -1356,6 +1426,7 @@ def test_the_allocation_of_a_service_removed_without_its_release_is_reclaimed(st
             await plane.manager.reclaim()
             assert launcher.running == {instance.instance_id: instance}
             assert await plane.registry.list_allocations(TENANT) == [allocation]
+            assert plane.counted() == {}
 
             await plane.registry.delete(KIND, NAMESPACE, NAME, TENANT)
             launcher.stop_failures = stop_failures
@@ -1368,6 +1439,12 @@ def test_the_allocation_of_a_service_removed_without_its_release_is_reclaimed(st
             assert launcher.running == {}
             assert (await plane.registry.get_allocation(allocation["id"]))["status"] == "Expired"
             assert await plane.registry.allocated_devices() == frozenset()
+            reclaims = {"reclaimed": 1, "failed": stop_failures}
+            assert plane.counted() == {
+                ("orphaned_allocation_reclaims", outcome): count
+                for outcome, count in reclaims.items()
+                if count
+            }
 
     asyncio.run(scenario())
 
@@ -1397,7 +1474,8 @@ def test_a_running_controller_deploys_and_deletes_a_service_on_its_own():
 @pytest.mark.unit
 def test_a_running_controller_deploys_a_service_again_once_its_instance_exits():
     """控制器在后台运行、定期核对实例（测试既不逐轮驱动，也不自己核对）：实例退出之后，服务
-    以同一分配上的新实例回到 Ready，退出的实例被停止。"""
+    以同一分配上的新实例回到 Ready，退出的实例被停止。定期核对按次数计数，丢失的实例与
+    重新部署各计一次。"""
     launcher = _ScriptedLauncher()
 
     async def serving(plane: _ControlPlane) -> list[Endpoint]:
@@ -1423,5 +1501,11 @@ def test_a_running_controller_deploys_a_service_again_once_its_instance_exits():
             assert endpoints == [second.endpoint()]
             assert launcher.stops == [first.instance_id]
             assert await plane.registry.list_allocations(TENANT) == [allocation]
+            counted = plane.counted()
+            assert counted.pop(("instance_checks", "completed")) >= 1
+            assert counted == {
+                ("instance_check_results", "periodic", "lost"): 1,
+                ("lost_instance_redeploys",): 1,
+            }
 
     asyncio.run(scenario())

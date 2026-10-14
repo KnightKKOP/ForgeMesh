@@ -64,7 +64,7 @@ func fallbackCorrelationID() string {
 //
 // 行为：
 //   - 若入站请求缺失关联 ID，则以 crypto/rand 生成一个并回填请求头。
-//   - 将关联 ID 注入 context（供日志/链路追踪读取）与响应头。
+//   - 将关联 ID 注入 context（供日志/链路追踪读取）与响应头，并记录给外层的 Recovery。
 //   - 若入站已携带关联 ID，则原样透传，保证跨服务链路连续。
 func Correlation(header string) Middleware {
 	if header == "" {
@@ -84,6 +84,9 @@ func Correlation(header string) Middleware {
 			// 回填请求头（下游反代/日志可见）与响应头（客户端可见）。
 			r.Header.Set(header, cid)
 			w.Header().Set(header, cid)
+			if ids := requestIDsFrom(r.Context()); ids != nil {
+				ids.correlationID = cid
+			}
 
 			ctx := context.WithValue(r.Context(), correlationIDKey, cid)
 			next.ServeHTTP(w, r.WithContext(ctx))

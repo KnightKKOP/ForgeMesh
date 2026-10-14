@@ -312,6 +312,8 @@ class ReconciliationController(Reconciler):
             :meth:`~forgemesh.controlplane.deployment.RuntimeLauncher.is_running` 确认实例
             仍在运行，否则重新部署（未注入时视为实例在运行）。
         clock: 单调时钟（秒），用于重新部署的退避；默认 :func:`time.monotonic`。
+        on_redeploy: 可选，为实例已不在运行的服务启动重新部署运行之后调用（如计入指标）；
+            退避期间推迟的协调不调用。
 
     Raises:
         ValueError: 注入了工作流运行时却没有 ``release_provider``，或
@@ -331,6 +333,7 @@ class ReconciliationController(Reconciler):
         workflow_poll_interval: float = 2.0,
         launcher: RuntimeLauncher | None = None,
         clock: Callable[[], float] = time.monotonic,
+        on_redeploy: Callable[[], None] | None = None,
     ) -> None:
         if workflow_runtime is not None and release_provider is None:
             raise ValueError(
@@ -350,6 +353,7 @@ class ReconciliationController(Reconciler):
         self._poll_interval = workflow_poll_interval
         self._launcher = launcher
         self._clock = clock
+        self._on_redeploy = on_redeploy
         # 已处理的去重键（内存级回退路径；processed_store 注入时以 SQLite
         # 持久化为准——architecture §5.5 不依赖单进程内存状态）。
         self._processed_keys: set[str] = set()
@@ -872,6 +876,8 @@ class ReconciliationController(Reconciler):
         if isinstance(started, ReconcileResult):
             return started
         self._record_redeploy(meta.uid, meta.generation)
+        if self._on_redeploy is not None:
+            self._on_redeploy()
         logger.warning(
             "redeploying a service whose instance is gone: run_id=%s attempt=%d kind=%s "
             "namespace=%s name=%s uid=%s generation=%s tenant_id=%s correlation_id=%s",

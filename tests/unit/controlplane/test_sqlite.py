@@ -6,8 +6,8 @@
 * 控制平面的各个存储都以 WAL 模式打开数据库文件；
 * 同一文件上一个连接的读事务不阻塞另一个存储写入；
 * 工作流存储使用同目录的独立文件，控制平面库被写锁占用时照常写入；
-* :class:`Database`：异常时回滚、拒绝遗留未提交的事务、事务整体提交或回滚，
-  共用它的存储不会丢失彼此的写入。
+* :class:`Database`：异常时回滚、拒绝遗留未提交的事务、事务整体提交或回滚，报告取得锁之前
+  等待的时间，共用它的存储不会丢失彼此的写入。
 """
 
 from __future__ import annotations
@@ -16,6 +16,7 @@ import asyncio
 import functools
 import inspect
 import sqlite3
+import threading
 import time
 
 import pytest
@@ -209,6 +210,31 @@ def test_database_transaction_commits_or_rolls_back_as_a_unit(tmp_path) -> None:
     finally:
         probe.close()
         db.close()
+
+
+@pytest.mark.unit
+def test_database_reports_how_long_call_and_transaction_waited_for_the_lock() -> None:
+    db = Database()
+    waits: list[float] = []
+    try:
+        db.set_lock_wait_observer(waits.append)
+        db.call(lambda: None)
+        with db.transaction():
+            pass
+        waiter = threading.Thread(target=db.call, args=(lambda: None,))
+        with db.lock:
+            waiter.start()
+            time.sleep(0.05)
+        waiter.join()
+        db.set_lock_wait_observer(None)
+        db.call(lambda: None)
+    finally:
+        db.close()
+
+    uncontended_call, uncontended_transaction, contended = waits
+    assert 0 <= uncontended_call < contended
+    assert 0 <= uncontended_transaction < contended
+    assert contended >= 0.03
 
 
 @pytest.mark.unit

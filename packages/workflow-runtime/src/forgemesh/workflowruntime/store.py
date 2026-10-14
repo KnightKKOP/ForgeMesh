@@ -379,6 +379,13 @@ class WorkflowStore:
                 raise NotFoundError(f"run not found: {run_id}")
         return {r["step_id"]: StepStatus(r["status"]) for r in rows}
 
+    def _count_runs_by_status_sync(self) -> dict[str, int]:
+        """同步按状态统计运行数。"""
+        rows = self._conn.execute(
+            "SELECT status, COUNT(*) AS n FROM workflow_runs GROUP BY status"
+        ).fetchall()
+        return {r["status"]: r["n"] for r in rows}
+
     def _close_sync(self) -> None:
         """同步关闭连接。"""
         self._conn.close()
@@ -464,6 +471,10 @@ class WorkflowStore:
             NotFoundError: 运行实例不存在。
         """
         return await self._call(self._get_step_statuses_sync, run_id)
+
+    async def count_runs_by_status(self) -> dict[str, int]:
+        """按状态统计运行数（状态 → 运行数，没有运行的状态不出现；供指标使用）。"""
+        return await self._call(self._count_runs_by_status_sync)
 
     async def close(self) -> None:
         """关闭数据库连接。"""

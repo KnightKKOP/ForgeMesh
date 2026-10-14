@@ -6,7 +6,8 @@
 * 无法调度的第二个服务；``list`` 逐页读取；``get``；
 * ``delete``：无法调度的服务直接删除（``204``），就绪的服务先进入 ``Terminating``（``202``），
   ``wait --for delete`` 等它消失；
-* API 的错误：没有 key（``401``）、文档的租户与 key 不符（``403``）、文档不合法（``400``）。
+* API 的错误：没有 key（``401``）、文档的租户与 key 不符（``403``）、文档不合法（``400``）；
+  ``--api-url`` 多了一段路径时控制平面返回 ``404 ROUTE_NOT_FOUND``，不被当作资源不存在。
 """
 
 from __future__ import annotations
@@ -206,6 +207,11 @@ def test_api_errors_are_reported_with_their_exit_codes(
     other_tenant = cli("apply", "-f", _write(tmp_path / "a.yaml", service("a", tenantId="other")))
     rejected = cli("apply", "-f", _write(tmp_path / "llama.yaml", invalid))
     missing = cli("get", "inferenceservice", "llama", "-n", "default")
+    wrong_url = ("--api-url", control_plane + "/forgemesh")
+    misrouted = cli("get", "inferenceservice", "llama", "-n", "default", *wrong_url)
+    misrouted_wait = cli(
+        "wait", "inferenceservice", "llama", "-n", "default", "--for", "delete", *wrong_url
+    )
 
     assert without_key.code == ExitCode.AUTH
     assert without_key.err.startswith("Error: missing bearer credentials (HTTP 401 UNAUTHENTICATED")
@@ -222,5 +228,10 @@ def test_api_errors_are_reported_with_their_exit_codes(
     assert "(HTTP 400 BAD_REQUEST" in rejected.err
     assert "\n  " in rejected.err
     assert missing.code == ExitCode.NOT_FOUND
-    assert KEY not in "".join(r.out + r.err for r in (without_key, other_tenant, rejected, missing))
+    for result in (misrouted, misrouted_wait):
+        assert (result.code, result.out) == (ExitCode.ERROR, "")
+        assert result.err.startswith("Error: route not found (HTTP 404 ROUTE_NOT_FOUND, ")
+        assert result.err.endswith("); check --api-url\n")
+    results = (without_key, other_tenant, rejected, missing, misrouted, misrouted_wait)
+    assert KEY not in "".join(r.out + r.err for r in results)
     assert _errors(caplog) == []

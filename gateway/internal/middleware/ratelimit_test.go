@@ -105,3 +105,20 @@ func TestRateLimit_IgnoresClientControlledHeaders(t *testing.T) {
 		})
 	}
 }
+
+// TestLimiter_CountsRejections 验证 Rejected 累计各个 key 被拒绝的次数，放行的请求不计。
+func TestLimiter_CountsRejections(t *testing.T) {
+	l := NewRateLimiter(0.0001, 2)
+	h := RateLimit(l)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+
+	for i := 0; i < 5; i++ {
+		rec := doTenantRequest(h, "tenant-a")
+		if i >= 2 && rec.Code != http.StatusTooManyRequests {
+			t.Fatalf("第 %d 次请求应 429，实际 %d", i+1, rec.Code)
+		}
+	}
+	doTenantRequest(h, "tenant-b")
+	if got := l.Rejected(); got != 3 {
+		t.Fatalf("应累计拒绝 3 次，实际 %d", got)
+	}
+}

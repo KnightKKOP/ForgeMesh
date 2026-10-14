@@ -90,6 +90,32 @@ class OutboxStatus(StrEnum):
     DEAD = "dead"
 
 
+class PublishOutcome(StrEnum):
+    """一次发布尝试的结果（:class:`Dispatcher` 的 ``on_attempt`` 收到的参数）。"""
+
+    #: 发布成功，事件已标记 ``published``。
+    PUBLISHED = "published"
+    #: 发布失败，事件仍为 ``pending``，按 :class:`RetryPolicy` 退避后重试。
+    FAILED = "failed"
+    #: 发布失败且失败次数达到上限，事件进入 ``dead``。
+    DEAD = "dead"
+
+
+@dataclass(frozen=True)
+class OutboxBacklog:
+    """未发布的事件数（:meth:`Outbox.backlog`）。
+
+    Attributes:
+        pending: 尚未发布失败过的 ``pending`` 事件，含经 :meth:`Outbox.redrive` 放回的。
+        retrying: 发布失败过、等待重试的 ``pending`` 事件。
+        dead: ``dead`` 事件。
+    """
+
+    pending: int = 0
+    retrying: int = 0
+    dead: int = 0
+
+
 class OutboxEvent(BaseModel):
     """Outbox 事件模型。
 
@@ -398,6 +424,21 @@ class Outbox:
         rows = self._query("SELECT status, COUNT(*) as cnt FROM outbox_events GROUP BY status")
         return {row["status"]: row["cnt"] for row in rows}
 
+    def backlog(self) -> OutboxBacklog:
+        """统计未发布的事件：``pending`` 事件按是否发布失败过分为两类，以及 ``dead`` 事件。
+
+        只读取这两个状态的行（经 ``status`` 索引），保留期内的已发布事件不影响查询的开销。
+        """
+        pending, dead = OutboxStatus.PENDING.value, OutboxStatus.DEAD.value
+        [row] = self._query(
+            "SELECT COALESCE(SUM(status = ? AND attempts = 0), 0) AS pending, "
+            "COALESCE(SUM(status = ? AND attempts > 0), 0) AS retrying, "
+            "COALESCE(SUM(status = ?), 0) AS dead "
+            "FROM outbox_events WHERE status IN (?, ?)",
+            (pending, pending, dead, pending, dead),
+        )
+        return OutboxBacklog(pending=row["pending"], retrying=row["retrying"], dead=row["dead"])
+
     @staticmethod
     def _row_to_event(row: sqlite3.Row) -> OutboxEvent:
         """将数据库行反序列化为 OutboxEvent。"""
@@ -444,6 +485,8 @@ class Dispatcher:
         retention: 已发布事件的保留秒数，:meth:`run` 每小时删除更早的事件；
             ``None`` 表示不删除。
         clock: 当前时间（Unix 秒），供测试注入。
+        on_attempt: 每次发布尝试的结果写入数据库之后调用（如计入指标），参数为
+            :class:`PublishOutcome`；结果未能写入时不调用，事件之后再次发布时才调用。
 
     Raises:
         ValueError: ``poll_interval`` 不大于 0，或 ``batch_size`` 小于 1。
@@ -459,6 +502,7 @@ class Dispatcher:
         retry: RetryPolicy | None = None,
         retention: float | None = DEFAULT_RETENTION_SECONDS,
         clock: Callable[[], float] = time.time,
+        on_attempt: Callable[[PublishOutcome], None] | None = None,
     ) -> None:
         if poll_interval <= 0:
             raise ValueError(f"poll_interval must be > 0, got {poll_interval}")
@@ -471,6 +515,7 @@ class Dispatcher:
         self._retry = retry or RetryPolicy()
         self._retention = retention
         self._clock = clock
+        self._on_attempt = on_attempt
         self._stopped = False
         self._wakeup: asyncio.Event | None = None
         self._task: asyncio.Task[None] | None = None
@@ -495,10 +540,17 @@ class Dispatcher:
                     now=self._clock(),
                 )
                 self._log_failure(failed)
+                dead = failed.status == OutboxStatus.DEAD
+                self._attempted(PublishOutcome.DEAD if dead else PublishOutcome.FAILED)
                 break
             await asyncio.to_thread(self._outbox.mark_published, event.event_id, self._clock())
+            self._attempted(PublishOutcome.PUBLISHED)
             published += 1
         return published
+
+    def _attempted(self, outcome: PublishOutcome) -> None:
+        if self._on_attempt is not None:
+            self._on_attempt(outcome)
 
     def _log_failure(self, event: OutboxEvent) -> None:
         if event.status == OutboxStatus.DEAD:
@@ -665,7 +717,9 @@ __all__ = [
     "Dispatcher",
     "IdempotentConsumer",
     "Outbox",
+    "OutboxBacklog",
     "OutboxEvent",
     "OutboxStatus",
+    "PublishOutcome",
     "RetryPolicy",
 ]

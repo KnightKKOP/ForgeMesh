@@ -39,6 +39,8 @@ from .process_records import record_file_path
 from .recovery import (
     DEFAULT_INSTANCE_CHECK_INTERVAL_SECONDS,
     INSTANCE_LOST_REASON,
+    InstanceCheckResult,
+    ReclaimOutcome,
     check_instances,
     reclaim_orphaned_allocations,
 )
@@ -74,9 +76,11 @@ __all__ = [
     "DeploymentSteps",
     "FakeLauncher",
     "InMemoryLauncher",
+    "InstanceCheckResult",
     "LaunchRequest",
     "LaunchedInstance",
     "LauncherConfigError",
+    "ReclaimOutcome",
     "RuntimeLauncher",
     "StepCallable",
     "TGIProcessLauncher",

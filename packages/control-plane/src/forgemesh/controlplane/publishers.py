@@ -6,8 +6,10 @@
 ``dead``。
 
 * :class:`LogPublisher`（默认）：每个事件写一条 INFO 日志（logger ``forgemesh.events``），
-  消息是事件信封的 JSON。进程没有配置 logging 时（uvicorn 只配置它自己的 logger），给这个
-  logger 加一个写标准输出的 handler，每行一个信封。写日志不会失败，事件随即标记为已发布。
+  消息是事件信封的 JSON。进程没有配置 logging 时（如直接以 uvicorn 运行应用：uvicorn 只配置
+  它自己的 logger），给这个 logger 加一个写标准输出的 handler，每行一个信封；
+  ``forgemesh-control-plane`` 配置了 logging（见 :mod:`forgemesh.controlplane.logs`），事件随
+  其他日志输出。写日志不会失败，事件随即标记为已发布。
 * :class:`WebhookPublisher`：把事件信封以 JSON ``POST`` 到 webhook；2xx 视为成功，其余状态码
   （不跟随重定向）、超时与连接错误视为失败。与 urllib 的默认行为一样，遵循 ``HTTPS_PROXY`` /
   ``HTTP_PROXY`` / ``NO_PROXY`` 等代理环境变量。

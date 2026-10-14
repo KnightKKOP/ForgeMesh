@@ -16,6 +16,7 @@ from typing import Any
 import pytest
 from forgemesh.controlplane.controller import ControllerManager, WorkQueue
 from forgemesh.controlplane.deployment import LAUNCH_INSTANCE, LaunchedInstance
+from forgemesh.controlplane.metrics import MetricsRegistry
 from forgemesh.controlplane.outbox import OutboxEvent
 from forgemesh.controlplane.reconciler import (
     ProcessedKeyStore,
@@ -27,6 +28,7 @@ from forgemesh.controlplane.registry import (
     ResourceKey,
     SQLiteRegistry,
 )
+from forgemesh.controlplane.telemetry import ControllerMetrics
 from forgemesh.core.errors import NotFoundError
 from forgemesh.core.objects import Condition, ObjectMeta, Resource
 from forgemesh.core.scheduler import AllocationRef, ScheduleRequest
@@ -44,6 +46,8 @@ from forgemesh.resource.inference import (
 )
 from forgemesh.workflow.runtime import RunInfo, RunRef
 from forgemesh.workflow.states import StepStatus, WorkflowStatus
+
+from .exposition import parse
 
 KIND = "InferenceService"
 TENANT = "tenant-a"
@@ -577,7 +581,7 @@ def test_an_instance_check_queues_the_managed_resources_it_reports() -> None:
 @pytest.mark.unit
 def test_a_running_manager_checks_instances_periodically_until_it_stops(caplog) -> None:
     """控制器运行时每隔 ``instance_check_interval`` 秒核对一次实例：核对失败时记日志，之后照常
-    核对、把报告的资源加入队列；停止之后不再核对。"""
+    核对、把报告的资源加入队列；停止之后不再核对。每次核对按结果计数。"""
     calls = 0
 
     async def check() -> list[ResourceKey]:
@@ -587,11 +591,16 @@ def test_a_running_manager_checks_instances_periodically_until_it_stops(caplog) 
             raise RuntimeError("launcher unavailable")
         return [_key()]
 
-    async def scenario() -> tuple[int, list[ResourceKey]]:
+    async def scenario() -> tuple[int, list[ResourceKey], str]:
         registry = SQLiteRegistry()
         queue = RecordingQueue()
+        metrics = MetricsRegistry()
         manager = _manager(
-            registry, queue=queue, instance_check=check, instance_check_interval=0.01
+            registry,
+            queue=queue,
+            instance_check=check,
+            instance_check_interval=0.01,
+            metrics=ControllerMetrics(metrics),
         )
         await manager.start()
         try:
@@ -605,13 +614,18 @@ def test_a_running_manager_checks_instances_periodically_until_it_stops(caplog) 
         stopped_after = calls
         await asyncio.sleep(0.05)
         await registry.close()
-        return stopped_after, queue.added
+        return stopped_after, queue.added, metrics.render()
 
-    stopped_after, added = _run(scenario())
+    stopped_after, added, text = _run(scenario())
     assert calls == stopped_after
     assert added and set(added) == {_key()}
     [failure] = [r for r in caplog.records if r.getMessage() == "controller instance check failed"]
     assert str(failure.exc_info[1]) == "launcher unavailable"
+    checks = parse(text)["forgemesh_instance_checks_total"]
+    assert {s.labels["outcome"]: s.value for s in checks.samples} == {
+        "completed": stopped_after - 1,
+        "failed": 1,
+    }
 
 
 @pytest.mark.unit

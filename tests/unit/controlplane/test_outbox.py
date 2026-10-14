@@ -6,9 +6,10 @@
 * 标记已发布（mark_published）与重复标记抛错；
 * 发布失败：指数退避（RetryPolicy）、到期查询（due）、达到上限进入 dead、
   重新投递（redrive）、错误截断；
-* 统计信息（get_stats）与已发布事件清理（purge_published）；
+* 统计信息（get_stats、backlog）与已发布事件清理（purge_published）；
 * 存量库迁移（补列、旧 failed 改为 dead）；
 * Dispatcher 单轮分发（dispatch_once）、遇到失败结束本轮；
+* Dispatcher 在发布尝试的结果写入数据库之后才报告它（on_attempt）；
 * Dispatcher 幂等（重复 dispatch 不重复处理）；
 * Dispatcher 异步 publisher 回调；
 * Dispatcher 后台运行：持续发布、数据库错误后继续、停止与超时取消；
@@ -28,8 +29,10 @@ from forgemesh.controlplane.outbox import (
     Dispatcher,
     IdempotentConsumer,
     Outbox,
+    OutboxBacklog,
     OutboxEvent,
     OutboxStatus,
+    PublishOutcome,
     RetryPolicy,
 )
 
@@ -162,6 +165,20 @@ def test_get_stats() -> None:
     assert stats.get("pending") == 1
     assert stats.get("published") == 1
     assert stats.get("dead") == 1
+
+
+@pytest.mark.unit
+def test_backlog_splits_pending_events_by_past_failures_and_counts_dead_ones() -> None:
+    outbox = Outbox()
+    assert outbox.backlog() == OutboxBacklog(pending=0, retrying=0, dead=0)
+    _put(outbox, *(_make_event(f"evt-{n}") for n in range(1, 6)))
+    outbox.mark_published("evt-1")
+    outbox.mark_failed("evt-2", "boom", now=10.0)
+    outbox.mark_failed("evt-3", "boom", policy=RetryPolicy(max_attempts=1))
+
+    assert outbox.backlog() == OutboxBacklog(pending=2, retrying=1, dead=1)
+    assert outbox.redrive(["evt-3"], now=20.0) == 1
+    assert outbox.backlog() == OutboxBacklog(pending=3, retrying=1, dead=0)
 
 
 @pytest.mark.unit
@@ -399,6 +416,69 @@ def test_dispatcher_ends_the_round_at_the_first_failure() -> None:
     [failed] = outbox.get_pending()
     assert (failed.event_id, failed.attempts) == ("evt-1", 1)
     assert failed.last_error == "ConnectionError: refused"
+
+
+@pytest.mark.unit
+def test_dispatcher_reports_each_attempt_after_recording_its_outcome() -> None:
+    """on_attempt 收到每次尝试的结果时，结果已经写入数据库。"""
+    outbox = Outbox()
+    _put(
+        outbox,
+        _make_event("evt-ok").model_copy(update={"created_at": 1.0}),
+        _make_event("evt-bad").model_copy(update={"created_at": 2.0}),
+    )
+    now = 100.0
+    seen: list[tuple[PublishOutcome, OutboxBacklog]] = []
+
+    def publisher(event: OutboxEvent) -> None:
+        if event.event_id == "evt-bad":
+            raise ConnectionError("refused")
+
+    dispatcher = Dispatcher(
+        outbox,
+        publisher,
+        retry=RetryPolicy(max_attempts=2, base_delay=1.0),
+        clock=lambda: now,
+        on_attempt=lambda outcome: seen.append((outcome, outbox.backlog())),
+    )
+    assert _run(dispatcher.dispatch_once()) == 1
+    now = 101.0
+    assert _run(dispatcher.dispatch_once()) == 0
+
+    assert seen == [
+        (PublishOutcome.PUBLISHED, OutboxBacklog(pending=1, retrying=0, dead=0)),
+        (PublishOutcome.FAILED, OutboxBacklog(pending=0, retrying=1, dead=0)),
+        (PublishOutcome.DEAD, OutboxBacklog(pending=0, retrying=0, dead=1)),
+    ]
+
+
+@pytest.mark.unit
+def test_dispatcher_does_not_report_an_attempt_whose_outcome_was_not_recorded(
+    monkeypatch,
+) -> None:
+    """发布成功但未能标记的事件不报告；它仍待发布，再次发布并标记之后才报告一次。"""
+    outbox = Outbox()
+    _put(outbox, _make_event("evt-1"))
+    real_mark_published = outbox.mark_published
+    calls = 0
+
+    def flaky_mark_published(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise sqlite3.OperationalError("database is locked")
+        return real_mark_published(*args, **kwargs)
+
+    monkeypatch.setattr(outbox, "mark_published", flaky_mark_published)
+    outcomes: list[PublishOutcome] = []
+    dispatcher = Dispatcher(outbox, lambda event: None, on_attempt=outcomes.append)
+
+    with pytest.raises(sqlite3.OperationalError):
+        _run(dispatcher.dispatch_once())
+    assert outcomes == []
+    assert outbox.get("evt-1").status == OutboxStatus.PENDING
+    assert _run(dispatcher.dispatch_once()) == 1
+    assert outcomes == [PublishOutcome.PUBLISHED]
 
 
 @pytest.mark.unit

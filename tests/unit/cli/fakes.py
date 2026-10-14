@@ -103,7 +103,7 @@ def error_body(
     correlation_id: str = "cid-server",
     details: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """控制平面的错误信封。"""
+    """控制平面与网关的错误信封。"""
     error: dict[str, Any] = {"code": code, "message": message, "correlationId": correlation_id}
     if details is not None:
         error["details"] = details
@@ -227,7 +227,7 @@ class FakeApi:
             if call.method == "PUT":
                 return self._replace(call, key, current)
             return self._delete(key, current)
-        return self._error(call, 404, "NOT_FOUND", "Not Found")
+        return self._error(call, 404, "ROUTE_NOT_FOUND", "route not found")
 
     def _create(self, call: Call) -> Reply:
         metadata = call.body["metadata"]

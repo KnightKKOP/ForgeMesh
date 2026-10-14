@@ -4,7 +4,9 @@
 
 * ``InferenceService`` 合法转移链（Pending→...→Ready）通过；
 * **非法转移被拒**（如 Ready→Scheduling 抛 ``InvalidStateTransition``）；
-* ``Ready`` 到 ``Degraded`` / ``Updating`` / ``Terminating`` 的双向/单向语义；
+* ``Ready`` 到 ``Degraded`` / ``Updating`` / ``Terminating`` 的双向/单向语义，
+  ``Degraded`` → ``Updating``（spec 变化）；
+* ``Failed`` 只经 ``Pending`` 重新部署（spec 变化），``Unknown`` 只能删除；
 * 所有非终态（含 ``Failed`` / ``Unknown``，人工清理入口）→ ``Terminating``；
 * ``Terminating`` 唯一终态无出边（finalizer 清空后由注册表物理删除）；
 * ``Allocation`` 的 ``Active → {Released, Expired}`` 单向语义；
@@ -44,8 +46,10 @@ pytestmark = pytest.mark.unit
         (InferencePhase.READY, InferencePhase.DEGRADED),
         (InferencePhase.DEGRADED, InferencePhase.READY),
         (InferencePhase.READY, InferencePhase.UPDATING),
+        (InferencePhase.DEGRADED, InferencePhase.UPDATING),
         (InferencePhase.UPDATING, InferencePhase.READY),
         (InferencePhase.READY, InferencePhase.TERMINATING),
+        (InferencePhase.FAILED, InferencePhase.PENDING),
     ],
 )
 def test_inference_legal_transitions_pass(current: InferencePhase, target: InferencePhase) -> None:
@@ -113,6 +117,20 @@ def test_any_state_can_terminate(source: InferencePhase) -> None:
     → Terminating 均合法。"""
     assert INFERENCE_STATE_MACHINE.can(source.value, InferencePhase.TERMINATING.value) is True
     INFERENCE_STATE_MACHINE.validate(source.value, InferencePhase.TERMINATING.value)
+
+
+def test_failed_is_deployed_again_only_through_pending() -> None:
+    """Failed 只能回到 Pending（spec 变化后重新部署）或进入 Terminating，不能跳过部署流程
+    直接进入后面的 phase；Unknown 只能删除。"""
+    assert INFERENCE_TRANSITIONS[InferencePhase.FAILED.value] == {
+        InferencePhase.PENDING.value,
+        InferencePhase.TERMINATING.value,
+    }
+    assert INFERENCE_TRANSITIONS[InferencePhase.UNKNOWN.value] == {InferencePhase.TERMINATING.value}
+    with pytest.raises(InvalidStateTransition):
+        INFERENCE_STATE_MACHINE.validate(
+            InferencePhase.FAILED.value, InferencePhase.SCHEDULING.value
+        )
 
 
 def test_terminating_has_no_outgoing() -> None:

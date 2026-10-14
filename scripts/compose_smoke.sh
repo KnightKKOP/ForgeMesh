@@ -4,8 +4,12 @@
 # 启动控制平面与网关，经网关走完推理服务的闭环：
 #   创建 → Ready（status.endpoints 指向假实例）→ 经网关流式对话（SSE，以 [DONE] 结束）→
 #   删除 → 资源消失、实例停止 → 同名重新创建（只有一块设备，可见分配已释放）→ 再次对话 →
-#   重启控制平面：资源仍在，实例随旧进程结束，服务转为 Degraded（Ready=False，
-#   InstanceLost），网关不再转发（503）→ 删除。
+#   PUT 修改 spec → Updating → 以新实例回到 Ready（旧实例已停止）→ 再次对话 →
+#   假实例退出（POST /fake/exit）→ Degraded（InstanceLost）→ 重新部署，以新实例回到 Ready →
+#   再次对话 → 重启控制平面：资源仍在，实例随旧进程结束，服务转为 Degraded（InstanceLost）
+#   后重新部署，以新实例回到 Ready → 再次对话 → 删除。
+#
+# 每一步都有时限，整个闭环只等待状态变化，不依赖网关在某一刻返回的状态码。
 #
 # 用法（任意目录）：scripts/compose_smoke.sh
 # 依赖 docker（含 compose v2 插件）、curl 与 jq；占用 127.0.0.1:8080 与 127.0.0.1:8081。
@@ -44,7 +48,7 @@ fail() {
 check() {
   local description=$1 expected=$2 actual
   shift 2
-  actual=$(curl -s -o /dev/null -w '%{http_code}' "$@")
+  actual=$(curl -s --max-time 30 -o /dev/null -w '%{http_code}' "$@")
   if [[ "$actual" != "$expected" ]]; then
     fail "$description: expected HTTP $expected, got $actual"
   fi
@@ -63,13 +67,15 @@ wait_ready() {
 
 # fetch：读取 smoke-svc 写入 $resource，输出 HTTP 状态码。
 fetch() {
-  curl -s -o "$resource" -w '%{http_code}' "${auth[@]}" "$service" || true
+  curl -s --max-time 30 -o "$resource" -w '%{http_code}' "${auth[@]}" "$service" || true
 }
 
 # wait_phase <phase>：等 smoke-svc 的 status.phase 变为 <phase>（最多 60 秒），资源留在 $resource。
+# 每 0.25 秒读取一次：协调器每 2 秒查询一次部署运行，Updating 与重新部署中的 Degraded 至少持续
+# 这么久，不会错过。
 wait_phase() {
   local phase=$1 current=""
-  for _ in $(seq 1 120); do
+  for _ in $(seq 1 240); do
     if [[ "$(fetch)" == 200 ]]; then
       current=$(jq -r '.status.phase // ""' "$resource")
       if [[ "$current" == "$phase" ]]; then
@@ -80,7 +86,7 @@ wait_phase() {
         break
       fi
     fi
-    sleep 0.5
+    sleep 0.25
   done
   jq '.status' "$resource" >&2 || true
   fail "smoke-svc did not reach phase $phase (last phase: ${current:-none})"
@@ -108,7 +114,7 @@ expect() {
 
 # chat：经网关发出一次流式对话，响应头写入 $headers、响应体写入 $stream，输出 HTTP 状态码。
 chat() {
-  curl -s -N -D "$headers" -o "$stream" -w '%{http_code}' "${auth[@]}" \
+  curl -s -N --max-time 30 -D "$headers" -o "$stream" -w '%{http_code}' "${auth[@]}" \
     -H "Content-Type: application/json" -X POST -d "$chat_body" "$chat_url" || true
 }
 
@@ -137,22 +143,6 @@ expect_reply() {
   fail "streaming chat did not reach $1 (last HTTP $code, reply: ${got:-none})"
 }
 
-# expect_unroutable：网关不再转发对话（503 NO_HEALTHY_UPSTREAM；缓存过期之前可能先是连接
-# 旧实例失败的 502）。
-expect_unroutable() {
-  local code=""
-  for _ in $(seq 1 30); do
-    code=$(chat)
-    if [[ "$code" == 503 ]] && jq -e '.error.code == "NO_HEALTHY_UPSTREAM"' "$stream" >/dev/null
-    then
-      echo "ok: the gateway no longer routes to smoke-svc (HTTP 503 NO_HEALTHY_UPSTREAM)"
-      return 0
-    fi
-    sleep 1
-  done
-  fail "the gateway still routes to smoke-svc (last HTTP $code)"
-}
-
 # port_closed <端口>：控制平面容器内没有进程在该端口上监听。
 port_closed() {
   "${compose[@]}" exec -T control-plane python - "$1" <<'EOF'
@@ -165,6 +155,24 @@ except ConnectionRefusedError:
     sys.exit(0)
 sys.exit(1)
 EOF
+}
+
+# exit_instance <端口>：经 POST /fake/exit（只有假实例有这个路由）让该端口上的实例像进程退出
+# 一样结束，输出 HTTP 状态码。实例端口不发布到宿主机，因此在控制平面容器内发出请求。
+exit_instance() {
+  "${compose[@]}" exec -T control-plane python - "$1" <<'EOF'
+import http.client
+import sys
+
+connection = http.client.HTTPConnection("127.0.0.1", int(sys.argv[1]), timeout=10)
+connection.request("POST", "/fake/exit")
+print(connection.getresponse().status)
+EOF
+}
+
+# endpoint_port：$resource 中第一个 endpoint 的端口。
+endpoint_port() {
+  jq -r '.status.endpoints[0].url | split(":") | last' "$resource"
 }
 
 "${compose[@]}" build
@@ -185,6 +193,7 @@ services="$gateway/api/v1/inference-services"
 service="$services/smoke-svc?namespace=default"
 chat_url="$gateway/api/v1/namespaces/default/inference/smoke-svc/chat"
 resource="$work/resource.json"
+update="$work/update.json"
 headers="$work/headers.txt"
 stream="$work/stream.txt"
 body='{"kind": "InferenceService", "metadata": {"name": "smoke-svc", "namespace": "default"},
@@ -207,7 +216,7 @@ expect "one ready openai-chat endpoint on the advertised host" \
   '.status.endpoints | length == 1 and (.[0] | .ready and .protocol == "openai-chat"
     and (.instanceId | startswith("fake-")) and (.url | test("^http://control-plane:[0-9]+$")))'
 first_instance=$(jq -r '.status.endpoints[0].instanceId' "$resource")
-first_port=$(jq -r '.status.endpoints[0].url | split(":") | last' "$resource")
+first_port=$(endpoint_port)
 expect_reply "$first_instance"
 "${compose[@]}" exec -T control-plane test -f /var/lib/forgemesh/forgemesh.workflows.db \
   || fail "the workflow store is not next to the registry"
@@ -224,25 +233,77 @@ check "re-create with the same name" 201 "${auth[@]}" -H "Content-Type: applicat
   -X POST -d "$body" "$services"
 wait_phase Ready
 second_instance=$(jq -r '.status.endpoints[0].instanceId' "$resource")
+second_port=$(endpoint_port)
 [[ "$second_instance" != "$first_instance" ]] \
   || fail "the re-created service reports the old instance $first_instance"
 echo "ok: the re-created service runs a new instance"
 expect_reply "$second_instance"
 
-# 假实例随控制平面进程结束：重启之后服务转为 Degraded，网关不再转发。
+# 更新：GET 的响应改一个 spec 字段后整体提交，metadata.resourceVersion 留在文档中作前置条件。
+# 加速器申请不变，新的 generation 复用同一分配；先停后起：Updating 中旧实例停止、新实例部署，
+# 之后服务以新实例回到 Ready。
+[[ "$(fetch)" == 200 ]] || fail "could not read smoke-svc before the update"
+jq -c '.spec.runtime.version = "0.6.3"' "$resource" > "$update"
+check "update the spec through the gateway" 200 "${auth[@]}" \
+  -H "Content-Type: application/json" -X PUT --data-binary @"$update" "$service"
+wait_phase Updating
+expect "Ready=False (Updating) and no ready endpoint while generation 2 deploys" \
+  '.metadata.generation == 2 and (.status.endpoints | all(.ready | not))
+    and (.status.conditions[] | select(.type == "Ready")
+      | .status == "False" and .reason == "Updating")'
+wait_phase Ready
+expect "generation 2 is deployed" \
+  '.metadata.generation == 2 and .status.observedGeneration == 2
+    and .spec.runtime.version == "0.6.3"'
+third_instance=$(jq -r '.status.endpoints[0].instanceId' "$resource")
+third_port=$(endpoint_port)
+[[ "$third_instance" != "$second_instance" ]] \
+  || fail "the updated service reports the old instance $second_instance"
+port_closed "$second_port" \
+  || fail "the replaced instance $second_instance still listens on port $second_port"
+echo "ok: the update replaced the instance"
+expect_reply "$third_instance"
+
+# 实例在运行中丢失：控制器每秒核对一次实例（见 docker-compose.fake-runtime.yaml），服务转为
+# Degraded（InstanceLost），随后以同一代 spec 重新部署，以新实例回到 Ready。
+[[ "$(exit_instance "$third_port")" == 202 ]] \
+  || fail "the fake instance $third_instance did not exit"
+echo "ok: the fake instance $third_instance exited"
+wait_phase Degraded
+expect "Ready=False (InstanceLost) and no ready endpoint" \
+  '(.status.endpoints | all(.ready | not)) and (.status.conditions[] | select(.type == "Ready")
+    | .status == "False" and .reason == "InstanceLost")'
+logs=$("${compose[@]}" logs --no-color control-plane)
+lost="service degraded, its instance is gone: instance $third_instance at"
+lost+=" http://control-plane:$third_port is not running any more"
+grep -qF "$lost" <<<"$logs" || fail "the control plane did not report the lost instance"
+echo "ok: the instance check reported the lost instance"
+wait_phase Ready
+fourth_instance=$(jq -r '.status.endpoints[0].instanceId' "$resource")
+fourth_port=$(endpoint_port)
+[[ "$fourth_instance" != "$third_instance" ]] \
+  || fail "the service still reports the lost instance $third_instance"
+echo "ok: the service was redeployed with a new instance"
+expect_reply "$fourth_instance"
+
+# 假实例随控制平面进程结束：启动时服务转为 Degraded（InstanceLost，日志记录丢失的实例），
+# 控制器随后以同一分配重新部署，服务以新实例回到 Ready。
 "${compose[@]}" restart control-plane
 "${compose[@]}" up --detach --wait
 wait_ready
 check "resource survives a control plane restart" 200 "${auth[@]}" "$service"
-wait_phase Degraded
-expect "Ready=False (InstanceLost) after the restart" \
-  '.status.conditions[] | select(.type == "Ready") | .status == "False" and .reason == "InstanceLost"'
-# shellcheck disable=SC2016 # $id 是 jq 变量
-expect "the endpoint of the lost instance is no longer ready" \
-  '.status.endpoints | length == 1 and .[0].ready == false and .[0].instanceId == $id' \
-  --arg id "$second_instance"
-expect_unroutable
-check "delete the degraded service" 202 "${auth[@]}" -X DELETE "$service"
+logs=$("${compose[@]}" logs --no-color control-plane)
+lost="service degraded, its instance is gone: instance $fourth_instance at"
+lost+=" http://control-plane:$fourth_port did not survive the control plane restart"
+grep -qF "$lost" <<<"$logs" || fail "the restart did not report the lost instance"
+echo "ok: the restart reported the lost instance"
+wait_phase Ready
+fifth_instance=$(jq -r '.status.endpoints[0].instanceId' "$resource")
+[[ "$fifth_instance" != "$fourth_instance" ]] \
+  || fail "the service still reports the lost instance $fourth_instance"
+echo "ok: the service was redeployed with a new instance after the restart"
+expect_reply "$fifth_instance"
+check "delete the redeployed service" 202 "${auth[@]}" -X DELETE "$service"
 wait_gone
 
 echo "compose smoke test passed"

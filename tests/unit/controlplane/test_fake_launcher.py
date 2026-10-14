@@ -4,7 +4,8 @@
   响应），非法请求得到 OpenAI 风格的错误；
 * 同一实例幂等键返回同一实例；监听地址与写进实例地址的主机分开配置；
 * ``stop`` 释放端口并中断进行中的请求，``aclose`` 停止全部实例；不开线程，关闭后不留下
-  任务；不认识的实例立即验证失败。
+  任务；不认识的实例立即验证失败；
+* ``POST /fake/exit`` 让实例像进程退出一样结束，``aclose`` 等正在退出的实例停止监听。
 """
 
 from __future__ import annotations
@@ -35,12 +36,13 @@ from forgemesh.resource.inference import (
 )
 
 CHAT_PATH = "/v1/chat/completions"
+EXIT_PATH = "/fake/exit"
 CHAT = {"model": "smoke", "messages": [{"role": "user", "content": "hi"}], "stream": True}
 
 
 def _request(uid: str = "uid-1") -> LaunchRequest:
     return LaunchRequest(
-        instance_key=deployment_run_key(uid),
+        instance_key=deployment_run_key(uid, 1),
         tenant_id="tenant-1",
         resource=ResourceRef(kind="InferenceService", namespace="team-a", name="svc", uid=uid),
         spec=InferenceServiceSpec(
@@ -172,6 +174,7 @@ def test_a_request_without_stream_gets_one_chat_completion() -> None:
         (_post(CHAT_PATH, {**CHAT, "stream": "yes"}), 400, None),
         (b"GET /v1/chat/completions HTTP/1.1\r\nHost: instance\r\n\r\n", 405, "POST"),
         (b"POST /health HTTP/1.1\r\nHost: instance\r\nContent-Length: 0\r\n\r\n", 405, "GET"),
+        (b"GET /fake/exit HTTP/1.1\r\nHost: instance\r\n\r\n", 405, "POST"),
         (b"GET /v1/models HTTP/1.1\r\nHost: instance\r\n\r\n", 404, None),
         (
             b"POST /v1/chat/completions HTTP/1.1\r\nHost: instance\r\n"
@@ -196,6 +199,7 @@ def test_a_request_without_stream_gets_one_chat_completion() -> None:
         "stream-not-a-boolean",
         "get-chat",
         "post-health",
+        "get-exit",
         "unknown-path",
         "chunked-body",
         "body-too-large",
@@ -359,6 +363,64 @@ def test_aclose_stops_every_instance_without_threads_or_leftover_tasks() -> None
 
     asyncio.run(scenario())
     assert set(threading.enumerate()) == threads
+
+
+@pytest.mark.unit
+def test_an_instance_exits_on_request_like_a_process_that_ended() -> None:
+    """回复 202 时实例已不在运行；随后停止监听、中断其余请求，同一实例键再启动的是新实例。"""
+    launcher = FakeLauncher()
+
+    async def scenario() -> None:
+        instance = await launcher.launch(_request())
+        other = await launcher.launch(_request("uid-2"))
+        reader, writer = await asyncio.open_connection("127.0.0.1", _port(instance))
+        writer.write(f"POST {CHAT_PATH} HTTP/1.1\r\n".encode())
+        await writer.drain()
+        await launcher.verify(instance)
+
+        status, headers, body = await _http(_port(instance), _post(EXIT_PATH, b""))
+
+        assert (status, headers["content-length"], body) == (202, "0", b"")
+        assert not await launcher.is_running(instance.instance_id)
+        with pytest.raises(RuntimeError, match=f"instance {instance.instance_id} is not running"):
+            await launcher.verify(instance)
+        with contextlib.suppress(ConnectionResetError):
+            assert await reader.read() == b""
+        writer.close()
+        with contextlib.suppress(ConnectionResetError):
+            await writer.wait_closed()
+        await _assert_refused(_port(instance))
+        await launcher.verify(other)
+        relaunched = await launcher.launch(_request())
+        assert relaunched.instance_id not in {instance.instance_id, other.instance_id}
+        await launcher.aclose()
+        assert asyncio.all_tasks() == {asyncio.current_task()}
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.unit
+def test_aclose_waits_for_an_instance_that_is_exiting() -> None:
+    launcher = FakeLauncher()
+
+    async def scenario() -> None:
+        instance = await launcher.launch(_request())
+        reader, writer = await asyncio.open_connection("127.0.0.1", _port(instance))
+        writer.write(_post(EXIT_PATH, b""))
+        await writer.drain()
+        async with asyncio.timeout(5):
+            while await launcher.is_running(instance.instance_id):
+                await asyncio.sleep(0)
+
+        await launcher.aclose()
+
+        assert asyncio.all_tasks() == {asyncio.current_task()}
+        await _assert_refused(_port(instance))
+        assert (await reader.read()).startswith(b"HTTP/1.1 202 Accepted\r\n")
+        writer.close()
+        await writer.wait_closed()
+
+    asyncio.run(scenario())
 
 
 @pytest.mark.unit

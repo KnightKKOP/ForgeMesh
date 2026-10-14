@@ -5,7 +5,9 @@
 * 同一实例幂等键在进程运行期间返回同一实例，进程退出之后启动新进程；
 * ``verify`` 等到 ``GET /health`` 返回 200，进程退出或超过就绪时限时失败，不认识的实例
   立即失败；
-* ``stop`` 先 ``SIGTERM``、宽限期过后 ``SIGKILL``，结束整个进程组；``aclose`` 停止全部实例；
+* ``stop`` 先 ``SIGTERM``、宽限期过后 ``SIGKILL``，结束实例会话中的全部进程（别的进程组中
+  的也一样），等它们都退出才返回；实例进程已经退出时也结束它进程组中剩下的进程（没有
+  ``/proc`` 时也是如此）；``aclose`` 停止全部实例；
 * 无法服务的请求（其他运行时、其他节点的设备、无法写进 ``CUDA_VISIBLE_DEVICES`` 的设备 id）
   不启动进程；非法配置在构造时被拒绝。
 """
@@ -32,6 +34,7 @@ from forgemesh.controlplane.deployment import (
     VLLMProcessLauncher,
     deployment_run_key,
 )
+from forgemesh.controlplane.deployment import process as process_module
 from forgemesh.controlplane.deployment.vllm_process import cuda_device
 from forgemesh.core.scheduler import AllocatedDevice, ResourceRef
 from forgemesh.resource.inference import (
@@ -56,7 +59,7 @@ def _request(
     devices: tuple[tuple[str, str], ...] = (("node-a", "gpu-0"),),
 ) -> LaunchRequest:
     return LaunchRequest(
-        instance_key=deployment_run_key(uid),
+        instance_key=deployment_run_key(uid, 1),
         tenant_id="tenant-1",
         resource=ResourceRef(kind="InferenceService", namespace="team-a", name="svc", uid=uid),
         spec=InferenceServiceSpec(
@@ -101,7 +104,7 @@ def _gone(pid: int) -> bool:
     """进程已不存在，或已结束、只等父进程回收（僵尸）。"""
     try:
         stat = Path(f"/proc/{pid}/stat").read_text()
-    except FileNotFoundError:
+    except (FileNotFoundError, ProcessLookupError):
         return True
     return stat.rpartition(")")[2].split()[0] in {"Z", "X"}
 
@@ -396,6 +399,64 @@ def test_stop_ends_every_process_of_the_instance(tmp_path: Path) -> None:
 
     try:
         assert asyncio.run(scenario())
+    finally:
+        for start in _starts(report):
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(start["child_pid"], signal.SIGKILL)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("proc", [True, False], ids=["with-proc", "without-proc"])
+def test_stop_ends_the_process_group_of_an_instance_process_that_already_exited(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, proc: bool
+) -> None:
+    if not proc:
+        monkeypatch.setattr(process_module, "_session_groups", lambda sid: set())
+    launcher, report = _launcher(tmp_path, "--mode", "exit", "--spawn-child")
+
+    async def scenario() -> bool:
+        instance = await launcher.launch(_request())
+        with pytest.raises(RuntimeError, match="exited with code 3"):
+            await launcher.verify(instance)
+        await launcher.stop(instance.instance_id)
+        return await _wait_gone(_starts(report)[0]["child_pid"])
+
+    try:
+        assert asyncio.run(scenario())
+    finally:
+        for start in _starts(report):
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(start["child_pid"], signal.SIGKILL)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "leader",
+    [
+        pytest.param((), id="instance-process-exits-on-sigterm"),
+        pytest.param(("--ignore-sigterm",), id="instance-process-ignores-sigterm"),
+    ],
+)
+def test_stop_waits_for_processes_of_the_instance_in_other_process_groups(
+    tmp_path: Path, leader: tuple[str, ...]
+) -> None:
+    launcher, report = _launcher(
+        tmp_path, "--spawn-child", "--child-group", *leader, stop_grace=0.2
+    )
+
+    async def scenario() -> bool:
+        instance = await launcher.launch(_request())
+        await launcher.verify(instance)
+        await launcher.stop(instance.instance_id)
+        return await launcher.is_running(instance.instance_id)
+
+    try:
+        running = asyncio.run(scenario())
+        [start] = _starts(report)
+        assert start["child_pgid"] != start["pid"]
+        assert running is False
+        assert _gone(start["pid"])
+        assert _gone(start["child_pid"])
     finally:
         for start in _starts(report):
             with contextlib.suppress(ProcessLookupError):

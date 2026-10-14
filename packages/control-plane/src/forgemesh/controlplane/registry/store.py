@@ -52,7 +52,10 @@ Allocation 持久化
 * ``allocations.idempotency_key`` 唯一：一个幂等键只对应一个分配，释放后也不复用。
 
 :meth:`SQLiteRegistry.create_allocation` 在同一个 ``BEGIN IMMEDIATE`` 事务中写入
-分配行与设备行；``release_allocation`` 走 ``ALLOCATION_STATE_MACHINE`` 校验。
+分配行与设备行；``release_allocation`` 走 ``ALLOCATION_STATE_MACHINE`` 校验。归属资源已不
+存在的 Active 分配由 :meth:`SQLiteRegistry.list_orphaned_allocations` 列出、
+:meth:`SQLiteRegistry.expire_orphaned_allocation` 标记为 ``Expired``（控制器回收孤立的分配）；
+没有组件按 ``lease_until`` 让分配过期。
 
 分页
 ----
@@ -1629,6 +1632,45 @@ class SQLiteRegistry(ResourceRegistry):
             return str(row["id"])
 
         return await self._run(_release_active)
+
+    async def list_orphaned_allocations(self) -> builtins.list[dict[str, Any]]:
+        """跨租户列出归属资源（同租户、同 uid）已不存在的 Active 分配（含 ``devices``）。
+
+        经 :meth:`request_delete` 删除的资源在物理删除之前释放分配；孤立的分配只来自绕过
+        受控删除的 :meth:`delete`，或之前的版本留下的数据。
+        """
+
+        def _list_orphaned() -> list[dict[str, Any]]:
+            rows = self._conn.execute(
+                "SELECT * FROM allocations AS a WHERE a.status=? AND NOT EXISTS ("
+                " SELECT 1 FROM resources AS r"
+                " WHERE r.tenant_id=a.tenant_id AND r.uid=a.resource_id"
+                ") ORDER BY a.created_at, a.id",
+                (AllocationStatus.ACTIVE.value,),
+            ).fetchall()
+            return [self._allocation_record(row) for row in rows]
+
+        return await self._run(_list_orphaned)
+
+    async def expire_orphaned_allocation(self, allocation_id: str) -> bool:
+        """把仍为 Active、归属资源仍不存在的分配标记为 ``Expired``，其设备随之空闲。
+
+        检查与写入在同一条 UPDATE 中完成；分配已不是 Active 或归属资源存在时不修改，返回
+        ``False``。
+        """
+
+        def _expire() -> bool:
+            cur = self._conn.execute(
+                "UPDATE allocations SET status=?, released_at=datetime('now') "
+                "WHERE id=? AND status=? AND NOT EXISTS ("
+                " SELECT 1 FROM resources AS r"
+                " WHERE r.tenant_id=allocations.tenant_id AND r.uid=allocations.resource_id)",
+                (AllocationStatus.EXPIRED.value, allocation_id, AllocationStatus.ACTIVE.value),
+            )
+            self._conn.commit()
+            return cur.rowcount == 1
+
+        return await self._run(_expire)
 
     async def release_allocation(
         self,

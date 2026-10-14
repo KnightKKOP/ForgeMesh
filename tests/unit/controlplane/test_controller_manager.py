@@ -2,7 +2,8 @@
 
 覆盖改进计划 4.10 的验收项：新资源在有限时间内得到带原因的 status；重启后
 从注册中心重建工作队列；同一 generation 不重复产生副作用。另覆盖 status 回写
-的 CAS 冲突处理、去重键的登记时机、受控删除、重新排队、失败退避与优雅停止。
+的 CAS 冲突处理、去重键的登记时机、受控删除、重新排队、失败退避、定期核对实例、
+回收孤立的分配与优雅停止。
 """
 
 from __future__ import annotations
@@ -153,15 +154,17 @@ class RecordingWorkflow:
         self.idempotency_keys.append(idempotency_key)
         return RunRef(run_id=idempotency_key, definition_version=1)
 
-    async def find_run(self, idempotency_key: str) -> RunInfo | None:
-        if idempotency_key not in self.idempotency_keys:
-            return None
-        return RunInfo(
-            run_id=idempotency_key,
-            status=WorkflowStatus.SUCCEEDED,
-            steps={LAUNCH_INSTANCE: StepStatus.SUCCEEDED},
-            outputs={LAUNCH_INSTANCE: INSTANCE.model_dump(mode="json")},
-        )
+    async def find_runs(self, key_prefix: str) -> dict[str, RunInfo]:
+        return {
+            key: RunInfo(
+                run_id=key,
+                status=WorkflowStatus.SUCCEEDED,
+                steps={LAUNCH_INSTANCE: StepStatus.SUCCEEDED},
+                outputs={LAUNCH_INSTANCE: INSTANCE.model_dump(mode="json")},
+            )
+            for key in self.idempotency_keys
+            if key.startswith(key_prefix)
+        }
 
 
 class RecordingRelease:
@@ -175,7 +178,12 @@ class RecordingRelease:
 class RecordingQueue(WorkQueue[ResourceKey]):
     def __init__(self) -> None:
         super().__init__()
+        self.added: list[ResourceKey] = []
         self.delays: list[tuple[ResourceKey, float]] = []
+
+    def add(self, key: ResourceKey) -> None:
+        self.added.append(key)
+        super().add(key)
 
     def add_after(self, key: ResourceKey, delay: float) -> None:
         self.delays.append((key, delay))
@@ -226,6 +234,18 @@ def test_manager_needs_a_reconciler_that_leaves_dedup_keys_to_it() -> None:
 
     with pytest.raises(ValueError):
         ControllerManager(registry, reconciler)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("interval", [0.0, -1.0])
+def test_manager_needs_a_positive_instance_check_interval(interval: float) -> None:
+    registry = SQLiteRegistry()
+    reconciler = ReconciliationController(
+        registry=registry, policy_engine=AllowPolicy(), record_dedup_keys=False
+    )
+
+    with pytest.raises(ValueError, match="instance_check_interval must be > 0"):
+        ControllerManager(registry, reconciler, instance_check_interval=interval)
 
 
 @pytest.mark.unit
@@ -470,6 +490,105 @@ def test_failing_reconciles_back_off_per_resource() -> None:
         return policy.calls
 
     assert _run(scenario()) >= 3
+
+
+@pytest.mark.unit
+def test_an_instance_check_queues_the_managed_resources_it_reports() -> None:
+    """核对实例报告的资源加入队列，其他 kind 的资源不加入。"""
+    widget = ResourceKey(TENANT, "Widget", NAMESPACE, "w")
+
+    async def check() -> list[ResourceKey]:
+        return [_key("a"), widget, _key("b")]
+
+    async def scenario() -> list[ResourceKey]:
+        registry = SQLiteRegistry()
+        queue = RecordingQueue()
+        manager = _manager(registry, queue=queue, instance_check=check)
+        await manager.check_instances()
+        await registry.close()
+        return queue.added
+
+    assert _run(scenario()) == [_key("a"), _key("b")]
+
+
+@pytest.mark.unit
+def test_a_running_manager_checks_instances_periodically_until_it_stops(caplog) -> None:
+    """控制器运行时每隔 ``instance_check_interval`` 秒核对一次实例：核对失败时记日志，之后照常
+    核对、把报告的资源加入队列；停止之后不再核对。"""
+    calls = 0
+
+    async def check() -> list[ResourceKey]:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("launcher unavailable")
+        return [_key()]
+
+    async def scenario() -> tuple[int, list[ResourceKey]]:
+        registry = SQLiteRegistry()
+        queue = RecordingQueue()
+        manager = _manager(
+            registry, queue=queue, instance_check=check, instance_check_interval=0.01
+        )
+        await manager.start()
+        try:
+
+            async def checked_again() -> bool:
+                return calls >= 3
+
+            await _eventually(checked_again)
+        finally:
+            await manager.stop()
+        stopped_after = calls
+        await asyncio.sleep(0.05)
+        await registry.close()
+        return stopped_after, queue.added
+
+    stopped_after, added = _run(scenario())
+    assert calls == stopped_after
+    assert added and set(added) == {_key()}
+    [failure] = [r for r in caplog.records if r.getMessage() == "controller instance check failed"]
+    assert str(failure.exc_info[1]) == "launcher unavailable"
+
+
+@pytest.mark.unit
+def test_a_manager_reclaims_allocations_when_it_starts_and_after_every_resync(caplog) -> None:
+    """启动时回收一次孤立的分配，失败时记日志、照常启动；之后每次周期性全量同步之后再回收
+    一次，停止之后不再回收。"""
+    calls = 0
+
+    async def reclaim() -> list[str]:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("database is locked")
+        return []
+
+    async def scenario() -> tuple[int, int]:
+        registry = SQLiteRegistry()
+        manager = _manager(registry, reclaim=reclaim, resync_period=0.01)
+        await manager.start()
+        at_start = calls
+        try:
+
+            async def reclaimed_again() -> bool:
+                return calls >= 3
+
+            await _eventually(reclaimed_again)
+        finally:
+            await manager.stop()
+        stopped_after = calls
+        await asyncio.sleep(0.05)
+        await registry.close()
+        return at_start, stopped_after
+
+    at_start, stopped_after = _run(scenario())
+    assert at_start == 1
+    assert calls == stopped_after
+    [failure] = [
+        r for r in caplog.records if r.getMessage() == "controller allocation reclaim failed"
+    ]
+    assert str(failure.exc_info[1]) == "database is locked"
 
 
 @pytest.mark.unit

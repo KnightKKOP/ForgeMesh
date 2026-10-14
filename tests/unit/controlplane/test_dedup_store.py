@@ -204,7 +204,8 @@ class _AllowPolicy:
 
 
 class _SucceededWorkflowRuntime:
-    """部署运行总是已成功的 WorkflowRuntime 测试替身，记录查询次数（协调的副作用）。"""
+    """部署运行总是已成功的 WorkflowRuntime 测试替身（查询的前缀即运行的幂等键），记录查询
+    次数（协调的副作用）。"""
 
     def __init__(self) -> None:
         self.lookups = 0
@@ -212,19 +213,20 @@ class _SucceededWorkflowRuntime:
     async def start(self, defn, inputs, idempotency_key):  # noqa: ANN001
         return RunRef(run_id=idempotency_key, definition_version=1)
 
-    async def find_run(self, idempotency_key: str) -> RunInfo:
+    async def find_runs(self, key_prefix: str) -> dict[str, RunInfo]:
         self.lookups += 1
         instance = LaunchedInstance(
             instance_id="instance-1",
             url="http://10.0.0.5:8000",
             protocol=EndpointProtocol.OPENAI_CHAT,
         )
-        return RunInfo(
-            run_id=idempotency_key,
+        run = RunInfo(
+            run_id=key_prefix,
             status=WorkflowStatus.SUCCEEDED,
             steps={LAUNCH_INSTANCE: StepStatus.SUCCEEDED},
             outputs={LAUNCH_INSTANCE: instance.model_dump(mode="json")},
         )
+        return {key_prefix: run}
 
 
 class _NoopRelease:

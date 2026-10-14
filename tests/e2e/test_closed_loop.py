@@ -4,8 +4,9 @@
   ``data: [DONE]`` 结束；
 * 删除 → 实例停止（端口拒绝连接）、分配释放、资源消失；同名服务重新创建后用同一块设备
   再次 ``Ready``（另一个实例）；
-* 重启控制平面：实例随旧进程结束，``Ready`` 服务转为 ``Degraded``（``Ready=False``、
-  ``InstanceLost``，端点不再就绪），删除后资源消失、分配释放。
+* 重启控制平面：实例随旧进程结束，启动时 ``Ready`` 服务转为 ``Degraded``（``Ready=False``、
+  ``InstanceLost``，端点不再就绪），控制器以同一分配重新部署，服务以新实例回到 ``Ready``；
+  删除后资源消失、分配释放。
 
 经网关转发（``/api/v1/namespaces/{ns}/inference/{svc}/chat``）的一段由 compose 冒烟
 ``scripts/compose_smoke.sh`` 覆盖。
@@ -205,7 +206,7 @@ def test_a_service_is_deployed_served_deleted_and_deployed_again(
 
 
 @pytest.mark.e2e
-def test_a_ready_service_whose_instance_ended_with_the_control_plane_is_degraded(
+def test_a_ready_service_whose_instance_ended_with_the_control_plane_is_deployed_again(
     db_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     with TestClient(create_app(db_path=str(db_path))) as client:
@@ -213,19 +214,24 @@ def test_a_ready_service_whose_instance_ended_with_the_control_plane_is_degraded
     stopped_with_the_control_plane = _refused(endpoint["url"])
 
     with TestClient(create_app(db_path=str(db_path))) as client:
-        degraded = _get(client)
+        redeployed = _wait(
+            client,
+            lambda s: s is not None and s["status"].get("phase") == "Ready",
+            "the service to be deployed again",
+        )
+        assert redeployed is not None
+        [endpoint_again] = redeployed["status"]["endpoints"]
+        status, _, events = _chat(endpoint_again["url"])
         deleted = _delete(client)
 
-    assert stopped_with_the_control_plane
-    assert degraded is not None
-    assert degraded["status"]["phase"] == "Degraded"
-    assert degraded["status"]["endpoints"] == [{**endpoint, "ready": False}]
-    ready = _ready_condition(degraded)
-    assert (ready["status"], ready["reason"]) == ("False", "InstanceLost")
-    assert ready["message"] == (
-        f"instance {endpoint['instanceId']} at {endpoint['url']} did not survive the control "
-        "plane restart; delete and re-create the service to deploy it again"
+    degraded = (
+        f"service degraded, its instance is gone: instance {endpoint['instanceId']} at "
+        f"{endpoint['url']} did not survive the control plane restart;"
     )
+    assert stopped_with_the_control_plane
+    assert any(record.getMessage().startswith(degraded) for record in caplog.records)
+    assert endpoint_again["instanceId"] != endpoint["instanceId"]
+    assert (status, events[-1]) == (200, "[DONE]")
     assert deleted == 202
     assert [a["status"] for a in asyncio.run(_allocations(db_path))] == ["Released"]
     assert db_path.with_name("cp.workflows.db").exists()

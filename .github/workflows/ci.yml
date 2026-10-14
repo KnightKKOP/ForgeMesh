@@ -100,7 +100,8 @@ jobs:
 
       # 构建两个镜像，以 deploy/docker/docker-compose.yaml 叠加 docker-compose.fake-runtime.yaml
       # （加速器清单 + 假启动器）启动，经网关走完推理服务的闭环（创建 → Ready → 流式对话 →
-      # 删除 → 重新创建 → 重启后 Degraded）。脚本依赖 runner 自带的 curl 与 jq。
+      # 删除 → 重新创建 → 修改 spec 后经 Updating、实例退出与重启后经 Degraded，都以新实例
+      # 回到 Ready）。脚本依赖 runner 自带的 curl 与 jq。
       - name: Compose smoke test
         run: scripts/compose_smoke.sh
   architecture-docs:

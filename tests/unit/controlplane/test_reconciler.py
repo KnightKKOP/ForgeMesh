@@ -5,8 +5,10 @@
 Pending 时评估）、按 phase 逐轮推进（Pending → Scheduling → Preparing → Deploying →
 Verifying → Ready，写入 ``status.endpoints``）、分配请求的资源身份与幂等键
 （uid + generation）、调度需求取自 ``spec.resources.accelerator``、部署工作流的启动
-（按 uid 的幂等键，输入携带分配）与启动 / 查询失败时的退避、运行失败或丢失时进入
-``Failed`` 以及分配的去留、缺少调度器 / 工作流运行时时如实报告 ``Ready=False``、
+（按 uid + generation 的幂等键，输入携带分配）与启动 / 查询 / 停止失败时的退避、部署过程中
+spec 变化（停止之前的部署、加速器申请变化时重新分配）、运行失败时进入 ``Failed`` 以及
+分配的去留（补偿没能停止的实例在之后的 ``Failed`` 一轮停止，然后释放分配）、实例丢失后按
+退避重新部署、缺少调度器 / 工作流运行时时如实报告 ``Ready=False``、
 幂等性，以及 Terminating 受控删除闭环
 （ReleaseProvider 释放 → 移除 finalizer → 按 uid 释放 Allocation → 物理删除）。
 """
@@ -15,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from typing import Any
 
 import pytest
@@ -28,13 +31,15 @@ from forgemesh.controlplane.deployment import (
 )
 from forgemesh.controlplane.reconciler import (
     MAX_RETRY_DELAY_SECONDS,
+    REDEPLOY_BACKOFF_INITIAL_SECONDS,
     ProcessedKeyStore,
     ReconciliationController,
     allocation_idempotency_key,
     compute_dedup_key,
 )
 from forgemesh.controlplane.registry import SQLiteRegistry
-from forgemesh.core.errors import NotFoundError
+from forgemesh.controlplane.scheduler import FirstFitScheduler, Inventory
+from forgemesh.core.errors import ConflictError, NotFoundError
 from forgemesh.core.objects import ObjectMeta, Resource
 from forgemesh.core.reconciler import ReconcileContext
 from forgemesh.core.scheduler import AllocatedDevice, AllocationRef, ResourceRef, ScheduleRequest
@@ -58,6 +63,9 @@ from forgemesh.workflow.states import StepStatus, WorkflowStatus
 # ---------------------------------------------------------------------- #
 
 ALLOW = PolicyDecision(decision="allow", reason="ok")
+
+#: ``uid-1`` 第 1 代 spec 的部署运行的幂等键。
+RUN_KEY = deployment_run_key("uid-1", 1)
 
 INSTANCE = LaunchedInstance(
     instance_id="instance-1", url="http://10.0.0.5:8000", protocol=EndpointProtocol.OPENAI_CHAT
@@ -218,19 +226,26 @@ class FlakyScheduler(MockScheduler):
 
 
 class StubWorkflowRuntime:
-    """Stub WorkflowRuntime：记录 start 的调用，find_run 返回预设的运行快照。
+    """Stub WorkflowRuntime：记录 start 的调用与 find_runs 查询的前缀。
+
+    ``runs`` 是幂等键到运行快照的映射，``find_runs`` 返回其中键以前缀开头的项。
 
     Args:
-        run: ``find_run`` 返回的快照；``None`` 表示运行不存在。
+        run: 部署运行的快照；``None`` 表示运行不存在。
         start_failures: 前几次 ``start`` 抛出异常。
+        key: ``run`` 预先登记的幂等键；``None`` 时 ``run`` 在成功 ``start`` 之后才登记在
+            启动所用的键下。
     """
 
-    def __init__(self, run: RunInfo | None = None, start_failures: int = 0) -> None:
+    def __init__(
+        self, run: RunInfo | None = None, start_failures: int = 0, key: str | None = RUN_KEY
+    ) -> None:
         self.run = run
         self.start_failures = start_failures
         self.lookup_error: Exception | None = None
         self.started: list[tuple[WorkflowDefinition, dict[str, Any], str]] = []
         self.lookups: list[str] = []
+        self.runs: dict[str, RunInfo] = {} if run is None or key is None else {key: run}
 
     @property
     def idempotency_keys(self) -> list[str]:
@@ -243,13 +258,15 @@ class StubWorkflowRuntime:
         if self.start_failures:
             self.start_failures -= 1
             raise RuntimeError("workflow store is locked")
+        if self.run is not None:
+            self.runs.setdefault(idempotency_key, self.run)
         return RunRef(run_id="run-1", definition_version=1)
 
-    async def find_run(self, idempotency_key: str) -> RunInfo | None:
-        self.lookups.append(idempotency_key)
+    async def find_runs(self, key_prefix: str) -> dict[str, RunInfo]:
+        self.lookups.append(key_prefix)
         if self.lookup_error is not None:
             raise self.lookup_error
-        return self.run
+        return {key: run for key, run in self.runs.items() if key.startswith(key_prefix)}
 
 
 class StubReleaseProvider:
@@ -263,6 +280,19 @@ class StubReleaseProvider:
         self.released.append(resource.metadata.name)
         if self.fail:
             raise RuntimeError("release failed: gpu driver error")
+
+
+class SnapshotReleaseProvider(StubReleaseProvider):
+    """记录每次 release 时工作流已启动的运行，用来检查先停止之前的部署、后启动新的运行。"""
+
+    def __init__(self, workflow: StubWorkflowRuntime) -> None:
+        super().__init__()
+        self._workflow = workflow
+        self.started_before: list[list[str]] = []
+
+    async def release(self, resource: Resource) -> None:
+        self.started_before.append(list(self._workflow.idempotency_keys))
+        await super().release(resource)
 
 
 def _controller(
@@ -311,10 +341,12 @@ def _allocate(registry: SQLiteRegistry, service: InferenceService, device_id: st
     return asyncio.run(registry.create_allocation(meta.tenant_id, owner, f"{meta.uid}:1", [device]))
 
 
-def _allocated_service(phase: InferencePhase) -> tuple[SQLiteRegistry, InferenceService]:
-    """注册表中处于 ``phase`` 的服务，它持有一个设备的 Active 分配。"""
+def _allocated_service(
+    phase: InferencePhase, observed_generation: int = 0
+) -> tuple[SQLiteRegistry, InferenceService]:
+    """注册表中处于 ``phase`` 的服务（第 1 代 spec），它持有一个设备的 Active 分配。"""
     registry = SQLiteRegistry()
-    service = make_inference_service(phase=phase)
+    service = make_inference_service(phase=phase, observed_generation=observed_generation)
     asyncio.run(registry.put(service))
     _allocate(registry, service)
     return registry, service
@@ -380,10 +412,12 @@ def test_compute_diff_pending_needs_reconcile():
         ("Preparing", True),
         ("Deploying", False),
         ("Verifying", False),
+        ("Updating", False),
     ],
 )
 def test_compute_diff_needs_the_scheduler_until_the_workflow_starts(phase, needs_allocation):
-    """部署过程中的每一轮都要用到工作流运行时；Preparing 及之前还要用到调度器。"""
+    """部署与更新过程中的每一轮都要用到工作流运行时；Preparing 及之前还要用到调度器
+    （Updating 在部署时自行检查）。"""
     observed = {} if phase is None else {"phase": phase}
     diff = ReconciliationController._compute_diff(make_resource(), observed)
     assert diff["needs_reconcile"] is True
@@ -392,9 +426,48 @@ def test_compute_diff_needs_the_scheduler_until_the_workflow_starts(phase, needs
 
 
 @pytest.mark.unit
-@pytest.mark.parametrize("phase", ["Ready", "Degraded", "Updating", "Failed", "Unknown"])
+@pytest.mark.parametrize("phase", ["Ready", "Degraded"])
+def test_compute_diff_starts_an_update_once_the_spec_of_a_serving_service_changed(phase):
+    """服务中的资源 generation 大于 observedGeneration 时需要协调（开始更新），这一轮要求
+    调度器与工作流运行时都已注入。"""
+    changed = make_resource(generation=2, observed_generation=1)
+
+    diff = ReconciliationController._compute_diff(changed, {"phase": phase})
+
+    assert (diff["needs_reconcile"], diff["needs_allocation"], diff["needs_workflow"]) == (
+        True,
+        True,
+        True,
+    )
+
+
+@pytest.mark.unit
+def test_compute_diff_leaves_a_ready_service_alone_until_its_spec_changes():
+    unchanged = make_resource(generation=2, observed_generation=2)
+    assert ReconciliationController._compute_diff(unchanged, {"phase": "Ready"}) == {
+        "needs_reconcile": False,
+        "operation": "noop",
+    }
+
+
+@pytest.mark.unit
+def test_compute_diff_always_reconciles_a_degraded_service():
+    """spec 没有变化的 Degraded 同样需要协调（恢复时可能重新部署），需要调度器与工作流运行时。"""
+    unchanged = make_resource(generation=2, observed_generation=2)
+
+    diff = ReconciliationController._compute_diff(unchanged, {"phase": "Degraded"})
+
+    assert (diff["needs_reconcile"], diff["needs_allocation"], diff["needs_workflow"]) == (
+        True,
+        True,
+        True,
+    )
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("phase", ["Failed", "Unknown"])
 def test_compute_diff_has_nothing_to_do_outside_a_deployment(phase):
-    """部署之外的 phase 没有可做的事，新 generation 也一样（还没有更新流程）。"""
+    """Failed / Unknown 没有可做的事，新 generation 也一样。"""
     resource = make_resource(generation=2, observed_generation=1)
     diff = ReconciliationController._compute_diff(resource, {"phase": phase})
     assert diff == {"needs_reconcile": False, "operation": "noop"}
@@ -505,7 +578,7 @@ def test_policy_is_evaluated_only_when_leaving_pending():
     controller = _controller(
         policy=policy,
         scheduler=MockScheduler(),
-        workflow=StubWorkflowRuntime(run=make_run(WorkflowStatus.SUCCEEDED)),
+        workflow=StubWorkflowRuntime(run=make_run(WorkflowStatus.SUCCEEDED), key=None),
     )
 
     patches = asyncio.run(_deploy(controller, make_inference_service(phase=InferencePhase.PENDING)))
@@ -543,6 +616,7 @@ def test_reconcile_without_scheduler_reports_unavailable(phase):
         InferencePhase.PREPARING,
         InferencePhase.DEPLOYING,
         InferencePhase.VERIFYING,
+        InferencePhase.UPDATING,
     ],
 )
 def test_reconcile_without_workflow_runtime_does_not_allocate(phase):
@@ -670,7 +744,7 @@ def test_a_deployment_moves_one_phase_per_pass():
     """每轮一个合法转移直到 Ready：两次分配请求同一幂等键（Preparing 取回分配），
     工作流只启动一次。"""
     scheduler = MockScheduler()
-    workflow = StubWorkflowRuntime(run=make_run(WorkflowStatus.SUCCEEDED))
+    workflow = StubWorkflowRuntime(run=make_run(WorkflowStatus.SUCCEEDED), key=None)
     controller = _controller(scheduler=scheduler, workflow=workflow)
 
     patches = asyncio.run(_deploy(controller, make_inference_service(phase=InferencePhase.PENDING)))
@@ -683,7 +757,7 @@ def test_a_deployment_moves_one_phase_per_pass():
         "Ready",
     ]
     assert [req.idempotency_key for req in scheduler.requests] == ["uid-1:1", "uid-1:1"]
-    assert workflow.idempotency_keys == [deployment_run_key("uid-1")]
+    assert workflow.idempotency_keys == [RUN_KEY]
     assert patches[-1]["endpoints"] == [INSTANCE.endpoint().model_dump(mode="json")]
 
 
@@ -803,8 +877,8 @@ def test_reconcile_requeue_after_allocation_failure_retries_allocation(make_stor
 
 @pytest.mark.unit
 def test_preparing_starts_the_deployment_workflow_with_the_allocation():
-    """Preparing：以同一幂等键取回分配，以 uid 的幂等键启动部署工作流，输入携带分配的
-    设备与 spec；进入 Deploying，按 workflow_poll_interval 重新排队。"""
+    """Preparing：以同一幂等键取回分配，以 uid + generation 的幂等键启动部署工作流，输入
+    携带分配的设备与 spec；进入 Deploying，按 workflow_poll_interval 重新排队。"""
     scheduler = MockScheduler()
     workflow = StubWorkflowRuntime()
     service = make_inference_service(
@@ -816,9 +890,9 @@ def test_preparing_starts_the_deployment_workflow_with_the_allocation():
 
     assert [req.idempotency_key for req in scheduler.requests] == ["uid-1:2"]
     [(definition, inputs, key)] = workflow.started
-    assert (definition.name, key) == (DEPLOYMENT_WORKFLOW, "deployment:uid-1")
+    assert (definition.name, key) == (DEPLOYMENT_WORKFLOW, "deployment:uid-1:2")
     assert LaunchRequest.model_validate(inputs["request"]) == LaunchRequest(
-        instance_key="deployment:uid-1",
+        instance_key="deployment:uid-1:2",
         tenant_id="tenant-1",
         resource=ResourceRef(
             kind="InferenceService", namespace="team-a", name="svc-1", uid="uid-1"
@@ -861,7 +935,7 @@ def test_workflow_start_failure_keeps_preparing_and_backs_off():
     assert failures[0].status_patch == _not_ready("WorkflowStartFailed", "workflow store is locked")
     assert started.status_patch["phase"] == "Deploying"
     assert failed_again.requeue_after == 1.0
-    assert workflow.idempotency_keys == ["deployment:uid-1"] * 10
+    assert workflow.idempotency_keys == [RUN_KEY] * 10
     assert ctx.dedup_key not in controller._processed_keys
     assert asyncio.run(registry.get_active_allocation("uid-1", "tenant-1")) is not None
 
@@ -889,7 +963,7 @@ def test_an_unfinished_run_is_polled_without_writing_status(phase, run):
     result = asyncio.run(controller.reconcile(ctx))
 
     assert (result.done, result.requeue_after, result.status_patch) == (False, 0.5, {})
-    assert workflow.lookups == ["deployment:uid-1"]
+    assert workflow.lookups == [RUN_KEY]
     assert workflow.started == []
     assert ctx.dedup_key not in controller._processed_keys
 
@@ -999,8 +1073,9 @@ def test_a_failed_run_fails_the_service_and_releases_its_allocation(run, message
 
 
 @pytest.mark.unit
-def test_an_instance_that_compensation_could_not_stop_keeps_the_allocation():
-    """补偿没能停止实例：进入 Failed 但保留分配（实例可能仍在运行），删除资源时再处理。"""
+def test_an_instance_that_compensation_could_not_stop_keeps_the_allocation_for_now():
+    """补偿没能停止实例：进入 Failed 但暂时保留分配（实例可能仍在运行），立即重新排队，由
+    之后的 Failed 一轮停止实例、释放分配。"""
     run = make_run(
         WorkflowStatus.FAILED,
         StepStatus.COMPENSATION_FAILED,
@@ -1013,12 +1088,13 @@ def test_an_instance_that_compensation_could_not_stop_keeps_the_allocation():
 
     result = asyncio.run(controller.reconcile(make_service_context(service)))
 
+    assert (result.done, result.requeue_after) == (True, 0.0)
     assert result.status_patch == {
         "phase": "Failed",
         **_not_ready(
             "WorkflowFailed",
             "step 'verify-instance' failed: timed out; instance instance-1 may still be running "
-            "and is stopped when the resource is deleted",
+            "and is stopped before the allocation is released",
         ),
     }
     assert asyncio.run(registry.get_active_allocation("uid-1", "tenant-1")) is not None
@@ -1028,7 +1104,7 @@ def test_an_instance_that_compensation_could_not_stop_keeps_the_allocation():
 @pytest.mark.parametrize(
     ("run", "reason", "message"),
     [
-        (None, "WorkflowRunNotFound", "deployment workflow run 'deployment:uid-1' not found"),
+        (None, "WorkflowRunNotFound", "deployment workflow run 'deployment:uid-1:1' not found"),
         (
             make_run(WorkflowStatus.SUCCEEDED, outputs=False),
             "WorkflowFailed",
@@ -1038,7 +1114,7 @@ def test_an_instance_that_compensation_could_not_stop_keeps_the_allocation():
 )
 def test_a_run_that_cannot_tell_where_its_instance_is_keeps_the_allocation(run, reason, message):
     """找不到运行（如工作流数据库被重置），或运行成功却没有报告实例：无法确认实例是否
-    在运行，进入 Failed 并保留分配。"""
+    在运行，进入 Failed 并保留分配，立即重新排队（之后的 Failed 一轮同样保留分配）。"""
     registry, service = _allocated_service(InferencePhase.DEPLOYING)
     controller = _controller(
         registry=registry, scheduler=MockScheduler(), workflow=StubWorkflowRuntime(run=run)
@@ -1046,11 +1122,119 @@ def test_a_run_that_cannot_tell_where_its_instance_is_keeps_the_allocation(run, 
 
     result = asyncio.run(controller.reconcile(make_service_context(service)))
 
-    assert (result.done, result.status_patch) == (
+    assert (result.done, result.requeue_after, result.status_patch) == (
         True,
+        0.0,
         {"phase": "Failed", **_not_ready(reason, message)},
     )
     assert asyncio.run(registry.get_active_allocation("uid-1", "tenant-1")) is not None
+
+
+@pytest.mark.unit
+def test_a_failed_service_stops_its_instance_before_releasing_its_allocation():
+    """spec 没有变化的 Failed 一轮（补偿没能停止实例，分配还在）：经 release provider 停止
+    实例，然后释放分配；这一轮不写 status、登记去重键，之后的协调不再停止。"""
+    run = make_run(WorkflowStatus.FAILED, StepStatus.COMPENSATION_FAILED)
+    registry, service = _allocated_service(InferencePhase.FAILED, observed_generation=1)
+    release = StubReleaseProvider()
+    controller = _controller(
+        registry=registry, workflow=StubWorkflowRuntime(run=run), release=release
+    )
+    ctx = make_service_context(service)
+
+    results = [asyncio.run(controller.reconcile(ctx)) for _ in range(2)]
+
+    assert [(r.done, r.requeue_after, r.status_patch) for r in results] == [(True, None, {})] * 2
+    assert release.released == ["svc-1"]
+    assert ctx.dedup_key in controller._processed_keys
+    assert asyncio.run(registry.get_active_allocation("uid-1", "tenant-1")) is None
+    assert asyncio.run(registry.allocated_devices()) == frozenset()
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("failure", ["lookup", "stop"])
+def test_a_failed_service_whose_deployment_cannot_be_stopped_keeps_its_allocation(failure):
+    """Failed 一轮查询运行或停止实例失败：保留分配，不写 status、不登记去重键，按指数退避
+    重试；之后停止成功时释放分配。"""
+    workflow = StubWorkflowRuntime(
+        run=make_run(WorkflowStatus.FAILED, StepStatus.COMPENSATION_FAILED)
+    )
+    release = StubReleaseProvider()
+    if failure == "lookup":
+        workflow.lookup_error = RuntimeError("database is locked")
+    else:
+        release.fail = True
+    registry, service = _allocated_service(InferencePhase.FAILED, observed_generation=1)
+    controller = _controller(
+        registry=registry, workflow=workflow, release=release, workflow_poll_interval=0.5
+    )
+    ctx = make_service_context(service)
+
+    failures = [asyncio.run(controller.reconcile(ctx)) for _ in range(2)]
+    held = asyncio.run(registry.get_active_allocation("uid-1", "tenant-1"))
+    marked = ctx.dedup_key in controller._processed_keys
+    workflow.lookup_error, release.fail = None, False
+    stopped = asyncio.run(controller.reconcile(ctx))
+
+    assert [(r.done, r.requeue_after, r.status_patch) for r in failures] == [
+        (False, 0.5, {}),
+        (False, 1.0, {}),
+    ]
+    assert (held is not None, marked) == (True, False)
+    assert (stopped.done, stopped.status_patch) == (True, {})
+    assert asyncio.run(registry.get_active_allocation("uid-1", "tenant-1")) is None
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "runs",
+    [
+        {},
+        {RUN_KEY: make_run(WorkflowStatus.SUCCEEDED, outputs=False)},
+        {
+            RUN_KEY: make_run(WorkflowStatus.SUCCEEDED, outputs=False),
+            deployment_run_key("uid-1", 2): make_run(
+                WorkflowStatus.FAILED, StepStatus.COMPENSATION_FAILED
+            ),
+        },
+    ],
+    ids=["no-run", "no-instance-reported", "one-run-reports-no-instance"],
+)
+def test_a_failed_service_whose_instance_cannot_be_found_keeps_its_allocation(runs):
+    """Failed 一轮找不到运行，或有运行成功却没有报告实例：无从停止实例，不调用 release
+    provider，保留分配（删除资源时释放），登记去重键。"""
+    registry, service = _allocated_service(InferencePhase.FAILED, observed_generation=1)
+    workflow = StubWorkflowRuntime()
+    workflow.runs = dict(runs)
+    release = StubReleaseProvider()
+    controller = _controller(registry=registry, workflow=workflow, release=release)
+    ctx = make_service_context(service)
+
+    result = asyncio.run(controller.reconcile(ctx))
+
+    assert (result.done, result.requeue_after, result.status_patch) == (True, None, {})
+    assert release.released == []
+    assert ctx.dedup_key in controller._processed_keys
+    assert asyncio.run(registry.get_active_allocation("uid-1", "tenant-1")) is not None
+
+
+@pytest.mark.unit
+def test_a_failed_service_without_an_allocation_has_nothing_to_stop():
+    """Failed 一轮且资源没有 Active 分配（失败时已释放）：不查询运行、不调用 release
+    provider，登记去重键。"""
+    registry = SQLiteRegistry()
+    service = make_inference_service(phase=InferencePhase.FAILED, observed_generation=1)
+    asyncio.run(registry.put(service))
+    workflow = StubWorkflowRuntime(run=make_run(WorkflowStatus.FAILED, StepStatus.COMPENSATED))
+    release = StubReleaseProvider()
+    controller = _controller(registry=registry, workflow=workflow, release=release)
+    ctx = make_service_context(service)
+
+    result = asyncio.run(controller.reconcile(ctx))
+
+    assert (result.done, result.status_patch) == (True, {})
+    assert (workflow.lookups, release.released) == ([], [])
+    assert ctx.dedup_key in controller._processed_keys
 
 
 @pytest.mark.unit
@@ -1079,27 +1263,687 @@ def test_a_failed_run_lookup_keeps_the_phase_and_backs_off():
 
 @pytest.mark.unit
 @pytest.mark.parametrize(
-    "phase",
+    ("phase", "observed_generation"),
     [
-        InferencePhase.READY,
-        InferencePhase.DEGRADED,
-        InferencePhase.UPDATING,
-        InferencePhase.FAILED,
-        InferencePhase.UNKNOWN,
+        (InferencePhase.READY, 2),
+        (InferencePhase.FAILED, 2),
+        (InferencePhase.UNKNOWN, 1),
     ],
 )
-def test_services_outside_a_deployment_are_left_alone(phase):
-    """部署之外的 phase 没有可做的事：Failed 不自动重试，Ready 的新 generation 不重新部署。"""
+def test_services_outside_a_deployment_are_left_alone(phase, observed_generation):
+    """部署之外没有可做的事：spec 没有变化的 Ready / Failed（不自动重试），以及 Unknown
+    （spec 变化也一样）。"""
     scheduler = MockScheduler()
     workflow = StubWorkflowRuntime()
     controller = _controller(scheduler=scheduler, workflow=workflow)
-    service = make_inference_service(phase=phase, generation=2, observed_generation=1)
+    service = make_inference_service(
+        phase=phase, generation=2, observed_generation=observed_generation
+    )
 
     result = asyncio.run(controller.reconcile(make_service_context(service)))
 
     assert (result.done, result.requeue_after, result.status_patch) == (True, None, {})
     assert scheduler.allocate_called is False
     assert (workflow.started, workflow.lookups) == ([], [])
+
+
+@pytest.mark.unit
+def test_a_failed_service_whose_spec_changed_goes_back_to_pending():
+    """Failed 且 spec 变化：回到 Pending、清空 endpoint，立即重新排队；这一轮没有副作用，
+    不评估策略（Pending 一轮像对新建的资源一样授权），不登记去重键。"""
+    policy = SequencePolicyEngine("deny")
+    scheduler = MockScheduler()
+    workflow = StubWorkflowRuntime(run=make_run(WorkflowStatus.FAILED))
+    release = StubReleaseProvider()
+    controller = _controller(policy=policy, scheduler=scheduler, workflow=workflow, release=release)
+    service = make_inference_service(
+        phase=InferencePhase.FAILED, generation=2, observed_generation=1
+    )
+    ctx = make_service_context(service)
+
+    result = asyncio.run(controller.reconcile(ctx))
+
+    assert (result.done, result.requeue_after) == (False, 0.0)
+    assert result.status_patch == {
+        "phase": "Pending",
+        "endpoints": [],
+        **_not_ready("Pending", "the spec changed (generation 2); deploying it again"),
+    }
+    assert (policy.calls, scheduler.requests, workflow.lookups, release.released) == (
+        0,
+        [],
+        [],
+        [],
+    )
+    assert ctx.dedup_key not in controller._processed_keys
+
+
+# ---------------------------------------------------------------------- #
+# 部署过程中 spec 变化
+# ---------------------------------------------------------------------- #
+
+
+def _two_gpu_scheduler(registry: SQLiteRegistry) -> FirstFitScheduler:
+    """``node-a`` 上一张 24 GiB（``gpu-0``）与一张 80 GiB（``gpu-1``）的卡。"""
+    devices = [
+        {"id": "gpu-0", "type": "nvidia-gpu", "memoryGiB": 24},
+        {"id": "gpu-1", "type": "nvidia-gpu", "memoryGiB": 80},
+    ]
+    inventory = Inventory.model_validate_json(
+        json.dumps({"nodes": [{"id": "node-a", "devices": devices}]})
+    )
+    return FirstFitScheduler(registry, inventory)
+
+
+@pytest.mark.unit
+def test_preparing_stops_the_previous_deployment_before_starting_a_run():
+    """Preparing 没有当前 generation 的运行：先经 release provider 停止资源之前的部署（如
+    旧 generation 仍在进行的运行），再启动当前 generation 的运行。"""
+    workflow = StubWorkflowRuntime(run=make_run(WorkflowStatus.RUNNING, StepStatus.RUNNING))
+    release = SnapshotReleaseProvider(workflow)
+    controller = _controller(scheduler=MockScheduler(), workflow=workflow, release=release)
+    service = make_inference_service(phase=InferencePhase.PREPARING, generation=2)
+
+    result = asyncio.run(controller.reconcile(make_service_context(service)))
+
+    assert release.started_before == [[]]
+    assert workflow.idempotency_keys == [deployment_run_key("uid-1", 2)]
+    assert result.status_patch == _progress("Deploying", "deployment workflow run run-1 started")
+
+
+@pytest.mark.unit
+def test_a_replayed_preparing_pass_follows_the_run_it_already_started():
+    """上一轮启动了当前 generation 的运行、没能写入 Deploying：重放的一轮沿用这次运行，
+    不停止它、也不再启动。"""
+    workflow = StubWorkflowRuntime(run=make_run(WorkflowStatus.RUNNING, StepStatus.RUNNING))
+    release = StubReleaseProvider()
+    controller = _controller(scheduler=MockScheduler(), workflow=workflow, release=release)
+    ctx = make_service_context(make_inference_service(phase=InferencePhase.PREPARING))
+
+    result = asyncio.run(controller.reconcile(ctx))
+
+    assert (release.released, workflow.started) == ([], [])
+    assert result.status_patch == _progress("Deploying", "deployment workflow run run-1 started")
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("phase", [InferencePhase.DEPLOYING, InferencePhase.VERIFYING])
+@pytest.mark.parametrize(
+    "run",
+    [make_run(WorkflowStatus.RUNNING, StepStatus.SUCCEEDED), make_run(WorkflowStatus.SUCCEEDED)],
+    ids=["in-progress", "succeeded"],
+)
+def test_a_spec_change_during_the_deployment_deploys_the_new_generation(phase, run):
+    """部署过程中 spec 变化（只有上一代 spec 的运行）：停止之前的部署，以新的 generation
+    取得分配、启动运行，phase 不变；上一代的运行即使已成功也不会让服务进入 Ready。"""
+    workflow = StubWorkflowRuntime(run=run)
+    release = SnapshotReleaseProvider(workflow)
+    scheduler = MockScheduler()
+    controller = _controller(
+        scheduler=scheduler, workflow=workflow, release=release, workflow_poll_interval=0.5
+    )
+    service = make_inference_service(phase=phase, generation=2, observed_generation=1)
+
+    result = asyncio.run(controller.reconcile(make_service_context(service)))
+
+    [(_, inputs, key)] = workflow.started
+    assert key == deployment_run_key("uid-1", 2)
+    assert LaunchRequest.model_validate(inputs["request"]).instance_key == key
+    assert release.started_before == [[]]
+    assert [req.idempotency_key for req in scheduler.requests] == ["uid-1:2"]
+    assert (result.done, result.requeue_after) == (False, 0.5)
+    assert result.status_patch == _not_ready(
+        phase.value,
+        "generation 2 replaces the deployment in progress: deployment workflow run run-1 started",
+    )
+
+
+@pytest.mark.unit
+def test_a_previous_deployment_that_cannot_be_stopped_blocks_the_new_one():
+    """停止之前的部署失败：不分配、不启动新的运行，停在当前 phase（StopFailed），按指数退避
+    重试，不登记去重键。"""
+    workflow = StubWorkflowRuntime(run=make_run(WorkflowStatus.RUNNING, StepStatus.SUCCEEDED))
+    scheduler = MockScheduler()
+    controller = _controller(
+        scheduler=scheduler,
+        workflow=workflow,
+        release=StubReleaseProvider(fail=True),
+        workflow_poll_interval=0.5,
+    )
+    service = make_inference_service(phase=InferencePhase.VERIFYING, generation=2)
+    ctx = make_service_context(service)
+
+    results = [asyncio.run(controller.reconcile(ctx)) for _ in range(2)]
+
+    assert [result.requeue_after for result in results] == [0.5, 1.0]
+    assert results[0].status_patch == _not_ready(
+        "StopFailed",
+        "the previous deployment could not be stopped: release failed: gpu driver error",
+    )
+    assert (scheduler.requests, workflow.started) == ([], [])
+    assert ctx.dedup_key not in controller._processed_keys
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("phase", [InferencePhase.DEPLOYING, InferencePhase.UPDATING])
+def test_replacing_a_deployment_without_a_scheduler_reports_unavailable(phase):
+    """需要为新的 generation 取得分配、却未注入调度器：SchedulerUnavailable，不停止之前的
+    部署、不启动运行。"""
+    workflow = StubWorkflowRuntime(run=make_run(WorkflowStatus.RUNNING, StepStatus.RUNNING))
+    release = StubReleaseProvider()
+    controller = _controller(workflow=workflow, release=release)
+    service = make_inference_service(phase=phase, generation=2)
+
+    result = asyncio.run(controller.reconcile(make_service_context(service)))
+
+    assert (result.done, result.requeue_after) == (False, None)
+    assert result.status_patch == _not_ready(
+        "SchedulerUnavailable", "no scheduler is configured to allocate resources"
+    )
+    assert (release.released, workflow.started) == ([], [])
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("phase", "next_phase"),
+    [
+        (InferencePhase.SCHEDULING, "Preparing"),
+        (InferencePhase.PREPARING, "Deploying"),
+        (InferencePhase.VERIFYING, None),
+    ],
+)
+def test_an_accelerator_change_releases_the_allocation_and_allocates_again(phase, next_phase):
+    """资源持有的分配（第 1 代 spec 的 24 GiB 卡）不满足新的申请（至少 40 GiB）：调度器拒绝
+    复用，协调器先停止之前的部署、释放这个分配，再按新的申请分配（80 GiB 卡）并照常推进。"""
+    registry = SQLiteRegistry()
+    accelerator = AcceleratorSpec(type="nvidia-gpu", minMemoryGiB=40)
+    service = make_inference_service(
+        phase=phase, accelerator=accelerator, generation=2, observed_generation=1
+    )
+    asyncio.run(registry.put(service))
+    previous = _allocate(registry, service)
+    workflow = StubWorkflowRuntime(run=make_run(WorkflowStatus.RUNNING, StepStatus.SUCCEEDED))
+    release = SnapshotReleaseProvider(workflow)
+    controller = _controller(
+        registry=registry,
+        scheduler=_two_gpu_scheduler(registry),
+        workflow=workflow,
+        release=release,
+    )
+
+    result = asyncio.run(controller.reconcile(make_service_context(service)))
+
+    active = asyncio.run(registry.get_active_allocation("uid-1", "tenant-1"))
+    assert asyncio.run(registry.get_allocation(previous["id"]))["status"] == "Released"
+    assert (active["idempotency_key"], active["devices"]) == (
+        "uid-1:2",
+        [{"node_id": "node-a", "device_id": "gpu-1"}],
+    )
+    assert release.started_before[0] == []
+    assert result.status_patch.get("phase") == next_phase
+    assert result.status_patch["conditions"][0]["reason"] != "AllocationFailed"
+
+
+@pytest.mark.unit
+def test_an_accelerator_request_that_no_longer_fits_releases_the_allocation_and_waits():
+    """新的申请放不下：之前的部署已停止、分配已释放，停在当前 phase（AllocationFailed），
+    10 秒后再试。"""
+    registry = SQLiteRegistry()
+    accelerator = AcceleratorSpec(type="nvidia-gpu", minMemoryGiB=100)
+    service = make_inference_service(
+        phase=InferencePhase.SCHEDULING, accelerator=accelerator, generation=2
+    )
+    asyncio.run(registry.put(service))
+    previous = _allocate(registry, service)
+    release = StubReleaseProvider()
+    controller = _controller(
+        registry=registry,
+        scheduler=_two_gpu_scheduler(registry),
+        workflow=StubWorkflowRuntime(),
+        release=release,
+    )
+
+    result = asyncio.run(controller.reconcile(make_service_context(service)))
+
+    assert (result.done, result.requeue_after) == (False, 10.0)
+    assert result.status_patch == _not_ready(
+        "AllocationFailed", "no node has 1 free nvidia-gpu device(s) with at least 100 GiB"
+    )
+    assert release.released == ["svc-1"]
+    assert asyncio.run(registry.get_allocation(previous["id"]))["status"] == "Released"
+    assert asyncio.run(registry.allocated_devices()) == frozenset()
+
+
+@pytest.mark.unit
+def test_an_allocation_conflict_without_a_previous_allocation_is_an_allocation_failure():
+    """调度器报告冲突、资源却没有为之前的 generation 持有分配（持有的就是当前幂等键的
+    分配）：AllocationFailed，不停止部署、不释放分配。"""
+
+    class ConflictingScheduler(MockScheduler):
+        async def allocate(self, req: ScheduleRequest) -> AllocationRef:
+            await super().allocate(req)
+            raise ConflictError("idempotency_key 'uid-1:1' belongs to another resource")
+
+    registry, service = _allocated_service(InferencePhase.SCHEDULING)
+    release = StubReleaseProvider()
+    controller = _controller(
+        registry=registry,
+        scheduler=ConflictingScheduler(),
+        workflow=StubWorkflowRuntime(),
+        release=release,
+    )
+
+    result = asyncio.run(controller.reconcile(make_service_context(service)))
+
+    assert (result.done, result.requeue_after) == (False, 10.0)
+    assert result.status_patch == _not_ready(
+        "AllocationFailed", "idempotency_key 'uid-1:1' belongs to another resource"
+    )
+    assert release.released == []
+    assert asyncio.run(registry.get_active_allocation("uid-1", "tenant-1")) is not None
+
+
+# ---------------------------------------------------------------------- #
+# 更新已部署的服务：Ready / Degraded → Updating → Ready
+# ---------------------------------------------------------------------- #
+
+
+def _changed_service(phase: InferencePhase = InferencePhase.READY) -> InferenceService:
+    """spec 已变化（第 2 代，已处理到第 1 代）、实例为 :data:`INSTANCE` 的服务。"""
+    service = make_inference_service(phase=phase, generation=2, observed_generation=1)
+    ready = phase == InferencePhase.READY
+    service.status.endpoints = [INSTANCE.endpoint().model_copy(update={"ready": ready})]
+    return service
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("phase", [InferencePhase.READY, InferencePhase.DEGRADED])
+def test_a_spec_change_moves_a_serving_service_to_updating(phase):
+    """spec 变化：进入 Updating、endpoint 标记为未就绪，立即重新排队；这一轮没有副作用，
+    不登记去重键。"""
+    scheduler = MockScheduler()
+    workflow = StubWorkflowRuntime(run=make_run(WorkflowStatus.SUCCEEDED))
+    release = StubReleaseProvider()
+    controller = _controller(scheduler=scheduler, workflow=workflow, release=release)
+    ctx = make_service_context(_changed_service(phase))
+
+    result = asyncio.run(controller.reconcile(ctx))
+
+    endpoint = INSTANCE.endpoint().model_copy(update={"ready": False})
+    assert (result.done, result.requeue_after) == (False, 0.0)
+    assert result.status_patch == {
+        "phase": "Updating",
+        "endpoints": [endpoint.model_dump(mode="json")],
+        **_not_ready("Updating", "deploying generation 2"),
+    }
+    assert (scheduler.requests, workflow.lookups, workflow.started) == ([], [], [])
+    assert release.released == []
+    assert ctx.dedup_key not in controller._processed_keys
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("decision", "reason"),
+    [("deny", "PolicyDenied"), ("require_approval", "PolicyApprovalRequired")],
+)
+def test_an_update_the_policy_blocks_writes_no_status(decision, reason, caplog):
+    """策略拒绝或要求审批：服务照旧，不写 status（observedGeneration 不变，更新仍待处理），
+    日志说明原因，30 秒后重新评估。"""
+    policy = SequencePolicyEngine(decision, "allow")
+    controller = _controller(
+        policy=policy, scheduler=MockScheduler(), workflow=StubWorkflowRuntime()
+    )
+    ctx = make_service_context(_changed_service())
+
+    with caplog.at_level(logging.WARNING):
+        blocked = asyncio.run(controller.reconcile(ctx))
+    allowed = asyncio.run(controller.reconcile(ctx))
+
+    assert (blocked.done, blocked.requeue_after, blocked.status_patch) == (False, 30.0, {})
+    assert f"update not started: reason={reason} message=call-1" in caplog.text
+    assert allowed.status_patch["phase"] == "Updating"
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("components", "reason"),
+    [
+        ({"workflow": StubWorkflowRuntime()}, "SchedulerUnavailable"),
+        ({"scheduler": MockScheduler()}, "WorkflowRuntimeUnavailable"),
+    ],
+    ids=["without-scheduler", "without-workflow-runtime"],
+)
+def test_an_update_that_cannot_be_deployed_writes_no_status(components, reason, caplog):
+    """缺少调度器或工作流运行时：不进入 Updating、不写 status，服务照旧；配置变化需要重启，
+    重启后的全量同步再处理这次更新。"""
+    controller = _controller(**components)
+
+    with caplog.at_level(logging.WARNING):
+        result = asyncio.run(controller.reconcile(make_service_context(_changed_service())))
+
+    assert (result.done, result.requeue_after, result.status_patch) == (False, None, {})
+    assert f"update not started: reason={reason}" in caplog.text
+
+
+@pytest.mark.unit
+def test_updating_stops_the_previous_deployment_and_deploys_the_new_generation():
+    """Updating 且没有新 generation 的运行：先停止之前的部署，再以新 generation 的幂等键
+    取得分配、启动运行，清空 status.endpoints，按 workflow_poll_interval 重新排队。"""
+    workflow = StubWorkflowRuntime(run=make_run(WorkflowStatus.SUCCEEDED))
+    release = SnapshotReleaseProvider(workflow)
+    scheduler = MockScheduler()
+    controller = _controller(
+        scheduler=scheduler, workflow=workflow, release=release, workflow_poll_interval=0.5
+    )
+    service = make_inference_service(
+        phase=InferencePhase.UPDATING, generation=2, observed_generation=2
+    )
+
+    result = asyncio.run(controller.reconcile(make_service_context(service)))
+
+    [(_, inputs, key)] = workflow.started
+    assert release.started_before == [[]]
+    assert [req.idempotency_key for req in scheduler.requests] == ["uid-1:2"]
+    assert key == deployment_run_key("uid-1", 2)
+    assert LaunchRequest.model_validate(inputs["request"]).spec == service.spec
+    assert (result.done, result.requeue_after) == (False, 0.5)
+    assert result.status_patch == {
+        "endpoints": [],
+        **_not_ready("Updating", "deployment workflow run run-1 deploys generation 2"),
+    }
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("run", "phase"),
+    [
+        (make_run(WorkflowStatus.RUNNING, StepStatus.SUCCEEDED), None),
+        (make_run(WorkflowStatus.SUCCEEDED), "Ready"),
+        (
+            make_run(
+                WorkflowStatus.FAILED,
+                StepStatus.COMPENSATED,
+                error="step 'verify-instance' failed: connection refused",
+            ),
+            "Failed",
+        ),
+    ],
+    ids=["in-progress", "succeeded", "failed"],
+)
+def test_updating_follows_the_run_of_the_new_generation(run, phase):
+    """新 generation 的运行进行中时轮询、不写 status；成功后进入 Ready（写入新实例的地址并
+    登记去重键），失败后进入 Failed。不再停止部署、不再启动运行。"""
+    workflow = StubWorkflowRuntime(run=run, key=deployment_run_key("uid-1", 2))
+    release = StubReleaseProvider()
+    controller = _controller(scheduler=MockScheduler(), workflow=workflow, release=release)
+    service = make_inference_service(
+        phase=InferencePhase.UPDATING, generation=2, observed_generation=2
+    )
+
+    result = asyncio.run(controller.reconcile(make_service_context(service)))
+
+    assert (result.done, result.status_patch.get("phase")) == (phase is not None, phase)
+    assert (release.released, workflow.started) == ([], [])
+    if phase == "Ready":
+        assert result.status_patch["endpoints"] == [INSTANCE.endpoint().model_dump(mode="json")]
+
+
+# ---------------------------------------------------------------------- #
+# 实例丢失后重新部署（Degraded，以及运行成功之后实例丢失的 Verifying / Updating）
+# ---------------------------------------------------------------------- #
+
+
+class StubLauncher:
+    """只回答 ``is_running`` 的启动器替身：``running`` 中的实例在运行。"""
+
+    def __init__(self, *running: str) -> None:
+        self.running = set(running)
+
+    async def is_running(self, instance_id: str) -> bool:
+        return instance_id in self.running
+
+
+class ManualClock:
+    """手动推进的单调时钟（秒）。"""
+
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def __call__(self) -> float:
+        return self.now
+
+
+def _degraded_service() -> InferenceService:
+    """spec 没有变化（第 1 代）、实例 :data:`INSTANCE` 已标记为未就绪的 Degraded 服务。"""
+    service = make_inference_service(phase=InferencePhase.DEGRADED, observed_generation=1)
+    service.status.endpoints = [INSTANCE.endpoint().model_copy(update={"ready": False})]
+    return service
+
+
+def _redeploying(attempt: int) -> dict[str, Any]:
+    message = f"deployment workflow run run-1 redeploys the service (attempt {attempt})"
+    return {"endpoints": [], **_not_ready("InstanceLost", message)}
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "launcher", [StubLauncher("instance-1"), None], ids=["instance-back", "without-launcher"]
+)
+def test_a_degraded_service_whose_instance_runs_returns_to_ready(launcher):
+    """最近一次部署的运行成功、实例在运行（未注入启动器时无从确认，视为在运行）：回到
+    Ready，写入实例地址；不停止、不启动部署，也不登记去重键（同一代 spec 可能再次丢失实例）。"""
+    workflow = StubWorkflowRuntime(run=make_run(WorkflowStatus.SUCCEEDED))
+    release = StubReleaseProvider()
+    controller = _controller(
+        scheduler=MockScheduler(), workflow=workflow, release=release, launcher=launcher
+    )
+    ctx = make_service_context(_degraded_service())
+
+    result = asyncio.run(controller.reconcile(ctx))
+
+    assert (result.done, result.requeue_after) == (False, None)
+    assert result.status_patch["phase"] == "Ready"
+    assert result.status_patch["endpoints"] == [INSTANCE.endpoint().model_dump(mode="json")]
+    assert (release.released, workflow.started) == ([], [])
+    assert ctx.dedup_key not in controller._processed_keys
+
+
+@pytest.mark.unit
+def test_a_degraded_service_whose_instance_is_gone_is_deployed_again():
+    """实例不在运行：不评估策略（这一代 spec 已经授权），先停止之前的部署，再以这一代 spec
+    的分配幂等键取得分配、以下一次部署的幂等键启动运行；清空 status.endpoints，phase 不变，
+    不登记去重键。"""
+    policy = SequencePolicyEngine("deny")
+    workflow = StubWorkflowRuntime(run=make_run(WorkflowStatus.SUCCEEDED))
+    release = SnapshotReleaseProvider(workflow)
+    scheduler = MockScheduler()
+    controller = _controller(
+        policy=policy,
+        scheduler=scheduler,
+        workflow=workflow,
+        release=release,
+        launcher=StubLauncher(),
+        workflow_poll_interval=0.5,
+    )
+    ctx = make_service_context(_degraded_service())
+
+    result = asyncio.run(controller.reconcile(ctx))
+
+    [(_, inputs, key)] = workflow.started
+    assert key == deployment_run_key("uid-1", 1, 2)
+    assert LaunchRequest.model_validate(inputs["request"]).instance_key == key
+    assert release.started_before == [[]]
+    assert [req.idempotency_key for req in scheduler.requests] == ["uid-1:1"]
+    assert policy.calls == 0
+    assert (result.done, result.requeue_after) == (False, 0.5)
+    assert result.status_patch == _redeploying(2)
+    assert ctx.dedup_key not in controller._processed_keys
+
+
+@pytest.mark.unit
+def test_a_redeployment_in_progress_is_polled_without_writing_status():
+    workflow = StubWorkflowRuntime(run=make_run(WorkflowStatus.SUCCEEDED))
+    workflow.runs[deployment_run_key("uid-1", 1, 2)] = make_run(
+        WorkflowStatus.RUNNING, StepStatus.RUNNING
+    )
+    release = StubReleaseProvider()
+    controller = _controller(
+        scheduler=MockScheduler(),
+        workflow=workflow,
+        release=release,
+        launcher=StubLauncher(),
+        workflow_poll_interval=0.5,
+    )
+
+    result = asyncio.run(controller.reconcile(make_service_context(_degraded_service())))
+
+    assert (result.done, result.requeue_after, result.status_patch) == (False, 0.5, {})
+    assert (release.released, workflow.started) == ([], [])
+
+
+@pytest.mark.unit
+def test_a_degraded_service_deployed_before_runs_were_keyed_by_generation_is_deployed_again():
+    """运行来自旧版本（幂等键 ``deployment:{uid}``，不含 generation）：这一代 spec 没有
+    运行，以它的第一次部署重新部署。"""
+    workflow = StubWorkflowRuntime(run=make_run(WorkflowStatus.SUCCEEDED), key="deployment:uid-1")
+    controller = _controller(scheduler=MockScheduler(), workflow=workflow, launcher=StubLauncher())
+
+    result = asyncio.run(controller.reconcile(make_service_context(_degraded_service())))
+
+    assert workflow.idempotency_keys == [RUN_KEY]
+    assert result.status_patch == _redeploying(1)
+
+
+@pytest.mark.unit
+def test_redeployments_of_a_generation_back_off_from_the_last_start():
+    """第一次重新部署立即开始；之后等到与上一次开始相隔 10 秒、再 20 秒……，等待的一轮没有
+    副作用、不写 status；新的 generation 从头开始。"""
+    clock = ManualClock()
+    workflow = StubWorkflowRuntime(run=make_run(WorkflowStatus.SUCCEEDED))
+    controller = _controller(
+        scheduler=MockScheduler(), workflow=workflow, launcher=StubLauncher(), clock=clock
+    )
+    ctx = make_service_context(_degraded_service())
+
+    first = asyncio.run(controller.reconcile(ctx))
+    waiting = asyncio.run(controller.reconcile(ctx))
+    clock.now = 9.0
+    still_waiting = asyncio.run(controller.reconcile(ctx))
+    clock.now = 10.0
+    second = asyncio.run(controller.reconcile(ctx))
+    waiting_longer = asyncio.run(controller.reconcile(ctx))
+    newer = make_inference_service(
+        phase=InferencePhase.DEGRADED, generation=2, observed_generation=2
+    )
+    workflow.runs[deployment_run_key("uid-1", 2)] = make_run(WorkflowStatus.SUCCEEDED)
+    next_generation = asyncio.run(controller.reconcile(make_service_context(newer)))
+
+    assert (first.status_patch, second.status_patch) == (_redeploying(2), _redeploying(3))
+    assert [(r.done, r.requeue_after, r.status_patch) for r in (waiting, still_waiting)] == [
+        (False, REDEPLOY_BACKOFF_INITIAL_SECONDS, {}),
+        (False, 1.0, {}),
+    ]
+    assert waiting_longer.requeue_after == 2 * REDEPLOY_BACKOFF_INITIAL_SECONDS
+    assert next_generation.status_patch == _redeploying(2)
+    assert workflow.idempotency_keys == [
+        deployment_run_key("uid-1", 1, 2),
+        deployment_run_key("uid-1", 1, 3),
+        deployment_run_key("uid-1", 2, 2),
+    ]
+
+
+@pytest.mark.unit
+def test_a_failed_redeployment_reports_why_while_the_service_waits():
+    """重新部署的运行失败：等待退避期间不启动运行，Ready=False（WorkflowFailed）说明失败原因。"""
+    clock = ManualClock()
+    workflow = StubWorkflowRuntime(run=make_run(WorkflowStatus.SUCCEEDED))
+    controller = _controller(
+        scheduler=MockScheduler(), workflow=workflow, launcher=StubLauncher(), clock=clock
+    )
+    ctx = make_service_context(_degraded_service())
+    asyncio.run(controller.reconcile(ctx))
+    workflow.runs[deployment_run_key("uid-1", 1, 2)] = make_run(
+        WorkflowStatus.FAILED,
+        StepStatus.COMPENSATED,
+        error="step 'verify-instance' failed: connection refused",
+    )
+
+    waiting = asyncio.run(controller.reconcile(ctx))
+
+    assert (waiting.done, waiting.requeue_after) == (False, REDEPLOY_BACKOFF_INITIAL_SECONDS)
+    assert waiting.status_patch == _not_ready(
+        "WorkflowFailed",
+        "step 'verify-instance' failed: connection refused; redeploying the service after a "
+        "backoff",
+    )
+    assert len(workflow.started) == 1
+
+
+@pytest.mark.unit
+def test_a_redeployment_that_cannot_stop_the_previous_deployment_backs_off():
+    """停止之前的部署失败：不启动运行，Ready=False（StopFailed），按指数退避重试；每轮查询
+    运行成功不会让退避从头开始。"""
+    workflow = StubWorkflowRuntime(run=make_run(WorkflowStatus.SUCCEEDED))
+    controller = _controller(
+        scheduler=MockScheduler(),
+        workflow=workflow,
+        release=StubReleaseProvider(fail=True),
+        launcher=StubLauncher(),
+        workflow_poll_interval=0.5,
+    )
+    ctx = make_service_context(_degraded_service())
+
+    results = [asyncio.run(controller.reconcile(ctx)) for _ in range(3)]
+
+    assert [result.requeue_after for result in results] == [0.5, 1.0, 2.0]
+    assert results[0].status_patch == _not_ready(
+        "StopFailed",
+        "the previous deployment could not be stopped: release failed: gpu driver error",
+    )
+    assert workflow.started == []
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("phase", "generation"), [(InferencePhase.VERIFYING, 1), (InferencePhase.UPDATING, 2)]
+)
+def test_an_instance_lost_before_the_service_is_ready_is_deployed_again(phase, generation):
+    """运行成功、写入 Ready 之前实例已不在运行（如控制平面恰好重启）：phase 不变，以同一代
+    spec 的下一次部署重新部署，不把不存在的实例写进 status.endpoints。"""
+    workflow = StubWorkflowRuntime(
+        run=make_run(WorkflowStatus.SUCCEEDED), key=deployment_run_key("uid-1", generation)
+    )
+    controller = _controller(scheduler=MockScheduler(), workflow=workflow, launcher=StubLauncher())
+    service = make_inference_service(
+        phase=phase, generation=generation, observed_generation=generation
+    )
+
+    result = asyncio.run(controller.reconcile(make_service_context(service)))
+
+    assert workflow.idempotency_keys == [deployment_run_key("uid-1", generation, 2)]
+    assert (result.done, result.status_patch) == (False, _redeploying(2))
+
+
+@pytest.mark.unit
+def test_a_degraded_service_whose_run_reported_no_instance_fails():
+    """最近一次部署的运行成功却没有报告实例（运行时不返回步骤输出）：与部署中一样进入
+    Failed、保留分配，不重新部署（同样无从得知、无从停止新的实例）。"""
+    workflow = StubWorkflowRuntime(run=make_run(WorkflowStatus.SUCCEEDED, outputs=False))
+    controller = _controller(scheduler=MockScheduler(), workflow=workflow, launcher=StubLauncher())
+
+    result = asyncio.run(controller.reconcile(make_service_context(_degraded_service())))
+
+    assert (result.done, result.status_patch) == (
+        True,
+        {
+            "phase": "Failed",
+            **_not_ready(
+                "WorkflowFailed",
+                "deployment workflow run run-1 succeeded without reporting an instance",
+            ),
+        },
+    )
+    assert workflow.started == []
 
 
 # ---------------------------------------------------------------------- #
@@ -1111,7 +1955,7 @@ def test_services_outside_a_deployment_are_left_alone(phase):
 def test_reconcile_idempotent():
     """部署完成（Ready）时登记去重键：同一 dedup_key 的重放直接返回 done=True，无副作用。"""
     scheduler = MockScheduler()
-    workflow = StubWorkflowRuntime(run=make_run(WorkflowStatus.SUCCEEDED))
+    workflow = StubWorkflowRuntime(run=make_run(WorkflowStatus.SUCCEEDED), key=None)
     controller = _controller(scheduler=scheduler, workflow=workflow)
     asyncio.run(_deploy(controller, make_inference_service(phase=InferencePhase.PENDING)))
 
@@ -1120,7 +1964,7 @@ def test_reconcile_idempotent():
 
     assert (replay.done, replay.requeue_after, replay.status_patch) == (True, None, {})
     assert scheduler.allocate_count == 2
-    assert workflow.idempotency_keys == ["deployment:uid-1"]
+    assert workflow.idempotency_keys == [RUN_KEY]
 
 
 @pytest.mark.unit

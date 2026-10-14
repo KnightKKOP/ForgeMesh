@@ -21,15 +21,20 @@
   :class:`~forgemesh.controlplane.scheduler.FirstFitScheduler`，清单不可读或非法时
   拒绝启动；未设置时需要分配加速器的资源报告 ``Ready=False``
   （``SchedulerUnavailable``）。
-* **部署**：``FORGEMESH_RUNTIME_LAUNCHER``（``fake`` / ``vllm-process``，只能与清单一起
-  使用，见 :mod:`forgemesh.controlplane.deployment.config`）选择推理实例的启动器，配置
+* **部署**：``FORGEMESH_RUNTIME_LAUNCHER``（``fake`` / ``vllm-process`` / ``tgi-process``，
+  只能与清单一起使用，见 :mod:`forgemesh.controlplane.deployment.config`）选择推理实例的启动器，配置
   非法时拒绝启动。此时协调器分配加速器、经部署工作流启动并验证实例，就绪后写入
   ``status.endpoints``；删除时停止实例、释放分配。工作流运行存放在单独的数据库文件
   （:func:`~forgemesh.controlplane.sqlite.workflow_db_path`，如 ``forgemesh.workflows.db``）
-  中。启动时先恢复未完成的部署，再把实例已不在运行的 ``Ready`` 服务转为 ``Degraded``
-  （不会自动重新部署），然后才启动控制器；关闭时依次停止控制器、工作流运行时、启动器
-  （其实例随之停止）。``POST /workflows`` 不使用这个运行时（仍返回 503）。未设置时不部署，
-  协调器在分配之前即报告 ``WorkflowRuntimeUnavailable``。
+  中。启动时先结束上次运行留下、仍在运行的实例进程（进程启动器把实例记在数据库旁的文件
+  中，见 :func:`~forgemesh.controlplane.deployment.record_file_path`），再恢复未完成的部署，
+  然后把实例已不在运行的 ``Ready`` 服务转为 ``Degraded``（控制器随后重新部署它们），最后
+  才启动控制器；控制器运行中每隔
+  ``FORGEMESH_INSTANCE_CHECK_INTERVAL_SECONDS`` 秒（默认 10，不论是否选择启动器都校验）
+  再核对一次实例，启动时与每次全量同步之后停止归属资源已不存在的分配所属的部署、让这些
+  分配过期。关闭时依次停止控制器、工作流运行时、启动器（其实例随之停止）。
+  ``POST /workflows`` 不使用这个运行时（仍返回 503）。未设置时不部署，协调器在分配之前
+  即报告 ``WorkflowRuntimeUnavailable``。
 * **无导入副作用**：数据库在应用启动（lifespan）时才打开，导入本模块不会
   创建文件。
 * **探针**：``/healthz``（存活）恒为 ok；``/readyz``（就绪）探测权威存储可用。
@@ -41,6 +46,7 @@
 
 from __future__ import annotations
 
+import functools
 import ipaddress
 import json
 import logging
@@ -68,11 +74,15 @@ from .auth import (
 )
 from .controller import ControllerManager
 from .deployment import (
+    DEFAULT_INSTANCE_CHECK_INTERVAL_SECONDS,
     RUNTIME_LAUNCHER_ENV,
     DeploymentReleaser,
     DeploymentSteps,
+    check_instances,
+    instance_check_interval_from_env,
     launcher_from_env,
-    mark_lost_instances,
+    reclaim_orphaned_allocations,
+    record_file_path,
 )
 from .reconciler import ProcessedKeyStore, ReconciliationController
 from .scheduler import INVENTORY_FILE_ENV, FirstFitScheduler, inventory_from_env
@@ -178,6 +188,7 @@ def _build_controller(
     inventory: Inventory | None,
     runtime: LocalWorkflowRuntime | None = None,
     launcher: RuntimeLauncher | None = None,
+    instance_check_interval: float = DEFAULT_INSTANCE_CHECK_INTERVAL_SECONDS,
 ) -> ControllerManager:
     # 没有授权规则的 DefaultPolicyEngine 拒绝一切操作。资源的创建和删除已经由 API 的
     # 认证与 scope 把关，协调只是推进这些已被接受的期望状态，因此放行 reconcile。
@@ -199,7 +210,22 @@ def _build_controller(
         workflow_poll_interval=WORKFLOW_POLL_INTERVAL_SECONDS,
         launcher=launcher,
     )
-    return ControllerManager(registry, reconciler, poll_interval=CONTROLLER_POLL_INTERVAL_SECONDS)
+    instance_check = (
+        functools.partial(check_instances, registry, launcher) if launcher is not None else None
+    )
+    reclaim = (
+        functools.partial(reclaim_orphaned_allocations, registry, release)
+        if release is not None
+        else None
+    )
+    return ControllerManager(
+        registry,
+        reconciler,
+        poll_interval=CONTROLLER_POLL_INTERVAL_SECONDS,
+        instance_check=instance_check,
+        instance_check_interval=instance_check_interval,
+        reclaim=reclaim,
+    )
 
 
 if _FASTAPI_AVAILABLE:
@@ -244,8 +270,9 @@ if _FASTAPI_AVAILABLE:
                     len(inventory.nodes),
                     sum(len(node.devices) for node in inventory.nodes),
                 )
-            launcher = launcher_from_env(inventory)
             path = resolve_db_path(db_path)
+            launcher = launcher_from_env(inventory, record_file=record_file_path(path))
+            instance_check_interval = instance_check_interval_from_env()
             async with AsyncExitStack() as cleanup:
                 registry = init_registry(path)
                 cleanup.push_async_callback(registry.close)
@@ -270,16 +297,17 @@ if _FASTAPI_AVAILABLE:
                         type(launcher).__name__,
                         workflow_path,
                     )
+                    await launcher.start()
                     resumed = await runtime.recover()
-                    lost = await mark_lost_instances(registry, launcher)
+                    checked = await check_instances(registry, launcher, after_restart=True)
                     logger.info(
-                        "deployments recovered: %d unfinished run(s) resumed, %d Ready "
-                        "service(s) degraded because their instance is gone",
+                        "deployments recovered: %d unfinished run(s) resumed, %d service(s) "
+                        "whose instance is gone or back handed to the controller",
                         len(resumed),
-                        len(lost),
+                        len(checked),
                     )
                 controller = _build_controller(
-                    registry, processed_store, inventory, runtime, launcher
+                    registry, processed_store, inventory, runtime, launcher, instance_check_interval
                 )
                 cleanup.push_async_callback(controller.stop)
                 await controller.start()

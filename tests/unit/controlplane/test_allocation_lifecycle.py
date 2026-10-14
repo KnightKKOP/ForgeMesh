@@ -33,7 +33,7 @@ from forgemesh.resource.inference import (
     ResourcesSpec,
     RuntimeRef,
 )
-from forgemesh.workflow.runtime import RunRef
+from forgemesh.workflow.runtime import RunInfo, RunRef
 
 KIND = "InferenceService"
 TENANT = "tenant-a"
@@ -69,7 +69,7 @@ def _service(uid: str, min_memory: int = 16) -> InferenceService:
 
 
 class _Workflow:
-    """只记录启动请求的部署工作流替身：本模块的部署停在 Deploying 之前。"""
+    """只记录启动请求的部署工作流替身：本模块的部署停在 Deploying 之前，查不到任何运行。"""
 
     def __init__(self) -> None:
         self.requests: list[LaunchRequest] = []
@@ -77,6 +77,9 @@ class _Workflow:
     async def start(self, defn: Any, inputs: dict[str, Any], idempotency_key: str) -> RunRef:
         self.requests.append(LaunchRequest.model_validate(inputs["request"]))
         return RunRef(run_id=idempotency_key, definition_version=1)
+
+    async def find_runs(self, key_prefix: str) -> dict[str, RunInfo]:
+        return {}
 
 
 class _Release:

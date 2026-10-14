@@ -9,10 +9,20 @@
 * **变更来源**：启动时先记下当前变更序号，再全量列出资源键重建队列，之后按
   序号增量轮询 ``resource_changes`` 并清理已读记录，另有周期性全量同步兜底。
   ``status`` 变更（包括控制器自己的写入）不触发协调。
+* **实例核对**：注入 ``instance_check`` 时每隔 ``instance_check_interval`` 秒调用一次，把它
+  报告的资源加入队列（应用注入绑定了注册表与启动器的
+  :func:`~forgemesh.controlplane.deployment.check_instances`：实例已不在运行的 ``Ready``
+  服务由它转为 ``Degraded``，实例回来了的 ``Degraded`` 服务由它报告）；核对失败时记日志，
+  下一个周期重试。
+* **回收分配**：注入 ``reclaim`` 时，启动时与每次周期性全量同步之后各调用一次（应用注入
+  绑定了注册表与 :class:`~forgemesh.controlplane.deployment.DeploymentReleaser` 的
+  :func:`~forgemesh.controlplane.deployment.reclaim_orphaned_allocations`：停止归属资源已
+  不存在的分配所属的部署，再让分配过期）；失败时记日志，下一次全量同步之后重试，启动照常
+  继续。
 * **并发**：``workers`` 个 worker 协程；同一资源同一时刻只由一个 worker 处理。
 * **status 回写**：以协调前读到的 ``resource_version`` 做 CAS。冲突时重读：
-  ``uid``、``generation`` 与操作（reconcile / terminate）都没变就以新版本重试，
-  否则丢弃这次结果并立即重新排队。
+  ``uid``、``generation`` 与操作（reconcile / recover / reclaim / terminate）都没变就以新
+  版本重试，否则丢弃这次结果并立即重新排队。
 * **去重键**：协调器以 ``record_dedup_keys=False`` 构造，管理器在 status 写入
   成功之后才登记去重键，避免"已登记、状态却没写进去"。
 * **重新排队**：``requeue_after`` 非空时按该延迟重试；为空时不再定时重试，等待
@@ -24,7 +34,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import Collection
+from collections.abc import Awaitable, Callable, Collection, Iterable
 from typing import Any
 from uuid import uuid4
 
@@ -32,6 +42,7 @@ from forgemesh.core.errors import ConflictError, NotFoundError
 from forgemesh.core.objects import Resource
 from forgemesh.core.reconciler import ReconcileContext
 
+from ..deployment import DEFAULT_INSTANCE_CHECK_INTERVAL_SECONDS
 from ..reconciler import ReconciliationController, compute_dedup_key
 from ..registry import ChangeType, ResourceKey, SQLiteRegistry
 from .queue import WorkQueue
@@ -45,10 +56,25 @@ DEFAULT_KINDS: tuple[str, ...] = ("InferenceService",)
 MAX_POLL_BACKOFF_SECONDS = 30.0
 
 _TERMINATING = "Terminating"
+_DEGRADED = "Degraded"
+_FAILED = "Failed"
 
 
 def _operation(phase: str | None) -> str:
-    return "terminate" if phase == _TERMINATING else "reconcile"
+    """去重键与 status 写入核对所用的操作。
+
+    ``Degraded`` 单独使用 ``recover``：同一代 spec 可能多次丢失实例、多次恢复，部署进入
+    ``Ready`` 时登记的去重键不得挡住恢复；报告实例丢失（``Ready`` 转为 ``Degraded``）也让
+    读到 ``Ready`` 的那一轮的结果作废，不会覆盖这次报告。``Failed`` 单独使用 ``reclaim``：
+    进入 ``Failed`` 的一轮登记的去重键不得挡住之后停止遗留实例、释放分配的一轮。
+    """
+    if phase == _TERMINATING:
+        return "terminate"
+    if phase == _DEGRADED:
+        return "recover"
+    if phase == _FAILED:
+        return "reclaim"
+    return "reconcile"
 
 
 def _describe(key: ResourceKey) -> str:
@@ -67,6 +93,9 @@ class ControllerManager:
         resync_period: 全量同步周期（秒）。
         batch_size: 每次读取的变更记录条数上限。
         status_write_attempts: status 写入遇到版本冲突时的最多尝试次数。
+        instance_check: 可选，核对已部署实例的协程函数，返回要协调的资源键。
+        instance_check_interval: 两次核对实例之间的秒数。
+        reclaim: 可选，回收孤立分配的协程函数（返回值不使用）。
         queue: 工作队列；为空时新建（测试可注入）。
     """
 
@@ -81,6 +110,9 @@ class ControllerManager:
         resync_period: float = 600.0,
         batch_size: int = 500,
         status_write_attempts: int = 3,
+        instance_check: Callable[[], Awaitable[Iterable[ResourceKey]]] | None = None,
+        instance_check_interval: float = DEFAULT_INSTANCE_CHECK_INTERVAL_SECONDS,
+        reclaim: Callable[[], Awaitable[object]] | None = None,
         queue: WorkQueue[ResourceKey] | None = None,
     ) -> None:
         if reconciler.records_dedup_keys:
@@ -90,8 +122,8 @@ class ControllerManager:
             )
         if workers < 1 or batch_size < 1 or status_write_attempts < 1:
             raise ValueError("workers, batch_size and status_write_attempts must be >= 1")
-        if poll_interval <= 0 or resync_period <= 0:
-            raise ValueError("poll_interval and resync_period must be > 0")
+        if poll_interval <= 0 or resync_period <= 0 or instance_check_interval <= 0:
+            raise ValueError("poll_interval, resync_period and instance_check_interval must be > 0")
         self._registry = registry
         self._reconciler = reconciler
         self._kinds = frozenset(kinds)
@@ -100,6 +132,9 @@ class ControllerManager:
         self._resync_period = resync_period
         self._batch_size = batch_size
         self._status_write_attempts = status_write_attempts
+        self._instance_check = instance_check
+        self._instance_check_interval = instance_check_interval
+        self._reclaim = reclaim
         self._queue: WorkQueue[ResourceKey] = queue if queue is not None else WorkQueue()
         self._cursor = 0
         self._started = False
@@ -107,16 +142,24 @@ class ControllerManager:
         self._workers: list[asyncio.Task[None]] = []
 
     async def start(self) -> None:
-        """重建工作队列，然后启动变更轮询、全量同步与 worker 任务。"""
+        """重建工作队列并回收一次孤立的分配，然后启动变更轮询、全量同步、实例核对与 worker
+        任务。"""
         if self._started:
             raise RuntimeError("a controller manager can only be started once")
         self._started = True
         self._cursor = await self._registry.latest_change_seq()
         await self.resync()
+        await self._reclaim_logging_failures()
         self._watchers = [
             asyncio.create_task(self._watch_changes(), name="forgemesh-controller-changes"),
             asyncio.create_task(self._resync_periodically(), name="forgemesh-controller-resync"),
         ]
+        if self._instance_check is not None:
+            self._watchers.append(
+                asyncio.create_task(
+                    self._check_instances_periodically(), name="forgemesh-controller-instances"
+                )
+            )
         self._workers = [
             asyncio.create_task(self._work(), name=f"forgemesh-controller-worker-{index}")
             for index in range(self._worker_count)
@@ -145,6 +188,26 @@ class ControllerManager:
         """全量列出受管资源并加入队列。"""
         for key in await self._registry.list_resource_keys(self._kinds):
             self._queue.add(key)
+
+    async def check_instances(self) -> None:
+        """核对一次已部署的实例，把报告的受管资源加入队列；没有注入 ``instance_check`` 时
+        什么都不做。"""
+        if self._instance_check is None:
+            return
+        for key in await self._instance_check():
+            if key.kind in self._kinds:
+                self._queue.add(key)
+
+    async def reclaim(self) -> None:
+        """回收一次孤立的分配；没有注入 ``reclaim`` 时什么都不做。"""
+        if self._reclaim is not None:
+            await self._reclaim()
+
+    async def _reclaim_logging_failures(self) -> None:
+        try:
+            await self.reclaim()
+        except Exception:  # noqa: BLE001 - 下一次全量同步之后重试
+            logger.exception("controller allocation reclaim failed")
 
     async def poll_changes(self) -> int:
         """读取一批新的变更记录，把相关资源加入队列并清理已读记录，返回读到的条数。"""
@@ -263,6 +326,15 @@ class ControllerManager:
                 await self.resync()
             except Exception:  # noqa: BLE001 - 下一个周期重试
                 logger.exception("controller resync failed")
+            await self._reclaim_logging_failures()
+
+    async def _check_instances_periodically(self) -> None:
+        while True:
+            await asyncio.sleep(self._instance_check_interval)
+            try:
+                await self.check_instances()
+            except Exception:  # noqa: BLE001 - 下一个周期重试
+                logger.exception("controller instance check failed")
 
 
 __all__ = ["DEFAULT_KINDS", "ControllerManager"]

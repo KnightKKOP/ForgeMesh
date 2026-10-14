@@ -4,7 +4,11 @@
   加速器清单都拒绝启动；
 * ``fake``：监听地址与写进实例地址的主机；
 * ``vllm-process``：命令（默认要求本解释器装有 ``vllm``）、地址与时限；清单必须恰好有一个
-  节点，设备 id 都能写进 ``CUDA_VISIBLE_DEVICES`` 且不会选中同一块设备。
+  节点，设备 id 都能写进 ``CUDA_VISIBLE_DEVICES`` 且不会选中同一块设备；
+* ``tgi-process``：命令（默认要求 ``PATH`` 中有 ``text-generation-launcher``）、地址与时限
+  读自 ``FORGEMESH_TGI_*``，对清单的要求同 ``vllm-process``；
+* 控制器核对实例的间隔 ``FORGEMESH_INSTANCE_CHECK_INTERVAL_SECONDS``：默认 10 秒，取值
+  必须是有限的正数秒。
 """
 
 from __future__ import annotations
@@ -12,12 +16,15 @@ from __future__ import annotations
 import json
 import shlex
 import sys
+from pathlib import Path
 
 import pytest
 from forgemesh.controlplane.deployment import (
     FakeLauncher,
     LauncherConfigError,
+    TGIProcessLauncher,
     VLLMProcessLauncher,
+    instance_check_interval_from_env,
     launcher_from_env,
 )
 from forgemesh.controlplane.deployment import config as config_module
@@ -46,6 +53,7 @@ def _inventory(*nodes: tuple[str, tuple[str, ...]]) -> Inventory:
 
 ONE_NODE = _inventory(("node-a", ("gpu-0", "gpu-1")))
 VLLM = {"FORGEMESH_RUNTIME_LAUNCHER": "vllm-process", "FORGEMESH_VLLM_COMMAND": PYTHON}
+TGI = {"FORGEMESH_RUNTIME_LAUNCHER": "tgi-process", "FORGEMESH_TGI_COMMAND": PYTHON}
 
 
 def _refusal(inventory: Inventory | None, env: dict[str, str]) -> str:
@@ -68,6 +76,7 @@ def test_no_launcher_is_selected_when_the_variable_is_unset_or_blank(
     env = {
         "FORGEMESH_FAKE_LAUNCHER_BIND_HOST": "not-an-address",
         "FORGEMESH_VLLM_COMMAND": "/no/such/vllm",
+        "FORGEMESH_TGI_COMMAND": "/no/such/tgi",
     }
     if value is not None:
         env["FORGEMESH_RUNTIME_LAUNCHER"] = value
@@ -76,17 +85,18 @@ def test_no_launcher_is_selected_when_the_variable_is_unset_or_blank(
 
 
 @pytest.mark.unit
-@pytest.mark.parametrize("value", ["docker", "vllm", "fake,vllm-process"])
+@pytest.mark.parametrize("value", ["docker", "vllm", "tgi", "fake,vllm-process"])
 def test_an_unknown_launcher_is_refused(value: str) -> None:
     message = _refusal(ONE_NODE, {"FORGEMESH_RUNTIME_LAUNCHER": value})
 
     assert message == (
-        f"unsupported FORGEMESH_RUNTIME_LAUNCHER={value!r}; expected 'fake' or 'vllm-process'"
+        f"unsupported FORGEMESH_RUNTIME_LAUNCHER={value!r}; expected 'fake', 'vllm-process' "
+        "or 'tgi-process'"
     )
 
 
 @pytest.mark.unit
-@pytest.mark.parametrize("value", ["fake", "vllm-process"])
+@pytest.mark.parametrize("value", ["fake", "vllm-process", "tgi-process"])
 def test_a_launcher_requires_the_accelerator_inventory(value: str) -> None:
     message = _refusal(None, {"FORGEMESH_RUNTIME_LAUNCHER": value})
 
@@ -313,6 +323,166 @@ def test_the_vllm_launcher_needs_an_inventory_of_this_host(
     assert message in _refusal(inventory, dict(VLLM))
 
 
+# ---------------------------------------------------------------------- #
+# tgi-process
+# ---------------------------------------------------------------------- #
+
+
+@pytest.mark.unit
+def test_the_tgi_launcher_runs_text_generation_launcher_from_path_by_default(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    executable = tmp_path / "text-generation-launcher"
+    executable.write_text("#!/bin/sh\n", encoding="utf-8")
+    executable.chmod(0o755)
+    monkeypatch.setenv("PATH", str(tmp_path))
+    env = {"FORGEMESH_RUNTIME_LAUNCHER": "tgi-process", "FORGEMESH_VLLM_BIND_HOST": "x"}
+
+    launcher = launcher_from_env(ONE_NODE, env)
+
+    assert isinstance(launcher, TGIProcessLauncher)
+    assert launcher.command == ("text-generation-launcher",)
+    assert launcher.node_id == "node-a"
+    assert (launcher.bind_host, launcher.advertise_host) == ("127.0.0.1", "127.0.0.1")
+    assert (launcher.ready_timeout, launcher.stop_grace) == (1200.0, 10.0)
+
+
+@pytest.mark.unit
+def test_the_default_tgi_command_must_be_on_the_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("PATH", str(tmp_path))
+
+    message = _refusal(ONE_NODE, {"FORGEMESH_RUNTIME_LAUNCHER": "tgi-process"})
+
+    assert message == (
+        "FORGEMESH_RUNTIME_LAUNCHER=tgi-process runs text-generation-launcher by default, but "
+        "it is not on PATH; install TGI or point FORGEMESH_TGI_COMMAND to its "
+        "text-generation-launcher"
+    )
+
+
+@pytest.mark.unit
+def test_the_tgi_launcher_uses_the_configured_command_addresses_and_timeouts() -> None:
+    env = {
+        "FORGEMESH_RUNTIME_LAUNCHER": "TGI-Process",
+        "FORGEMESH_TGI_COMMAND": f"{PYTHON} -m my.tgi --max-input-tokens 2048",
+        "FORGEMESH_TGI_BIND_HOST": "0.0.0.0",
+        "FORGEMESH_TGI_ADVERTISE_HOST": "gpu-host.internal",
+        "FORGEMESH_TGI_READY_TIMEOUT_SECONDS": "600",
+        "FORGEMESH_TGI_STOP_GRACE_SECONDS": "30",
+        "FORGEMESH_VLLM_BIND_HOST": "not-an-address",
+        "FORGEMESH_VLLM_READY_TIMEOUT_SECONDS": "soon",
+    }
+    inventory = _inventory(("this-host", ("0", GPU_UUID)))
+
+    launcher = launcher_from_env(inventory, env)
+
+    assert isinstance(launcher, TGIProcessLauncher)
+    assert launcher.command == (sys.executable, "-m", "my.tgi", "--max-input-tokens", "2048")
+    assert launcher.node_id == "this-host"
+    assert (launcher.bind_host, launcher.advertise_host) == ("0.0.0.0", "gpu-host.internal")
+    assert (launcher.ready_timeout, launcher.stop_grace) == (600.0, 30.0)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("settings", "message"),
+    [
+        pytest.param(
+            {"FORGEMESH_TGI_COMMAND": "/no/such/text-generation-launcher"},
+            "invalid FORGEMESH_TGI_COMMAND: '/no/such/text-generation-launcher' is not an "
+            "executable file",
+            id="missing-executable",
+        ),
+        pytest.param(
+            {"FORGEMESH_TGI_READY_TIMEOUT_SECONDS": "0"},
+            "FORGEMESH_TGI_READY_TIMEOUT_SECONDS='0' must be a positive number of seconds",
+            id="ready-timeout-zero",
+        ),
+        pytest.param(
+            {"FORGEMESH_TGI_STOP_GRACE_SECONDS": "later"},
+            "FORGEMESH_TGI_STOP_GRACE_SECONDS='later' is not a number of seconds",
+            id="stop-grace-text",
+        ),
+        pytest.param(
+            {"FORGEMESH_TGI_BIND_HOST": "::"},
+            "FORGEMESH_TGI_ADVERTISE_HOST must be set when FORGEMESH_TGI_BIND_HOST=:: listens "
+            "on all addresses",
+            id="wildcard-without-advertise",
+        ),
+        pytest.param(
+            {"FORGEMESH_TGI_ADVERTISE_HOST": "tgi_host"},
+            "invalid FORGEMESH_TGI_ADVERTISE_HOST: 'tgi_host' is neither an IP address nor a "
+            "host name",
+            id="advertise-host",
+        ),
+    ],
+)
+def test_invalid_tgi_settings_are_refused(settings: dict[str, str], message: str) -> None:
+    assert message in _refusal(ONE_NODE, {**TGI, **settings})
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("inventory", "message"),
+    [
+        pytest.param(
+            _inventory(("node-a", ("gpu-0",)), ("node-b", ("gpu-0",))),
+            "FORGEMESH_RUNTIME_LAUNCHER=tgi-process runs instances on the control plane host "
+            "only, so FORGEMESH_INVENTORY_FILE must describe exactly one node (this host), not "
+            "2: node-a, node-b",
+            id="two-nodes",
+        ),
+        pytest.param(
+            _inventory(("node-a", ("gpu-0", "0"))),
+            "invalid FORGEMESH_INVENTORY_FILE for TGI: device ids 'gpu-0' and '0' both select "
+            "CUDA device 0",
+            id="same-device-twice",
+        ),
+    ],
+)
+def test_the_tgi_launcher_needs_an_inventory_of_this_host(
+    inventory: Inventory, message: str
+) -> None:
+    assert message in _refusal(inventory, dict(TGI))
+
+
+# ---------------------------------------------------------------------- #
+# 核对实例的间隔
+# ---------------------------------------------------------------------- #
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("value", "interval"), [(None, 10.0), ("", 10.0), ("  ", 10.0), ("2.5", 2.5), (" 30 ", 30.0)]
+)
+def test_instances_are_checked_every_ten_seconds_unless_configured(
+    value: str | None, interval: float
+) -> None:
+    env = {} if value is None else {"FORGEMESH_INSTANCE_CHECK_INTERVAL_SECONDS": value}
+
+    assert instance_check_interval_from_env(env) == interval
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("value", "problem"),
+    [
+        ("soon", "is not a number of seconds"),
+        ("0", "must be a positive number of seconds"),
+        ("-5", "must be a positive number of seconds"),
+        ("nan", "must be a positive number of seconds"),
+        ("inf", "must be a positive number of seconds"),
+    ],
+)
+def test_an_invalid_instance_check_interval_is_refused(value: str, problem: str) -> None:
+    with pytest.raises(LauncherConfigError) as caught:
+        instance_check_interval_from_env({"FORGEMESH_INSTANCE_CHECK_INTERVAL_SECONDS": value})
+
+    assert str(caught.value) == f"FORGEMESH_INSTANCE_CHECK_INTERVAL_SECONDS={value!r} {problem}"
+
+
 @pytest.mark.unit
 def test_settings_are_read_from_the_process_environment_by_default(
     monkeypatch: pytest.MonkeyPatch,
@@ -320,8 +490,10 @@ def test_settings_are_read_from_the_process_environment_by_default(
     monkeypatch.setenv("FORGEMESH_RUNTIME_LAUNCHER", "fake")
     monkeypatch.setenv("FORGEMESH_FAKE_LAUNCHER_ADVERTISE_HOST", "127.0.0.2")
     monkeypatch.delenv("FORGEMESH_FAKE_LAUNCHER_BIND_HOST", raising=False)
+    monkeypatch.setenv("FORGEMESH_INSTANCE_CHECK_INTERVAL_SECONDS", "3")
 
     launcher = launcher_from_env(ONE_NODE)
 
     assert isinstance(launcher, FakeLauncher)
     assert launcher.advertise_host == "127.0.0.2"
+    assert instance_check_interval_from_env() == 3.0

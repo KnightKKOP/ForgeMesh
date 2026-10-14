@@ -4,7 +4,8 @@
 ``--report`` 文件追加一行 JSON（参数、进程与会话 id、相关环境变量、派生的子进程），然后按
 ``--mode`` 行事：``serve``（``--delay`` 秒后监听，``GET /health`` 返回 200）、``exit``（以
 退出码 3 结束）、``hang``（从不监听）。``--ignore-sigterm`` 忽略 ``SIGTERM``；
-``--spawn-child`` 派生一个忽略 ``SIGTERM`` 的子进程（同一进程组）。
+``--spawn-child`` 派生一个忽略 ``SIGTERM`` 的子进程（同一进程组；加上 ``--child-group`` 时
+在自己的进程组中）。
 """
 
 from __future__ import annotations
@@ -38,6 +39,7 @@ def main() -> None:
     parser.add_argument("--delay", type=float, default=0.0)
     parser.add_argument("--ignore-sigterm", action="store_true")
     parser.add_argument("--spawn-child", action="store_true")
+    parser.add_argument("--child-group", action="store_true")
     parser.add_argument("--model", required=True)
     parser.add_argument("--host", required=True)
     parser.add_argument("--port", type=int, required=True)
@@ -45,7 +47,13 @@ def main() -> None:
     args = parser.parse_args()
     if args.ignore_sigterm:
         signal.signal(signal.SIGTERM, signal.SIG_IGN)
-    child = subprocess.Popen([sys.executable, "-c", _CHILD]) if args.spawn_child else None
+    child = (
+        subprocess.Popen(
+            [sys.executable, "-c", _CHILD], process_group=0 if args.child_group else None
+        )
+        if args.spawn_child
+        else None
+    )
     report = {
         "argv": sys.argv[1:],
         "model": args.model,
@@ -55,6 +63,7 @@ def main() -> None:
         "pid": os.getpid(),
         "sid": os.getsid(0),
         "child_pid": child.pid if child else None,
+        "child_pgid": os.getpgid(child.pid) if child else None,
         "env": {
             name: os.environ.get(name)
             for name in ("CUDA_VISIBLE_DEVICES", "CUDA_DEVICE_ORDER", "FORGEMESH_STANDIN_SECRET")

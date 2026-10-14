@@ -156,11 +156,12 @@ curl -s -H "Authorization: Bearer fmk_…" http://127.0.0.1:8080/api/v1/inferenc
 | --- | --- | --- |
 | `FORGEMESH_AUTH_MODE` | `apikey` | `apikey`：校验 `Authorization: Bearer <key>`；`dev`：直接信任 `X-Tenant-Id` 请求头，只允许监听回环地址，仅供本地开发 |
 | `FORGEMESH_API_KEYS_FILE` | — | `apikey` 模式必填，缺失或格式非法时拒绝启动 |
-| `FORGEMESH_DB_PATH` | `forgemesh.db` | SQLite 权威存储文件；同一文件只允许一个控制平面实例写入（ADR-013）。以 WAL 模式打开，运行时旁边有 `-wal` / `-shm` 文件，不能直接复制文件做备份，见 [备份与灾备演练](docs/operations/backup-restore.md)。设置了 `FORGEMESH_RUNTIME_LAUNCHER` 时，部署工作流的运行记录在同目录的第二个文件中（`forgemesh.db` → `forgemesh.workflows.db`），两个文件一起备份与恢复 |
+| `FORGEMESH_DB_PATH` | `forgemesh.db` | SQLite 权威存储文件；同一文件只允许一个控制平面实例写入（ADR-013）。以 WAL 模式打开，运行时旁边有 `-wal` / `-shm` 文件，不能直接复制文件做备份，见 [备份与灾备演练](docs/operations/backup-restore.md)。设置了 `FORGEMESH_RUNTIME_LAUNCHER` 时，部署工作流的运行记录在同目录的第二个文件中（`forgemesh.db` → `forgemesh.workflows.db`），两个文件一起备份与恢复；`vllm-process` / `tgi-process` 还在同目录记录实例进程（`forgemesh.instances.json`，不需要备份，见「部署推理服务」） |
 | `FORGEMESH_HOST` | `127.0.0.1` | 监听地址 |
 | `FORGEMESH_PORT` | `8080` | 监听端口 |
 | `FORGEMESH_INVENTORY_FILE` | — | 静态加速器清单（JSON，格式见下），设置后启用首次适配调度器；文件不可读或格式非法时拒绝启动，修改后需重启。未设置时不启用调度器 |
-| `FORGEMESH_RUNTIME_LAUNCHER` | — | 推理实例启动器，设置后部署推理服务（见「部署推理服务」）：`fake`（控制平面进程内的 OpenAI 兼容桩服务，不需要 GPU，供 CI 与本地开发）或 `vllm-process`（本机上的 vLLM 子进程），不区分大小写。必须同时设置 `FORGEMESH_INVENTORY_FILE`；取值未知、缺少清单或所选启动器的配置非法时拒绝启动。未设置时不部署。下面各启动器的变量只在选中该启动器时读取，空白值视同未设置 |
+| `FORGEMESH_INSTANCE_CHECK_INTERVAL_SECONDS` | `10` | 部署推理服务时控制器核对实例是否仍在运行的间隔（秒）：实例退出之后，下一次核对把服务转为 `Degraded` 并重新部署（见「部署推理服务」）。须为有限的正数，不论是否设置了启动器都校验，非法时拒绝启动 |
+| `FORGEMESH_RUNTIME_LAUNCHER` | — | 推理实例启动器，设置后部署推理服务（见「部署推理服务」）：`fake`（控制平面进程内的 OpenAI 兼容桩服务，不需要 GPU，供 CI 与本地开发）、`vllm-process`（本机上的 vLLM 子进程）或 `tgi-process`（本机上的 TGI 子进程），不区分大小写。必须同时设置 `FORGEMESH_INVENTORY_FILE`；取值未知、缺少清单或所选启动器的配置非法时拒绝启动。未设置时不部署。下面各启动器的变量只在选中该启动器时读取，空白值视同未设置 |
 | `FORGEMESH_FAKE_LAUNCHER_BIND_HOST` | `127.0.0.1` | `fake`：实例监听的 IP 地址，`0.0.0.0` / `::` 监听全部地址 |
 | `FORGEMESH_FAKE_LAUNCHER_ADVERTISE_HOST` | 同监听地址 | `fake`：写进 `status.endpoints` 的主机名或 IP 地址，网关用它连接实例；监听全部地址时必须设置 |
 | `FORGEMESH_VLLM_COMMAND` | `<控制平面的解释器> -m vllm.entrypoints.openai.api_server` | `vllm-process`：启动 vLLM OpenAI 兼容服务的命令，按 shell 规则拆分（不经过 shell），第一个词须是可执行文件；使用默认命令时控制平面的解释器必须装有 `vllm` |
@@ -168,6 +169,11 @@ curl -s -H "Authorization: Bearer fmk_…" http://127.0.0.1:8080/api/v1/inferenc
 | `FORGEMESH_VLLM_ADVERTISE_HOST` | 同监听地址 | `vllm-process`：写进 `status.endpoints` 的主机名或 IP 地址；监听全部地址时必须设置 |
 | `FORGEMESH_VLLM_READY_TIMEOUT_SECONDS` | `1200` | `vllm-process`：进程启动后等 `GET /health` 返回 `200` 的时限（秒），包括下载与加载模型 |
 | `FORGEMESH_VLLM_STOP_GRACE_SECONDS` | `10` | `vllm-process`：停止实例时 `SIGTERM` 之后等它退出的秒数，之后 `SIGKILL` |
+| `FORGEMESH_TGI_COMMAND` | `text-generation-launcher` | `tgi-process`：启动 TGI 的命令，规则同 `FORGEMESH_VLLM_COMMAND`；使用默认命令时它必须能在 `PATH` 中找到 |
+| `FORGEMESH_TGI_BIND_HOST` | `127.0.0.1` | `tgi-process`：实例监听的 IP 地址，`0.0.0.0` / `::` 监听全部地址 |
+| `FORGEMESH_TGI_ADVERTISE_HOST` | 同监听地址 | `tgi-process`：写进 `status.endpoints` 的主机名或 IP 地址；监听全部地址时必须设置 |
+| `FORGEMESH_TGI_READY_TIMEOUT_SECONDS` | `1200` | `tgi-process`：进程启动后等 `GET /health` 返回 `200` 的时限（秒），包括下载与加载模型 |
+| `FORGEMESH_TGI_STOP_GRACE_SECONDS` | `10` | `tgi-process`：停止实例时 `SIGTERM` 之后等它退出的秒数，之后 `SIGKILL` |
 
 > 请求可以不带 `X-Tenant-Id`；带了就必须与 key 绑定的租户一致，否则返回 `403`。缺少或无效的 key 返回 `401`。
 
@@ -180,9 +186,9 @@ curl -s -H "Authorization: Bearer fmk_…" http://127.0.0.1:8080/api/v1/inferenc
 ]}]}
 ```
 
-节点 `id` 在清单内唯一，设备 `id` 在所属节点内唯一，节点与设备都至少一个，不允许其他字段；`type` 与 `spec.resources.accelerator.type` 按字符串精确匹配，`memoryGiB` 是单卡显存（正整数，不接受 `"80"` 或 `80.0`）。调度器按清单顺序取第一个能凑齐 `count` 张卡的节点，在该节点内按顺序取类型匹配、显存不低于 `minMemoryGiB` 且未被占用的设备，不跨节点凑数。分配按资源 `uid` 记录在权威存储中（`allocations` / `allocation_devices`），同一设备同时至多属于一个生效的分配；分配不设租约，在资源删除时释放：持有分配的资源无论处于哪个 phase，`DELETE` 都返回 `202` 并先进入 `Terminating`。
+节点 `id` 在清单内唯一，设备 `id` 在所属节点内唯一，节点与设备都至少一个，不允许其他字段；`type` 与 `spec.resources.accelerator.type` 按字符串精确匹配，`memoryGiB` 是单卡显存（正整数，不接受 `"80"` 或 `80.0`）。调度器按清单顺序取第一个能凑齐 `count` 张卡的节点，在该节点内按顺序取类型匹配、显存不低于 `minMemoryGiB` 且未被占用的设备，不跨节点凑数。分配按资源 `uid` 记录在权威存储中（`allocations` / `allocation_devices`），同一设备同时至多属于一个生效的分配；分配不设租约，在资源删除时释放：持有分配的资源无论处于哪个 phase，`DELETE` 都返回 `202` 并先进入 `Terminating`。部署失败（确认实例已经停止之后）与加速器申请变化时同样释放分配；归属资源已不存在的分配由控制器回收，见「部署推理服务」。
 
-控制平面启动后会自动协调 `InferenceService`：新建、修改或请求删除的资源在 0.5 秒内被处理，协调结果写入 `status.conditions`（例如 `Ready=False` 及其原因）。未设置 `FORGEMESH_INVENTORY_FILE` 时，新建的服务会停在 `Pending`，并带有 `Ready=False`（`SchedulerUnavailable`）条件；只设置清单、未设置 `FORGEMESH_RUNTIME_LAUNCHER` 时，条件为 `Ready=False`（`WorkflowRuntimeUnavailable`），协调器在分配之前停下，不占用设备。两者都设置后，资源每轮推进一个 phase（`Pending` → `Scheduling` → `Preparing` → `Deploying` → `Verifying` → `Ready`）：分配设备，运行部署工作流（准备模型 → 启动实例 → 验证实例），成功后写入 `status.endpoints` 与 `Ready=True`，网关随即可以转发对话；部署失败时资源进入 `Failed`，不自动重试，删除后重新创建即可再次部署；删除时先取消部署、停止实例，再释放分配。每个服务只部署一个实例（`spec.availability.replicas` 不生效），已部署服务的 `spec` 变化不会重新部署。控制器与 API 运行在同一个进程中，是权威存储的唯一写者（ADR-013）：请以单进程运行，不要使用 `uvicorn --workers` 或多副本。设置了启动器时 `POST /api/v1/workflows` 同样返回 `503`（`WORKFLOW_RUNTIME_UNAVAILABLE`）：部署工作流的运行时只供协调器使用，不对外开放。
+控制平面启动后会自动协调 `InferenceService`：新建、修改或请求删除的资源在 0.5 秒内被处理，协调结果写入 `status.conditions`（例如 `Ready=False` 及其原因）。未设置 `FORGEMESH_INVENTORY_FILE` 时，新建的服务会停在 `Pending`，并带有 `Ready=False`（`SchedulerUnavailable`）条件；只设置清单、未设置 `FORGEMESH_RUNTIME_LAUNCHER` 时，条件为 `Ready=False`（`WorkflowRuntimeUnavailable`），协调器在分配之前停下，不占用设备。两者都设置后，资源每轮推进一个 phase（`Pending` → `Scheduling` → `Preparing` → `Deploying` → `Verifying` → `Ready`）：分配设备，运行部署工作流（准备模型 → 启动实例 → 验证实例），成功后写入 `status.endpoints` 与 `Ready=True`，网关随即可以转发对话；`spec` 变化时经 `Updating` 重新部署（见下文「更新」）；实例丢失时服务转为 `Degraded` 并重新部署；部署失败时资源进入 `Failed`，不自动重试，修改 `spec` 或删除后重新创建即可再次部署；删除时先取消部署、停止实例，再释放分配。每个服务只部署一个实例（`spec.availability.replicas` 不生效）。控制器与 API 运行在同一个进程中，是权威存储的唯一写者（ADR-013）：请以单进程运行，不要使用 `uvicorn --workers` 或多副本。设置了启动器时 `POST /api/v1/workflows` 同样返回 `503`（`WORKFLOW_RUNTIME_UNAVAILABLE`）：部署工作流的运行时只供协调器使用，不对外开放。
 
 ### REST API
 
@@ -216,7 +222,7 @@ curl -s -X PATCH -H "$KEY" -H "Content-Type: application/merge-patch+json" \
 curl -s -H "$KEY" "http://127.0.0.1:8081/api/v1/inference-services?limit=50&pageToken=<nextPageToken>"
 ```
 
-更新只修改期望状态，控制器目前不按新的 `spec` 重新部署（见上文）：已经 `Ready` 的服务保持 `generation` 大于 `observedGeneration`；部署工作流启动之后（`Deploying` / `Verifying`）提交的变化同样不会生效，但服务进入 `Ready` 时 `observedGeneration` 会记为最新的 `generation`。
+`spec` 变化（`generation` 递增）之后，控制器按新的 `spec` 重新部署：`Ready` / `Degraded` 的服务经策略放行后进入 `Updating`（`Ready=False`，endpoint 标记为 `ready: false`），然后停止旧实例，取得分配（仍满足新的加速器申请时复用，否则先释放再重新分配；新的申请放不下时停在 `Updating`，`AllocationFailed`，10 秒后重试），以新的 `spec` 运行部署工作流，新实例通过验证后回到 `Ready`；更新失败时进入 `Failed`。先停后起：从进入 `Updating` 到新实例通过验证，服务不可用，网关返回 `503`（`NO_HEALTHY_UPSTREAM`；缓存的几秒内仍连接旧实例，旧实例停止之后为 `502`）。还在部署时提交的变化取消进行中的部署，改为部署最新的 `spec`（phase 不变，不重新评估策略）；`Failed` 的服务在 `spec` 变化之后回到 `Pending`，与新建的服务一样重新部署。被策略拒绝、等待审批或缺少调度器 / 启动器的更新不写 `status`（只记日志），服务保持原状，`generation` 大于 `observedGeneration`。开始更新的一轮就写入新的 `observedGeneration`：`status.phase` 为 `Ready` 且 `observedGeneration` 等于 `generation` 时，服务运行的才是最新的 `spec`。
 
 ### Go 网关
 
@@ -232,10 +238,11 @@ make run-dev        # dev 模式：信任租户请求头，只监听 127.0.0.1:8
 
 ### 部署推理服务
 
-设置 `FORGEMESH_INVENTORY_FILE` 与 `FORGEMESH_RUNTIME_LAUNCHER` 后，控制平面为每个 `InferenceService` 启动一个推理实例，网关经 `/api/v1/namespaces/{ns}/inference/{svc}/chat` 把对话转发给它。启动器有两种：
+设置 `FORGEMESH_INVENTORY_FILE` 与 `FORGEMESH_RUNTIME_LAUNCHER` 后，控制平面为每个 `InferenceService` 启动一个推理实例，网关经 `/api/v1/namespaces/{ns}/inference/{svc}/chat` 把对话转发给它。启动器有三种：
 
-- `fake`：每个实例是控制平面进程内的 OpenAI 兼容桩服务，监听一个临时端口：`GET /health`；`POST /v1/chat/completions` 返回固定的回复，`"stream": true` 时以 SSE 返回，以 `data: [DONE]` 结束。不需要 GPU，也不加载模型，只用于 CI 与本地开发。
+- `fake`：每个实例是控制平面进程内的 OpenAI 兼容桩服务，监听一个临时端口：`GET /health`；`POST /v1/chat/completions` 返回固定的回复，`"stream": true` 时以 SSE 返回，以 `data: [DONE]` 结束；`POST /fake/exit` 返回 `202`，实例随即像进程退出一样结束，用来演练实例丢失（网关只转发推理协议的路径，经网关调用不到它）。不需要 GPU，也不加载模型，只用于 CI 与本地开发。
 - `vllm-process`：每个实例是控制平面所在主机上的一个 vLLM 进程，见下文「vLLM」。
+- `tgi-process`：每个实例是控制平面所在主机上的一个 TGI（text-generation-inference）进程，见下文「TGI」。
 
 不需要 GPU 的完整闭环，控制平面与网关都以 `dev` 模式运行在本机：
 
@@ -261,12 +268,16 @@ curl -sN -H "X-Tenant-Id: acme" -H "Content-Type: application/json" \
 curl -s -X DELETE -H "X-Tenant-Id: acme" "http://127.0.0.1:8081/api/v1/inference-services/llama?namespace=default"
 ```
 
-`Ready` 的服务带有 `Ready=True`（`Reconciled`），`status.endpoints` 形如 `[{"url": "http://127.0.0.1:<端口>", "ready": true, "instanceId": "fake-…", "protocol": "openai-chat"}]`；回复拼起来是 `Hello from the ForgeMesh fake instance fake-….`。删除返回 `202`，实例停止、分配释放之后资源消失（`404`）。网关缓存服务的实例列表 5 秒（`GATEWAY_RESOLVER_TTL_SECONDS`），删除或重新创建之后的几秒内可能仍连接旧实例（`502`）。在容器中运行同样的闭环见「容器部署」。
+`Ready` 的服务带有 `Ready=True`（`Reconciled`），`status.endpoints` 形如 `[{"url": "http://127.0.0.1:<端口>", "ready": true, "instanceId": "fake-…", "protocol": "openai-chat"}]`；回复拼起来是 `Hello from the ForgeMesh fake instance fake-….`。删除返回 `202`，实例停止、分配释放之后资源消失（`404`）。网关缓存服务的实例列表 5 秒（`GATEWAY_RESOLVER_TTL_SECONDS`），删除、重新创建或更新之后的几秒内可能仍连接旧实例（`502`）。在容器中运行同样的闭环见「容器部署」。
 
-**控制平面重启**：两种启动器的实例都随控制平面进程结束（`fake` 的实例在进程内；`vllm-process` 的实例是子进程，控制平面退出时停止它们），重启之后：
+**实例丢失**：控制器每 `FORGEMESH_INSTANCE_CHECK_INTERVAL_SECONDS` 秒（默认 `10`）向启动器核对 `Ready` / `Degraded` 服务的实例是否仍在运行，只看进程或桩服务是否还在，不探测它能否回答请求。实例已不在运行的 `Ready` 服务转为 `Degraded`：`Ready=False`（`InstanceLost`），`status.endpoints` 中的实例标记为 `ready: false`，网关不再转发（缓存的几秒内除外）。随后控制器以同一个 `spec` 重新部署（不重新评估策略）：停止之前的部署，复用服务持有的分配，清空 `status.endpoints`，新实例通过验证后回到 `Ready`。同一代 `spec` 的第一次重新部署立即开始，之后与上一次开始至少相隔 10 秒，每次翻倍，最多 300 秒，上一次开始已过 600 秒时从头开始；重新部署的运行失败时服务保持 `Degraded`，等待期间 `Ready=False`（`WorkflowFailed`）给出原因。退避只记在内存中，控制平面重启之后从头开始。
 
-- 重启之前 `Ready` 的服务转为 `Degraded`：`Ready=False`（`InstanceLost`），`status.endpoints` 中的实例标记为 `ready: false`，网关不再转发（缓存的几秒内除外）。控制平面不会自动重新部署，删除后重新创建即可；`Degraded` 的服务在删除之前一直持有分配。
-- 仍在部署的服务从中断处继续（部署工作流的运行记录在 `forgemesh.workflows.db` 中，启动时继续未结束的运行）：还没有启动实例的照常完成；已经启动了实例的进入 `Failed`（实例已不在运行）。
+**控制平面重启**：三种启动器的实例都活不过控制平面的重启（`fake` 的实例在进程内；进程启动器的实例是子进程，控制平面退出时停止它们，控制平面被杀死时留下的实例在下次启动时结束，见下文「vLLM」），重启之后：
+
+- 重启之前 `Ready` 的服务在控制器启动之前转为 `Degraded`（`InstanceLost`，消息说明实例没能活过控制平面重启），随后像实例丢失一样重新部署，以新实例回到 `Ready`。
+- 仍在部署的服务从中断处继续（部署工作流的运行记录在 `forgemesh.workflows.db` 中，启动时继续未结束的运行）：还没有启动实例的照常完成；实例已经启动、还在验证的，运行在验证实例时失败，服务进入 `Failed`（`WorkflowFailed`）；运行已经成功、还没写入 `Ready` 的重新部署。
+
+**回收孤立的分配**：经 `DELETE` 删除的服务在消失之前释放分配。归属资源（同租户、同 `uid`）已不存在的分配只可能来自绕过受控删除的操作或旧版本的数据，它们的设备再也分不出去：控制器在启动时与每次全量同步（每 10 分钟）之后先停止这些分配对应的部署，再把分配标记为 `Expired`，设备随之空闲；停止失败时保留分配，下次再试。资源仍存在的分配不在回收之列，不论它处于哪个 phase。
 
 **vLLM**：`vllm-process` 以 `<FORGEMESH_VLLM_COMMAND> --model=<spec.model.reference> --host <监听地址> --port <空闲端口> --tensor-parallel-size <设备数>` 启动实例，`GET /health` 返回 `200` 后服务进入 `Ready`。它只部署 `spec.runtime.provider` 为 `vllm` 的服务，不检查 `spec.runtime.version` 与 `spec.model.digest`：运行的是命令对应的 vLLM 版本，模型由 vLLM 启动时按引用下载、加载（计入就绪时限）。
 
@@ -274,7 +285,8 @@ curl -s -X DELETE -H "X-Tenant-Id: acme" "http://127.0.0.1:8081/api/v1/inference
 - 默认命令要求控制平面的解释器装有 vLLM（例如 `.venv/bin/pip install vllm`）；也可以用 `FORGEMESH_VLLM_COMMAND` 指向另一个环境中的 vLLM，如 `/opt/vllm/bin/python -m vllm.entrypoints.openai.api_server`。仓库的控制平面镜像不含 vLLM。
 - 实例继承控制平面的环境变量（去掉 `FORGEMESH_*`，例如 `HF_TOKEN` 会传给 vLLM），输出写到控制平面的标准输出与标准错误。
 - 实例默认监听 `127.0.0.1`：网关在同一台主机上时为它设置 `GATEWAY_INSTANCE_ALLOWED_CIDRS=127.0.0.0/8`；网关在其他主机上时设置 `FORGEMESH_VLLM_BIND_HOST=0.0.0.0` 与网关能够连接的 `FORGEMESH_VLLM_ADVERTISE_HOST`。
-- 每个实例在自己的进程组中运行，停止时整组收到 `SIGTERM`，`FORGEMESH_VLLM_STOP_GRACE_SECONDS` 秒后 `SIGKILL`。控制平面退出时并行停止全部实例，连同控制器与工作流的收尾，默认设置下最长约 40 秒，在容器或服务管理器中相应调大停止时限。控制平面被 `SIGKILL` 时实例进程不会随之结束、继续占用 GPU：请以容器或 systemd 服务（默认 `KillMode=control-group`）运行控制平面。
+- 每个实例在自己的会话中运行：停止时实例进程的进程组收到 `SIGTERM`，实例进程退出或 `FORGEMESH_VLLM_STOP_GRACE_SECONDS` 秒后，会话中的每个进程组收到 `SIGKILL`；在 Linux 上停止要等到会话中的进程都已退出（至多 10 秒，超过即停止失败）。控制平面退出时并行停止全部实例，连同控制器与工作流的收尾，默认设置下最长约 40 秒，在容器或服务管理器中相应调大停止时限。
+- 控制平面直接在主机上运行、被 `SIGKILL`（或崩溃、被 OOM 结束）时，实例进程在自己的会话中，不会随之结束、继续占用 GPU。启动器因此把每个实例进程记在数据库旁的 `forgemesh.instances.json` 中（实例停止之后删去），下次启动时在恢复部署之前像停止实例一样结束其中仍在运行的进程。只向 pid 与启动时间都与记录一致的进程及其会话发送信号，另一次开机或另一个 PID 命名空间的记录被忽略。限制：在下次启动之前实例一直占用 GPU；调用 `setsid` 离开了会话的进程、实例进程退出之后会话中剩下的进程找不到；数据库为 `:memory:` 时不记录。以容器或 systemd 服务（默认 `KillMode=control-group`）运行控制平面时，容器或 systemd 还会结束控制平面留下的全部进程。
 
 ```bash
 # 一台有两块 GPU 的主机：节点 id 任意，设备 id 为 CUDA 设备序号
@@ -292,6 +304,8 @@ FORGEMESH_API_KEYS_FILE=./api-keys.json FORGEMESH_DB_PATH=./forgemesh.db \
 #       spec.resources.accelerator.count 即 --tensor-parallel-size
 ```
 
+**TGI**：`tgi-process` 以 `<FORGEMESH_TGI_COMMAND> --model-id <spec.model.reference> --hostname <监听地址> --port <空闲端口> --num-shard <设备数> --master-port <另一个空闲端口> --shard-uds-path <实例私有目录>/shard` 启动实例，只部署 `spec.runtime.provider` 为 `tgi` 的服务。实例的协议为 `tgi-generate`：网关把对话请求转发到实例的 `/generate_stream`，不转换请求体，客户端按 TGI 的格式发送请求。`--master-port` 与私有目录（权限 `0700`，实例停止之后删除）避免同一主机上的实例争用 TGI 默认的端口 `29500` 与 shard 套接字。默认命令 `text-generation-launcher` 须能在 `PATH` 中找到，仓库的镜像不含 TGI。设备 id、`CUDA_VISIBLE_DEVICES`、环境变量、监听地址、`GET /health` 就绪检查、停止（TGI 的 router 与各个 shard 各在自己的进程组中，一并结束）与实例记录同 vLLM，变量为 `FORGEMESH_TGI_*`（见「运行控制平面」）。
+
 ### 容器部署
 
 ```bash
@@ -308,7 +322,7 @@ docker compose -f deploy/docker/docker-compose.yaml \
 scripts/compose_smoke.sh   # 端到端冒烟（CI 同样执行）
 ```
 
-只用 `docker-compose.yaml` 时控制平面没有清单与启动器，新建的服务停在 `Pending`（`SchedulerUnavailable`）。`docker-compose.fake-runtime.yaml` 为控制平面加上清单 `deploy/docker/fake-runtime-inventory.json`（一个节点、一块设备 `gpu-0`）与 `fake` 启动器：实例在控制平面容器内监听全部地址，写进 `status.endpoints` 的主机是服务名 `control-plane`，网关经 compose 网络连接它（私网地址默认允许），实例端口不发布到宿主机。`scripts/compose_smoke.sh` 用这两个文件经网关走完闭环：无 key 的请求返回 `401`；创建 → `Ready`（一个就绪的 `openai-chat` 端点）→ 流式对话到达实例、以 `[DONE]` 结束 → 删除后资源消失、实例停止监听 → 同名重新创建（只有一块设备，可见分配已释放）→ 再次对话到达新实例 → 重启控制平面：资源仍在，服务转为 `Degraded`（`InstanceLost`），网关返回 `503`（`NO_HEALTHY_UPSTREAM`）→ 删除。
+只用 `docker-compose.yaml` 时控制平面没有清单与启动器，新建的服务停在 `Pending`（`SchedulerUnavailable`）。`docker-compose.fake-runtime.yaml` 为控制平面加上清单 `deploy/docker/fake-runtime-inventory.json`（一个节点、一块设备 `gpu-0`）与 `fake` 启动器：实例在控制平面容器内监听全部地址，写进 `status.endpoints` 的主机是服务名 `control-plane`，网关经 compose 网络连接它（私网地址默认允许），实例端口不发布到宿主机。`scripts/compose_smoke.sh` 用这两个文件经网关走完闭环：无 key 的请求返回 `401`；创建 → `Ready`（一个就绪的 `openai-chat` 端点）→ 流式对话到达实例、以 `[DONE]` 结束 → 删除后资源消失、实例停止监听 → 同名重新创建（只有一块设备，可见分配已释放）→ 再次对话到达新实例 → 以 `PUT` 修改 `spec` → `Updating` → 以新实例回到 `Ready`（`observedGeneration` 为 `2`，旧实例停止监听）并再次对话 → 让实例退出（在控制平面容器内 `POST /fake/exit`）→ `Degraded`（`InstanceLost`）→ 重新部署，以新实例回到 `Ready` 并再次对话 → 重启控制平面：资源仍在，服务转为 `Degraded`（`InstanceLost`）后重新部署，以新实例回到 `Ready` 并再次对话 → 删除。叠加文件把核对实例的间隔设为 1 秒；每一步都有时限，只等待状态变化，不依赖网关在某一刻返回的状态码。
 
 控制平面的 SQLite 数据库（部署推理服务时还有工作流存储 `forgemesh.workflows.db`）在 compose 卷 `control-plane-data` 中。Kubernetes 清单见 `deploy/kubernetes/`：数据库放在 PersistentVolumeClaim 上，key 文件来自 Secret `forgemesh-api-keys`，更新策略为 `Recreate`，保证任何时刻只有一个控制平面写数据库（ADR-013）；清单没有设置加速器清单与启动器，不部署推理实例。容器中的备份与恢复见 [备份与灾备演练](docs/operations/backup-restore.md) 2.5 / 3.4 节。
 
@@ -322,7 +336,7 @@ ForgeMesh 目前处于预览阶段，API 稳定性标注为 `beta`：minor 版�
 
 ### 核心控制平面（M2）
 - **资源注册中心**：SQLite 持久化，乐观并发 CAS，租户隔离，分页游标（现状：自 1.1.0 起列表接口返回签名的分页游标 `nextPageToken`）
-- **协调控制器**：9 步声明式闭环（获取→查询→比较→生成候选→策略校验→调度分配→执行→重观察→更新状态）（现状：自 1.1.0 起由控制器自动驱动；同时设置 `FORGEMESH_INVENTORY_FILE` 与 `FORGEMESH_RUNTIME_LAUNCHER` 后，调度、部署、写入 `status.endpoints` 与受控删除形成完整闭环，见[部署推理服务](#部署推理服务)；未设置启动器时，新建的推理服务停在 `Pending`，并报告 `Ready=False`（`SchedulerUnavailable` 或 `WorkflowRuntimeUnavailable`）。控制平面重启后实例不会自动重新启动）
+- **协调控制器**：9 步声明式闭环（获取→查询→比较→生成候选→策略校验→调度分配→执行→重观察→更新状态）（现状：自 1.1.0 起由控制器自动驱动；同时设置 `FORGEMESH_INVENTORY_FILE` 与 `FORGEMESH_RUNTIME_LAUNCHER` 后，调度、部署、写入 `status.endpoints`、`spec` 变化之后的重新部署、实例丢失（包括控制平面重启之后）时的重新部署与受控删除形成完整闭环，见[部署推理服务](#部署推理服务)；未设置启动器时，新建的推理服务停在 `Pending`，并报告 `Ready=False`（`SchedulerUnavailable` 或 `WorkflowRuntimeUnavailable`）。每个服务只部署一个实例；核对实例只看实例是否还在运行，不探测它能否回答请求）
 - **策略引擎**：allow/deny/require_approval 三态决策，配额规则，高风险审批触发
   - 说明：Decision Router 的 `OK/FALLBACK_REQUIRED/FAILED` 是决策路由层的另一组状态，与 Policy 三态不混用
 - **插件管理器**：Manifest 解析校验，生命周期状态机，能力发现，权限授予（现状：自 1.1.0 起注册时验证 Ed25519 签名，权限按管理员的授予判定；控制平面应用尚未加载插件）
@@ -355,7 +369,7 @@ ForgeMesh 目前处于预览阶段，API 稳定性标注为 `beta`：minor 版�
 - **MIG 支持**：NVIDIA MIG 实例管理（创建/销毁/发现/健康检查/能力报告），并发安全，资源不超分
 - **异构 GPU**：非 NVIDIA 能力差异显式报告（差异不隐藏）
 - **Temporal Provider**：WorkflowRuntime 契约适配，补偿注册，信号投递（现状：只有内存客户端，没有接入 temporalio）
-- **TGI Runtime**：HuggingFace TGI 推理 Runtime Provider（deploy→verify→release 闭环）（现状：默认 launcher 抛出 `NotImplementedError`，控制平面也还没有 TGI 启动器）
+- **TGI Runtime**：HuggingFace TGI 推理 Runtime Provider（deploy→verify→release 闭环）（现状：插件中的默认 launcher 仍抛出 `NotImplementedError`；控制平面部署推理服务时不使用这个插件，而是使用自带的 TGI 进程启动器 `FORGEMESH_RUNTIME_LAUNCHER=tgi-process`）
 - **插件 SDK**：脚手架生成，Manifest 校验，打包发布，开放契约测试套件
 - **治理文档**：GOVERNANCE / SECURITY / CONTRIBUTING / CODE_OF_CONDUCT 完善，弃用政策
 - **API 版本管理**：OpenAPI 版本号与稳定性标注（当前为 1.1.0、`beta`），CHANGELOG，发布记录，CI 架构文档检查
@@ -364,7 +378,7 @@ ForgeMesh 目前处于预览阶段，API 稳定性标注为 `beta`：minor 版�
 
 | 类型 | 数量 |
 |------|------|
-| Python 测试 | **2066** |
+| Python 测试 | **2207** |
 | Go 测试 | 134 个测试函数，全部通过 |
 | ruff 检查 | All checks passed |
 

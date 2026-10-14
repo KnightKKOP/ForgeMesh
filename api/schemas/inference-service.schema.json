@@ -72,7 +72,7 @@
         "observedGeneration": {
           "type": "integer",
           "minimum": 0,
-          "description": "控制器已处理到的 generation（系统维护）。"
+          "description": "控制器已处理到的 generation（系统维护）；开始更新时即记为新的 generation，status.phase 为 Ready 且与 generation 相等时服务运行的才是最新的 spec。"
         }
       }
     },

@@ -1,11 +1,16 @@
 """控制平面应用入口测试：真实路由已挂载、存储可配置、探针反映存储状态、控制器随应用运行、
-配置加速器清单时启用调度器、配置启动器时启用部署（完整闭环见 ``tests/e2e/test_closed_loop.py``）。"""
+配置加速器清单时启用调度器、配置启动器时启用部署、启动时结束上次运行留下的实例进程、定期
+核对实例并回收孤立的分配（完整闭环见 ``tests/e2e/test_closed_loop.py``）。"""
 
 from __future__ import annotations
 
 import asyncio
 import json
+import os
+import signal
 import sqlite3
+import subprocess
+import sys
 import time
 from pathlib import Path
 from typing import Any
@@ -27,6 +32,7 @@ from forgemesh.controlplane.deployment import FakeLauncher, LauncherConfigError
 from forgemesh.controlplane.deployment import config as launcher_config
 from forgemesh.controlplane.registry import SQLiteRegistry
 from forgemesh.controlplane.scheduler import INVENTORY_FILE_ENV, InventoryConfigError
+from forgemesh.core.scheduler import AllocatedDevice, ResourceRef
 from forgemesh.resource.inference import InferenceService
 from forgemesh.workflowruntime.runtime import LocalWorkflowRuntime
 from forgemesh.workflowruntime.store import WorkflowStore
@@ -80,6 +86,25 @@ def _wait_for_ready_condition(client: TestClient, timeout: float = 5.0) -> dict[
         time.sleep(0.02)
 
 
+def _wait_for_instance(
+    client: TestClient, other_than: str | None = None, timeout: float = 5.0
+) -> dict[str, Any]:
+    """轮询直到 ``llama`` 为 Ready，且实例不是 ``other_than``，返回它的 endpoint。"""
+    deadline = time.monotonic() + timeout
+    while True:
+        response = client.get(
+            "/api/v1/inference-services/llama", params={"namespace": "default"}, headers=HEADERS
+        )
+        assert response.status_code == 200
+        status = response.json()["status"]
+        if status["phase"] == "Ready":
+            [endpoint] = status["endpoints"]
+            if endpoint["instanceId"] != other_than:
+                return endpoint
+        assert time.monotonic() < deadline, f"llama did not serve a new instance: {status}"
+        time.sleep(0.02)
+
+
 async def _store_service(db_file: Path) -> None:
     registry = SQLiteRegistry(str(db_file))
     try:
@@ -98,6 +123,22 @@ async def _allocations(db_file: Path) -> list[dict[str, Any]]:
         return await registry.list_allocations("acme")
     finally:
         await registry.close()
+
+
+async def _store_orphaned_allocation(db_file: Path) -> str:
+    """存入持有 ``node-a/gpu-0`` 的 ``llama``，再绕过受控删除删掉它，返回留下的分配 id。"""
+    await _store_service(db_file)
+    registry = SQLiteRegistry(str(db_file))
+    try:
+        owner = ResourceRef(
+            kind="InferenceService", namespace="default", name="llama", uid="uid-llama"
+        )
+        gpu = AllocatedDevice(node_id="node-a", device_id="gpu-0")
+        record = await registry.create_allocation("acme", owner, "uid-llama:1", [gpu])
+        await registry.delete("InferenceService", "default", "llama", "acme")
+    finally:
+        await registry.close()
+    return record["id"]
 
 
 @pytest.mark.unit
@@ -284,8 +325,8 @@ def test_a_launcher_enables_deployments_with_their_own_workflow_database(
 def test_deployments_recover_before_the_controller_starts_and_stop_after_it(
     tmp_path, monkeypatch
 ) -> None:
-    """启动：恢复未完成的部署 → 标记实例已丢失的服务 → 控制器；关闭：控制器 → 工作流运行时
-    （其补偿还会调用启动器）→ 启动器 → 工作流存储。"""
+    """启动：结束上次运行留下的实例 → 恢复未完成的部署 → 标记实例已丢失的服务 → 控制器；
+    关闭：控制器 → 工作流运行时（其补偿还会调用启动器）→ 启动器 → 工作流存储。"""
     calls: list[str] = []
 
     def record(owner: Any, name: str, label: str) -> None:
@@ -297,8 +338,9 @@ def test_deployments_recover_before_the_controller_starts_and_stop_after_it(
 
         monkeypatch.setattr(owner, name, wrapper)
 
+    record(FakeLauncher, "start", "launcher.start")
     record(LocalWorkflowRuntime, "recover", "runtime.recover")
-    record(app_module, "mark_lost_instances", "mark_lost_instances")
+    record(app_module, "check_instances", "check_instances")
     record(ControllerManager, "start", "controller.start")
     record(ControllerManager, "stop", "controller.stop")
     record(LocalWorkflowRuntime, "aclose", "runtime.aclose")
@@ -310,13 +352,98 @@ def test_deployments_recover_before_the_controller_starts_and_stop_after_it(
     with TestClient(create_app(db_path=str(tmp_path / "cp.db"))):
         started = list(calls)
 
-    assert started == ["runtime.recover", "mark_lost_instances", "controller.start"]
+    assert started == ["launcher.start", "runtime.recover", "check_instances", "controller.start"]
     assert calls[len(started) :] == [
         "controller.stop",
         "runtime.aclose",
         "launcher.aclose",
         "workflow_store.close",
     ]
+
+
+@pytest.mark.unit
+def test_the_app_stops_instance_processes_a_killed_control_plane_left_running(
+    tmp_path, monkeypatch
+) -> None:
+    """进程启动器的实例记录在数据库旁的 ``cp.instances.json`` 中：应用开始服务时，被杀死的
+    控制平面留下、仍在运行的实例进程已经结束，记录已删去。"""
+    record_file = tmp_path / "cp.instances.json"
+    monkeypatch.setenv(INVENTORY_FILE_ENV, str(_write_inventory(tmp_path)))
+    monkeypatch.setenv(launcher_config.RUNTIME_LAUNCHER_ENV, "vllm-process")
+    monkeypatch.setenv(launcher_config.VLLM_COMMAND_ENV, sys.executable)
+    leftover = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(600)"], start_new_session=True
+    )
+    try:
+        stat = Path(f"/proc/{leftover.pid}/stat").read_text().rpartition(")")[2].split()
+        boot_id = Path("/proc/sys/kernel/random/boot_id").read_text(encoding="ascii").strip()
+        instance = {
+            "instanceId": "vllm-0123456789ab",
+            "instanceKey": "deployment:uid-llama:1",
+            "pid": leftover.pid,
+            "startTime": int(stat[19]),
+        }
+        content = {
+            "version": 1,
+            "bootId": boot_id,
+            "pidNamespace": os.readlink("/proc/self/ns/pid"),
+        }
+        record_file.write_text(json.dumps({**content, "instances": [instance]}))
+
+        with TestClient(create_app(db_path=str(tmp_path / "cp.db"))):
+            assert leftover.poll() == -signal.SIGTERM
+            assert json.loads(record_file.read_text()) == {**content, "instances": []}
+    finally:
+        leftover.kill()
+        leftover.wait()
+
+
+@pytest.mark.unit
+def test_the_controller_deploys_a_service_again_once_its_instance_exits(
+    tmp_path, monkeypatch
+) -> None:
+    """控制器每隔 FORGEMESH_INSTANCE_CHECK_INTERVAL_SECONDS 秒核对实例：实例在控制器背后停止
+    之后，服务以新的实例回到 Ready。"""
+    launchers: list[Any] = []
+    original = app_module.launcher_from_env
+
+    def recording_launcher_from_env(*args: Any, **kwargs: Any) -> Any:
+        launchers.append(original(*args, **kwargs))
+        return launchers[-1]
+
+    monkeypatch.setattr(app_module, "launcher_from_env", recording_launcher_from_env)
+    monkeypatch.setattr(app_module, "WORKFLOW_POLL_INTERVAL_SECONDS", 0.05)
+    monkeypatch.setenv(INVENTORY_FILE_ENV, str(_write_inventory(tmp_path)))
+    monkeypatch.setenv(launcher_config.RUNTIME_LAUNCHER_ENV, "fake")
+    monkeypatch.setenv(launcher_config.INSTANCE_CHECK_INTERVAL_ENV, "0.05")
+
+    with TestClient(create_app(db_path=str(tmp_path / "cp.db"))) as client:
+        created = client.post("/api/v1/inference-services", json=BODY, headers=HEADERS)
+        assert created.status_code == 201
+        first = _wait_for_instance(client)
+        [launcher] = launchers
+        client.portal.call(launcher.stop, first["instanceId"])
+
+        second = _wait_for_instance(client, other_than=first["instanceId"])
+        assert client.portal.call(launcher.is_running, second["instanceId"])
+
+
+@pytest.mark.unit
+def test_the_controller_reclaims_an_orphaned_allocation_before_it_serves(
+    tmp_path, monkeypatch
+) -> None:
+    """配置启动器时，控制器启动时回收归属资源已不存在的分配：应用开始服务时分配已过期，
+    设备空闲。"""
+    db_file = tmp_path / "cp.db"
+    allocation_id = asyncio.run(_store_orphaned_allocation(db_file))
+    monkeypatch.setenv(INVENTORY_FILE_ENV, str(_write_inventory(tmp_path)))
+    monkeypatch.setenv(launcher_config.RUNTIME_LAUNCHER_ENV, "fake")
+
+    with TestClient(create_app(db_path=str(db_file))) as client:
+        registry = get_registry()
+        allocation = client.portal.call(registry.get_allocation, allocation_id)
+        assert allocation["status"] == "Expired"
+        assert client.portal.call(registry.allocated_devices) == frozenset()
 
 
 @pytest.mark.unit
@@ -340,6 +467,21 @@ def test_deployments_recover_before_the_controller_starts_and_stop_after_it(
             True,
             "FORGEMESH_FAKE_LAUNCHER_ADVERTISE_HOST must be set",
             id="no-advertise-host",
+        ),
+        pytest.param(
+            {
+                "FORGEMESH_RUNTIME_LAUNCHER": "fake",
+                "FORGEMESH_INSTANCE_CHECK_INTERVAL_SECONDS": "0",
+            },
+            True,
+            "FORGEMESH_INSTANCE_CHECK_INTERVAL_SECONDS='0' must be a positive number of seconds",
+            id="instance-check-interval",
+        ),
+        pytest.param(
+            {"FORGEMESH_INSTANCE_CHECK_INTERVAL_SECONDS": "soon"},
+            False,
+            "FORGEMESH_INSTANCE_CHECK_INTERVAL_SECONDS='soon' is not a number of seconds",
+            id="instance-check-interval-without-launcher",
         ),
     ],
 )

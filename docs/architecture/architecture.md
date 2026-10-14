@@ -1338,7 +1338,7 @@ Foundation
 ## 20.6 已知限制
 
 - `InferenceServiceStatus.endpoints`（实例地址、`ready`、`protocol`）已进入资源模型、JSON Schema 与 OpenAPI，可经 status 子资源写入，网关按 `protocol` 映射实例上的推理路径。控制平面只在设置了加速器清单（`FORGEMESH_INVENTORY_FILE`）与启动器（`FORGEMESH_RUNTIME_LAUNCHER`）时部署实例、写入实例地址；未设置时服务停在 `Pending`（`Ready=False`），网关对推理请求明确返回 503，不静默降级。
-- 启动器只有两种：控制平面进程内的假实例（`fake`，供 CI 与本地开发）与控制平面所在主机上的 vLLM 子进程（`vllm-process`，清单只能有这一个节点）；还没有容器、Kubernetes 或经 Node Agent 的远程启动。每个服务只部署一个实例（`spec.availability.replicas` 不生效）。实例活不过控制平面的重启：重启之前 `Ready` 的服务转为 `Degraded`（`InstanceLost`），不会自动重新部署，需删除后重新创建。
+- 启动器有三种：控制平面进程内的假实例（`fake`，供 CI 与本地开发）与控制平面所在主机上的 vLLM / TGI 子进程（`vllm-process` / `tgi-process`，清单只能有这一个节点）；还没有容器、Kubernetes 或经 Node Agent 的远程启动。每个服务只部署一个实例（`spec.availability.replicas` 不生效），更新先停止旧实例再部署新的 `spec`，期间服务不可用。实例活不过控制平面的重启：重启之前 `Ready` 的服务转为 `Degraded`（`InstanceLost`）后重新部署。控制器只向启动器核对实例是否仍在运行，不探测实例能否服务请求。
 
 # 附录 A. 状态转移矩阵
 
@@ -1357,13 +1357,13 @@ Foundation
 | Deploying   | Verifying、Terminating、Failed、Unknown          |
 | Verifying   | Ready、Terminating、Failed、Unknown              |
 | Ready       | Degraded、Updating、Terminating、Failed、Unknown |
-| Degraded    | Ready、Terminating、Failed、Unknown              |
+| Degraded    | Ready、Updating、Terminating、Failed、Unknown    |
 | Updating    | Ready、Terminating、Failed、Unknown              |
 | Terminating | —（终态：finalizer 清空后物理删除，见 5.6）     |
-| Failed      | Terminating（供人工清理失败资源）                |
+| Failed      | Pending（spec 变化后）、Terminating              |
 | Unknown     | Terminating（供人工清理状态不明资源）            |
 
-`Terminating` 是唯一删除终态；`Failed` 与 `Unknown` 不是吸收态，必须可达 `Terminating`。
+`Terminating` 是唯一删除终态；`Failed` 与 `Unknown` 不是吸收态，必须可达 `Terminating`。`Failed → Pending` 只在 `spec` 变化（`generation` 大于 `observedGeneration`）时由协调器执行，以新的 `spec` 重新部署；`spec` 没有变化时不自动重试，失败资源经 `Terminating` 删除。
 
 ## A.2 资源分配（Allocation）
 

@@ -3,11 +3,12 @@
 覆盖：
 
 * ``LaunchRequest`` / ``LaunchedInstance`` 的校验，实例地址与 ``status.endpoints`` 同规则；
-* 部署工作流的步骤、时限与幂等键；步骤 handler 调用启动器，``launch-instance`` 的补偿停止实例；
+* 部署工作流的步骤、时限与幂等键（uid + generation），按资源查找部署运行；步骤 handler
+  调用启动器，``launch-instance`` 的补偿停止实例；
 * 在 ``LocalWorkflowRuntime`` 中执行：成功、验证失败时停止已启动的实例、启动失败、
   启动中途重启后复用同一实例；
 * ``DeploymentReleaser``：没有部署时不做事、停止已部署的实例、取消进行中的部署、
-  重试补偿时没能停止的实例、停止失败时抛出异常；
+  重试补偿时没能停止的实例、停止资源每一次部署运行的实例、停止失败时抛出异常；
 * ``InMemoryLauncher`` 按实例幂等键复用实例，只把仍在运行的实例报告为运行中。
 """
 
@@ -15,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from collections import defaultdict
 from typing import Any
 
@@ -33,6 +35,7 @@ from forgemesh.controlplane.deployment import (
     deployment_inputs,
     deployment_run_key,
     deployment_workflow,
+    find_deployment_runs,
     launched_instance,
 )
 from forgemesh.controlplane.deployment.workflow import (
@@ -60,7 +63,7 @@ from forgemesh.workflowruntime.runtime import LocalWorkflowRuntime
 from forgemesh.workflowruntime.store import WorkflowStore
 from pydantic import ValidationError
 
-KEY = deployment_run_key("uid-1")
+KEY = deployment_run_key("uid-1", 1)
 
 
 def _request(key: str = KEY) -> LaunchRequest:
@@ -153,8 +156,8 @@ def _runtime(launcher: RuntimeLauncher, store: WorkflowStore | None = None) -> L
     )
 
 
-async def _deploy(runtime: LocalWorkflowRuntime) -> str:
-    ref = await runtime.start(deployment_workflow(), deployment_inputs(_request()), KEY)
+async def _deploy(runtime: LocalWorkflowRuntime, key: str = KEY) -> str:
+    ref = await runtime.start(deployment_workflow(), deployment_inputs(_request(key)), key)
     return ref.run_id
 
 
@@ -249,9 +252,59 @@ def test_deployment_workflow_prepares_launches_and_verifies() -> None:
 
 
 @pytest.mark.unit
-def test_deployment_run_key_is_per_resource_uid() -> None:
-    assert KEY == "deployment:uid-1"
-    assert deployment_run_key("uid-2") != KEY
+def test_deployment_run_key_is_per_resource_uid_generation_and_attempt() -> None:
+    """第一次部署的键不带次数（与之前的版本相同），之后的重新部署带上次数。"""
+    assert KEY == "deployment:uid-1:1"
+    assert deployment_run_key("uid-1", 1, attempt=1) == KEY
+    assert deployment_run_key("uid-1", 2) == "deployment:uid-1:2"
+    assert deployment_run_key("uid-1", 2, attempt=3) == "deployment:uid-1:2:3"
+    assert deployment_run_key("uid-2", 1) != KEY
+    with pytest.raises(ValueError, match="attempt must be >= 1"):
+        deployment_run_key("uid-1", 1, attempt=0)
+
+
+@pytest.mark.unit
+def test_find_deployment_runs_returns_the_runs_of_one_resource_in_creation_order() -> None:
+    """包括旧版本不含 generation 的键与重新部署的各次运行；uid 互为前缀的其他资源
+    不算在内。"""
+    keys = [
+        "deployment:uid-1:2",
+        "deployment:uid-1",
+        "deployment:uid-10:1",
+        "deployment:uid-1:1",
+        "deployment:uid-1:x",
+        "deployment:uid-1:12",
+        "deployment:uid-1:1:2",
+        "deployment:uid-1:1:y",
+        "deployment:uid-1:12:3",
+    ]
+
+    async def scenario() -> dict[int | None, list[tuple[str, int | None, int]]]:
+        runtime = _runtime(InMemoryLauncher())
+        try:
+            run_ids = {key: await _deploy(runtime, key) for key in keys}
+            found = {}
+            for generation in (None, 1, 2, 3):
+                runs = await find_deployment_runs(runtime, "uid-1", generation)
+                assert all(run.run.run_id == run_ids[run.key] for run in runs)
+                found[generation] = [(run.key, run.generation, run.attempt) for run in runs]
+            return found
+        finally:
+            await runtime.aclose()
+
+    found = asyncio.run(scenario())
+
+    assert found[None] == [
+        ("deployment:uid-1:2", 2, 1),
+        ("deployment:uid-1", None, 1),
+        ("deployment:uid-1:1", 1, 1),
+        ("deployment:uid-1:12", 12, 1),
+        ("deployment:uid-1:1:2", 1, 2),
+        ("deployment:uid-1:12:3", 12, 3),
+    ]
+    assert found[1] == [("deployment:uid-1:1", 1, 1), ("deployment:uid-1:1:2", 1, 2)]
+    assert found[2] == [("deployment:uid-1:2", 2, 1)]
+    assert found[3] == []
 
 
 @pytest.mark.unit
@@ -534,6 +587,39 @@ def test_releaser_retries_a_stop_that_failed_during_compensation() -> None:
 
 
 @pytest.mark.unit
+def test_releaser_stops_the_instances_of_every_deployment_run(caplog) -> None:
+    """每一代 spec 与旧版本的运行都被处理；只为停止时仍在运行的实例记日志。"""
+    launcher = _ScriptedLauncher()
+
+    async def scenario() -> tuple[list[RunInfo], list[str]]:
+        runtime = _runtime(launcher)
+        try:
+            legacy = await runtime.wait(await _deploy(runtime, "deployment:uid-1"))
+            await launcher.stop(launched_instance(legacy).instance_id)
+            first = await runtime.wait(await _deploy(runtime, KEY))
+            launcher.entered["verify"].clear()
+            launcher.block.add("verify")
+            second_id = await _deploy(runtime, deployment_run_key("uid-1", 2))
+            await launcher.entered["verify"].wait()
+            stops_before = len(launcher.stops)
+            with caplog.at_level(logging.INFO, logger="forgemesh.controlplane.deployment.release"):
+                await DeploymentReleaser(runtime, launcher).release(_resource(generation=2))
+            return [legacy, first, await runtime.get_run(second_id)], launcher.stops[stops_before:]
+        finally:
+            await runtime.aclose()
+
+    (legacy, first, second), stops = asyncio.run(scenario())
+
+    assert second.status is WorkflowStatus.CANCELLED
+    assert stops == [run.outputs[LAUNCH_INSTANCE]["instance_id"] for run in (legacy, first, second)]
+    assert launcher.running == {}
+    [stopped] = [record.getMessage() for record in caplog.records]
+    assert stopped.startswith(
+        f"instance stopped: instance_id={launched_instance(first).instance_id}"
+    )
+
+
+@pytest.mark.unit
 def test_releaser_raises_when_the_instance_cannot_be_stopped() -> None:
     launcher = _ScriptedLauncher()
     launcher.stop_failures = 1
@@ -555,7 +641,7 @@ def test_in_memory_launcher_reuses_instances_per_key() -> None:
     async def scenario() -> dict[str, Any]:
         first = await launcher.launch(_request())
         again = await launcher.launch(_request())
-        other = await launcher.launch(_request(deployment_run_key("uid-2")))
+        other = await launcher.launch(_request(deployment_run_key("uid-2", 1)))
         await launcher.verify(first)
         await launcher.stop(first.instance_id)
         await launcher.stop(first.instance_id)

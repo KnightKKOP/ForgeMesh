@@ -43,7 +43,7 @@ $(VENV_PY):
 # 注意（--no-deps）：子包之间通过 `forgemesh-*` 名称互相依赖（如 forgemesh-core、
 # forgemesh-workflow-api），但它们都是本仓库内的本地包。若按目录字母序逐个做
 # 依赖解析式 editable 安装，pip 会在兄弟包尚未安装时误向 PyPI 查询（例如先装
-# packages/cli 时解析 forgemesh-core），因私有包不在 PyPI 而失败。故统一加
+# packages/control-plane 时解析 forgemesh-core），因私有包不在 PyPI 而失败。故统一加
 # --no-deps：
 #   * 外部第三方依赖（pydantic）已由上面的 requirements-dev.txt 统一提供；
 #   * 跨包依赖由本循环内的 editable 安装逐一登记，安装完成后即可互相 import。

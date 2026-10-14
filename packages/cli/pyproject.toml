@@ -5,10 +5,10 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "forgemesh-cli"
 version = "0.0.1"
-description = "ForgeMesh command line interface (apply/get/describe/version)"
+description = "ForgeMesh command line client of the REST API (apply/get/describe/list/delete/wait)"
 requires-python = ">=3.12"
 dependencies = [
-    "forgemesh-core",
+    "pyyaml>=6.0.1",
 ]
 
 [project.scripts]

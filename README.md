@@ -236,6 +236,69 @@ make run-dev        # dev 模式：信任租户请求头，只监听 127.0.0.1:8
 
 > 网关默认不连接回环、链路本地与云元数据地址上的推理实例。实例运行在本机时设置 `GATEWAY_INSTANCE_ALLOWED_CIDRS=127.0.0.0/8,::1/128`（`make run-dev` 已设置），见 [gateway/README.md](gateway/README.md)「实例地址限制」。
 
+### 命令行工具
+
+`forgemesh`（`packages/cli`，`make install` 之后为 `.venv/bin/forgemesh`）经 REST API 管理推理服务，只依赖标准库与 PyYAML。默认经网关访问 `http://127.0.0.1:8081`；直连控制平面时以 `--api-url http://127.0.0.1:8080` 或环境变量 `FORGEMESH_API_URL` 指定地址。地址是网关或控制平面的基地址，不含 `/api/v1`（可以带反向代理的路径前缀），不能带凭证、查询串或片段；CLI 不跟随重定向。
+
+API key 取自 `--api-key-file` 指向的文件（只含一行 key，即 keygen 输出的第 2 行，权限设为 `0600`），其次取自环境变量 `FORGEMESH_API_KEY`（例如由 CI 注入的密钥）。CLI 没有接受 key 本身的选项：命令行参数对本机的其他用户可见，也会留在 shell 历史中。key 只放在 `Authorization` 请求头中，任何输出都不包含它。没有 key 时不发送 `Authorization`，`dev` 模式的控制平面需要 `--tenant`（作为 `X-Tenant-Id` 发送）；带 key 时可以省略 `--tenant`，给出就必须是 key 绑定的租户，否则返回 `403`。
+
+```bash
+KEY_FILE=~/.config/forgemesh/acme.key   # 只含 keygen 输出的第 2 行（key），权限 0600
+.venv/bin/forgemesh --api-key-file "$KEY_FILE" apply -f - <<'EOF'
+kind: InferenceService
+metadata: {name: llama, namespace: default}
+spec:
+  model: {reference: models/llama}
+  runtime: {provider: vllm}
+  resources: {accelerator: {type: nvidia-gpu, minMemoryGiB: 16}}
+EOF
+.venv/bin/forgemesh --api-key-file "$KEY_FILE" wait inferenceservice llama -n default --timeout 120
+.venv/bin/forgemesh --api-key-file "$KEY_FILE" list inferenceservices
+.venv/bin/forgemesh --api-key-file "$KEY_FILE" delete inferenceservice llama -n default
+.venv/bin/forgemesh --api-key-file "$KEY_FILE" wait inferenceservice llama -n default --for delete
+```
+
+| 命令 | 说明 |
+| --- | --- |
+| `apply -f FILE` | 资源不存在就创建，存在就整体替换，见下；`-f` 可以重复，`-` 读取标准输入 |
+| `get inferenceservice NAME [-o yaml\|json]` | 输出资源，默认 YAML |
+| `describe inferenceservice NAME` | 便于阅读的详情：元数据、`spec` 要点、phase、条件与实例地址 |
+| `list inferenceservices [-o table\|yaml\|json] [--page-size N]` | 跟随 `nextPageToken` 读取全部页（每页 `N` 条，`1`–`1000`，默认 `100`）；表格列出命名空间、名称、phase、`Ready` 条件及其原因与模型，`-o yaml` 输出以 `---` 分隔的多个文档，`-o json` 输出数组 |
+| `delete inferenceservice NAME` | 受控删除：`204` 时报告 `deleted`；`202` 时报告资源进入 `Terminating`，控制器停止实例、释放加速器之后删除它 |
+| `wait inferenceservice NAME [--for ready\|delete] [--timeout SECONDS]` | 等服务就绪（默认）或被删除，默认最多等 300 秒，见下 |
+
+CLI 只管理 `InferenceService`（写作 `inferenceservice` 或 `inferenceservices`，不区分大小写）。单个资源的命令以 `-n` / `--namespace` 指定命名空间，省略时指不带命名空间的资源（与 API 相同）；`list` 省略时列出全部命名空间。公共选项（`--api-url`、`--api-key-file`、`--tenant`、`-n`）可以写在子命令之前或之后。
+
+**apply**：对每个文档先 `GET`，资源不存在就 `POST`；存在就 `PUT` 文档，以读到的 `metadata.resourceVersion` 与 `metadata.uid` 作为前置条件（取代文档中的值）。读取之后资源被并发修改、创建或删除时重新读取再试，最多 5 次。每个文档输出一行结果，如 `InferenceService default/llama created`，结果是 `created`、`configured` 或 `unchanged`：没有任何变化的更新不写入，同一个文件再次 `apply` 得到 `unchanged`。`PUT` 整体替换 `spec`、labels 与 annotations（文档中省略的 labels / annotations 被清空）并忽略 `status`，所以 `get` 与 `list -o yaml|json` 的输出修改后可以直接 `apply`。资源正在删除时报告冲突（`409`，原因 `Terminating`），删除完成后再 `apply`。
+
+文件是 YAML（可以有多个以 `---` 分隔的文档）或 JSON（对象或对象的数组）；省略 `kind` 时视为 `InferenceService`；文档没有 `metadata.namespace` 时使用 `-n`，两者都给出时必须相同。全部文档在发出任何请求之前读取并检查，有一个不合法就不发出请求；某个资源失败时报告错误、继续处理其余的资源，以第一个失败的退出码结束。文档中的 `metadata.tenantId` 作为 `X-Tenant-Id` 发送（与 `--tenant` 不同时报错）：与 key 绑定的租户不符时 API 返回 `403`，资源不会被写进 key 的租户。
+
+**wait**：每秒读取一次资源。`--for ready` 在同一次读取中 `status.phase` 为 `Ready`、`Ready` 条件为 `True` 且 `metadata.observedGeneration` 等于 `generation` 时成功，这时服务运行的是当前的 `spec`（见「REST API」）：`spec` 变化之后，服务先以旧的 `observedGeneration` 保持 `Ready`，再经 `Updating` 重新部署，`wait` 等到新的 `spec` 部署完成。资源正在删除，或在当前的 `spec` 下进入 `Failed`（`spec` 变化之前控制器不会再部署它）时立即失败；其他状态都继续等待，如 `Updating`、重新部署中的 `Degraded`，以及 `spec` 变化之后还没重新部署的 `Failed`。超时时报告最后看到的状态：被策略拒绝、等待审批或缺少调度器 / 启动器的更新不写 `status`，服务一直以旧的 `observedGeneration` 停在 `Ready` / `Degraded`，消息说明更新没有开始、原因见控制平面的日志。`--for delete` 在资源不存在时成功（退出码 `0`），输出如 `InferenceService default/llama deleted`：开始等待时资源已经不存在（例如 `delete` 之后控制器在第一次读取之前就删除了它）同样如此，结果不取决于这个先后；因此名称或命名空间写错时也报告成功。读取遇到限流（`429`，按 `Retry-After` 推迟下一次读取）或 `502`–`504` 时继续等待；连接失败只在此前收到过 HTTP 响应时视为暂时故障，第一次请求就连不上时立即失败。
+
+**错误与退出码**：错误消息写到标准错误，以 `Error:` 开头（参数写错时是 argparse 的用法提示）。错误信封显示为 `<message> (HTTP <状态码> <code>[, reason <details.reason>], correlation id <关联 ID>)`，请求校验失败时逐行列出字段与原因；网关自己的纯文本 `429` 与 `502` 分别报告为被网关限流（附上 `Retry-After` 的秒数）与网关连不上控制平面。一次调用的全部请求带同一个随机的 `X-Correlation-Id`，可以用它在网关与控制平面的日志中找到这次调用。`forgemesh --help` 列出同一张退出码表：
+
+| 退出码 | 含义 |
+| --- | --- |
+| `0` | 成功 |
+| `1` | 其他错误，如地址不提供 ForgeMesh API（不是错误信封的 `404`、重定向）或响应无法解析 |
+| `2` | 参数、配置或资源文档不合法，没有发出请求 |
+| `3` | 资源不存在（`404`）；`wait --for delete` 此时以 `0` 成功 |
+| `4` | 冲突（`409`），如资源正在删除，或 `apply` 的 5 次尝试都遇到并发修改 |
+| `5` | 请求被拒绝（`400`、`405`、`413`、`415` 等其他 4xx） |
+| `6` | 认证或授权失败（`401`、`403`） |
+| `7` | 被限流（`429`） |
+| `8` | 服务端错误（`500` 等其他 5xx） |
+| `9` | API 暂时不可用（`502`、`503`、`504`） |
+| `10` | 没有收到 HTTP 响应：连接被拒绝、主机名无法解析、TLS 失败或超时 |
+| `11` | `wait` 超时 |
+| `12` | `wait` 等待的状态不会出现：服务正在删除，或在当前的 `spec` 下进入 `Failed` |
+| `130` | 被 Ctrl-C 中断 |
+
+| 环境变量 | 默认值 | 说明 |
+| --- | --- | --- |
+| `FORGEMESH_API_URL` | `http://127.0.0.1:8081` | API 的基地址，默认是网关（控制平面默认监听 `http://127.0.0.1:8080`）；`--api-url` 优先 |
+| `FORGEMESH_API_KEY` | — | API key，`--api-key-file` 优先；空白值视同未设置 |
+
 ### 部署推理服务
 
 设置 `FORGEMESH_INVENTORY_FILE` 与 `FORGEMESH_RUNTIME_LAUNCHER` 后，控制平面为每个 `InferenceService` 启动一个推理实例，网关经 `/api/v1/namespaces/{ns}/inference/{svc}/chat` 把对话转发给它。启动器有三种：
@@ -341,7 +404,7 @@ ForgeMesh 目前处于预览阶段，API 稳定性标注为 `beta`：minor 版�
   - 说明：Decision Router 的 `OK/FALLBACK_REQUIRED/FAILED` 是决策路由层的另一组状态，与 Policy 三态不混用
 - **插件管理器**：Manifest 解析校验，生命周期状态机，能力发现，权限授予（现状：自 1.1.0 起注册时验证 Ed25519 签名，权限按管理员的授予判定；控制平面应用尚未加载插件）
 - **审计与 Outbox**：事务性 Outbox，异步事件发布，幂等消费，correlation_id 全链路（现状：组件已实现，尚未接入控制平面的生产路径）
-- **REST API 与 CLI**：资源 CRUD，状态查询，任务管理，租户上下文注入（现状：自 1.1.0 起提供 `PUT` / `PATCH` 更新接口（以 `resourceVersion` 或 `ETag` 做乐观并发）；控制平面应用不对外提供工作流运行时，`POST /api/v1/workflows` 返回 `503`；CLI 每条命令使用一个新的内存数据库，尚不可用）
+- **REST API 与 CLI**：资源 CRUD，状态查询，任务管理，租户上下文注入（现状：自 1.1.0 起提供 `PUT` / `PATCH` 更新接口（以 `resourceVersion` 或 `ETag` 做乐观并发），CLI 经 REST API 管理推理服务（`apply` / `get` / `list` / `describe` / `delete` / `wait`），只管理 `InferenceService`；控制平面应用不对外提供工作流运行时，`POST /api/v1/workflows` 返回 `503`）
 
 ### 工作流与决策（M3）
 - **工作流引擎**：持久化执行，幂等去重，三级超时，重试策略
@@ -378,7 +441,7 @@ ForgeMesh 目前处于预览阶段，API 稳定性标注为 `beta`：minor 版�
 
 | 类型 | 数量 |
 |------|------|
-| Python 测试 | **2207** |
+| Python 测试 | **2360** |
 | Go 测试 | 134 个测试函数，全部通过 |
 | ruff 检查 | All checks passed |
 

@@ -222,6 +222,7 @@ if _FASTAPI_AVAILABLE:
             init_authenticator,
             init_registry,
             reset_authenticator,
+            reset_registry,
         )
         from .api.errors import install_exception_handlers
 
@@ -248,6 +249,7 @@ if _FASTAPI_AVAILABLE:
             async with AsyncExitStack() as cleanup:
                 registry = init_registry(path)
                 cleanup.push_async_callback(registry.close)
+                cleanup.callback(reset_registry)
                 logger.info("control plane registry opened: %s", path)
                 init_authenticator(auth)
                 cleanup.callback(reset_authenticator)

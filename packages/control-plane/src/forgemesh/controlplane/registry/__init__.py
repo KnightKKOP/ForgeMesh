@@ -6,9 +6,12 @@ from .store import (
     DEFAULT_RELEASE_FINALIZER,
     SIDE_EFFECT_PHASES,
     ChangeType,
+    ConflictReason,
+    InvalidPageTokenError,
     RequestDeleteResult,
     ResourceChange,
     ResourceKey,
+    ResourcePage,
     SQLiteRegistry,
 )
 
@@ -16,8 +19,11 @@ __all__ = [
     "DEFAULT_RELEASE_FINALIZER",
     "SIDE_EFFECT_PHASES",
     "ChangeType",
+    "ConflictReason",
+    "InvalidPageTokenError",
     "RequestDeleteResult",
     "ResourceChange",
     "ResourceKey",
+    "ResourcePage",
     "SQLiteRegistry",
 ]

@@ -17,6 +17,9 @@
 * :meth:`SQLiteRegistry.update_status` → **status 子资源**：只修改状态条件、
   phase 与 ``observedGeneration``，不递增 ``generation``，可选 CAS；合并后
   没有变化时不写库。
+* :meth:`SQLiteRegistry.update_spec` → **期望状态**：整体替换 ``spec`` / labels /
+  annotations，可选 uid 与版本 CAS；只有 ``spec`` 变化时递增 ``generation``，
+  ``Terminating`` 的资源拒绝更新；没有变化时不写库。
 
 受控删除（finalizer 语义，对齐 architecture.md §5.3/§12.4 与 development-plan
 第 7 章）
@@ -51,6 +54,17 @@ Allocation 持久化
 :meth:`SQLiteRegistry.create_allocation` 在同一个 ``BEGIN IMMEDIATE`` 事务中写入
 分配行与设备行；``release_allocation`` 走 ``ALLOCATION_STATE_MACHINE`` 校验。
 
+分页
+----
+:meth:`SQLiteRegistry.list_page` 按 ``(namespace, name)`` 升序（``namespace`` 为空视为
+``""``）返回一页资源与下一页的不透明游标 ``next_page_token``，格式为 ``<载荷>.<签名>``：
+载荷是 ``{"v": 1, "ns": ..., "name": ...}``（本页最后一个资源的位置）的 base64url 编码
+（无填充），签名是以 ``registry_meta`` 表中持久化的随机密钥对「载荷 + 租户、kind 与过滤
+条件」计算的 HMAC-SHA256（同样 base64url 编码）。游标因此绑定租户、kind 与过滤条件
+（``limit`` 每页可以不同），被篡改或用于另一租户 / kind / 另一组过滤条件时抛
+:class:`InvalidPageTokenError`；密钥随数据库保存，控制平面重启后游标仍然有效。游标记录
+位置而不是快照：翻页期间新建或删除的资源可能出现也可能缺席，全程存在的资源恰好出现一次。
+
 变更记录
 --------
 每次写入 ``resources`` 都在**同一事务**中向 ``resource_changes`` 追加一条
@@ -74,8 +88,11 @@ import asyncio
 import base64
 import builtins
 import contextlib
+import hashlib
+import hmac
 import json
 import logging
+import secrets
 import sqlite3
 import threading
 from collections.abc import Callable, Collection, Iterator, Sequence
@@ -176,7 +193,34 @@ CREATE TABLE IF NOT EXISTS resource_changes (
     change TEXT NOT NULL,
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
+CREATE TABLE IF NOT EXISTS registry_meta (
+    name TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
 """
+
+#: ``registry_meta`` 中保存分页游标签名密钥（hex）的行。
+_PAGE_TOKEN_KEY_NAME = "page_token_key"
+
+#: 分页游标载荷的格式版本。
+_PAGE_TOKEN_VERSION = 1
+
+_INVALID_PAGE_TOKEN = (
+    "invalid page token: it is malformed, was modified, or was issued for "
+    "a different tenant, kind or filter set"
+)
+
+
+def _b64encode(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).rstrip(b"=").decode("ascii")
+
+
+def _b64decode(text: str) -> bytes:
+    return base64.urlsafe_b64decode(text + "=" * (-len(text) % 4))
+
+
+class InvalidPageTokenError(ValueError):
+    """分页游标无效：无法解析、被篡改，或签发给了另一个租户、kind 或另一组过滤条件。"""
 
 
 class ChangeType(StrEnum):
@@ -187,6 +231,14 @@ class ChangeType(StrEnum):
     STATUS = "status"
     TERMINATING = "terminating"
     DELETED = "deleted"
+
+
+class ConflictReason(StrEnum):
+    """:meth:`SQLiteRegistry.update_spec` 拒绝写入的原因（``ConflictError.details["reason"]``）。"""
+
+    RESOURCE_VERSION = "ResourceVersionMismatch"
+    UID = "UidMismatch"
+    TERMINATING = "Terminating"
 
 
 @dataclass(frozen=True)
@@ -213,6 +265,19 @@ class ResourceChange:
     seq: int
     key: ResourceKey
     change: ChangeType
+
+
+@dataclass(frozen=True)
+class ResourcePage:
+    """:meth:`SQLiteRegistry.list_page` 返回的一页资源。
+
+    Attributes:
+        items: 本页资源，按 ``(namespace, name)`` 升序（``namespace`` 为空视为 ``""``）。
+        next_page_token: 继续列出下一页的游标；没有更多资源时为 ``None``。
+    """
+
+    items: builtins.list[Resource]
+    next_page_token: str | None = None
 
 
 @dataclass(frozen=True)
@@ -266,6 +331,7 @@ class SQLiteRegistry(ResourceRegistry):
         self._conn.row_factory = sqlite3.Row
         self._lock = threading.RLock()
         self._init_schema()
+        self._page_token_key = self._load_page_token_key()
 
     # ------------------------------------------------------------------ #
     # 内部辅助
@@ -329,6 +395,23 @@ class SQLiteRegistry(ResourceRegistry):
         self._migrate_legacy_allocations()
         self._ensure_identity_index()
         self._conn.commit()
+
+    def _load_page_token_key(self) -> bytes:
+        """读取分页游标的签名密钥；库中还没有时生成并持久化。
+
+        多个进程同时打开同一个新库时，``INSERT OR IGNORE`` 保证只有先写入的密钥生效，
+        各方随后读到的都是同一个值。
+        """
+        query = "SELECT value FROM registry_meta WHERE name=?"
+        row = self._conn.execute(query, (_PAGE_TOKEN_KEY_NAME,)).fetchone()
+        if row is None:
+            self._conn.execute(
+                "INSERT OR IGNORE INTO registry_meta (name, value) VALUES (?, ?)",
+                (_PAGE_TOKEN_KEY_NAME, secrets.token_hex(32)),
+            )
+            self._conn.commit()
+            row = self._conn.execute(query, (_PAGE_TOKEN_KEY_NAME,)).fetchone()
+        return bytes.fromhex(row["value"])
 
     def _migrate_legacy_allocations(self) -> None:
         """删除存量库中不分租户的旧索引 ``idx_allocations_one_active_per_resource``。
@@ -441,20 +524,58 @@ class SQLiteRegistry(ResourceRegistry):
         return f'$.metadata.labels."{key}"'
 
     @staticmethod
-    def _encode_token(namespace: str | None, name: str) -> str:
-        """将分页游标 ``(namespace, name)`` 编码为 opaque base64 字符串。"""
-        payload = json.dumps({"ns": namespace, "name": name}, ensure_ascii=False)
-        return base64.urlsafe_b64encode(payload.encode("utf-8")).decode("ascii")
+    def _page_scope(
+        tenant_id: str, kind: str, namespace: str | None, labels: dict[str, str] | None
+    ) -> str:
+        """分页游标绑定的上下文：租户、kind 与过滤条件（不含 ``limit``）。"""
+        return json.dumps(
+            {
+                "tenant": tenant_id,
+                "kind": kind,
+                "namespace": namespace,
+                "labels": sorted((labels or {}).items()),
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        )
 
-    @staticmethod
-    def _decode_token(token: str) -> tuple[str | None, str]:
-        """解码分页游标，返回 ``(namespace, name)``。"""
+    def _sign_page_token(self, payload: str, scope: str) -> str:
+        message = f"{payload}.{scope}".encode()
+        return _b64encode(hmac.new(self._page_token_key, message, hashlib.sha256).digest())
+
+    def _encode_page_token(self, scope: str, namespace_key: str, name: str) -> str:
+        """把本页最后一个资源的位置编码为签名游标。"""
+        position = {"v": _PAGE_TOKEN_VERSION, "ns": namespace_key, "name": name}
+        payload = _b64encode(
+            json.dumps(position, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+        )
+        return f"{payload}.{self._sign_page_token(payload, scope)}"
+
+    def _decode_page_token(self, token: str, scope: str) -> tuple[str, str]:
+        """校验签名并解码游标，返回 ``(namespace 排序键, name)``。
+
+        Raises:
+            InvalidPageTokenError: 游标无法解析、被篡改，或属于另一个上下文 ``scope``。
+        """
+        # 签发的游标只含 base64url 字符与 "."；先排除非 ASCII 输入，compare_digest 才能比较 str
+        if not token.isascii():
+            raise InvalidPageTokenError(_INVALID_PAGE_TOKEN)
+        payload, _, signature = token.partition(".")
+        if not hmac.compare_digest(signature, self._sign_page_token(payload, scope)):
+            raise InvalidPageTokenError(_INVALID_PAGE_TOKEN)
         try:
-            raw = base64.urlsafe_b64decode(token.encode("ascii")).decode("utf-8")
-            payload = json.loads(raw)
-            return payload["ns"], payload["name"]
-        except (ValueError, KeyError, UnicodeDecodeError) as exc:
-            raise ValueError(f"invalid continue_token: {token!r}") from exc
+            position = json.loads(_b64decode(payload))
+        except ValueError as exc:
+            raise InvalidPageTokenError(_INVALID_PAGE_TOKEN) from exc
+        if not (
+            isinstance(position, dict)
+            and position.get("v") == _PAGE_TOKEN_VERSION
+            and isinstance(position.get("ns"), str)
+            and isinstance(position.get("name"), str)
+        ):
+            raise InvalidPageTokenError(_INVALID_PAGE_TOKEN)
+        return position["ns"], position["name"]
 
     @staticmethod
     def _row_to_resource(row: sqlite3.Row) -> Resource:
@@ -637,24 +758,57 @@ class SQLiteRegistry(ResourceRegistry):
         continue_token: str | None = None,
         limit: int = 100,
     ) -> builtins.list[Resource]:
-        """按 ``kind`` + 可选 ``namespace`` / ``labels`` 过滤列出资源（分页）。
+        """按 ``kind`` + 可选 ``namespace`` / ``labels`` 过滤列出一页资源。
 
-        标签过滤在 SQL 中先于 ``LIMIT`` 执行，保证每页返回的都是匹配项。
+        与 :meth:`list_page` 相同，只是不返回下一页游标；``continue_token`` 必须是
+        :meth:`list_page` 以相同租户、kind 与过滤条件返回的 ``next_page_token``。
         ``watch=True`` 在阶段 P1 暂未实现，抛 :class:`NotImplementedError`。
 
         Raises:
             ValueError: ``limit`` 小于 1，或标签键包含双引号 / 反斜杠。
+            InvalidPageTokenError: ``continue_token`` 无效。
         """
         if watch:
             raise NotImplementedError("watch stream is not implemented in phase P1")
+        page = await self.list_page(
+            kind, tenant_id, namespace, labels, page_token=continue_token, limit=limit
+        )
+        return page.items
+
+    async def list_page(
+        self,
+        kind: str,
+        tenant_id: str,
+        namespace: str | None = None,
+        labels: dict[str, str] | None = None,
+        page_token: str | None = None,
+        limit: int = 100,
+    ) -> ResourcePage:
+        """按 ``kind`` + 可选 ``namespace`` / ``labels`` 过滤列出一页资源与下一页游标。
+
+        结果按 ``(namespace, name)`` 升序（``namespace`` 为空视为 ``""``），标签过滤在 SQL
+        中先于 ``LIMIT`` 执行，保证每页返回的都是匹配项。还有更多匹配项时
+        ``next_page_token`` 非空：以相同的租户、kind 与过滤条件把它作为 ``page_token``
+        传回即得下一页（``limit`` 可以不同），游标格式见模块文档「分页」。
+
+        Raises:
+            ValueError: ``limit`` 小于 1，或标签键包含双引号 / 反斜杠。
+            InvalidPageTokenError: ``page_token`` 无法解析、被篡改，或签发给了另一个租户、
+                kind 或另一组过滤条件。
+        """
         if limit < 1:
             raise ValueError(f"limit must be >= 1, got {limit}")
         label_paths = [
             (self._label_path(key), value) for key, value in sorted((labels or {}).items())
         ]
+        scope = self._page_scope(tenant_id, kind, namespace, labels)
+        after = self._decode_page_token(page_token, scope) if page_token is not None else None
 
-        def _list() -> list[Resource]:
-            sql = "SELECT body FROM resources WHERE tenant_id=? AND kind=?"
+        def _list_page() -> ResourcePage:
+            sql = (
+                "SELECT body, COALESCE(namespace, '') AS ns_key, name FROM resources "
+                "WHERE tenant_id=? AND kind=?"
+            )
             params: list[Any] = [tenant_id, kind]
             if namespace is not None:
                 sql += " AND namespace IS ?"
@@ -662,21 +816,24 @@ class SQLiteRegistry(ResourceRegistry):
             for path, value in label_paths:
                 sql += " AND json_extract(body, ?) = ?"
                 params.extend([path, value])
-            if continue_token is not None:
-                cursor_ns, cursor_name = self._decode_token(continue_token)
-                cursor_ns_key = cursor_ns if cursor_ns is not None else ""
-                # 按 (COALESCE(namespace,''), name) 升序游标推进
+            if after is not None:
+                after_ns_key, after_name = after
                 sql += (
                     " AND (COALESCE(namespace, '') > ?"
                     " OR (COALESCE(namespace, '') = ? AND name > ?))"
                 )
-                params.extend([cursor_ns_key, cursor_ns_key, cursor_name])
+                params.extend([after_ns_key, after_ns_key, after_name])
+            # 多取一行，用来判断是否还有下一页
             sql += " ORDER BY COALESCE(namespace, ''), name LIMIT ?"
-            params.append(limit)
+            params.append(limit + 1)
             rows = self._conn.execute(sql, tuple(params)).fetchall()
-            return [self._row_to_resource(r) for r in rows]
+            items = [self._row_to_resource(row) for row in rows[:limit]]
+            if len(rows) <= limit:
+                return ResourcePage(items)
+            last = rows[limit - 1]
+            return ResourcePage(items, self._encode_page_token(scope, last["ns_key"], last["name"]))
 
-        return await self._run(_list)
+        return await self._run(_list_page)
 
     async def delete(
         self,
@@ -982,6 +1139,122 @@ class SQLiteRegistry(ResourceRegistry):
             return updated
 
         return await self._run(_update_status)
+
+    async def update_spec(
+        self,
+        kind: str,
+        namespace: str | None,
+        name: str,
+        tenant_id: str,
+        spec: dict[str, Any],
+        *,
+        labels: dict[str, str],
+        annotations: dict[str, str],
+        expected_version: str | None = None,
+        expected_uid: str | None = None,
+    ) -> Resource:
+        """期望状态写入：整体替换 ``spec``、``metadata.labels`` 与 ``metadata.annotations``。
+
+        只适用于登记了强类型模型的 kind（:data:`_KIND_MODELS`），写入结果须满足该模型；
+        status、条件、finalizer、uid 与 ``observedGeneration`` 原样保留。规则：
+
+        * ``spec`` 按模型规范化（补齐默认值）后与当前值比较，变化时 ``generation`` 加 1；
+          只有 labels / annotations 变化时 ``generation`` 不变；
+        * 有变化时 ``resource_version`` 加 1，并追加 ``updated`` 变更记录（控制器据此
+          重新协调）；没有任何变化时不写库，返回当前资源；
+        * 资源处于 ``Terminating`` 时拒绝，先于 uid / 版本检查（重新读取后重试也不会成功）；
+        * ``expected_uid`` / ``expected_version`` 非空时须与当前 uid / 版本相同（版本按
+          字符串比较）；同名资源被删除后重建时版本会从 0 重新计数，uid 可以识别这种情况。
+
+        检查与写入在同一个 ``BEGIN IMMEDIATE`` 事务中完成。
+
+        Returns:
+            写入后的资源；没有变化时为当前资源。
+
+        Raises:
+            NotFoundError: 资源不存在（或跨租户不可见）。
+            ConflictError: 资源处于 ``Terminating``，或 uid / 版本与预期不同；
+                ``details["reason"]`` 为 :class:`ConflictReason` 的取值。
+            ValueError: kind 没有登记强类型模型。
+            pydantic.ValidationError: 替换后的资源不满足模型约束（``ValueError`` 的子类）。
+        """
+        model = _KIND_MODELS.get(kind)
+        if model is None:
+            raise ValueError(f"spec updates are not supported for kind {kind!r}")
+        target = f"kind={kind} namespace={namespace!r} name={name}"
+
+        def _update_spec() -> Resource:
+            with self._immediate_transaction() as cur:
+                row = cur.execute(
+                    "SELECT body, phase, uid, generation, resource_version FROM resources "
+                    "WHERE tenant_id=? AND kind=? AND namespace IS ? AND name=?",
+                    (tenant_id, kind, namespace, name),
+                ).fetchone()
+                if row is None:
+                    raise NotFoundError(f"resource not found: {target} tenant_id={tenant_id}")
+                if row["phase"] == "Terminating":
+                    raise ConflictError(
+                        f"resource is terminating and no longer accepts updates: {target}",
+                        details={"reason": ConflictReason.TERMINATING.value},
+                    )
+                if expected_uid is not None and expected_uid != row["uid"]:
+                    raise ConflictError(
+                        f"uid {expected_uid!r} does not match the current resource: {target}",
+                        details={"reason": ConflictReason.UID.value},
+                    )
+                read_version = row["resource_version"]
+                if expected_version is not None and expected_version != str(read_version):
+                    raise ConflictError(
+                        f"resourceVersion {expected_version!r} does not match the current "
+                        f"version {read_version}: {target}",
+                        details={"reason": ConflictReason.RESOURCE_VERSION.value},
+                    )
+                body = json.loads(row["body"])
+                metadata = body["metadata"]
+                replaced = model.model_validate(
+                    {
+                        **body,
+                        "spec": spec,
+                        "metadata": {**metadata, "labels": labels, "annotations": annotations},
+                    }
+                )
+                new_spec = replaced.model_dump(mode="json", by_alias=True)["spec"]
+                new_labels = dict(replaced.metadata.labels)
+                new_annotations = dict(replaced.metadata.annotations)
+                spec_changed = new_spec != self._normalised_spec(model, body)
+                if (
+                    not spec_changed
+                    and new_labels == metadata.get("labels", {})
+                    and new_annotations == metadata.get("annotations", {})
+                ):
+                    return self._body_to_resource(row["body"])
+
+                generation = row["generation"] + 1 if spec_changed else row["generation"]
+                new_version = read_version + 1
+                body["spec"] = new_spec
+                metadata["labels"] = new_labels
+                metadata["annotations"] = new_annotations
+                metadata["generation"] = generation
+                metadata["resourceVersion"] = str(new_version)
+                new_body = json.dumps(body, ensure_ascii=False)
+                cur.execute(
+                    "UPDATE resources SET body=?, generation=?, resource_version=?, "
+                    " updated_at=datetime('now') "
+                    "WHERE tenant_id=? AND kind=? AND namespace IS ? AND name=?",
+                    (new_body, generation, new_version, tenant_id, kind, namespace, name),
+                )
+                self._record_change(cur, tenant_id, kind, namespace, name, ChangeType.UPDATED)
+                return self._body_to_resource(new_body)
+
+        return await self._run(_update_spec)
+
+    @staticmethod
+    def _normalised_spec(model: type[Resource], body: dict[str, Any]) -> Any:
+        """payload 中 ``spec`` 按模型规范化后的 JSON；payload 不满足模型时取原值。"""
+        try:
+            return model.model_validate(body).model_dump(mode="json", by_alias=True).get("spec")
+        except ValidationError:
+            return body.get("spec")
 
     # ------------------------------------------------------------------ #
     # 控制器读取（跨租户，仅供控制平面内部使用）
@@ -1445,8 +1718,11 @@ __all__ = [
     "DEFAULT_RELEASE_FINALIZER",
     "SIDE_EFFECT_PHASES",
     "ChangeType",
+    "ConflictReason",
+    "InvalidPageTokenError",
     "RequestDeleteResult",
     "ResourceChange",
     "ResourceKey",
+    "ResourcePage",
     "SQLiteRegistry",
 ]

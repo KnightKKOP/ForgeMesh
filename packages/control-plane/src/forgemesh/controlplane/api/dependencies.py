@@ -2,7 +2,9 @@
 
 组件组装模式（对齐 development-plan 8.2「组装与依赖注入」）：
 
-* ``Registry`` —— 由 :func:`init_registry` 初始化，未初始化时以内存库兜底；
+* ``Registry`` —— 由 :func:`init_registry` 初始化；未初始化时 :func:`get_registry` 抛出
+  :class:`ComponentNotReadyError`，依赖它的端点经 :func:`require_registry` 返回 503
+  （``REGISTRY_UNAVAILABLE``），不以内存库兜底（否则配置错误时数据只写进进程内存）；
 * ``WorkflowRuntime`` / ``DecisionRouter`` —— 由组装方（部署入口/测试）通过
   :func:`init_workflow_runtime` / :func:`init_decision_router` 显式注入；
   未注入时 :func:`get_workflow_runtime` / :func:`get_decision_router` 抛出
@@ -16,8 +18,9 @@ from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
 from typing import TYPE_CHECKING
+from uuid import uuid4
 
-from fastapi import Depends, Request
+from fastapi import Depends, Header, Request
 from forgemesh.controlplane.auth import (
     SCOPE_READ,
     SCOPE_WRITE,
@@ -28,7 +31,7 @@ from forgemesh.controlplane.auth import (
 )
 from forgemesh.controlplane.registry import SQLiteRegistry
 
-from .errors import ApiError
+from .errors import CORRELATION_HEADER, ApiError
 
 if TYPE_CHECKING:  # pragma: no cover - 仅静态类型检查使用，运行时不导入
     from forgemesh.decision.router import DecisionRouter
@@ -69,10 +72,24 @@ def init_registry(db_path: str = ":memory:") -> SQLiteRegistry:
 
 
 def get_registry() -> SQLiteRegistry:
-    """获取当前 Registry 实例；未初始化时以内存库兜底。"""
+    """获取已初始化的 Registry；未初始化时抛 :class:`ComponentNotReadyError`。"""
     if _registry is None:
-        return init_registry()
+        raise ComponentNotReadyError("Registry 未初始化：请先调用 init_registry(...) 完成组装。")
     return _registry
+
+
+def reset_registry() -> None:
+    """清空已初始化的 Registry（应用关闭与测试用）；连接由持有方关闭。"""
+    global _registry
+    _registry = None
+
+
+async def require_registry() -> SQLiteRegistry:
+    """端点依赖：返回已初始化的 Registry；未初始化时返回 503 错误信封。"""
+    try:
+        return get_registry()
+    except ComponentNotReadyError as exc:
+        raise ApiError(503, "REGISTRY_UNAVAILABLE", str(exc)) from exc
 
 
 def init_workflow_runtime(runtime: WorkflowRuntime) -> WorkflowRuntime:
@@ -174,6 +191,13 @@ async def get_principal(request: Request) -> Principal:
         ) from exc
     except PermissionDeniedError as exc:
         raise ApiError(403, "FORBIDDEN", str(exc)) from exc
+
+
+async def get_correlation_id(
+    correlation_id: str | None = Header(default=None, alias=CORRELATION_HEADER),
+) -> str:
+    """本次请求的关联 ID：取 ``X-Correlation-Id`` 请求头，缺失时生成；错误信封回显该值。"""
+    return correlation_id or uuid4().hex
 
 
 async def get_tenant_id(principal: Principal = Depends(get_principal)) -> str:

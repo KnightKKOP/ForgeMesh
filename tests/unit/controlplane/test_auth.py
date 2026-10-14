@@ -279,11 +279,24 @@ def test_read_only_credentials_cannot_write(api_client) -> None:
         params={"namespace": "default"},
         headers=_bearer(KEY_READ_ONLY),
     )
+    replaced = api_client.put(
+        "/api/v1/inference-services/llama",
+        params={"namespace": "default"},
+        json=BODY,
+        headers=_bearer(KEY_READ_ONLY),
+    )
+    patched = api_client.patch(
+        "/api/v1/inference-services/llama",
+        params={"namespace": "default"},
+        content=b'{"metadata": {"labels": {"tier": "gold"}}}',
+        headers=_bearer(KEY_READ_ONLY, **{"Content-Type": "application/merge-patch+json"}),
+    )
 
     assert listed.status_code == 200
     assert listed.json()["count"] == 1
     assert created.status_code == 403
     assert deleted.status_code == 403
+    assert (replaced.status_code, patched.status_code) == (403, 403)
     assert api_client.get("/api/v1/inference-services", headers=_bearer(KEY_A)).json()["count"] == 1
 
 

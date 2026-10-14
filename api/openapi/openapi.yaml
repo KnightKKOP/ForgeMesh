@@ -11,6 +11,8 @@ info:
     认证（ADR-014）：除探针外的全部端点要求 Authorization: Bearer <API key>，
     租户取自 key 绑定的租户；X-Tenant-Id 请求头可以省略，携带时必须与之一致，
     否则返回 403。读接口要求 read scope，写接口要求 write scope。
+    任何端点遇到未预期的内部错误都返回 500（错误码 INTERNAL_ERROR，不含内部细节），
+    各操作只列出设计中的响应。
   x-stability: beta
   x-deprecation-policy: >-
     端点或字段弃用时使用 x-deprecated: true 扩展字段标记，并附带 x-deprecated-since
@@ -23,11 +25,13 @@ security:
   - apiKey: []
 tags:
   - name: inference-services
-    description: 推理服务声明式生命周期管理（创建/查询/删除）
+    description: 推理服务声明式生命周期管理（创建/查询/更新/删除）
   - name: workflows
     description: 工作流运行启动与状态查询
   - name: decisions
     description: 结构化决策请求（决策≠授权；授权由 Scheduler/Policy 完成）
+  - name: resources
+    description: 按 kind 列出资源（只读）
   - name: probes
     description: 存活与就绪探针
 
@@ -66,10 +70,15 @@ paths:
                 $ref: "#/components/schemas/Error"
 
   /api/v1/inference-services:
+    parameters:
+      - $ref: "#/components/parameters/CorrelationId"
     get:
       tags: [inference-services]
       summary: 列出推理服务
       operationId: listInferenceServices
+      description: >-
+        按 (namespace, name) 升序分页，不带命名空间的资源排在最前。响应带 nextPageToken 时
+        还有下一页：以相同的过滤条件把它作为 pageToken 传回。
       parameters:
         - name: tenantId
           in: query
@@ -80,22 +89,12 @@ paths:
           description: 从未生效，服务端忽略；租户取自凭证（ADR-014）。
           schema:
             type: string
-        - name: namespace
-          in: query
-          description: 只列出该命名空间中的资源；省略时不按命名空间过滤。
-          schema:
-            type: string
-        - name: limit
-          in: query
-          description: 单页最多返回的条数；超出 1–1000 返回 400。
-          schema:
-            type: integer
-            minimum: 1
-            maximum: 1000
-            default: 100
+        - $ref: "#/components/parameters/NamespaceFilter"
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/PageToken"
       responses:
         "200":
-          description: 列表
+          description: 一页推理服务
           content:
             application/json:
               schema:
@@ -106,6 +105,8 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/Forbidden"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
     post:
       tags: [inference-services]
       summary: 创建推理服务（声明式）
@@ -118,7 +119,10 @@ paths:
               $ref: "#/components/schemas/InferenceService"
       responses:
         "201":
-          description: 已创建
+          description: 已创建（generation 为 1，observedGeneration 为 0）
+          headers:
+            ETag:
+              $ref: "#/components/headers/ETag"
           content:
             application/json:
               schema:
@@ -131,6 +135,8 @@ paths:
           $ref: "#/components/responses/Forbidden"
         "409":
           $ref: "#/components/responses/Conflict"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
 
 
   /api/v1/inference-services/{name}:
@@ -145,6 +151,7 @@ paths:
         description: 资源所在的命名空间；省略时指不带命名空间的资源。
         schema:
           type: string
+      - $ref: "#/components/parameters/CorrelationId"
     get:
       tags: [inference-services]
       summary: 获取推理服务
@@ -152,6 +159,9 @@ paths:
       responses:
         "200":
           description: 资源
+          headers:
+            ETag:
+              $ref: "#/components/headers/ETag"
           content:
             application/json:
               schema:
@@ -162,6 +172,92 @@ paths:
           $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/NotFound"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+    put:
+      tags: [inference-services]
+      summary: 整体替换推理服务的 spec / labels / annotations
+      operationId: replaceInferenceService
+      description: >-
+        请求体是完整的资源文档（GET 的响应修改后可直接提交）。spec、metadata.labels 与
+        metadata.annotations 整体替换（省略 labels / annotations 即清空）；只有 spec 变化时
+        generation 递增，labels / annotations 变化不递增，没有任何变化时不写入、版本不变。
+        kind、apiVersion、metadata.name、metadata.namespace 与租户不可修改：给出时必须与当前
+        资源一致，否则 400。status、conditions、finalizers、generation、observedGeneration
+        被忽略。metadata.uid / metadata.resourceVersion 给出时是前置条件，与 If-Match 一样，
+        不满足时返回 409；处于 Terminating 的资源拒绝更新（409）。
+        已经 Ready 的服务在 spec 变化后保持 generation 大于 observedGeneration，直到控制器
+        处理新的 spec。
+      parameters:
+        - $ref: "#/components/parameters/IfMatch"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/InferenceService"
+      responses:
+        "200":
+          description: 更新后的资源（没有变化时为当前资源）
+          headers:
+            ETag:
+              $ref: "#/components/headers/ETag"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/InferenceService"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+    patch:
+      tags: [inference-services]
+      summary: 以 JSON Merge Patch（RFC 7386）更新推理服务
+      operationId: patchInferenceService
+      description: >-
+        补丁合并到当前资源的 JSON 表示（与 GET 的响应相同）之后，按与 PUT 相同的规则检查并
+        写入：null 删除字段，对象逐字段合并，数组整体替换。补丁中没有给出的字段沿用当前值，
+        所以只有补丁里给出的 metadata.resourceVersion / metadata.uid 才构成前置条件。
+      parameters:
+        - $ref: "#/components/parameters/IfMatch"
+      requestBody:
+        required: true
+        content:
+          application/merge-patch+json:
+            schema:
+              $ref: "#/components/schemas/InferenceServicePatch"
+      responses:
+        "200":
+          description: 更新后的资源（没有变化时为当前资源）
+          headers:
+            ETag:
+              $ref: "#/components/headers/ETag"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/InferenceService"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "415":
+          $ref: "#/components/responses/UnsupportedMediaType"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
     delete:
       tags: [inference-services]
       summary: 删除推理服务（受控删除：finalizer 驱动受控释放）
@@ -186,13 +282,20 @@ paths:
           $ref: "#/components/responses/NotFound"
         "409":
           $ref: "#/components/responses/Conflict"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
 
 
   /api/v1/workflows:
+    parameters:
+      - $ref: "#/components/parameters/CorrelationId"
     post:
       tags: [workflows]
       summary: 启动工作流运行
       operationId: startWorkflow
+      description: >-
+        需要注入的工作流运行时。控制平面目前不为这个端点注入运行时（部署工作流由控制器在内部
+        启动），因此返回 503 WORKFLOW_RUNTIME_UNAVAILABLE。
       requestBody:
         required: true
         content:
@@ -212,13 +315,34 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/Forbidden"
+        "404":
+          description: 工作流定义不存在（错误码 NOT_FOUND）
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "500":
+          $ref: "#/components/responses/InternalError"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
 
 
   /api/v1/decisions:
+    parameters:
+      - $ref: "#/components/parameters/CorrelationId"
     post:
       tags: [decisions]
       summary: 请求一次结构化决策（决策≠授权；授权由 Scheduler/Policy 完成）
       operationId: requestDecision
+      description: >-
+        风险等级由服务端按 question 推导：question 是形如 <域>.<动作> 的操作标识（如
+        inference.schedule），只看第一个 "." 之前的域（忽略大小写与首尾空白）。driver、node、mig、
+        gpu、device、plugin、model、quota、tenant、policy、system、platform 为 high（architecture
+        14.2 列出的高风险操作），inference 为 low，其他（含自由文本）为 medium。请求中的
+        riskLevel 只能调高，低于推导值时被忽略。高风险请求没有备用 Provider 时返回 503
+        DECISION_NO_CANDIDATE；候选来自备用 Provider 时不自动采用，返回 503
+        DECISION_FALLBACK_REQUIRED，候选在 details.candidates 中供人工审批。需要注入的决策
+        路由器：控制平面目前不注入，因此返回 503 DECISION_ROUTER_UNAVAILABLE。
       requestBody:
         required: true
         content:
@@ -238,9 +362,99 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/Forbidden"
+        "500":
+          $ref: "#/components/responses/InternalError"
+        "503":
+          $ref: "#/components/responses/DecisionUnavailable"
+
+
+  /api/v1/resources:
+    parameters:
+      - $ref: "#/components/parameters/CorrelationId"
+    get:
+      tags: [resources]
+      summary: 按 kind 列出资源
+      operationId: listResources
+      description: >-
+        与推理服务列表相同的排序与分页规则；省略 kind 时返回空列表（不做全表扫描），这时不会
+        签发 nextPageToken，带 pageToken 返回 400。
+      parameters:
+        - name: kind
+          in: query
+          description: 资源类型，如 InferenceService。
+          schema:
+            type: string
+        - $ref: "#/components/parameters/NamespaceFilter"
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/PageToken"
+      responses:
+        "200":
+          description: 一页资源
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ResourceList"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
 
 
 components:
+  parameters:
+    CorrelationId:
+      name: X-Correlation-Id
+      in: header
+      required: false
+      description: >-
+        全链路关联 ID（大小写不敏感，与网关的 X-Correlation-ID 相同）：错误响应在
+        error.correlationId 中回显该值；省略时由服务端生成。经网关访问时网关总会补上它。
+      schema:
+        type: string
+    NamespaceFilter:
+      name: namespace
+      in: query
+      description: 只列出该命名空间中的资源；省略时不按命名空间过滤。
+      schema:
+        type: string
+    Limit:
+      name: limit
+      in: query
+      description: 单页最多返回的条数；超出 1–1000 返回 400。
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 1000
+        default: 100
+    PageToken:
+      name: pageToken
+      in: query
+      description: >-
+        上一页响应中的 nextPageToken（不透明字符串），空字符串等同于省略。只对签发它的租户与
+        同一组过滤条件（namespace；资源列表还有 kind）有效，limit 可以逐页变化；格式不对、
+        被修改或用于其他租户 / 过滤条件时返回 400。控制平面重启后仍然有效。
+      schema:
+        type: string
+    IfMatch:
+      name: If-Match
+      in: header
+      required: false
+      description: >-
+        乐观并发前置条件：取自资源响应的 ETag（强比较，弱标签永不匹配；* 表示资源存在即可）。
+        与当前 ETag 不匹配返回 409（details.reason 为 ResourceVersionMismatch）。
+      schema:
+        type: string
+  headers:
+    ETag:
+      description: >-
+        资源当前版本的强实体标签（不透明字符串，可原样用于 If-Match）：resourceVersion 变化时
+        随之变化，同名资源删除后重建也不会得到旧的 ETag。
+      schema:
+        type: string
   securitySchemes:
     apiKey:
       type: http
@@ -280,8 +494,10 @@ components:
               type: string
     InferenceService:
       type: object
-      description: "权威 Schema: api/schemas/inference-service.schema.json（此处为骨架摘要）。"
-      additionalProperties: true
+      description: >-
+        权威 Schema: api/schemas/inference-service.schema.json（此处为 API 表示的摘要）。
+        status、conditions、finalizers 由控制平面维护，请求中的值被忽略；未知的顶层字段返回 400。
+      additionalProperties: false
       required: [apiVersion, kind, metadata, spec]
       properties:
         apiVersion:
@@ -289,13 +505,75 @@ components:
         kind:
           type: string
         metadata:
-          type: object
-          additionalProperties: true
+          $ref: "#/components/schemas/ObjectMeta"
         spec:
           type: object
           additionalProperties: true
         status:
           $ref: "#/components/schemas/InferenceServiceStatus"
+        conditions:
+          type: array
+          readOnly: true
+          items:
+            type: object
+            additionalProperties: true
+        finalizers:
+          type: array
+          readOnly: true
+          description: 受控删除的阻塞器，由控制平面维护。
+          items:
+            type: string
+    InferenceServicePatch:
+      type: object
+      description: >-
+        JSON Merge Patch 文档（RFC 7386）：合并到当前资源的 JSON 表示之后，结果须满足
+        InferenceService 与 PUT 的规则。
+      additionalProperties: true
+    ObjectMeta:
+      type: object
+      description: >-
+        公共元数据。uid、tenantId、resourceVersion、generation、observedGeneration
+        由服务端维护（readOnly），创建请求中的值被忽略。
+      required: [name]
+      additionalProperties: false
+      properties:
+        name:
+          type: string
+        namespace:
+          type: [string, "null"]
+          description: 租户内的逻辑命名空间；null 表示不带命名空间的资源。
+        labels:
+          type: object
+          additionalProperties:
+            type: string
+        annotations:
+          type: object
+          additionalProperties:
+            type: string
+        uid:
+          type: [string, "null"]
+          readOnly: true
+          description: 服务端分配的稳定标识，资源生命周期内不变。
+        tenantId:
+          type: [string, "null"]
+          readOnly: true
+          description: 凭证绑定的租户。
+        resourceVersion:
+          type: [string, "null"]
+          readOnly: true
+          description: 乐观并发版本（不透明字符串），每次成功写入（含控制器写 status）都会变化。
+        generation:
+          type: integer
+          minimum: 0
+          readOnly: true
+          description: >-
+            期望状态（spec）版本：创建时为 1，只有 spec 变化时递增，labels / annotations
+            变化不递增。1.1.0 之前创建的资源保留原值（通常为 0），下一次 spec 变化时从原值递增。
+        observedGeneration:
+          type: integer
+          minimum: 0
+          readOnly: true
+          description: 控制器已处理到的 generation；小于 generation 表示最新的 spec 尚未被处理。
     InferenceServiceStatus:
       type: object
       description: 实际状态，只由控制器写入；创建请求中的 status 会被忽略。
@@ -338,14 +616,60 @@ components:
             tgi-generate 为 POST /generate_stream。
     InferenceServiceList:
       type: object
-      required: [items]
+      required: [items, count]
       properties:
         items:
           type: array
           items:
             $ref: "#/components/schemas/InferenceService"
+        count:
+          $ref: "#/components/schemas/PageCount"
         nextPageToken:
+          $ref: "#/components/schemas/NextPageToken"
+    Resource:
+      type: object
+      description: >-
+        通用资源表示：apiVersion、kind、metadata，加上该 kind 特有的字段（如 InferenceService
+        的 spec / status，见 InferenceService）。
+      required: [apiVersion, kind, metadata]
+      additionalProperties: true
+      properties:
+        apiVersion:
           type: string
+        kind:
+          type: string
+        metadata:
+          $ref: "#/components/schemas/ObjectMeta"
+        conditions:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+        finalizers:
+          type: array
+          items:
+            type: string
+    ResourceList:
+      type: object
+      required: [items, count]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/Resource"
+        count:
+          $ref: "#/components/schemas/PageCount"
+        nextPageToken:
+          $ref: "#/components/schemas/NextPageToken"
+    PageCount:
+      type: integer
+      minimum: 0
+      description: 本页的条数（不是总数）。
+    NextPageToken:
+      type: string
+      description: >-
+        还有更多结果时出现，最后一页不带此字段：作为 pageToken 传回即得下一页。游标记录位置而
+        不是快照，翻页期间新建或删除的资源可能出现也可能缺席，全程存在的资源恰好出现一次。
     TerminatingResponse:
       type: object
       description: >
@@ -387,20 +711,30 @@ components:
           type: integer
     DecisionRequest:
       type: object
-      required: [question, context]
+      required: [question]
       properties:
         question:
           type: string
+          minLength: 1
+          description: 操作标识，形如 <域>.<动作>（如 inference.schedule），决定推导的风险等级。
         context:
           type: object
           additionalProperties: true
+          default: {}
         requiredCapabilities:
           type: array
           items:
             type: string
+        riskLevel:
+          $ref: "#/components/schemas/RiskLevel"
+    RiskLevel:
+      type: string
+      enum: [low, medium, high]
+      description: >-
+        风险等级。请求中的值只能调高服务端按 question 推导的等级；响应中是实际采用的等级。
     DecisionResponse:
       type: object
-      required: [decisionId, outcome, rationale]
+      required: [decisionId, outcome, rationale, riskLevel]
       properties:
         decisionId:
           type: string
@@ -415,6 +749,8 @@ components:
         degraded:
           type: boolean
           description: 是否走了 Provider 降级路径。
+        riskLevel:
+          $ref: "#/components/schemas/RiskLevel"
   responses:
     BadRequest:
       description: 请求不合法
@@ -448,7 +784,48 @@ components:
           schema:
             $ref: "#/components/schemas/Error"
     Conflict:
-      description: 并发冲突/已存在
+      description: >-
+        冲突（错误码 CONFLICT）：同名资源已存在，或写入被拒绝。更新被拒绝时 details.reason
+        说明原因：ResourceVersionMismatch（resourceVersion 或 If-Match 与当前版本不符，重新
+        读取后重试）、UidMismatch（同名资源已被删除并重建）、Terminating（资源正在删除，不再
+        接受更新）。
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    UnsupportedMediaType:
+      description: 请求体的媒体类型不受支持（错误码 UNSUPPORTED_MEDIA_TYPE）。
+      headers:
+        Accept-Patch:
+          description: PATCH 接受的媒体类型，固定为 application/merge-patch+json。
+          schema:
+            type: string
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    InternalError:
+      description: 内部错误（错误码 INTERNAL_ERROR）。
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    ServiceUnavailable:
+      description: >-
+        所依赖的组件未就绪（错误码 AUTHENTICATOR_UNAVAILABLE、REGISTRY_UNAVAILABLE、
+        WORKFLOW_RUNTIME_UNAVAILABLE 等）：控制平面未完成组装或正在关闭，不会以临时内存库或
+        放行兜底。
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    DecisionUnavailable:
+      description: >-
+        没有可以自动采用的决策，绝不默认放行。错误码：DECISION_ROUTER_UNAVAILABLE（决策路由器
+        未注入）；DECISION_NO_CANDIDATE（全部 Provider 失败，或高风险请求没有备用 Provider；
+        details.attempts、details.riskLevel）；DECISION_FALLBACK_REQUIRED（高风险请求的候选
+        来自备用 Provider，不自动采用；details.candidates 供人工审批，另有 details.attempts、
+        details.riskLevel）。所依赖的组件未就绪时同 ServiceUnavailable。
       content:
         application/json:
           schema:

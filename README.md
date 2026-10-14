@@ -184,6 +184,40 @@ curl -s -H "Authorization: Bearer fmk_…" http://127.0.0.1:8080/api/v1/inferenc
 
 控制平面启动后会自动协调 `InferenceService`：新建、修改或请求删除的资源在 0.5 秒内被处理，协调结果写入 `status.conditions`（例如 `Ready=False` 及其原因）。未设置 `FORGEMESH_INVENTORY_FILE` 时，新建的服务会停在 `Pending`，并带有 `Ready=False`（`SchedulerUnavailable`）条件；只设置清单、未设置 `FORGEMESH_RUNTIME_LAUNCHER` 时，条件为 `Ready=False`（`WorkflowRuntimeUnavailable`），协调器在分配之前停下，不占用设备。两者都设置后，资源每轮推进一个 phase（`Pending` → `Scheduling` → `Preparing` → `Deploying` → `Verifying` → `Ready`）：分配设备，运行部署工作流（准备模型 → 启动实例 → 验证实例），成功后写入 `status.endpoints` 与 `Ready=True`，网关随即可以转发对话；部署失败时资源进入 `Failed`，不自动重试，删除后重新创建即可再次部署；删除时先取消部署、停止实例，再释放分配。每个服务只部署一个实例（`spec.availability.replicas` 不生效），已部署服务的 `spec` 变化不会重新部署。控制器与 API 运行在同一个进程中，是权威存储的唯一写者（ADR-013）：请以单进程运行，不要使用 `uvicorn --workers` 或多副本。设置了启动器时 `POST /api/v1/workflows` 同样返回 `503`（`WORKFLOW_RUNTIME_UNAVAILABLE`）：部署工作流的运行时只供协调器使用，不对外开放。
 
+### REST API
+
+控制平面的 REST API 以 `/api/v1` 为前缀，契约是 [api/openapi/openapi.yaml](api/openapi/openapi.yaml)。契约测试 `tests/contract/test_openapi_contract.py` 双向核对应用提供的路由、参数、请求体与状态码（探针除外），并逐一调用每个操作、校验响应符合契约：修改路由时须同步修改契约。网关把 `/api/v1/inference-services`、`/api/v1/resources`、`/api/v1/workflows`、`/api/v1/decisions` 及其子路径的请求（任意方法，连同查询串、请求头与请求体）转发给控制平面。错误响应都是错误信封 `{"error": {"code", "message", "correlationId", "details"}}`，`correlationId` 回显请求头 `X-Correlation-Id`（经网关访问时由网关补上）。
+
+| 端点 | 说明 |
+| --- | --- |
+| `POST /api/v1/inference-services` | 创建（`201`）：`uid`、租户与 `resourceVersion` 由服务端设置，`generation` 为 `1`、`observedGeneration` 为 `0`，`status` 被忽略；未知的顶层字段返回 `400`，同名资源已存在返回 `409` |
+| `GET /api/v1/inference-services` | 列出推理服务，可按 `namespace` 过滤，分页见下 |
+| `GET /api/v1/inference-services/{name}` | 读取一个推理服务，响应带 `ETag` |
+| `PUT /api/v1/inference-services/{name}` | 整体替换 `spec`、labels 与 annotations，规则见下 |
+| `PATCH /api/v1/inference-services/{name}` | JSON Merge Patch（RFC 7386，`Content-Type: application/merge-patch+json`），规则同 `PUT` |
+| `DELETE /api/v1/inference-services/{name}` | 受控删除：直接删除返回 `204`；持有 finalizer 或加速器分配时返回 `202`，资源进入 `Terminating`，由协调器释放后删除 |
+| `GET /api/v1/resources?kind=…` | 按 kind 列出资源，分页同上；省略 `kind` 时返回空列表 |
+| `POST /api/v1/workflows`、`POST /api/v1/decisions` | 控制平面应用不注入工作流运行时与决策路由器，合法的请求返回 `503`（`WORKFLOW_RUNTIME_UNAVAILABLE` / `DECISION_ROUTER_UNAVAILABLE`）；决策的风险等级由服务端按 `question` 推导，请求中的 `riskLevel` 只能调高 |
+
+单个资源的端点以 `namespace` 查询参数指定命名空间，省略时指不带命名空间的资源。读接口要求 `read` scope，写接口（含 `PUT` / `PATCH`、启动工作流与请求决策）要求 `write` scope。
+
+**分页**：列表按 `(namespace, name)` 升序返回（不带命名空间的资源在最前），每页最多 `limit` 条（`1`–`1000`，默认 `100`），`count` 是本页的条数。还有更多结果时响应带 `nextPageToken`：以相同的过滤条件把它作为 `pageToken` 传回即得下一页，`limit` 可以变化。游标不透明，只对签发它的租户与同一组过滤条件有效，格式不对、被修改或用于其他租户 / 过滤条件时返回 `400`；控制平面重启后仍然有效。
+
+**更新**：`PUT` 的请求体是完整的资源文档（`GET` 的响应修改后可以直接提交），`spec`、`metadata.labels` 与 `metadata.annotations` 整体替换，省略 labels / annotations 即清空；`PATCH` 的补丁合并到当前资源之后按同样的规则处理（`null` 删除字段，对象逐字段合并，数组整体替换）。`kind`、`apiVersion`、`metadata.name`、`metadata.namespace` 与租户不可修改（`400`），`status`、`conditions`、`finalizers`、`generation`、`observedGeneration` 被忽略。只有 `spec` 变化时 `generation` 递增，没有任何变化的更新不写入。乐观并发：把读到的 `metadata.resourceVersion`（及 `metadata.uid`）留在请求体中，或在 `If-Match` 中携带响应的 `ETag`；资源在此期间被修改过（包括控制器写入 `status`）就返回 `409`（`details.reason` 为 `ResourceVersionMismatch`），重新读取后再试。同名资源删除后重建时 `resourceVersion` 从 `0` 重新计数，`uid` 不符（`UidMismatch`）或 `ETag` 不符可以识别这种情况；资源正在删除时返回 `409`（`Terminating`）。
+
+```bash
+KEY="Authorization: Bearer fmk_…"
+URL="http://127.0.0.1:8081/api/v1/inference-services/llama?namespace=default"
+# 带上读到的版本修改模型引用；期间资源被修改过时返回 409
+RV=$(curl -s -H "$KEY" "$URL" | jq -r .metadata.resourceVersion)
+curl -s -X PATCH -H "$KEY" -H "Content-Type: application/merge-patch+json" \
+  -d "{\"metadata\": {\"resourceVersion\": \"$RV\"}, \"spec\": {\"model\": {\"reference\": \"models/llama-3\"}}}" "$URL"
+# 翻页：把响应中的 nextPageToken 作为 pageToken 传回，直到响应不再带它
+curl -s -H "$KEY" "http://127.0.0.1:8081/api/v1/inference-services?limit=50&pageToken=<nextPageToken>"
+```
+
+更新只修改期望状态，控制器目前不按新的 `spec` 重新部署（见上文）：已经 `Ready` 的服务保持 `generation` 大于 `observedGeneration`；部署工作流启动之后（`Deploying` / `Verifying`）提交的变化同样不会生效，但服务进入 `Ready` 时 `observedGeneration` 会记为最新的 `generation`。
+
 ### Go 网关
 
 ```bash
@@ -287,13 +321,13 @@ ForgeMesh 目前处于预览阶段，API 稳定性标注为 `beta`：minor 版�
 以下是 v1.0.0 发布时列出的核心能力，与实现不符或尚未完成的部分在条目后以「现状」注明：
 
 ### 核心控制平面（M2）
-- **资源注册中心**：SQLite 持久化，乐观并发 CAS，租户隔离，分页游标（现状：API 尚未返回分页游标）
+- **资源注册中心**：SQLite 持久化，乐观并发 CAS，租户隔离，分页游标（现状：自 1.1.0 起列表接口返回签名的分页游标 `nextPageToken`）
 - **协调控制器**：9 步声明式闭环（获取→查询→比较→生成候选→策略校验→调度分配→执行→重观察→更新状态）（现状：自 1.1.0 起由控制器自动驱动；同时设置 `FORGEMESH_INVENTORY_FILE` 与 `FORGEMESH_RUNTIME_LAUNCHER` 后，调度、部署、写入 `status.endpoints` 与受控删除形成完整闭环，见[部署推理服务](#部署推理服务)；未设置启动器时，新建的推理服务停在 `Pending`，并报告 `Ready=False`（`SchedulerUnavailable` 或 `WorkflowRuntimeUnavailable`）。控制平面重启后实例不会自动重新启动）
 - **策略引擎**：allow/deny/require_approval 三态决策，配额规则，高风险审批触发
   - 说明：Decision Router 的 `OK/FALLBACK_REQUIRED/FAILED` 是决策路由层的另一组状态，与 Policy 三态不混用
 - **插件管理器**：Manifest 解析校验，生命周期状态机，能力发现，权限授予（现状：自 1.1.0 起注册时验证 Ed25519 签名，权限按管理员的授予判定；控制平面应用尚未加载插件）
 - **审计与 Outbox**：事务性 Outbox，异步事件发布，幂等消费，correlation_id 全链路（现状：组件已实现，尚未接入控制平面的生产路径）
-- **REST API 与 CLI**：资源 CRUD，状态查询，任务管理，租户上下文注入（现状：没有更新接口；CLI 每条命令使用一个新的内存数据库，尚不可用）
+- **REST API 与 CLI**：资源 CRUD，状态查询，任务管理，租户上下文注入（现状：自 1.1.0 起提供 `PUT` / `PATCH` 更新接口（以 `resourceVersion` 或 `ETag` 做乐观并发）；控制平面应用不对外提供工作流运行时，`POST /api/v1/workflows` 返回 `503`；CLI 每条命令使用一个新的内存数据库，尚不可用）
 
 ### 工作流与决策（M3）
 - **工作流引擎**：持久化执行，幂等去重，三级超时，重试策略
@@ -330,7 +364,7 @@ ForgeMesh 目前处于预览阶段，API 稳定性标注为 `beta`：minor 版�
 
 | 类型 | 数量 |
 |------|------|
-| Python 测试 | **1800** |
+| Python 测试 | **2066** |
 | Go 测试 | 134 个测试函数，全部通过 |
 | ruff 检查 | All checks passed |
 

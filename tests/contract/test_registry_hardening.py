@@ -290,12 +290,11 @@ def test_label_selector_is_applied_before_limit() -> None:
             seen: list[str] = []
             token = None
             while True:
-                page = await reg.list(KIND, TENANT, labels=selector, limit=4, continue_token=token)
-                if not page:
+                page = await reg.list_page(KIND, TENANT, labels=selector, page_token=token, limit=4)
+                seen.extend(r.metadata.name for r in page.items)
+                token = page.next_page_token
+                if token is None:
                     break
-                seen.extend(r.metadata.name for r in page)
-                last = page[-1].metadata
-                token = SQLiteRegistry._encode_token(last.namespace, last.name)
             assert seen == [f"res-{i:03d}" for i in range(140, 150)]
         finally:
             await reg.close()

@@ -91,7 +91,7 @@ ForgeMesh 不负责重新实现整个基础设施生态。
 
 # 2. 已采纳的 ADR 与架构原则
 
-本节将前一版提出的 13 项 ADR 正式纳入架构基线。
+本节列出已采纳的 ADR（ADR-001 至 ADR-014，索引与全文见 [design-decisions](../design-decisions/README.md)）。
 
 这里的“已采纳”表示项目选择了相应的架构方向；具体实现仍需通过接口定义、测试和后续 ADR 完善。
 
@@ -105,13 +105,14 @@ ForgeMesh 不负责重新实现整个基础设施生态。
 | ADR-004 | JEV 不是唯一决策系统               | 支持规则、JEV、LLM 和其他 Provider    |
 | ADR-005 | Scheduler 与 Policy 拥有最终治理权 | 决策建议不能直接分配资源或授权        |
 | ADR-006 | 插件按信任级别隔离                 | 高风险或第三方插件采用隔离执行        |
-| ADR-007 | PostgreSQL 作为权威业务存储        | 缓存与事件系统不能取代权威状态        |
+| ADR-007 | PostgreSQL 作为权威业务存储（目标态，实施顺序见 ADR-013） | 缓存与事件系统不能取代权威状态        |
 | ADR-008 | 采用事务性 Outbox 与幂等消费者     | 关键业务事件不得依赖非原子双写        |
 | ADR-009 | Node Agent 采用受认证的任务协议    | 禁止默认执行任意远程 Shell            |
 | ADR-010 | 采用能力驱动的异构资源模型         | 厂商差异通过 Provider 显式表达        |
 | ADR-011 | 插件与工作流版本固定               | 升级不能破坏正在运行的任务            |
 | ADR-012 | 所有公共契约版本化                 | 通过 Schema、兼容性测试和弃用周期管理 |
 | ADR-013 | 权威存储 SQLite 先行、PostgreSQL 为目标态 | SQL 方言限定兼容子集，PG 独有特性不进核心路径 |
+| ADR-014 | 对外 API 采用绑定租户的 API Key 认证 | 租户只来自已验证的凭证，网关与控制平面各自校验 |
 
 ## 2.2 四条不可违背的架构不变量
 
@@ -169,7 +170,7 @@ Node Agent · Kubernetes · Container Runtime · GPU · Inference Services
 
 ### L6 · Platform Infrastructure
 
-PostgreSQL · Outbox/Event Bus · Object Storage · Secret Manager · Observability
+权威存储（SQLite 先行，PostgreSQL 为目标态，ADR-013）· Outbox/Event Bus · Object Storage · Secret Manager · Observability
 
 持久化、消息、制品、密钥与监控
 
@@ -206,7 +207,7 @@ flowchart TB
     INS["Inference Services"]
   end
   subgraph L6["L6 · Platform Infrastructure"]
-    DB[("PostgreSQL")]
+    DB[("权威存储：SQLite → PostgreSQL")]
     OB["Outbox / Event Bus"]
     OBS["Object Storage · Secret Manager · Observability"]
   end
@@ -263,7 +264,7 @@ flowchart TB
 - 核心模块位于一个受控的服务部署中。
 - Node Agent 作为独立的执行组件。
 - 插件可根据信任等级运行在进程内或独立进程。
-- PostgreSQL 是权威业务存储。
+- 权威业务存储在 ADR-013 的过渡期为 SQLite，目标态为 PostgreSQL（ADR-007）；过渡期内控制平面以单进程运行，保证单写者。
 - 事件总线在确有异步扩展需求时引入，不强制成为初始依赖。
 
 当控制器吞吐量、隔离需求或团队维护边界要求拆分时，再将特定模块部署为独立服务。拆分不能改变已定义的资源状态、接口和一致性语义。
@@ -373,6 +374,8 @@ Pending → Scheduling → Preparing → Deploying → Verifying → Ready
 - 控制器重启后的未完成操作。
 
 领导者选举可以减少重复工作，但不能替代数据层面的并发保护。
+
+在 ADR-013 的 SQLite 阶段，控制器与 API 运行在同一个进程中，是权威存储的唯一写者：不能使用多个 worker 或多副本。资源版本、唯一约束与 CAS 写入在这一阶段同样生效。多实例部署要等 PostgreSQL 与领导者选举就绪（[路线图](roadmap.md) 5.1）。
 
 ## 5.6 Finalizer 与受控删除
 
@@ -1019,6 +1022,8 @@ Allocation 持久化必须保证「同一资源至多一个 Active 分配」：�
 
 对外 API 使用版本前缀，例如 `/api/v1/`。资源 Schema、插件协议、工作流定义和事件格式分别维护自己的版本。
 
+1.1.0 的对外 API 以 `api/openapi/openapi.yaml` 为契约，契约测试双向核对实现：推理服务的创建、读取、`PUT` / `PATCH` 更新（以 `resourceVersion` 做乐观并发）与受控删除，按 kind 列出资源，审计查询，以及工作流与决策两个运行 API；列表接口以签名的分页游标翻页。调用方以绑定租户的 API key 认证，租户只来自已验证的凭证，网关与控制平面各自校验（ADR-014）。错误响应统一为错误信封 `{"error": {"code", "message", "correlationId", "traceId", "details"}}`。
+
 ## 13.2 事件结构
 
 ```yaml
@@ -1040,6 +1045,8 @@ data:
 ```
 
 这是示例结构。正式规范必须明确字段必需性、兼容规则、顺序保证、重复投递和敏感字段处理。
+
+这一结构已经固化为 `api/schemas/event.schema.json`（另有 `resourceUid` 与 `resourceVersion`）。控制平面在写入资源的同一事务中写入事件，至少投递一次，接收方按 `eventId` 去重；目前只尽力按写入顺序投递，不保证按资源保序（ADR-008）。
 
 ## 13.3 兼容性策略
 
@@ -1064,6 +1071,8 @@ data:
 7. 远程节点通信经过认证。
 8. 关键操作有审计记录。
 9. 模型和插件制品具有来源与完整性校验机制。
+
+对外 API 的认证方式见 ADR-014。数据平面网关不把调用方的 `Authorization` 与 `Cookie` 转发给推理实例，只连接实例地址策略允许的网段（默认拒绝回环、链路本地与云元数据地址）。
 
 ## 14.2 高风险操作
 
@@ -1102,6 +1111,8 @@ data:
 
 三者应共享资源 ID、工作流 ID、租户 ID 和 `correlation_id` 等关联字段，同时避免将密钥、令牌和完整敏感请求写入观测数据。
 
+1.1.0 已实现：控制平面与网关以 Prometheus 文本格式在 `/metrics` 输出指标，标签只取有界的取值、不含租户与服务标识；按 W3C `traceparent` 传递 trace-id，日志与错误信封都带 trace-id 与关联 ID。追踪的导出（OTLP）尚未实现。
+
 ## 15.2 关键指标
 
 | 类别     | 指标                                 |
@@ -1135,17 +1146,17 @@ data:
 
 | 领域         | 推荐方案                           |
 | ------------ | ---------------------------------- |
-| 核心语言     | Python                             |
+| 核心语言     | Python 3.12                        |
 | 数据平面网关 | Go 1.27（REST 反代 / SSE 流式 / 实例路由 / 摘流） |
 | API          | FastAPI、OpenAPI                   |
 | 数据验证     | Pydantic 或等效强类型 Schema       |
-| 权威数据库   | PostgreSQL                         |
+| 权威数据库   | SQLite（过渡期，单写者）→ PostgreSQL（目标态），见 ADR-013 |
 | 事务事件     | Transactional Outbox               |
 | Agent 协议   | gRPC / Protobuf 或等价版本化 RPC   |
 | 工作流       | 自有运行契约、可替换 Provider      |
 | GPU          | NVIDIA Provider 起步，后续扩展厂商 |
 | 推理 Runtime | vLLM Provider 起步                 |
-| 观测         | OpenTelemetry、Prometheus 兼容体系 |
+| 观测         | Prometheus 文本格式指标与 W3C Trace Context（已实现）；OpenTelemetry / OTLP 导出（计划中） |
 | 制品         | OCI 镜像、对象存储、制品摘要       |
 | 密钥         | Secret Manager                     |
 | 开发工具     | CLI、Python SDK、OpenAPI           |
@@ -1169,33 +1180,21 @@ data:
 
 # 17. 开源仓库与项目治理
 
-## 17.1 推荐仓库结构
+## 17.1 仓库结构
 
 ```
 forgemesh/
-├── README.md
-├── LICENSE
-├── CONTRIBUTING.md
-├── CODE_OF_CONDUCT.md
-├── SECURITY.md
-├── GOVERNANCE.md
-├── pyproject.toml
-├── Makefile
+├── README.md · CHANGELOG.md · LICENSE
+├── CONTRIBUTING.md · CODE_OF_CONDUCT.md · SECURITY.md · GOVERNANCE.md
+├── pyproject.toml · requirements-dev.txt · Makefile · conftest.py   # 根级只有开发工具的配置，不打包
 │
 ├── docs/
-│   ├── architecture/
-│   │   ├── architecture.md
-│   │   ├── control-plane.md
-│   │   ├── workflow-engine.md
-│   │   ├── decision-model.md
-│   │   ├── plugin-system.md
-│   │   ├── security.md
-│   │   └── tenancy-qos.md
-│   ├── design-decisions/
-│   ├── plugin-development/
-│   ├── api/
-│   ├── operations/
-│   └── tutorials/
+│   ├── architecture/        # 本文、开发计划、v1.1 计划、模块映射与路线图
+│   ├── design-decisions/    # ADR 索引与 ADR-001~014
+│   ├── governance/          # 弃用政策
+│   ├── operations/          # 备份与灾备
+│   ├── plugin-development/  # 插件开发指南
+│   └── releases/            # 发布记录
 │
 ├── api/
 │   ├── openapi/
@@ -1214,10 +1213,14 @@ forgemesh/
 │   ├── node-agent/
 │   └── cli/
 │
-├── gateway/
-│   ├── go.mod
+├── gateway/                 # Go 数据平面网关，只使用标准库
+│   ├── go.mod · Makefile
+│   ├── cmd/gateway/
 │   └── internal/
 │       ├── config/
+│       ├── health/
+│       ├── metrics/
+│       ├── middleware/
 │       ├── router/
 │       ├── stream/
 │       └── upstream/
@@ -1225,6 +1228,7 @@ forgemesh/
 ├── plugins/
 │   ├── decision-rules/
 │   ├── decision-jev/
+│   ├── decision-typesafe-jev/
 │   ├── workflow-reference/
 │   ├── workflow-temporal/
 │   ├── gpu-nvidia/
@@ -1234,15 +1238,15 @@ forgemesh/
 │   └── metering-basic/
 │
 ├── deploy/
-│   ├── docker/
-│   ├── kubernetes/
-│   └── examples/
+│   ├── docker/              # 两个 Dockerfile 与 compose 配置
+│   └── kubernetes/          # 控制平面、网关、网络策略与可选的清单
+│
+├── scripts/                 # CI 校验脚本与 compose 冒烟
 │
 ├── tests/
 │   ├── unit/
 │   ├── contract/
 │   ├── compat/
-│   ├── integration/
 │   ├── e2e/
 │   ├── chaos/
 │   ├── security/
@@ -1250,9 +1254,10 @@ forgemesh/
 │
 └── examples/
     ├── single-node/
-    ├── multi-node/
     └── multi-tenant/
 ```
+
+按组件拆分的设计文档（控制平面、工作流、决策、插件、安全、租户与 QoS）目前都写在本文中；需要拆分时放在 `docs/architecture/` 下，并在本节登记。v1.0 规划过的 `docs/api/`、`docs/tutorials/`、`deploy/examples/`、`tests/integration/` 与 `examples/multi-node/` 尚未创建。新增顶层目录、包或插件时，同步修改本节与 README 的目录结构。
 
 ## 17.2 开源治理要求
 
@@ -1298,6 +1303,8 @@ Apache License 2.0 是合理的默认候选方案。正式发布前，需要检�
 - 计量修正不会无痕覆盖历史记录。
 
 # 19. 实施路线图
+
+本节是 v1.0 的原始实施路线（对应 [development-plan.md](development-plan.md) 的阶段 P0–P5 与里程碑 M0–M6），保留为历史基线：1.0.0 中与实现不符的表述已在 CHANGELOG 中勘误，#5–#24 之后的阶段与迭代以 [roadmap.md](roadmap.md) 为准。
 
 完整开源项目应按架构依赖关系推进，而不是以最短时间完成演示为目标。
 
@@ -1349,11 +1356,11 @@ Foundation
 
 # 20. 架构验收标准
 
-在正式进入稳定版发布之前，ForgeMesh 应满足以下要求。
+在正式进入稳定版发布之前，ForgeMesh 应满足以下要求。1.1.0 尚未满足的条目，以及关闭它们的迭代，见 [roadmap.md](roadmap.md) 第 4 节的正式版验收表。
 
 ## 20.1 架构完整性
 
-- ADR-001 至 ADR-013 已落实到接口、代码结构和测试。
+- ADR-001 至 ADR-014 已落实到接口、代码结构和测试。
 - 核心模块与插件边界明确。
 - 所有公共 Schema 均有版本。
 - Resource Registry、Controller、WorkEngine、JEV 和 Scheduler 的职责无歧义。
@@ -1491,3 +1498,4 @@ ForgeMesh 的最终架构不是“把所有东西都做成插件”，而是建�
 | v1.0 | 2026-10-09 | 原始基线：把 ADR 作为已采纳的设计决策，补齐关键接口和运行语义，把架构决策落实到工程规范 |
 | v1.0（仓库内修订） | 2026-10-10 至 2026-10-13 | 随实现补充：ADR-013（SQLite 先行）、受控删除与 finalizer（5.3、5.6）、Allocation 的唯一约束（12.4）、性能基准（18.1）、已知限制（20.6）与附录 A 的状态转移矩阵 |
 | v1.1 | 2026-10-14 | 去掉复制时带入的对话文字与界面标签；三张示意图改为 mermaid 源码（原图是本机文件路径与 GitHub 不渲染的 data URI）；代码块标注语言 |
+| v1.1 | 2026-10-14 | 与 ADR-013、ADR-014 及 1.1.0 的实现对齐：ADR 总表补上 ADR-014；权威存储的表述（3.1、3.2、4.2、16.1）改为 SQLite 先行；单写者阶段的控制器部署（5.5）；1.1.0 的 API、认证、事件与转发安全（13.1、13.2、14.1）；可观测性的实现状态（15.1、16.1）；仓库结构（17.1）按实际目录更正；第 19 节标明为原始路线并指向 roadmap.md；第 20 节的 ADR 范围与验收进度 |
